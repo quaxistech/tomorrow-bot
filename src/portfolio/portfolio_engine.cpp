@@ -1,4 +1,5 @@
 #include "portfolio/portfolio_engine.hpp"
+#include "common/constants.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -159,8 +160,9 @@ PortfolioSnapshot InMemoryPortfolioEngine::snapshot() const {
     // Рассчитать P&L
     snap.pnl = compute_pnl();
 
-    // Доступный капитал = капитал - валовая экспозиция
-    snap.available_capital = total_capital_ + snap.pnl.total_pnl - snap.exposure.gross_exposure;
+    // Доступный капитал = начальный капитал + реализованная прибыль - валовая экспозиция
+    // Нереализованная прибыль уже отражена в стоимости открытых позиций
+    snap.available_capital = total_capital_ + snap.pnl.realized_pnl_today - snap.exposure.gross_exposure;
     snap.available_capital = std::max(snap.available_capital, 0.0);
 
     snap.computed_at = clock_->now();
@@ -225,7 +227,13 @@ void InMemoryPortfolioEngine::recalculate_position_pnl(Position& pos) const {
         pos.unrealized_pnl = (entry - current) * size;
     }
 
-    pos.unrealized_pnl_pct = (pos.unrealized_pnl / (entry * size)) * 100.0;
+    // Безопасный расчёт процента P&L с проверкой делителя
+    const double entry_notional = entry * size;
+    if (entry_notional > common::finance::kMinValidPrice) {
+        pos.unrealized_pnl_pct = (pos.unrealized_pnl / entry_notional) * common::finance::kPercentScaler;
+    } else {
+        pos.unrealized_pnl_pct = 0.0;
+    }
     pos.notional = NotionalValue(current * size);
 }
 
@@ -244,8 +252,8 @@ ExposureSummary InMemoryPortfolioEngine::compute_exposure() const {
 
     exp.gross_exposure = exp.long_exposure + exp.short_exposure;
     exp.net_exposure = exp.long_exposure - exp.short_exposure;
-    exp.exposure_pct = (total_capital_ > 0.0)
-        ? (exp.gross_exposure / total_capital_) * 100.0
+    exp.exposure_pct = (total_capital_ > common::finance::kMinValidPrice)
+        ? (exp.gross_exposure / total_capital_) * common::finance::kPercentScaler
         : 0.0;
 
     return exp;
@@ -267,8 +275,8 @@ PnlSummary InMemoryPortfolioEngine::compute_pnl() const {
 
     // Текущая просадка от пика
     double current_equity = total_capital_ + summary.total_pnl;
-    if (peak_equity_ > 0.0) {
-        summary.current_drawdown_pct = ((peak_equity_ - current_equity) / peak_equity_) * 100.0;
+    if (peak_equity_ > common::finance::kMinValidPrice) {
+        summary.current_drawdown_pct = ((peak_equity_ - current_equity) / peak_equity_) * common::finance::kPercentScaler;
         summary.current_drawdown_pct = std::max(summary.current_drawdown_pct, 0.0);
     }
 

@@ -8,16 +8,11 @@ namespace tb::indicators {
 
 IndicatorEngine::IndicatorEngine(std::shared_ptr<tb::logging::ILogger> logger)
     : logger_(std::move(logger))
+    , talib_available_(false) // TA-Lib не интегрирована, используется встроенная реализация
 {
-}
-
-bool IndicatorEngine::run_talib_smoke_test() {
-    // TA-Lib не установлена — логируем и возвращаем false
-    talib_available_ = false;
     if (logger_) {
-        logger_->info("IndicatorEngine", "TA-Lib недоступна, используется встроенная реализация индикаторов");
+        logger_->info("IndicatorEngine", "Используется встроенная реализация индикаторов");
     }
-    return false;
 }
 
 bool IndicatorEngine::is_talib_available() const {

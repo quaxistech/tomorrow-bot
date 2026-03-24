@@ -47,6 +47,14 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     // Тип ордера и force
     bool is_market = (order.order_type == OrderType::Market);
     bool is_post_only = (order.order_type == OrderType::PostOnly);
+    bool is_limit = (order.order_type == OrderType::Limit);
+
+    // Проверка неподдерживаемых типов ордеров
+    if (order.order_type == OrderType::StopMarket || order.order_type == OrderType::StopLimit) {
+        logger_->error(kComp, "Стоп-ордера не поддерживаются Bitget Spot API v2",
+            {{"order_type", std::string(to_string(order.order_type))}});
+        return "{}"; // Вернуть пустой JSON для индикации ошибки
+    }
 
     if (is_market) {
         obj["orderType"] = "market";
@@ -54,8 +62,8 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     } else if (is_post_only) {
         obj["orderType"] = "limit";
         obj["force"] = "post_only";
-    } else {
-        // Limit и остальные — как limit
+    } else if (is_limit) {
+        // Limit
         obj["orderType"] = "limit";
 
         // TimeInForce → force
@@ -65,6 +73,11 @@ std::string BitgetOrderSubmitter::build_place_order_json(
             case TimeInForce::FillOrKill:        obj["force"] = "fok"; break;
             default:                             obj["force"] = "gtc"; break;
         }
+    } else {
+        // Неизвестный тип ордера
+        logger_->error(kComp, "Неизвестный тип ордера",
+            {{"order_type", std::string(to_string(order.order_type))}});
+        return "{}";
     }
 
     // Размер ордера
@@ -125,6 +138,14 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
 
     try {
         std::string body = build_place_order_json(order);
+
+        // Проверка на ошибку формирования JSON (пустой объект)
+        if (body == "{}") {
+            result.success = false;
+            result.error_message = "Неподдерживаемый тип ордера";
+            return result;
+        }
+
         last_order_symbol_ = order.symbol.get();  // Запоминаем символ для cancel_order
 
         logger_->info(kComp, "Отправка ордера на биржу",

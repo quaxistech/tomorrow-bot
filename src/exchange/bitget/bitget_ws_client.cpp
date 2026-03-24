@@ -99,7 +99,8 @@ struct BitgetWsClient::Impl {
         , url_parts(parse_url(config.url))
     {
         // TLS 1.2 клиент — не требует отключения SSLv2/v3
-        ssl_ctx.set_verify_mode(ssl::verify_none);
+        ssl_ctx.set_verify_mode(ssl::verify_peer);
+        ssl_ctx.set_default_verify_paths();
     }
 
     // ----------------------------------------------------------------

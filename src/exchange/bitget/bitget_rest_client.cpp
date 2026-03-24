@@ -100,7 +100,8 @@ RestResponse BitgetRestClient::execute(const std::string& method,
 
         // 2. Настроить SSL контекст
         ssl::context ssl_ctx{ssl::context::tlsv12_client};
-        ssl_ctx.set_verify_mode(ssl::verify_none);
+        ssl_ctx.set_verify_mode(ssl::verify_peer);
+        ssl_ctx.set_default_verify_paths();
         ssl_ctx.set_options(
             ssl::context::default_workarounds |
             ssl::context::no_sslv2 |
