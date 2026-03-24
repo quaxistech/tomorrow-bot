@@ -103,7 +103,8 @@ private:
     void check_order_rate(RiskDecision& decision);
 
     /// Проверка: Подряд убыточные сделки
-    void check_consecutive_losses(RiskDecision& decision) const;
+    void check_consecutive_losses(const portfolio::PortfolioSnapshot& portfolio,
+                                   RiskDecision& decision) const;
 
     /// Проверка: Актуальность данных
     void check_stale_feed(const features::FeatureSnapshot& features,
@@ -132,7 +133,7 @@ private:
 
     std::atomic<bool> kill_switch_active_{false};
     std::string kill_switch_reason_;
-    int consecutive_losses_{0};
+    // Note: consecutive_losses теперь берётся из portfolio snapshot
     std::deque<int64_t> order_timestamps_; ///< Временные метки ордеров для rate limiting
     mutable std::mutex mutex_;
 };

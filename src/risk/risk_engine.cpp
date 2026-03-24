@@ -1,5 +1,6 @@
 #include "risk/risk_engine.hpp"
 #include "order_book/order_book_types.hpp"
+#include "common/constants.hpp"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -61,7 +62,7 @@ RiskDecision ProductionRiskEngine::evaluate(
     check_order_rate(decision);
 
     // 10. Серия подряд убыточных сделок
-    check_consecutive_losses(decision);
+    check_consecutive_losses(portfolio, decision);
 
     // 11. Актуальность данных
     check_stale_feed(features, decision);
@@ -136,19 +137,17 @@ void ProductionRiskEngine::record_order_sent() {
     order_timestamps_.push_back(clock_->now().get());
 
     // Очистить старые записи (старше 60 секунд)
-    const int64_t cutoff = clock_->now().get() - 60'000'000'000LL; // 60 сек в наносекундах
+    const int64_t cutoff = clock_->now().get() - common::time::kOneMinuteNs;
     while (!order_timestamps_.empty() && order_timestamps_.front() < cutoff) {
         order_timestamps_.pop_front();
     }
 }
 
 void ProductionRiskEngine::record_trade_result(bool is_loss) {
+    // Теперь consecutive_losses отслеживается в PortfolioEngine.
+    // Этот метод оставлен для совместимости с интерфейсом, но не используется.
     std::lock_guard lock(mutex_);
-    if (is_loss) {
-        consecutive_losses_++;
-    } else {
-        consecutive_losses_ = 0;
-    }
+    (void)is_loss; // Подавление предупреждения о неиспользуемом параметре
 }
 
 // ========== Реализация 14 проверок ==========
@@ -171,10 +170,10 @@ void ProductionRiskEngine::check_max_daily_loss(
 {
     if (portfolio.total_capital <= 0.0) return;
 
-    // Используем РЕАЛИЗОВАННУЮ P&L для проверки дневного убытка.
-    // total_pnl включает unrealized, которая может маскировать реальные убытки.
-    const double daily_loss_pct =
-        std::abs(std::min(portfolio.pnl.realized_pnl_today, 0.0)) / portfolio.total_capital * 100.0;
+    // Используем ОБЩУЮ P&L (реализованная + нереализованная) для проверки дневного убытка.
+    // Это предотвращает открытие новых позиций, когда существующие позиции уже в убытке.
+    const double total_loss = std::min(portfolio.pnl.total_pnl, 0.0);
+    const double daily_loss_pct = std::abs(total_loss) / portfolio.total_capital * 100.0;
 
     if (daily_loss_pct >= config_.max_daily_loss_pct) {
         decision.verdict = RiskVerdict::Denied;
@@ -302,7 +301,7 @@ void ProductionRiskEngine::check_order_rate(RiskDecision& decision) {
     std::lock_guard lock(mutex_);
 
     // Очистить старые записи
-    const int64_t cutoff = clock_->now().get() - 60'000'000'000LL;
+    const int64_t cutoff = clock_->now().get() - common::time::kOneMinuteNs;
     while (!order_timestamps_.empty() && order_timestamps_.front() < cutoff) {
         order_timestamps_.pop_front();
     }
@@ -321,12 +320,17 @@ void ProductionRiskEngine::check_order_rate(RiskDecision& decision) {
     }
 }
 
-void ProductionRiskEngine::check_consecutive_losses(RiskDecision& decision) const {
-    if (consecutive_losses_ >= config_.max_consecutive_losses) {
+void ProductionRiskEngine::check_consecutive_losses(
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision) const
+{
+    // Используем счётчик из портфолио как единственный источник правды
+    const int losses = portfolio.pnl.consecutive_losses;
+    if (losses >= config_.max_consecutive_losses) {
         decision.verdict = RiskVerdict::Denied;
         decision.reasons.push_back({
             "CONSECUTIVE_LOSSES",
-            "Серия убытков " + std::to_string(consecutive_losses_) +
+            "Серия убытков " + std::to_string(losses) +
             " достигла лимита " + std::to_string(config_.max_consecutive_losses),
             0.8
         });
