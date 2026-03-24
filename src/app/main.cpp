@@ -22,7 +22,9 @@
 #include "common/enums.hpp"
 #include <iostream>
 #include <string>
+#include <vector>
 #include <span>
+#include <unordered_map>
 
 namespace {
 
@@ -128,16 +130,29 @@ int main(int argc, const char* argv[]) {
     logger->info("main", "Запуск сканирования торговых пар...");
     auto scan_result = pair_scanner->scan();
 
-    // Определяем символ для торговли
-    std::string active_symbol = "BTCUSDT";  // Fallback по умолчанию
+    // Определяем символы для торговли (до top_n пар из конфига)
+    std::vector<std::string> active_symbols;
     if (!scan_result.selected.empty()) {
-        active_symbol = scan_result.selected.front();
-        logger->info("main", "Лучшая пара для торговли: " + active_symbol,
-            {{"total_scanned", std::to_string(scan_result.total_pairs_found)},
-             {"after_filter", std::to_string(scan_result.pairs_after_filter)},
-             {"selected_count", std::to_string(scan_result.selected.size())}});
+        active_symbols = scan_result.selected;
+        std::string symbols_str;
+        for (const auto& s : active_symbols) {
+            if (!symbols_str.empty()) symbols_str += ", ";
+            symbols_str += s;
+        }
+        logger->info("main", "Выбрано пар для торговли: " + std::to_string(active_symbols.size()),
+            {{"symbols", symbols_str},
+             {"total_scanned", std::to_string(scan_result.total_pairs_found)},
+             {"after_filter", std::to_string(scan_result.pairs_after_filter)}});
     } else {
+        active_symbols.push_back("BTCUSDT");
         logger->warn("main", "Сканер не нашёл подходящих пар. Используется BTCUSDT по умолчанию");
+    }
+
+    // Собираем precision для cada выбранного символа из результатов сканирования
+    // (PairScanner уже загрузил quantityPrecision/pricePrecision из exchange info)
+    std::unordered_map<std::string, std::pair<int, int>> symbol_precisions;
+    for (const auto& ps : scan_result.ranked_pairs) {
+        symbol_precisions[ps.symbol] = {ps.quantity_precision, ps.price_precision};
     }
 
     // ---- 5. Создание и запуск супервизора ----
@@ -150,15 +165,38 @@ int main(int argc, const char* argv[]) {
 
     supervisor.install_signal_handlers();
 
-    // ---- 5.5. Создание торгового pipeline для лучшей пары ----
-    auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
-        config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, comp.health,
-        active_symbol);
+    // ---- 5.5. Создание торговых pipeline для КАЖДОЙ выбранной пары ----
+    std::vector<std::shared_ptr<tb::pipeline::TradingPipeline>> pipelines;
+    pipelines.reserve(active_symbols.size());
 
-    // Регистрируем pipeline как подсистему supervisor
-    supervisor.register_subsystem("trading_pipeline",
-        [pipeline]() { return pipeline->start(); },
-        [pipeline]() { pipeline->stop(); });
+    for (size_t i = 0; i < active_symbols.size(); ++i) {
+        const auto& sym = active_symbols[i];
+
+        auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
+            config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, comp.health,
+            sym);
+
+        // Устанавливаем точность ордеров из данных сканирования
+        auto prec_it = symbol_precisions.find(sym);
+        if (prec_it != symbol_precisions.end()) {
+            pipeline->set_symbol_precision(prec_it->second.first, prec_it->second.second);
+        }
+
+        // Устанавливаем количество pipeline для корректного деления капитала
+        pipeline->set_num_pipelines(static_cast<int>(active_symbols.size()));
+
+        // Регистрируем pipeline как подсистему supervisor с уникальным именем
+        std::string subsystem_name = "pipeline_" + sym;
+        supervisor.register_subsystem(subsystem_name,
+            [pipeline]() { return pipeline->start(); },
+            [pipeline]() { pipeline->stop(); });
+
+        pipelines.push_back(std::move(pipeline));
+
+        logger->info("main", "Pipeline создан для " + sym,
+            {{"index", std::to_string(i + 1)},
+             {"total", std::to_string(active_symbols.size())}});
+    }
 
     // ---- 5.6. Запуск ротации пар (каждые N часов) ----
     pair_scanner->start_rotation([&logger](const std::vector<std::string>& new_symbols) {
@@ -170,7 +208,6 @@ int main(int argc, const char* argv[]) {
         }
         logger->info("main", "Ротация пар завершена. Новые лучшие пары: " + symbols_str,
             {{"count", std::to_string(new_symbols.size())}});
-        // TODO: горячая замена символа в pipeline (требует перезапуск подключений)
     });
 
     try {
@@ -182,8 +219,16 @@ int main(int argc, const char* argv[]) {
     }
 
     // ---- 6. Ожидание завершения ----
-    logger->info("main", "Система запущена. Ожидание сигнала завершения (SIGTERM/SIGINT)...",
-        {{"active_pair", active_symbol}});
+    {
+        std::string all_symbols;
+        for (const auto& s : active_symbols) {
+            if (!all_symbols.empty()) all_symbols += ", ";
+            all_symbols += s;
+        }
+        logger->info("main", "Система запущена. Ожидание сигнала завершения (SIGTERM/SIGINT)...",
+            {{"active_pairs", all_symbols},
+             {"pair_count", std::to_string(active_symbols.size())}});
+    }
     supervisor.wait_for_shutdown();
 
     // ---- 7. Корректное завершение ----

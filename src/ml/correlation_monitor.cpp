@@ -42,6 +42,7 @@ void CorrelationMonitor::on_primary_tick(double price) {
         }
     }
     last_primary_price_ = price;
+    cache_valid_ = false;
 }
 
 void CorrelationMonitor::on_reference_tick(const std::string& asset, double price) {
@@ -58,6 +59,7 @@ void CorrelationMonitor::on_reference_tick(const std::string& asset, double pric
         }
     }
     last_reference_prices_[asset] = price;
+    cache_valid_ = false;
 }
 
 // ==================== Pearson корреляция ====================
@@ -109,6 +111,11 @@ double CorrelationMonitor::compute_pearson(
 CorrelationResult CorrelationMonitor::evaluate() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Возвращаем кэшированный результат, если данные не изменились
+    if (cache_valid_) {
+        return cached_result_;
+    }
+
     CorrelationResult result;
     double total_corr = 0.0;
     size_t valid_count = 0;
@@ -155,8 +162,11 @@ CorrelationResult CorrelationMonitor::evaluate() const {
             result.any_break = true;
         }
 
-        total_corr += std::abs(snap.short_correlation);
-        ++valid_count;
+        // Считаем среднюю только по валидным snapshot-ам
+        if (snap.valid) {
+            total_corr += std::abs(snap.short_correlation);
+            ++valid_count;
+        }
 
         result.snapshots.push_back(snap);
     }
@@ -170,16 +180,19 @@ CorrelationResult CorrelationMonitor::evaluate() const {
     if (result.any_break) {
         result.risk_multiplier = 0.5;
     } else {
-        // Проверяем декорреляцию хотя бы с одним референсом
+        // Проверяем декорреляцию хотя бы с одним ВАЛИДНЫМ референсом
         bool any_decorr = false;
         for (const auto& s : result.snapshots) {
-            if (s.decorrelated) {
+            if (s.valid && s.decorrelated) {
                 any_decorr = true;
                 break;
             }
         }
         result.risk_multiplier = any_decorr ? 0.7 : 1.0;
     }
+
+    cached_result_ = result;
+    cache_valid_ = true;
 
     return result;
 }

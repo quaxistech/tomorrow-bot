@@ -81,9 +81,15 @@ EntryAction ThompsonSampler::select_action() {
 void ThompsonSampler::record_reward(EntryAction action, double reward) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Применяем забывание ПЕРЕД обновлением — чтобы не дисконтировать новое наблюдение
+    apply_decay();
+
     // Находим руку по действию
     for (auto& arm : arms_) {
         if (arm.action == action) {
+            // Инкрементируем счётчик выборов ПЕРЕД обновлением
+            arm.pulls++;
+
             // Обновляем posterior: reward > порог → успех, иначе — неудача
             if (reward > config_.reward_threshold) {
                 arm.alpha += 1.0;
@@ -92,7 +98,7 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
             }
 
             // Обновляем среднюю награду (экспоненциальное скользящее)
-            if (arm.pulls > 0) {
+            {
                 double w = 1.0 / static_cast<double>(arm.pulls);
                 arm.avg_reward = (1.0 - w) * arm.avg_reward + w * reward;
             }
@@ -109,9 +115,6 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
             break;
         }
     }
-
-    // Применяем забывание для адаптации к изменяющимся условиям
-    apply_decay();
 }
 
 // ==================== Статистика ====================

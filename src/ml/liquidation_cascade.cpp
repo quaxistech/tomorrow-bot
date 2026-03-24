@@ -51,6 +51,8 @@ void LiquidationCascadeDetector::on_tick(
         avg_depth_ = std::accumulate(depths_.begin(), depths_.end(), 0.0)
                      / static_cast<double>(depths_.size());
     }
+
+    cache_valid_ = false;  // Инвалидируем кэш при новых данных
 }
 
 // ==================== Оценка каскада ====================
@@ -58,10 +60,17 @@ void LiquidationCascadeDetector::on_tick(
 CascadeSignal LiquidationCascadeDetector::evaluate() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Возвращаем кэшированный результат, если данные не изменились
+    if (cache_valid_) {
+        return cached_signal_;
+    }
+
     CascadeSignal signal;
 
     // Недостаточно данных для анализа
     if (prices_.size() < 6) {
+        cached_signal_ = signal;
+        cache_valid_ = true;
         return signal;
     }
 
@@ -92,15 +101,16 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     double volume_score = std::min(1.0,
         signal.volume_ratio / config_.volume_spike_mult);
 
-    // Для глубины: чем меньше ratio, тем выше скор
-    // depth_ratio < threshold → скор высокий; depth_ratio ≈ 1.0 → скор = 0.0
+    // Для глубины: чем меньше ratio, тем выше скор (линейная шкала)
+    // depth_ratio < threshold → скор высокий; depth_ratio ≈ threshold → скор = 0.0
     double depth_score = 0.0;
     if (config_.depth_thin_threshold >= 1.0) {
         // Некорректный порог — используем упрощённую оценку
         depth_score = (signal.depth_ratio < 0.5) ? 1.0 : 0.0;
     } else if (signal.depth_ratio < config_.depth_thin_threshold) {
-        double denominator = std::max(config_.depth_thin_threshold, 0.01);
-        depth_score = std::min(1.0, (1.0 - signal.depth_ratio) / (1.0 - denominator));
+        // Линейная шкала: 0 при depth_ratio=threshold, 1 при depth_ratio=0
+        double threshold = std::max(config_.depth_thin_threshold, 0.01);
+        depth_score = (threshold - signal.depth_ratio) / threshold;
     }
 
     // 5. Взвешенная вероятность каскада
@@ -118,6 +128,9 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     // 7. Каскад неминуем, если вероятность выше порога
     signal.cascade_imminent =
         (signal.probability >= config_.cascade_probability_threshold);
+
+    cached_signal_ = signal;
+    cache_valid_ = true;
 
     return signal;
 }

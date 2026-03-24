@@ -34,18 +34,22 @@ bool is_valid_transition(OrderState from, OrderState to) {
             return to == OrderState::Open ||
                    to == OrderState::Rejected ||
                    to == OrderState::Filled ||
+                   to == OrderState::PartiallyFilled ||
+                   to == OrderState::Cancelled ||
                    to == OrderState::UnknownRecovery;
 
         case OrderState::Open:
             return to == OrderState::PartiallyFilled ||
                    to == OrderState::Filled ||
                    to == OrderState::CancelPending ||
+                   to == OrderState::Cancelled ||
                    to == OrderState::Expired ||
                    to == OrderState::UnknownRecovery;
 
         case OrderState::PartiallyFilled:
             return to == OrderState::Filled ||
                    to == OrderState::CancelPending ||
+                   to == OrderState::Cancelled ||
                    to == OrderState::Expired ||
                    to == OrderState::UnknownRecovery;
 

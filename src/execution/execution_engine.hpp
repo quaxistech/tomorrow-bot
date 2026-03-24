@@ -11,8 +11,8 @@
 #include "metrics/metrics_registry.hpp"
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace tb::execution {
@@ -68,7 +68,7 @@ public:
     std::vector<OrderRecord> active_orders() const;
 
     /// Проверка дублирования (не отправлять одинаковый интент дважды)
-    bool is_duplicate(const strategy::TradeIntent& intent) const;
+    bool is_duplicate(const strategy::TradeIntent& intent);
 
 private:
     /// Создать запись ордера из интента, решения риска и параметров исполнения
@@ -87,9 +87,9 @@ private:
 
     std::unordered_map<std::string, OrderRecord> orders_;      ///< По order_id
     std::unordered_map<std::string, OrderFSM> order_fsms_;     ///< FSM для каждого ордера
-    std::unordered_set<std::string> recent_intents_;           ///< Для обнаружения дублей
+    std::unordered_map<std::string, int64_t> recent_intents_;  ///< Для обнаружения дублей (key -> timestamp_ns)
     mutable std::mutex mutex_;
-    int next_order_seq_{1};
+    std::atomic<int> next_order_seq_{1};
 };
 
 } // namespace tb::execution

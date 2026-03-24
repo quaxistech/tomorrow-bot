@@ -36,6 +36,7 @@
 #include "metrics/metrics_registry.hpp"
 #include "health/health_service.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
+#include "exchange/bitget/bitget_order_submitter.hpp"
 #include "alpha_decay/alpha_decay_monitor.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
@@ -72,6 +73,12 @@ public:
     /// Получить символ, которым торгует этот pipeline
     const Symbol& symbol() const { return symbol_; }
 
+    /// Установить точность ордеров для символа (из PairScanner exchange info)
+    void set_symbol_precision(int quantity_precision, int price_precision);
+
+    /// Установить количество параллельных pipeline (для корректного деления капитала)
+    void set_num_pipelines(int n) { num_pipelines_ = std::max(1, n); }
+
     /// Остановить все подсистемы (вызывается supervisor)
     void stop();
 
@@ -90,6 +97,7 @@ private:
     // Конфигурация
     config::AppConfig config_;
     Symbol symbol_;
+    int num_pipelines_{1};  ///< Кол-во параллельных pipeline (для деления капитала)
 
     // Инфраструктура
     std::shared_ptr<security::ISecretProvider> secret_provider_;
@@ -163,6 +171,11 @@ private:
     /// Минимальный интервал между ордерами: 30 секунд
     static constexpr int64_t kOrderCooldownNs = 30'000'000'000LL;
 
+    /// Счётчик последовательных отклонений ордеров (для экспоненциального backoff)
+    int consecutive_rejections_{0};
+    /// Максимальный backoff: 10 минут
+    static constexpr int64_t kMaxRejectionBackoffNs = 600'000'000'000LL;
+
     /// Время последнего стоп-лосс ордера (отдельный cooldown от обычных сделок).
     /// Стоп-лосс — экстренный механизм, его нельзя блокировать обычным cooldown'ом,
     /// иначе позиция остаётся открытой и убыток растёт.
@@ -174,8 +187,14 @@ private:
     /// REST клиент для запроса баланса (только production/testnet)
     std::shared_ptr<exchange::bitget::BitgetRestClient> rest_client_;
 
+    /// Ссылка на BitgetOrderSubmitter для настройки precision (nullptr в paper mode)
+    std::shared_ptr<exchange::bitget::BitgetOrderSubmitter> bitget_submitter_;
+
     /// Запросить баланс USDT с биржи и обновить капитал
     void sync_balance_from_exchange();
+
+    /// Загрузить точность ордеров (quantity/price) для текущего символа с биржи
+    void fetch_symbol_precision();
 
     /// Запросить актуальный баланс конкретного ассета (BTC/USDT) перед ордером
     double query_asset_balance(const std::string& coin);
@@ -291,6 +310,8 @@ private:
     StrategyId current_position_strategy_{""};
     /// Conviction при открытии текущей позиции
     double current_position_conviction_{0.0};
+    /// Thompson action при открытии текущей позиции (для корректной записи reward)
+    ml::EntryAction current_entry_thompson_action_{ml::EntryAction::EnterNow};
     /// Текущий множитель размера из alpha decay (1.0 = нет корректировки)
     double alpha_decay_size_mult_{1.0};
     /// Текущая добавка к порогу conviction из alpha decay

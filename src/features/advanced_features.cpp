@@ -77,14 +77,12 @@ void AdvancedFeatureEngine::update_cusum(double return_val) {
         double threshold = cusum_cfg_.threshold_mult;
         cusum_change_detected_ = (cusum_pos_ > threshold) || (cusum_neg_ > threshold);
 
-        // Сброс после обнаружения — для детекции следующего изменения
+        // Сброс после обнаружения — для детекции следующего изменения.
+        // ВАЖНО: fill_snapshot() должен записать значения ДО сброса.
+        // Храним значения на момент детекции для snapshot.
         if (cusum_change_detected_) {
-            if (logger_) {
-                logger_->debug("AdvancedFeatures",
-                    "CUSUM: обнаружена смена режима",
-                    {{"cusum_pos", std::to_string(cusum_pos_)},
-                     {"cusum_neg", std::to_string(cusum_neg_)}});
-            }
+            cusum_detected_pos_ = cusum_pos_;
+            cusum_detected_neg_ = cusum_neg_;
             cusum_pos_ = 0.0;
             cusum_neg_ = 0.0;
         }
@@ -226,8 +224,14 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
 
     // CUSUM
     if (returns_buffer_.size() >= 20) {
-        snapshot.technical.cusum_positive = cusum_pos_;
-        snapshot.technical.cusum_negative = cusum_neg_;
+        // При детекции: отдаём значения НА МОМЕНТ СРАБАТЫВАНИЯ (до сброса)
+        if (cusum_change_detected_) {
+            snapshot.technical.cusum_positive = cusum_detected_pos_;
+            snapshot.technical.cusum_negative = cusum_detected_neg_;
+        } else {
+            snapshot.technical.cusum_positive = cusum_pos_;
+            snapshot.technical.cusum_negative = cusum_neg_;
+        }
         snapshot.technical.cusum_threshold = cusum_cfg_.threshold_mult;
         snapshot.technical.cusum_regime_change = cusum_change_detected_;
         snapshot.technical.cusum_valid = true;

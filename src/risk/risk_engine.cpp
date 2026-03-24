@@ -171,8 +171,10 @@ void ProductionRiskEngine::check_max_daily_loss(
 {
     if (portfolio.total_capital <= 0.0) return;
 
+    // Используем РЕАЛИЗОВАННУЮ P&L для проверки дневного убытка.
+    // total_pnl включает unrealized, которая может маскировать реальные убытки.
     const double daily_loss_pct =
-        std::abs(std::min(portfolio.pnl.total_pnl, 0.0)) / portfolio.total_capital * 100.0;
+        std::abs(std::min(portfolio.pnl.realized_pnl_today, 0.0)) / portfolio.total_capital * 100.0;
 
     if (daily_loss_pct >= config_.max_daily_loss_pct) {
         decision.verdict = RiskVerdict::Denied;
@@ -306,7 +308,10 @@ void ProductionRiskEngine::check_order_rate(RiskDecision& decision) {
     }
 
     if (static_cast<int>(order_timestamps_.size()) >= config_.max_orders_per_minute) {
-        decision.verdict = RiskVerdict::Throttled;
+        // Не ослабляем вердикт: если уже Denied — оставляем Denied
+        if (decision.verdict != RiskVerdict::Denied) {
+            decision.verdict = RiskVerdict::Throttled;
+        }
         decision.reasons.push_back({
             "ORDER_RATE",
             "Превышен лимит " + std::to_string(config_.max_orders_per_minute) +

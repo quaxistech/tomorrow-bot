@@ -132,14 +132,13 @@ std::unordered_map<std::string, double> BayesianAdapter::get_all_adapted(
 {
     std::unordered_map<std::string, double> result;
 
-    // get_adapted_value берёт свой lock — не вызываем под нашим
-    auto strat_it = params_.find(strategy_id);
-    if (strat_it == params_.end()) return result;
-
-    // Собираем имена параметров без удержания lock
+    // Собираем имена параметров под lock, затем вызываем get_adapted_value
+    // (который берёт свой lock) уже после освобождения нашего.
     std::vector<std::string> names;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        auto strat_it = params_.find(strategy_id);
+        if (strat_it == params_.end()) return result;
         for (const auto& [name, _] : strat_it->second) {
             names.push_back(name);
         }

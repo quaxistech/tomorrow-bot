@@ -34,7 +34,8 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
     }
 
     // ADX должен быть достаточно высоким (подтверждение тренда)
-    if (tech.adx < 25.0) {
+    // Порог 18 — компромисс между фильтрацией шума и пропуском сигналов
+    if (tech.adx < 18.0) {
         return std::nullopt;
     }
 
@@ -51,7 +52,7 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
         intent.reason_codes = {"trend_aligned", "momentum_positive", "rsi_not_overbought"};
 
         // Уверенность: чем выше ADX и momentum, тем выше conviction
-        double adx_factor = std::min(1.0, (tech.adx - 25.0) / 25.0);
+        double adx_factor = std::min(1.0, (tech.adx - 18.0) / 25.0);
         double momentum_factor = std::min(1.0, std::abs(tech.momentum_5) / 0.05);
         intent.conviction = std::clamp(0.4 + adx_factor * 0.3 + momentum_factor * 0.3, 0.0, 1.0);
         intent.entry_score = intent.conviction * 0.8;
@@ -69,7 +70,7 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
         intent.signal_name = "ema_crossover_down";
         intent.reason_codes = {"trend_aligned", "momentum_negative", "rsi_not_oversold"};
 
-        double adx_factor = std::min(1.0, (tech.adx - 25.0) / 25.0);
+        double adx_factor = std::min(1.0, (tech.adx - 18.0) / 25.0);
         double momentum_factor = std::min(1.0, std::abs(tech.momentum_5) / 0.05);
         intent.conviction = std::clamp(0.4 + adx_factor * 0.3 + momentum_factor * 0.3, 0.0, 1.0);
         intent.entry_score = intent.conviction * 0.8;

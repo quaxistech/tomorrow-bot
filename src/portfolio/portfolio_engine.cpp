@@ -106,6 +106,15 @@ void InMemoryPortfolioEngine::close_position(
 
     positions_.erase(it);
 
+    // Обновить peak equity после закрытия (realized PnL может увеличить equity)
+    double current_equity = total_capital_ + realized_pnl_today_;
+    for (const auto& [_, p] : positions_) {
+        current_equity += p.unrealized_pnl;
+    }
+    if (current_equity > peak_equity_) {
+        peak_equity_ = current_equity;
+    }
+
     if (metrics_) {
         metrics_->gauge("portfolio_positions_count", {})->set(
             static_cast<double>(positions_.size()));
@@ -189,8 +198,11 @@ void InMemoryPortfolioEngine::reset_daily() {
 void InMemoryPortfolioEngine::set_capital(double capital) {
     std::lock_guard lock(mutex_);
     total_capital_ = capital;
+    // Сброс realized_pnl, т.к. новый капитал уже включает все реализованные P&L.
+    // Без сброса realized_pnl будет считаться дважды в compute_pnl().
+    realized_pnl_today_ = 0.0;
     peak_equity_ = capital;
-    logger_->info("Portfolio", "Капитал обновлён",
+    logger_->info("Portfolio", "Капитал обновлён (realized PnL сброшен)",
                   {{"capital", std::to_string(capital)}});
 }
 
@@ -199,7 +211,7 @@ void InMemoryPortfolioEngine::recalculate_position_pnl(Position& pos) const {
     const double current = pos.current_price.get();
     const double size = pos.size.get();
 
-    if (entry <= 0.0) {
+    if (entry <= 0.0 || size <= 0.0) {
         pos.unrealized_pnl = 0.0;
         pos.unrealized_pnl_pct = 0.0;
         return;

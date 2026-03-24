@@ -50,7 +50,7 @@ std::string BitgetOrderSubmitter::build_place_order_json(
 
     if (is_market) {
         obj["orderType"] = "market";
-        obj["force"] = "gtc";
+        // Для market ордеров force не отправляем — Bitget его не принимает
     } else if (is_post_only) {
         obj["orderType"] = "limit";
         obj["force"] = "post_only";
@@ -72,29 +72,43 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     // Для market sell — size = количество в BTC (base currency)
     // Для limit — size = количество в BTC (base currency)
     if (is_market && order.side == Side::Buy) {
-        // Рыночная покупка: size = quantity * price (сколько USDT потратить)
-        double quote_amount = order.original_quantity.get() * order.price.get();
+        // Рыночная покупка: size = сколько USDT потратить.
+        // original_quantity в base currency (BTC), price — оценочная рыночная цена.
+        // Если price задана, конвертируем base → quote. Иначе используем quantity как USDT.
+        double quote_amount = 0.0;
+        if (order.price.get() > 0.0) {
+            quote_amount = order.original_quantity.get() * order.price.get();
+        }
         if (quote_amount <= 0.0) {
-            // Если цена не задана, используем quantity как USDT напрямую
+            // Fallback: если цена не задана, используем quantity как USDT напрямую.
+            // Это корректно только если вызывающий код задал qty уже в USDT.
             quote_amount = order.original_quantity.get();
+            // Защита: если quote_amount слишком мал (< $1), скорее всего это base qty
+            // без цены — логируем предупреждение
+            if (quote_amount < 1.0) {
+                logger_->warn(kComp, "Market buy: quote_amount подозрительно мал, возможно base qty без цены",
+                    {{"quote_amount", std::to_string(quote_amount)}});
+            }
         }
         std::ostringstream oss;
-        oss << std::fixed << std::setprecision(2) << quote_amount;
+        oss << std::fixed << std::setprecision(price_scale_) << quote_amount;
         obj["size"] = oss.str();
     } else {
-        // Limit или market sell: size = количество base currency
-        // Bitget BTCUSDT spot: максимум 6 знаков после запятой (checkScale=6).
-        // Используем floor (обрезание вниз), чтобы не превысить реальный баланс.
-        double base_qty = std::floor(order.original_quantity.get() * 1e6) / 1e6;
+        // Limit или market sell: size = количество base currency.
+        // Используем quantity_scale_ из exchange info (checkScale для данного символа).
+        // floor (обрезание вниз), чтобы не превысить реальный баланс.
+        double scale_factor = std::pow(10.0, quantity_scale_);
+        double base_qty = std::floor(order.original_quantity.get() * scale_factor) / scale_factor;
         std::ostringstream oss;
-        oss << std::fixed << std::setprecision(6) << base_qty;
+        oss << std::fixed << std::setprecision(quantity_scale_) << base_qty;
         obj["size"] = oss.str();
     }
 
     // Цена — только для лимитных ордеров
+    // Используем price_scale_ из exchange info (quotePrecision для данного символа).
     if (!is_market) {
         std::ostringstream oss;
-        oss << std::fixed << order.price.get();
+        oss << std::fixed << std::setprecision(price_scale_) << order.price.get();
         obj["price"] = oss.str();
     }
 
@@ -111,6 +125,7 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
 
     try {
         std::string body = build_place_order_json(order);
+        last_order_symbol_ = order.symbol.get();  // Запоминаем символ для cancel_order
 
         logger_->info(kComp, "Отправка ордера на биржу",
             {{"symbol", order.symbol.get()},
@@ -174,9 +189,9 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
 bool BitgetOrderSubmitter::cancel_order(const OrderId& order_id) {
     try {
         boost::json::object obj;
-        // Bitget требует symbol, но у нас только order_id.
-        // Используем BTCUSDT по умолчанию (один торгуемый символ).
-        obj["symbol"] = "BTCUSDT";
+        // Используем символ последнего отправленного ордера (т.к. interface IOrderSubmitter
+        // не передаёт symbol в cancel_order). Бот торгует одним символом за раз.
+        obj["symbol"] = last_order_symbol_;
         obj["orderId"] = order_id.get();
 
         std::string body = boost::json::serialize(obj);

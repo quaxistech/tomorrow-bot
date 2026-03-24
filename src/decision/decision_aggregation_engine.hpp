@@ -30,10 +30,11 @@ public:
 /// Комитетный движок: голосование стратегий с вето-логикой
 class CommitteeDecisionEngine : public IDecisionAggregationEngine {
 public:
-    /// Порог одобрения (weighted_score > threshold).
-    /// Повышен с 0.2 до 0.35 — требует более уверенных сигналов для входа.
-    /// Это предотвращает открытие позиций на слабых/сомнительных сигналах.
-    static constexpr double kDefaultThreshold = 0.35;
+    /// Порог одобрения (conviction > threshold × uncertainty_multiplier).
+    /// Снижен до 0.28 для spot-торговли с малым капиталом и tight stop-loss.
+    /// Прежний 0.35 с uncertainty_multiplier до 1.3 давал эффективный порог 0.46,
+    /// что блокировало даже обоснованные сигналы mean reversion.
+    static constexpr double kDefaultThreshold = 0.28;
 
     CommitteeDecisionEngine(std::shared_ptr<logging::ILogger> logger,
                             std::shared_ptr<clock::IClock> clock);

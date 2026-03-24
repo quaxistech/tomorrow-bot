@@ -59,6 +59,10 @@ private:
     double avg_volume_{0.0};
     double avg_depth_{0.0};
 
+    /// Кэш результата evaluate() (инвалидируется при on_tick)
+    mutable CascadeSignal cached_signal_;
+    mutable bool cache_valid_{false};
+
     mutable std::mutex mutex_;
 };
 

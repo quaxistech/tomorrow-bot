@@ -45,88 +45,99 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
     intent.symbol = context.features.symbol;
     intent.generated_at = clock_->now();
 
-    // Покупка: цена ниже нижней BB + RSI < 30 (перепроданность)
-    // ЗАЩИТА: не ловим "падающий нож" — требуем подтверждение разворота
-    if (last_price < tech.bb_lower && tech.rsi_14 < 30.0) {
+    // === BUY: Градуированный вход по mean reversion ===
+    // Используем позицию цены в BB канале (bb_pos) вместо жёсткого "ниже BB_lower".
+    // На 1m таймфрейме цена редко выходит за нижнюю BB — необходим более мягкий порог.
+    // bb_pos: 0.0 = на нижней BB, 1.0 = на верхней BB, <0 = ниже нижней BB
+    double bb_range = tech.bb_upper - tech.bb_lower;
+    double bb_pos = (bb_range > 1e-10)
+        ? (last_price - tech.bb_lower) / bb_range
+        : 0.5;
+
+    // BUY: цена в нижних 30% BB + RSI < 40 (расширенная зона перепроданности)
+    // На 1m таймфрейме цена редко доходит до экстремумов BB — используем мягкий порог.
+    if (bb_pos < 0.30 && tech.rsi_14 < 40.0) {
 
         // === Фильтр 1: Сильный нисходящий тренд ===
-        // Если EMA20 < EMA50 И ADX > 20 — это сильный направленный тренд вниз.
-        // Mean reversion в таких условиях = "ловля падающего ножа".
+        // ADX > 30 + EMA20 < EMA50 = выраженный нисходящий тренд.
+        // В таких условиях требуем подтверждение разворота (MACD или RSI).
+        // ADX > 20 (прежний порог) — слишком строго, блокировал нормальные сигналы.
         if (tech.ema_valid && tech.adx_valid) {
-            bool strong_downtrend = (tech.ema_20 < tech.ema_50) && (tech.adx > 20.0);
+            bool strong_downtrend = (tech.ema_20 < tech.ema_50) && (tech.adx > 30.0);
             if (strong_downtrend) {
-                // Разрешаем вход ТОЛЬКО при явном развороте:
-                // MACD histogram > 0 (бычье пересечение) ИЛИ momentum разворачивается
                 bool macd_reversal = tech.macd_valid && tech.macd_histogram > 0.0;
                 bool rsi_divergence = tech.rsi_14 > 25.0; // RSI начал расти от дна
 
                 if (!macd_reversal && !rsi_divergence) {
-                    logger_->debug("MeanReversion",
-                        "BUY подавлен — сильный даунтренд без разворота",
+                    logger_->info("MeanReversion",
+                        "BUY подавлен — сильный даунтренд (ADX>30) без разворота",
                         {{"ema20", std::to_string(tech.ema_20)},
                          {"ema50", std::to_string(tech.ema_50)},
                          {"adx", std::to_string(tech.adx)},
-                         {"macd_hist", std::to_string(tech.macd_histogram)}});
+                         {"bb_pos", std::to_string(bb_pos)},
+                         {"rsi", std::to_string(tech.rsi_14)}});
                     return std::nullopt;
                 }
             }
         }
 
         // === Фильтр 2: Слишком глубокая перепроданность ===
-        // RSI < 15 = паника, цена может падать дальше. Ждём стабилизации.
         if (tech.rsi_14 < 15.0) {
-            logger_->debug("MeanReversion",
-                "BUY подавлен — RSI в зоне паники, ожидание стабилизации",
+            logger_->info("MeanReversion",
+                "BUY подавлен — RSI в зоне паники",
                 {{"rsi", std::to_string(tech.rsi_14)}});
             return std::nullopt;
         }
 
         intent.side = Side::Buy;
         intent.signal_name = "bb_oversold";
-        intent.reason_codes = {"price_below_bb_lower", "rsi_oversold"};
+        intent.reason_codes = {"price_near_bb_lower", "rsi_oversold"};
         intent.limit_price = Price(tech.bb_lower);
 
-        // Conviction зависит от расстояния до средней BB.
-        // Уменьшаем conviction если тренд неопределённый (осторожность).
-        double distance = (tech.bb_middle - last_price) / (tech.bb_middle * tech.bb_bandwidth + 1e-10);
-        double base_conviction = std::clamp(0.3 + std::min(0.5, distance * 0.1), 0.0, 1.0);
+        // Conviction: градуированный расчёт на основе глубины перепроданности.
+        // rsi_factor: чем ниже RSI, тем сильнее сигнал (0.0 при RSI=40, 1.0 при RSI=15)
+        // bb_factor: чем ниже bb_pos, тем сильнее сигнал (0.0 при 0.30, ~1.0 при 0.0)
+        double rsi_factor = (40.0 - tech.rsi_14) / 25.0;
+        double bb_factor = (0.30 - bb_pos) / 0.30;
+        double base_conviction = std::clamp(0.25 + 0.35 * rsi_factor + 0.25 * bb_factor, 0.0, 1.0);
 
-        // Штраф за неопределённый тренд: снижаем conviction на 30%
-        if (tech.ema_valid && tech.ema_20 < tech.ema_50) {
-            base_conviction *= 0.7;
-        }
-        // Бонус за MACD reversal: подтверждённый разворот добавляет уверенности
+        // Mean reversion — контр-трендовая стратегия.
+        // НЕ штрафуем за медвежий EMA (это ожидаемо при перепроданности).
+        // Вместо этого бонус за подтверждение разворота (MACD).
         if (tech.macd_valid && tech.macd_histogram > 0.0) {
-            base_conviction = std::min(1.0, base_conviction * 1.2);
+            base_conviction = std::min(1.0, base_conviction * 1.25);
         }
 
         intent.conviction = base_conviction;
         intent.entry_score = intent.conviction * 0.85;
-        intent.urgency = std::min(1.0, (30.0 - tech.rsi_14) / 20.0);
+        intent.urgency = std::min(1.0, (40.0 - tech.rsi_14) / 25.0);
 
-        logger_->debug("MeanReversion", "Сигнал BUY (перепроданность с подтверждением)",
+        logger_->info("MeanReversion", "Сигнал BUY (перепроданность)",
                        {{"rsi", std::to_string(tech.rsi_14)},
+                        {"bb_pos", std::to_string(bb_pos)},
                         {"conviction", std::to_string(intent.conviction)},
-                        {"macd_hist", std::to_string(tech.macd_histogram)}});
+                        {"rsi_factor", std::to_string(rsi_factor)},
+                        {"bb_factor", std::to_string(bb_factor)}});
         return intent;
     }
 
-    // Продажа: цена выше верхней BB + RSI > 70 (перекупленность)
-    // Аналогичная защита от продажи в сильном аптренде
-    if (last_price > tech.bb_upper && tech.rsi_14 > 70.0) {
+    // === SELL: Градуированный вход по mean reversion (перекупленность) ===
+    if (bb_pos > 0.80 && tech.rsi_14 > 65.0) {
 
         // === Фильтр: Сильный восходящий тренд ===
         if (tech.ema_valid && tech.adx_valid) {
-            bool strong_uptrend = (tech.ema_20 > tech.ema_50) && (tech.adx > 20.0);
+            bool strong_uptrend = (tech.ema_20 > tech.ema_50) && (tech.adx > 30.0);
             if (strong_uptrend) {
                 bool macd_reversal = tech.macd_valid && tech.macd_histogram < 0.0;
                 bool rsi_cooling = tech.rsi_14 < 75.0;
                 if (!macd_reversal && !rsi_cooling) {
-                    logger_->debug("MeanReversion",
-                        "SELL подавлен — сильный аптренд без разворота",
+                    logger_->info("MeanReversion",
+                        "SELL подавлен — сильный аптренд (ADX>30) без разворота",
                         {{"ema20", std::to_string(tech.ema_20)},
                          {"ema50", std::to_string(tech.ema_50)},
-                         {"adx", std::to_string(tech.adx)}});
+                         {"adx", std::to_string(tech.adx)},
+                         {"bb_pos", std::to_string(bb_pos)},
+                         {"rsi", std::to_string(tech.rsi_14)}});
                     return std::nullopt;
                 }
             }
@@ -134,36 +145,35 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
 
         // RSI > 85 = эйфория, может продолжить расти
         if (tech.rsi_14 > 85.0) {
-            logger_->debug("MeanReversion",
-                "SELL подавлен — RSI в зоне эйфории, ожидание стабилизации",
+            logger_->info("MeanReversion",
+                "SELL подавлен — RSI в зоне эйфории",
                 {{"rsi", std::to_string(tech.rsi_14)}});
             return std::nullopt;
         }
+
         intent.side = Side::Sell;
         intent.signal_name = "bb_overbought";
-        intent.reason_codes = {"price_above_bb_upper", "rsi_overbought"};
+        intent.reason_codes = {"price_near_bb_upper", "rsi_overbought"};
         intent.limit_price = Price(tech.bb_upper);
 
-        double distance = (last_price - tech.bb_middle) / (tech.bb_middle * tech.bb_bandwidth + 1e-10);
-        double base_conviction = std::clamp(0.3 + std::min(0.5, distance * 0.1), 0.0, 1.0);
+        // Conviction: симметрично BUY
+        double rsi_factor = (tech.rsi_14 - 65.0) / 20.0;
+        double bb_factor = (bb_pos - 0.80) / 0.30;
+        double base_conviction = std::clamp(0.25 + 0.35 * rsi_factor + 0.25 * bb_factor, 0.0, 1.0);
 
-        // Штраф за неопределённый тренд вверх
-        if (tech.ema_valid && tech.ema_20 > tech.ema_50) {
-            base_conviction *= 0.7;
-        }
         // Бонус за медвежий MACD
         if (tech.macd_valid && tech.macd_histogram < 0.0) {
-            base_conviction = std::min(1.0, base_conviction * 1.2);
+            base_conviction = std::min(1.0, base_conviction * 1.25);
         }
 
         intent.conviction = base_conviction;
         intent.entry_score = intent.conviction * 0.85;
-        intent.urgency = std::min(1.0, (tech.rsi_14 - 70.0) / 20.0);
+        intent.urgency = std::min(1.0, (tech.rsi_14 - 65.0) / 25.0);
 
-        logger_->debug("MeanReversion", "Сигнал SELL (перекупленность с подтверждением)",
+        logger_->info("MeanReversion", "Сигнал SELL (перекупленность)",
                        {{"rsi", std::to_string(tech.rsi_14)},
-                        {"conviction", std::to_string(intent.conviction)},
-                        {"macd_hist", std::to_string(tech.macd_histogram)}});
+                        {"bb_pos", std::to_string(bb_pos)},
+                        {"conviction", std::to_string(intent.conviction)}});
         return intent;
     }
 

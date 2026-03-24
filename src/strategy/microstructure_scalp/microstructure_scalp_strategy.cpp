@@ -70,13 +70,15 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
     }
 
     // Покупка: сильный дисбаланс в сторону bid + покупатели доминируют
-    // + тренд НЕ медвежий (не торгуем против тренда)
+    // В медвежьем тренде — разрешаем BUY при ОЧЕНЬ сильном дисбалансе (>0.5)
+    // с пониженным conviction (order flow может предсказать разворот)
     if (micro.book_imbalance_5 > 0.3 && micro.buy_sell_ratio > 1.5) {
-        // Блокируем BUY скальп в медвежьем тренде
-        if (trend_bearish) {
+        // Повышенный порог дисбаланса в медвежьем тренде
+        if (trend_bearish && micro.book_imbalance_5 < 0.5) {
             logger_->debug("MicroScalp",
-                "BUY подавлен — медвежий тренд (EMA20 < EMA50)",
-                {{"ema20", std::to_string(tech.ema_20)},
+                "BUY подавлен — медвежий тренд + слабый дисбаланс (<0.5)",
+                {{"imbalance", std::to_string(micro.book_imbalance_5)},
+                 {"ema20", std::to_string(tech.ema_20)},
                  {"ema50", std::to_string(tech.ema_50)}});
             return std::nullopt;
         }
@@ -91,6 +93,10 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
         // Бонус если тренд подтверждает направление
         if (trend_bullish) {
             base_conv *= 1.15; // +15% conviction в направлении тренда
+        }
+        // Штраф за контр-трендовый скальп (вместо полной блокировки)
+        if (trend_bearish) {
+            base_conv *= 0.65; // -35% conviction против тренда
         }
         intent.conviction = std::clamp(base_conv, 0.0, 1.0);
         intent.entry_score = intent.conviction * 0.9;

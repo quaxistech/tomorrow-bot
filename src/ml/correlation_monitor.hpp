@@ -78,6 +78,10 @@ private:
     double last_primary_price_{0.0};
     std::unordered_map<std::string, double> last_reference_prices_;
 
+    /// Кэш результата evaluate() (инвалидируется при on_primary_tick / on_reference_tick)
+    mutable CorrelationResult cached_result_;
+    mutable bool cache_valid_{false};
+
     mutable std::mutex mutex_;
 };
 

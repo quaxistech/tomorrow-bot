@@ -41,8 +41,17 @@ Result<OrderId> ExecutionEngine::execute(
     const execution_alpha::ExecutionAlphaResult& exec_alpha)
 {
     // Проверить, что risk decision одобрен
-    if (risk_decision.verdict == risk::RiskVerdict::Denied) {
+    if (risk_decision.verdict == risk::RiskVerdict::Denied ||
+        risk_decision.verdict == risk::RiskVerdict::Throttled) {
         return std::unexpected(TbError::RiskDenied);
+    }
+
+    // Проверить, что execution alpha не заблокировал исполнение
+    if (!exec_alpha.should_execute ||
+        exec_alpha.recommended_style == execution_alpha::ExecutionStyle::NoExecution) {
+        logger_->debug("Execution", "Execution alpha заблокировал ордер",
+            {{"should_execute", exec_alpha.should_execute ? "true" : "false"}});
+        return std::unexpected(TbError::ExecutionFailed);
     }
 
     // Проверить дублирование
@@ -68,6 +77,23 @@ Result<OrderId> ExecutionEngine::execute(
     }
     order.state = OrderState::PendingAck;
 
+    // Для рыночных ордеров: определяем fill price ЗАРАНЕЕ, до отправки на биржу.
+    // Если fill price = 0, отклоняем ДО отправки, чтобы не создать phantom position.
+    Price market_fill_price{0.0};
+    if (order.order_type == OrderType::Market) {
+        market_fill_price = order.price.get() > 0.0
+            ? order.price : Price(intent.limit_price.value_or(Price(0.0)));
+        if (market_fill_price.get() <= 0.0) {
+            logger_->error("Execution", "Fill price = 0 для market ордера — отмена ДО отправки",
+                {{"order_id", order_id_str},
+                 {"order_price", std::to_string(order.price.get())}});
+            fsm.transition(OrderState::Rejected, "Fill price = 0");
+            order.state = OrderState::Rejected;
+            orders_[order_id_str] = order;
+            return std::unexpected(TbError::ExecutionFailed);
+        }
+    }
+
     // Отправить ордер на биржу
     auto submit_result = submitter_->submit_order(order);
 
@@ -88,9 +114,8 @@ Result<OrderId> ExecutionEngine::execute(
     order.exchange_order_id = submit_result.exchange_order_id;
     orders_[order_id_str] = order;
 
-    // Запомнить интент для обнаружения дублей
-    recent_intents_.insert(
-        intent.correlation_id.get() + ":" + intent.symbol.get());
+    // Запомнить интент для обнаружения дублей (с таймстампом для очистки)
+    recent_intents_[intent.correlation_id.get() + ":" + intent.symbol.get()] = clock_->now().get();
 
     logger_->info("Execution", "Ордер отправлен",
                   {{"order_id", order_id_str},
@@ -108,8 +133,8 @@ Result<OrderId> ExecutionEngine::execute(
     // канал для трекинга fill-ов не реализован. Это безопасное допущение
     // для spot market-ордеров, которые исполняются мгновенно.
     if (order.order_type == OrderType::Market) {
-        auto fill_price = order.price.get() > 0.0
-            ? order.price : Price(intent.limit_price.value_or(Price(0.0)));
+        // fill price уже проверен выше (market_fill_price > 0)
+        auto fill_price = market_fill_price;
         // PendingAck → Filled — допустимый переход в FSM
         fsm.transition(OrderState::Filled, "Рыночный ордер исполнен");
         order.state = OrderState::Filled;
@@ -185,8 +210,8 @@ VoidResult ExecutionEngine::cancel(const OrderId& order_id) {
 
     it->second.state = OrderState::CancelPending;
 
-    // Отправить запрос отмены
-    bool cancelled = submitter_->cancel_order(order_id);
+    // Отправить запрос отмены — используем exchange_order_id, а не internal
+    bool cancelled = submitter_->cancel_order(it->second.exchange_order_id);
     if (cancelled) {
         fsm_it->second.transition(OrderState::Cancelled, "Отменён");
         it->second.state = OrderState::Cancelled;
@@ -293,6 +318,18 @@ std::vector<OrderRecord> ExecutionEngine::active_orders() const {
 bool ExecutionEngine::is_duplicate(const strategy::TradeIntent& intent) const {
     std::lock_guard lock(mutex_);
     const auto key = intent.correlation_id.get() + ":" + intent.symbol.get();
+
+    // Очистить записи старше 5 минут
+    constexpr int64_t kDuplicateWindowNs = 300'000'000'000LL; // 5 минут
+    auto now_ns = clock_->now().get();
+    for (auto it = recent_intents_.begin(); it != recent_intents_.end(); ) {
+        if ((now_ns - it->second) > kDuplicateWindowNs) {
+            it = recent_intents_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     return recent_intents_.contains(key);
 }
 

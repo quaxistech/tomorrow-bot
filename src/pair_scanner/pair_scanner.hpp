@@ -23,6 +23,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 
 namespace tb::pair_scanner {
 
@@ -46,6 +47,10 @@ public:
 
     /// Получить последний результат сканирования
     ScanResult last_result() const;
+
+    /// Получить информацию о точности для символа (из exchange info)
+    /// @return {quantity_precision, price_precision} или {6, 2} если неизвестен
+    std::pair<int, int> symbol_precision(const std::string& symbol) const;
 
     /// Запустить фоновую ротацию (каждые N часов из конфига)
     void start_rotation(RotationCallback on_rotation);
@@ -78,6 +83,9 @@ private:
 
     mutable std::mutex mutex_;
     ScanResult last_result_;
+
+    /// Кеш информации о символах (symbol → PairInfo) для получения precision
+    std::unordered_map<std::string, PairInfo> symbol_info_;
 
     // Ротация
     std::atomic<bool> rotation_running_{false};

@@ -79,6 +79,8 @@ private:
     std::deque<double> returns_buffer_;        ///< Буфер доходностей для оценки σ
     double cusum_pos_{0.0};                    ///< Накопленное + отклонение
     double cusum_neg_{0.0};                    ///< Накопленное - отклонение
+    double cusum_detected_pos_{0.0};           ///< Значение cusum_pos при детекции (до сброса)
+    double cusum_detected_neg_{0.0};           ///< Значение cusum_neg при детекции (до сброса)
     double cusum_mean_{0.0};                   ///< Скользящее среднее доходности
     double cusum_sigma_{1.0};                  ///< Оценка стандартного отклонения
     bool cusum_change_detected_{false};        ///< Обнаружена смена режима

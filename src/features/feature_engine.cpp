@@ -7,21 +7,35 @@ namespace tb::features {
 
 namespace {
 
-// Стандартное отклонение последних n значений вектора
-double std_dev(const std::vector<double>& data, std::size_t n) {
-    if (data.size() < n || n == 0) return 0.0;
-    const std::size_t start = data.size() - n;
-    double mean = 0.0;
-    for (std::size_t i = start; i < data.size(); ++i) {
-        mean += data[i];
+// Стандартное отклонение логарифмических доходностей последних n свечей
+double returns_std_dev(const std::vector<double>& prices, std::size_t n) {
+    // Нужно n+1 цен чтобы получить n доходностей
+    if (prices.size() < n + 1 || n == 0) return 0.0;
+    const std::size_t start = prices.size() - n - 1;
+
+    // Вычисляем логарифмические доходности
+    std::vector<double> returns;
+    returns.reserve(n);
+    for (std::size_t i = start; i < prices.size() - 1; ++i) {
+        if (prices[i] <= 0.0 || prices[i + 1] <= 0.0) continue;
+        returns.push_back(std::log(prices[i + 1] / prices[i]));
     }
-    mean /= static_cast<double>(n);
+
+    if (returns.empty()) return 0.0;
+
+    const double count = static_cast<double>(returns.size());
+    double mean = 0.0;
+    for (double r : returns) {
+        mean += r;
+    }
+    mean /= count;
+
     double variance = 0.0;
-    for (std::size_t i = start; i < data.size(); ++i) {
-        const double diff = data[i] - mean;
+    for (double r : returns) {
+        const double diff = r - mean;
         variance += diff * diff;
     }
-    variance /= static_cast<double>(n);
+    variance /= count;
     return std::sqrt(variance);
 }
 
@@ -207,13 +221,13 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
         }
     }
 
-    // Волатильность: стандартное отклонение доходностей
-    if (close.size() >= 5) {
-        tf.volatility_5 = std_dev(close, std::min(close.size(), std::size_t{5}));
+    // Волатильность: стандартное отклонение логарифмических доходностей
+    if (close.size() >= 6) {  // 6 цен -> 5 доходностей
+        tf.volatility_5 = returns_std_dev(close, 5);
         tf.volatility_valid = true;
     }
-    if (close.size() >= 20) {
-        tf.volatility_20 = std_dev(close, std::min(close.size(), std::size_t{20}));
+    if (close.size() >= 21) {  // 21 цена -> 20 доходностей
+        tf.volatility_20 = returns_std_dev(close, 20);
         tf.volatility_valid = true;
     }
 

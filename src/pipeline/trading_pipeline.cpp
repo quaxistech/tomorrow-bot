@@ -23,6 +23,16 @@ double parse_json_double(const boost::json::value& v) {
     if (v.is_int64()) return static_cast<double>(v.as_int64());
     return 0.0;
 }
+
+/// Извлечь базовую монету из символа (BTCUSDT → BTC, IRYSUSDT → IRYS)
+std::string extract_base_coin(const std::string& symbol) {
+    constexpr std::string_view kQuote = "USDT";
+    if (symbol.size() > kQuote.size() &&
+        symbol.compare(symbol.size() - kQuote.size(), kQuote.size(), kQuote) == 0) {
+        return symbol.substr(0, symbol.size() - kQuote.size());
+    }
+    return symbol;  // fallback: вернуть как есть
+}
 } // anonymous namespace
 
 namespace tb::pipeline {
@@ -179,8 +189,10 @@ TradingPipeline::TradingPipeline(
 
         rest_client_ = rest_client;  // Сохраняем для запроса баланса
 
-        submitter = std::make_shared<exchange::bitget::BitgetOrderSubmitter>(
+        auto bitget_sub = std::make_shared<exchange::bitget::BitgetOrderSubmitter>(
             rest_client, logger_);
+        bitget_submitter_ = bitget_sub;  // Сохраняем для set_symbol_precision
+        submitter = bitget_sub;
 
         logger_->info("pipeline",
             "Режим исполнения: РЕАЛЬНАЯ БИРЖА (Bitget REST API)");
@@ -216,6 +228,59 @@ TradingPipeline::~TradingPipeline() {
     stop();
 }
 
+void TradingPipeline::set_symbol_precision(int quantity_precision, int price_precision) {
+    if (bitget_submitter_) {
+        bitget_submitter_->set_symbol_precision(quantity_precision, price_precision);
+        logger_->info("pipeline", "Установлена точность ордеров",
+            {{"symbol", symbol_.get()},
+             {"qty_precision", std::to_string(quantity_precision)},
+             {"price_precision", std::to_string(price_precision)}});
+    }
+}
+
+// ==================== Загрузка точности ордеров ====================
+
+void TradingPipeline::fetch_symbol_precision() {
+    if (!rest_client_ || !bitget_submitter_) return;
+
+    try {
+        auto resp = rest_client_->get("/api/v2/spot/public/symbols",
+                                       "symbol=" + symbol_.get());
+        if (!resp.success) {
+            logger_->warn("pipeline", "Не удалось запросить precision для " + symbol_.get());
+            return;
+        }
+
+        auto doc = boost::json::parse(resp.body);
+        auto& obj = doc.as_object();
+        if (obj.at("code").as_string() != "00000") return;
+
+        auto& data = obj.at("data").as_array();
+        for (const auto& item : data) {
+            auto& o = item.as_object();
+            std::string sym(o.at("symbol").as_string());
+            if (sym != symbol_.get()) continue;
+
+            int qty_prec = 6, price_prec = 2;
+            if (o.contains("quantityPrecision")) {
+                qty_prec = static_cast<int>(parse_json_double(o.at("quantityPrecision")));
+            }
+            if (o.contains("pricePrecision")) {
+                price_prec = static_cast<int>(parse_json_double(o.at("pricePrecision")));
+            }
+
+            bitget_submitter_->set_symbol_precision(qty_prec, price_prec);
+            logger_->info("pipeline", "Precision загружена с биржи",
+                {{"symbol", sym},
+                 {"qty_precision", std::to_string(qty_prec)},
+                 {"price_precision", std::to_string(price_prec)}});
+            return;
+        }
+    } catch (const std::exception& e) {
+        logger_->warn("pipeline", "Ошибка загрузки precision: " + std::string(e.what()));
+    }
+}
+
 // ==================== Синхронизация баланса ====================
 
 void TradingPipeline::sync_balance_from_exchange() {
@@ -241,7 +306,8 @@ void TradingPipeline::sync_balance_from_exchange() {
         }
 
         double usdt_available = 0.0;
-        double btc_available = 0.0;
+        double base_available = 0.0;
+        std::string base_coin = extract_base_coin(symbol_.get());
 
         auto& data = obj.at("data").as_array();
         for (const auto& item : data) {
@@ -252,34 +318,39 @@ void TradingPipeline::sync_balance_from_exchange() {
 
             if (coin == "USDT") {
                 usdt_available = available;
-            } else if (coin == "BTC") {
-                btc_available = available;
+            } else if (!base_coin.empty() && coin == base_coin) {
+                base_available = available;
             }
         }
 
         logger_->info("pipeline", "Балансы получены с биржи",
             {{"USDT", std::to_string(usdt_available)},
-             {"BTC", std::to_string(btc_available)}});
+             {base_coin.empty() ? "BASE" : base_coin, std::to_string(base_available)}});
 
-        // Обновить капитал USDT
-        portfolio_->set_capital(usdt_available);
+        // Обновить капитал USDT — делим поровну между параллельными pipeline
+        double capital_per_pipeline = usdt_available / std::max(1, num_pipelines_);
+        portfolio_->set_capital(capital_per_pipeline);
 
-        // Если есть BTC в достаточном количестве — зарегистрировать как позицию.
-        // Пылевые остатки (< min order 0.00001 BTC) игнорируем — они блокируют
-        // новые BUY-ордера, но сами не могут быть проданы.
-        constexpr double kMinTradeableBtc = 0.00001;
-        if (btc_available >= kMinTradeableBtc) {
-            portfolio::Position btc_pos;
-            btc_pos.symbol = symbol_;
-            btc_pos.side = Side::Buy;
-            btc_pos.size = Quantity(btc_available);
-            btc_pos.avg_entry_price = Price(0.0);  // Неизвестна, обновится по тику
-            btc_pos.opened_at = clock_->now();
-            btc_pos.strategy_id = StrategyId("sync_from_exchange");
-            portfolio_->open_position(btc_pos);
+        logger_->info("pipeline", "Капитал для этого pipeline",
+            {{"total_usdt", std::to_string(usdt_available)},
+             {"per_pipeline", std::to_string(capital_per_pipeline)},
+             {"num_pipelines", std::to_string(num_pipelines_)}});
 
-            logger_->info("pipeline", "Восстановлена позиция BTC с биржи",
-                {{"size", std::to_string(btc_available)}});
+        // Если есть base coin в достаточном количестве — зарегистрировать как позицию.
+        // Пылевые остатки игнорируем.
+        constexpr double kMinTradeableValue = 1.0;  // $1 минимум
+        if (base_available > 0.0) {
+            portfolio::Position base_pos;
+            base_pos.symbol = symbol_;
+            base_pos.side = Side::Buy;
+            base_pos.size = Quantity(base_available);
+            base_pos.avg_entry_price = Price(0.0);  // Неизвестна, обновится по тику
+            base_pos.opened_at = clock_->now();
+            base_pos.strategy_id = StrategyId("sync_from_exchange");
+            portfolio_->open_position(base_pos);
+
+            logger_->info("pipeline", "Восстановлена позиция с биржи",
+                {{"coin", base_coin}, {"size", std::to_string(base_available)}});
         }
 
     } catch (const std::exception& e) {
@@ -468,9 +539,9 @@ void TradingPipeline::bootstrap_htf_candles() {
         }
 
         if (closes.size() >= 50) {
-            // Защита от гонки данных: HTF буферы и индикаторы читаются
-            // в on_feature_snapshot() под pipeline_mutex_
-            std::lock_guard<std::mutex> lock(pipeline_mutex_);
+            // Примечание: pipeline_mutex_ НЕ берём здесь, т.к.:
+            // - При загрузке (start): однопоточный, конкуренция невозможна
+            // - При обновлении (on_feature_snapshot): вызывающий уже держит mutex
 
             htf_last_close_ = closes.back();
 
@@ -524,6 +595,12 @@ void TradingPipeline::maybe_update_htf(const features::FeatureSnapshot& snapshot
         // Загружаем свежие свечи через REST (тот же метод что при bootstrap)
         bootstrap_htf_candles();
         last_htf_update_ns_ = now_ns;
+
+        // КРИТИЧНО: обновляем htf_last_close_ текущей ценой, чтобы
+        // urgent-проверка (price_move > 3×ATR) не срабатывала повторно.
+        // bootstrap_htf_candles() ставит htf_last_close_ = последняя часовая свеча,
+        // которая может отличаться от real-time цены на > 3×ATR(1m).
+        htf_last_close_ = snapshot.mid_price.get();
         htf_urgent_update_needed_ = false;
 
         logger_->info("pipeline", "HTF данные обновлены",
@@ -688,7 +765,9 @@ void TradingPipeline::compute_htf_trend(const std::vector<double>& closes) {
     }
 
     // Сила тренда: комбинация ADX + расстояния EMA + RSI
-    double ema_gap_pct = std::abs(htf_ema_20_ - htf_ema_50_) / htf_ema_50_ * 100.0;
+    double ema_gap_pct = (htf_ema_50_ > 0.0)
+        ? std::abs(htf_ema_20_ - htf_ema_50_) / htf_ema_50_ * 100.0
+        : 0.0;
     double adx_factor = std::clamp((htf_adx_ - 15.0) / 35.0, 0.0, 1.0);
     double ema_factor = std::clamp(ema_gap_pct / 3.0, 0.0, 1.0);
 
@@ -953,12 +1032,12 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         double actual_qty = pos.size.get();
         if (actual_qty <= 0.0) {
             // Фолбэк на реальный баланс если портфель не имеет данных
-            actual_qty = query_asset_balance("BTC");
+            actual_qty = query_asset_balance(extract_base_coin(symbol_.get()));
         }
         if (actual_qty < 0.00001) {
-            // BTC уже продан (стоп-лосс сработал ранее), но позиция
+            // Токен уже продан (стоп-лосс сработал ранее), но позиция
             // осталась в портфеле. Очищаем её принудительно.
-            logger_->info("pipeline", "Стоп-лосс: BTC уже продан, очищаем позицию из портфеля",
+            logger_->info("pipeline", "Стоп-лосс: актив уже продан, очищаем позицию из портфеля",
                 {{"qty", std::to_string(actual_qty)},
                  {"symbol", symbol_.get()}});
             record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
@@ -1044,10 +1123,9 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                  {"reason", reason}});
 
             if (is_full_close) {
-                // Принудительно закрываем позицию в портфеле.
-                // Execution engine вызовет close_position при заполнении, но для
-                // надёжности делаем это явно — чтобы следующий тик не увидел
-                // «открытую» позицию и не запустил стоп-лосс повторно.
+                // Execution engine уже вызовет close_position при fill.
+                // Записываем данные для decay/fingerprint/thompson, но НЕ вызываем
+                // portfolio_->close_position() повторно — иначе PnL будет двойным.
                 record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
 
                 // Записываем результат fingerprint (стоп-лосс = негативный исход)
@@ -1057,13 +1135,15 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     last_entry_fingerprint_.reset();
                 }
 
-                // Thompson Sampling: стоп-лосс — обычно негативный исход
+                // Thompson Sampling: стоп-лосс — используем действие входа
                 if (thompson_sampler_) {
                     double ts_reward = (pos.unrealized_pnl > 0) ? 1.0 : -1.0;
-                    thompson_sampler_->record_reward(ml::EntryAction::EnterNow, ts_reward);
+                    thompson_sampler_->record_reward(current_entry_thompson_action_, ts_reward);
                 }
 
-                portfolio_->close_position(symbol_, pos.current_price, pos.unrealized_pnl);
+                // Записываем результат в risk engine
+                risk_engine_->record_trade_result(pos.unrealized_pnl < 0.0);
+
                 reset_trailing_state();
             }
         } else {
@@ -1087,6 +1167,7 @@ bool TradingPipeline::start() {
     // Синхронизация баланса с биржей (только production)
     if (rest_client_) {
         sync_balance_from_exchange();
+        fetch_symbol_precision();
     }
 
     // Загрузка исторических свечей для прогрева индикаторов.
@@ -1404,6 +1485,27 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     // 7. Оценка каждой активной стратегии
     std::vector<strategy::TradeIntent> intents;
+
+    // Проверяем текущую позицию ДО оценки стратегий.
+    // На споте: без позиции нужны только BUY сигналы, с позицией — только SELL.
+    // Фильтрация ДО стратегий экономит CPU и избавляет от лог-спама.
+    bool has_long_position = false;
+    {
+        auto port_snap = portfolio_->snapshot();
+        for (const auto& pos : port_snap.positions) {
+            if (pos.symbol.get() == symbol_.get()
+                && pos.side == Side::Buy
+                && pos.size.get() >= 0.00001) {
+                has_long_position = true;
+                break;
+            }
+        }
+    }
+
+    // Диагностика: сколько стратегий сгенерировали сигналы, сколько отфильтровано
+    int total_intents = 0;
+    int filtered_intents = 0;
+
     for (const auto& strat : strategy_registry_->active()) {
         strategy::StrategyContext ctx;
         ctx.features = snapshot;
@@ -1415,8 +1517,25 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         auto intent = strat->evaluate(ctx);
         if (intent.has_value()) {
+            ++total_intents;
+            // Фильтруем неисполнимые сигналы на споте:
+            // - SELL без открытой long-позиции бесполезен
+            // - BUY при уже открытой long-позиции — нарастить нельзя
+            bool is_buy = (intent->side == Side::Buy);
+            if (is_buy && has_long_position) { ++filtered_intents; continue; }
+            if (!is_buy && !has_long_position) { ++filtered_intents; continue; }
             intents.push_back(std::move(*intent));
         }
+    }
+
+    // Логируем состояние сигналов каждые 200 тиков для диагностики
+    if (tick_count_ % 200 == 0) {
+        logger_->info("pipeline", "Итоги оценки стратегий",
+            {{"total_intents", std::to_string(total_intents)},
+             {"filtered", std::to_string(filtered_intents)},
+             {"actionable", std::to_string(intents.size())},
+             {"has_position", has_long_position ? "true" : "false"},
+             {"tick", std::to_string(tick_count_)}});
     }
 
     if (intents.empty()) return;
@@ -1529,7 +1648,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // 9_htf. HTF Trend Filter — ФИНАЛЬНЫЙ барьер перед отправкой ордера.
     // Даже если стратегия одобрила сигнал, мы блокируем его если он
     // идёт ПРОТИВ сильного тренда на старшем таймфрейме.
+    // ВАЖНО: SELL для закрытия существующей позиции (take-profit) НЕ блокируется —
+    // иначе бот не сможет зафиксировать прибыль в аптренде.
     if (htf_valid_) {
+        // Определяем, есть ли открытая позиция для этого символа (для bypass SELL filter)
+        bool has_open_long = portfolio_->has_position(symbol_);
+
         bool blocked = false;
         // Блокируем BUY в сильном даунтренде HTF (EMA20 < EMA50, сила > 0.4)
         if (intent.side == Side::Buy && htf_trend_direction_ == -1 && htf_trend_strength_ > 0.4) {
@@ -1548,8 +1672,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 }
             }
         }
-        // Блокируем SELL в сильном аптренде HTF (EMA20 > EMA50, сила > 0.4)
-        if (intent.side == Side::Sell && htf_trend_direction_ == 1 && htf_trend_strength_ > 0.4) {
+        // Блокируем SELL в сильном аптренде HTF, но ТОЛЬКО для новых коротких позиций.
+        // SELL при наличии открытой длинной позиции = take-profit, его не блокируем.
+        if (intent.side == Side::Sell && !has_open_long && htf_trend_direction_ == 1 && htf_trend_strength_ > 0.4) {
             bool reversal_confirmed = (htf_macd_histogram_ < 0.0 && htf_rsi_14_ < 60.0);
             if (!reversal_confirmed) {
                 blocked = true;
@@ -1643,14 +1768,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     if (is_closing_position) {
         // Закрытие позиции — обходим allocator и risk проверки экспозиции,
         // т.к. закрытие УМЕНЬШАЕТ риск, а не увеличивает.
-        // Запрашиваем актуальный баланс BTC, чтобы избежать "Insufficient balance"
+        // Запрашиваем актуальный баланс base coin, чтобы избежать "Insufficient balance"
         // (портфельный размер может не учитывать комиссии/пыль)
-        double actual_btc = query_asset_balance("BTC");
-        if (actual_btc > 1e-8) {
-            closing_qty = Quantity(actual_btc);
-            logger_->info("pipeline", "Актуальный баланс BTC для закрытия",
+        std::string base_coin = extract_base_coin(symbol_.get());
+        double actual_base = query_asset_balance(base_coin);
+        if (actual_base > 1e-8) {
+            closing_qty = Quantity(actual_base);
+            logger_->info("pipeline", "Актуальный баланс " + base_coin + " для закрытия",
                 {{"portfolio_qty", std::to_string(position_size_for_log)},
-                 {"exchange_qty", std::to_string(actual_btc)}});
+                 {"exchange_qty", std::to_string(actual_base)}});
         }
 
         // Минимальный ордер Bitget: 0.00001 BTC (или ~$5)
@@ -1744,6 +1870,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     auto order_result = execution_engine_->execute(intent, risk_decision, exec_alpha);
     if (order_result) {
+        consecutive_rejections_ = 0;  // Успешный ордер — сброс backoff
         risk_engine_->record_order_sent();
         logger_->info("pipeline", "ОРДЕР ОТПРАВЛЕН",
             {{"order_id", order_result->get()},
@@ -1756,6 +1883,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (intent.side == Side::Buy) {
             current_position_strategy_ = intent.strategy_id;
             current_position_conviction_ = intent.conviction;
+            current_entry_thompson_action_ = thompson_action;
             reset_trailing_state();
             double entry_price = snapshot.mid_price.get();
             highest_price_since_entry_ = entry_price;
@@ -1769,6 +1897,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         // Сброс trailing state при полном закрытии позиции (SELL всей позиции)
+        // Execution engine уже вызовет portfolio_->close_position() при fill.
+        // Здесь только записываем данные для аналитики.
         if (intent.side == Side::Sell && is_closing_position) {
             record_trade_for_decay(current_position_strategy_,
                 closing_pnl,
@@ -1788,17 +1918,28 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             }
 
             // Thompson Sampling: бинарная награда для бандита
+            // Используем действие, выбранное при ВХОДЕ в позицию, а не текущее
             if (thompson_sampler_) {
                 double ts_reward = (closing_pnl > 0) ? 1.0 : -1.0;
-                thompson_sampler_->record_reward(thompson_action, ts_reward);
+                thompson_sampler_->record_reward(current_entry_thompson_action_, ts_reward);
             }
+
+            // Записываем результат в risk engine
+            risk_engine_->record_trade_result(closing_pnl < 0.0);
 
             reset_trailing_state();
         }
     } else {
+        ++consecutive_rejections_;
+        // Экспоненциальный backoff: 30с × 2^(rejections-1), макс 10 минут
+        int64_t backoff = kOrderCooldownNs * (1LL << std::min(consecutive_rejections_, 8));
+        backoff = std::min(backoff, kMaxRejectionBackoffNs);
+        last_order_time_ns_ = clock_->now().get() + backoff - kOrderCooldownNs;
         logger_->warn("pipeline", "Ордер не исполнен",
             {{"side", intent.side == Side::Buy ? "BUY" : "SELL"},
-             {"symbol", symbol_.get()}});
+             {"symbol", symbol_.get()},
+             {"consecutive_rejections", std::to_string(consecutive_rejections_)},
+             {"backoff_sec", std::to_string(backoff / 1'000'000'000LL)}});
     }
 }
 
@@ -1809,15 +1950,42 @@ void TradingPipeline::print_status(
     const world_model::WorldModelSnapshot& world,
     const regime::RegimeSnapshot& regime)
 {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(2) << snap.technical.sma_20;
-    std::ostringstream rsi_s;
-    rsi_s << std::fixed << std::setprecision(1) << snap.technical.rsi_14;
+    // Адаптивная точность: для дешёвых токенов ($0.02) нужно больше знаков
+    auto adaptive_prec = [](double v) -> int {
+        if (v <= 0.0) return 2;
+        if (v < 0.001) return 8;
+        if (v < 0.01) return 6;
+        if (v < 0.1) return 5;
+        if (v < 1.0) return 4;
+        if (v < 100.0) return 3;
+        return 2;
+    };
+
+    auto fmt = [](double v, int prec = 2) {
+        std::ostringstream s;
+        s << std::fixed << std::setprecision(prec) << v;
+        return s.str();
+    };
+
+    // Основные индикаторы для диагностики стратегий
+    std::string ema_signal = (snap.technical.ema_20 > snap.technical.ema_50)
+                             ? "BULL" : "BEAR";
+    double bb_pos = 0.0;  // Позиция цены в BB каналe: <0=ниже, >1=выше
+    if (snap.technical.bb_upper > snap.technical.bb_lower) {
+        bb_pos = (snap.mid_price.get() - snap.technical.bb_lower) /
+                 (snap.technical.bb_upper - snap.technical.bb_lower);
+    }
+
+    int price_prec = adaptive_prec(snap.mid_price.get());
+    int atr_prec = adaptive_prec(snap.technical.atr_14);
 
     logger_->info("pipeline", "Статус рынка",
         {{"tick", std::to_string(tick_count_)},
-         {"sma20", oss.str()},
-         {"rsi14", rsi_s.str()},
+         {"price", fmt(snap.mid_price.get(), price_prec)},
+         {"rsi14", fmt(snap.technical.rsi_14, 1)},
+         {"ema", ema_signal},
+         {"bb_pos", fmt(bb_pos, 2)},
+         {"atr", fmt(snap.technical.atr_14, atr_prec)},
          {"regime", std::string(to_string(regime.label))},
          {"world", std::string(world_model::to_string(world.state))},
          {"positions", std::to_string(portfolio_->snapshot().exposure.open_positions_count)}});

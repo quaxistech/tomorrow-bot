@@ -82,6 +82,15 @@ ScanResult PairScanner::scan() {
         return result;
     }
 
+    // Кешируем symbol → PairInfo для precision данных
+    {
+        std::lock_guard lock(mutex_);
+        symbol_info_.clear();
+        for (const auto& p : pairs) {
+            symbol_info_[p.symbol] = p;
+        }
+    }
+
     // Шаг 2: Получить 24ч тикеры
     auto tickers = fetch_tickers();
     logger_->info(kComp, "Загружено тикеров: " + std::to_string(tickers.size()));
@@ -104,11 +113,12 @@ ScanResult PairScanner::scan() {
     }
 
     // Шаг 4: Для каждого кандидата загружаем свечи и считаем скоринг
-    // Ограничиваем количество API-вызовов: загружаем свечи только для
-    // топ-30 по объёму (предварительная сортировка по volume)
+    // КРИТИЧЕСКИ ВАЖНО: сортируем по 24h change (убывание), чтобы
+    // РАСТУЩИЕ монеты получили приоритет на загрузку свечей.
+    // Раньше сортировали по volume — из-за этого BTC всегда был в топ-30.
     std::sort(candidates.begin(), candidates.end(),
         [](const TickerData& a, const TickerData& b) {
-            return a.quote_volume_24h > b.quote_volume_24h;
+            return a.change_24h_pct > b.change_24h_pct;
         });
 
     const size_t kMaxCandidatesForCandles = 30;
@@ -123,6 +133,20 @@ ScanResult PairScanner::scan() {
         auto candles = fetch_candles(ticker.symbol, 48);  // 48 часовых свечей
 
         auto score = scorer_.score(ticker, candles);
+
+        // Пропускаем отфильтрованные монеты (24h change < -1%)
+        if (score.filtered_out) continue;
+
+        // Заполняем precision из кеша symbol_info_
+        {
+            std::lock_guard lock(mutex_);
+            auto it = symbol_info_.find(ticker.symbol);
+            if (it != symbol_info_.end()) {
+                score.quantity_precision = static_cast<int>(it->second.quantity_precision);
+                score.price_precision = static_cast<int>(it->second.price_precision);
+            }
+        }
+
         result.ranked_pairs.push_back(std::move(score));
     }
 
@@ -138,19 +162,20 @@ ScanResult PairScanner::scan() {
         result.selected.push_back(result.ranked_pairs[i].symbol);
     }
 
-    // Лог результатов
-    logger_->info(kComp, "=== РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ ===");
+    // Лог результатов (формат v3: Mom/Trend/Trade/Qual)
+    logger_->info(kComp, "=== РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ v3 (ТОЛЬКО РАСТУЩИЕ) ===");
     for (int i = 0; i < static_cast<int>(result.ranked_pairs.size()) && i < 10; ++i) {
         const auto& s = result.ranked_pairs[i];
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(1);
         oss << "#" << (i + 1) << " " << s.symbol
             << " | Score: " << s.total_score
-            << " (Vol:" << s.volume_score
-            << " Vola:" << s.volatility_score
-            << " Spr:" << s.spread_score
+            << " (Mom:" << s.momentum_score
             << " Trend:" << s.trend_score
+            << " Trade:" << s.tradability_score
             << " Qual:" << s.quality_score << ")"
+            << " | 24h:" << std::showpos << std::setprecision(2) << s.change_24h_pct << "%"
+            << std::noshowpos
             << " | Vol24h: $" << std::setprecision(0) << s.quote_volume_24h;
         bool selected = (i < top_n);
         logger_->info(kComp, oss.str(),
@@ -173,6 +198,16 @@ std::vector<std::string> PairScanner::selected_symbols() const {
 ScanResult PairScanner::last_result() const {
     std::lock_guard lock(mutex_);
     return last_result_;
+}
+
+std::pair<int, int> PairScanner::symbol_precision(const std::string& symbol) const {
+    std::lock_guard lock(mutex_);
+    auto it = symbol_info_.find(symbol);
+    if (it != symbol_info_.end()) {
+        return {static_cast<int>(it->second.quantity_precision),
+                static_cast<int>(it->second.price_precision)};
+    }
+    return {6, 2};  // defaults
 }
 
 // ========== Ротация ==========

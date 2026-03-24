@@ -50,7 +50,12 @@ SizingResult HierarchicalAllocator::compute_size(
 
     // Шаг 2: Лимит из иерархии бюджетов
     double budget_limit = compute_budget_limit(portfolio);
-    if (original_notional > budget_limit && budget_limit > 0.0) {
+    if (budget_limit <= 0.0) {
+        result.approved = false;
+        result.reduction_reason = "Бюджетный лимит исчерпан";
+        return result;
+    }
+    if (original_notional > budget_limit) {
         qty = budget_limit / price;
         result.was_reduced = true;
         result.reduction_reason = "Превышен бюджетный лимит";
@@ -59,7 +64,12 @@ SizingResult HierarchicalAllocator::compute_size(
     // Шаг 3: Лимит концентрации — одна позиция не более max_concentration_pct от капитала
     double concentration_limit = compute_concentration_limit(portfolio);
     double notional_after_budget = qty * price;
-    if (notional_after_budget > concentration_limit && concentration_limit > 0.0) {
+    if (concentration_limit <= 0.0) {
+        result.approved = false;
+        result.reduction_reason = "Лимит концентрации исчерпан";
+        return result;
+    }
+    if (notional_after_budget > concentration_limit) {
         qty = concentration_limit / price;
         result.was_reduced = true;
         result.reduction_reason = "Превышен лимит концентрации";
@@ -68,7 +78,12 @@ SizingResult HierarchicalAllocator::compute_size(
     // Шаг 4: Лимит по стратегии
     double strategy_limit = compute_strategy_limit(intent, portfolio);
     double notional_after_concentration = qty * price;
-    if (notional_after_concentration > strategy_limit && strategy_limit > 0.0) {
+    if (strategy_limit <= 0.0) {
+        result.approved = false;
+        result.reduction_reason = "Лимит стратегии исчерпан";
+        return result;
+    }
+    if (notional_after_concentration > strategy_limit) {
         qty = strategy_limit / price;
         result.was_reduced = true;
         result.reduction_reason = "Превышен лимит стратегии";
@@ -94,10 +109,35 @@ SizingResult HierarchicalAllocator::compute_size(
         }
     }
 
+    // Шаг 5.6: Повторное применение жёстких лимитов ПОСЛЕ vol multiplier.
+    // Vol multiplier может увеличить размер (до 2x), что нарушит concentration/strategy/budget caps.
+    {
+        double notional_after_vol = qty * price;
+        if (notional_after_vol > budget_limit) {
+            qty = budget_limit / price;
+            result.was_reduced = true;
+        }
+        notional_after_vol = qty * price;
+        if (notional_after_vol > concentration_limit) {
+            qty = concentration_limit / price;
+            result.was_reduced = true;
+        }
+        notional_after_vol = qty * price;
+        if (notional_after_vol > strategy_limit) {
+            qty = strategy_limit / price;
+            result.was_reduced = true;
+        }
+    }
+
     // Шаг 6: Ограничить доступным капиталом
     double max_from_capital = portfolio.available_capital;
     double final_notional = qty * price;
-    if (final_notional > max_from_capital && max_from_capital > 0.0) {
+    if (max_from_capital <= 0.0) {
+        result.approved = false;
+        result.reduction_reason = "Доступный капитал исчерпан";
+        return result;
+    }
+    if (final_notional > max_from_capital) {
         qty = max_from_capital / price;
         result.was_reduced = true;
         result.reduction_reason = "Ограничен доступным капиталом";
@@ -127,8 +167,12 @@ SizingResult HierarchicalAllocator::compute_size(
 double HierarchicalAllocator::compute_budget_limit(
     const portfolio::PortfolioSnapshot& portfolio) const
 {
-    // Бюджет для символа = глобальный бюджет * доля символа
-    return config_.budget.global_budget * config_.budget.symbol_budget_pct;
+    // Бюджет для символа = реальный капитал * доля символа.
+    // Используем фактический капитал из портфеля, а не статический config.
+    double effective_capital = portfolio.total_capital > 0.0
+        ? portfolio.total_capital
+        : config_.budget.global_budget;
+    return effective_capital * config_.budget.symbol_budget_pct;
 }
 
 double HierarchicalAllocator::compute_concentration_limit(
@@ -176,6 +220,7 @@ double HierarchicalAllocator::compute_volatility_multiplier() const {
     double vol_ratio = config_.target_annual_vol / realized_vol_annual_;
 
     // Kelly-критерий: f* = (p*b - q) / b, где p=win_rate, b=avg_win/avg_loss, q=1-p
+    // Если edge нулевой или отрицательный — не торгуем (Kelly = 0)
     double kelly_full = 0.0;
     if (avg_win_loss_ratio_ > 0.0) {
         double p = win_rate_;
@@ -184,7 +229,10 @@ double HierarchicalAllocator::compute_volatility_multiplier() const {
         kelly_full = (p * b - q) / b;
         kelly_full = std::max(kelly_full, 0.0);
     }
-    double kelly_adj = kelly_full > 0.0 ? config_.kelly_fraction * kelly_full : 1.0;
+    // Если Kelly = 0 (нет edge), возвращаем минимальный множитель вместо полного размера
+    double kelly_adj = kelly_full > 0.0
+        ? config_.kelly_fraction * kelly_full
+        : config_.min_size_multiplier;
 
     // Комбинированный множитель: vol_ratio × kelly_adj
     double combined = vol_ratio * std::max(kelly_adj, 0.1);

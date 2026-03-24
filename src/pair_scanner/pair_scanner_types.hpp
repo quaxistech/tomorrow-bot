@@ -54,24 +54,29 @@ struct CandleData {
     double volume{0.0};
 };
 
-/// Результат скоринга одной пары
+/// Результат скоринга одной пары (v3 — ТОЛЬКО растущие монеты)
 struct PairScore {
     std::string symbol;
 
-    /// Компоненты скоринга (каждый 0-20, суммарно 0-100)
-    double volume_score{0.0};     ///< Ликвидность (24ч объём, log-шкала)
-    double volatility_score{0.0}; ///< Волатильность (оптимум 2-5% дневная)
-    double spread_score{0.0};     ///< Стоимость входа/выхода
-    double trend_score{0.0};      ///< Сила тренда (ADX-подобная метрика)
-    double quality_score{0.0};    ///< Качество движения (body/shadow ratio)
+    /// Компоненты скоринга v3 (суммарно 0-100)
+    double momentum_score{0.0};    ///< Импульс роста (0-40) — ГЛАВНЫЙ (ROC 24h + ускорение + EMA)
+    double trend_score{0.0};       ///< Бычий тренд (0-25) — направление + сила
+    double tradability_score{0.0}; ///< Торгуемость (0-25) — volume + spread + volatility
+    double quality_score{0.0};     ///< Качество движения (0-10) — body ratio
 
-    /// Суммарный балл 0-100
+    /// Суммарный балл 0-100 (= -1 если отфильтрована)
     double total_score{0.0};
 
     /// Метаданные для логирования
-    double quote_volume_24h{0.0}; ///< Объём 24ч USDT (для отладки)
+    double quote_volume_24h{0.0}; ///< Объём 24ч USDT
     double daily_volatility{0.0}; ///< Дневная волатильность %
     double avg_spread_bps{0.0};   ///< Средний спред bps
+    double change_24h_pct{0.0};   ///< Изменение цены за 24ч %
+    bool filtered_out{false};     ///< Отфильтрована (отрицательный 24h change)
+
+    /// Точность ордеров для данного символа (из exchange info)
+    int quantity_precision{6};    ///< Кол-во десятичных знаков количества
+    int price_precision{2};       ///< Кол-во десятичных знаков цены
 
     bool operator>(const PairScore& other) const {
         return total_score > other.total_score;

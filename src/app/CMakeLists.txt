@@ -12,6 +12,9 @@ target_include_directories(tomorrow-bot
 
 target_link_libraries(tomorrow-bot
     PRIVATE
+        tb_pipeline
+        tb_pair_scanner
+        tb_exchange_bitget
         tb_common
         tb_config
         tb_security
@@ -21,33 +24,6 @@ target_link_libraries(tomorrow-bot
         tb_clock
         tb_supervisor
         tb_platform
-        tb_world_model
-        tb_regime
-        tb_uncertainty
-        tb_strategy
-        tb_strategy_allocator
-        tb_decision
-        tb_ai
-        tb_execution_alpha
-        tb_opportunity_cost
-        tb_portfolio
-        tb_portfolio_allocator
-        tb_risk
-        tb_execution
-        tb_persistence
-        tb_replay
-        tb_telemetry
-        tb_alpha_decay
-        tb_shadow
-        tb_champion_challenger
-        tb_self_diagnosis
-        tb_adversarial_defense
-        tb_synthetic_scenarios
-        tb_governance
-        tb_operator_control
-        tb_pair_scanner
-        tb_exchange_bitget
-        tb_pipeline
         Threads::Threads
 )
 

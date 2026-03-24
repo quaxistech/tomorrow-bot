@@ -190,6 +190,7 @@ TEST_CASE("Risk: Правило 2 — Макс дневной убыток → D
     auto portfolio = make_clean_portfolio();
     // Убыток 3% при лимите 2%
     portfolio.pnl.total_pnl = -3000.0; // -3% от 100000
+    portfolio.pnl.realized_pnl_today = -3000.0; // Реализованный убыток
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
@@ -423,6 +424,7 @@ TEST_CASE("Risk: Множественные нарушения → все при
 
     auto portfolio = make_clean_portfolio();
     portfolio.pnl.total_pnl = -3000.0; // Дневной убыток
+    portfolio.pnl.realized_pnl_today = -3000.0; // Реализованный дневной убыток
 
     auto features = make_clean_features();
     features.execution_context.is_feed_fresh = false; // Устаревшие данные

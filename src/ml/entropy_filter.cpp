@@ -133,7 +133,7 @@ double EntropyFilter::compute_shannon_entropy(const std::deque<double>& data) co
     std::vector<size_t> bins(config_.num_bins, 0);
     for (const double val : data) {
         int bin = static_cast<int>(
-            (val - min_val) / range * static_cast<double>(config_.num_bins - 1));
+            (val - min_val) / range * static_cast<double>(config_.num_bins));
         bin = std::clamp(bin, 0, static_cast<int>(config_.num_bins) - 1);
         bins[static_cast<size_t>(bin)]++;
     }
