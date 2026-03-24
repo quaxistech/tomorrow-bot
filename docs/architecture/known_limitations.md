@@ -3,7 +3,7 @@
 ## Текущее состояние
 
 Tomorrow Bot — полностью рабочая production-grade торговая система:
-- **36 модулей** реализованы без заглушек
+- **42+ модулей** реализованы без заглушек
 - **203 unit-теста** проходят
 - **Реальная торговля** на Bitget через REST API
 - **WebSocket**: ~1000+ сообщений в минуту
@@ -11,6 +11,10 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Автоматический выбор пар** через PairScanner (24ч ротация)
 - **Мультитаймфреймный анализ**: 200 × 1h свечей (8+ дней) для HTF тренда
 - **Тренд-фильтрация**: стратегии не торгуют против HTF тренда
+- **6 ML-модулей**: entropy filter, fingerprinting, cascade detection, correlation, bayesian, thompson
+- **Smart TWAP**: адаптивное исполнение крупных ордеров
+- **Chandelier Exit / Trailing Stop**: адаптивный ATR-based стоп
+- **Volatility Targeting**: динамический сайзинг позиций
 
 ---
 
@@ -20,10 +24,11 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Автоматический выбор пар**: PairScanner (объём, спред, волатильность, ATR скоринг)
 - **Загрузка истории**: 200 × 1m свечей (прогрев индикаторов) + 200 × 1h свечей (HTF тренд)
 - **HTF Trend Analysis**: EMA20/50, RSI14, MACD, ADX на часовом таймфрейме
+- **HTF Real-Time Update**: пересчёт HTF каждый час + экстренное обновление при > 3×ATR
 - **Market Readiness Gate**: блокировка торговли до готовности всех индикаторов
 - **HTF Trend Filter**: блокировка сигналов против тренда на старшем ТФ
 - **Тренд-защита стратегий**: MeanReversion и MicrostructureScalp не торгуют против EMA тренда
-- **Conviction threshold 0.35**: повышенный порог уверенности для входа
+- **Conviction threshold 0.35**: повышенный порог уверенности для входа (динамический)
 - **Bitget WebSocket**: Подключение, подписки (ticker, trade, books, candle1m, candle5m), reconnect
 - **Bitget REST API**: Отправка market/limit/post-only ордеров, отмена, HMAC-SHA256 подпись
 - **5 торговых стратегий**: Momentum, MeanReversion, Breakout, VolatilityExpansion, MicrostructureScalp
@@ -50,6 +55,44 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Governance**: Audit log (15+ типов), strategy registry, config hashing
 - **OperatorControl**: 11 команд (kill-switch, safe-mode, shadow, inspect и др.)
 - **Supervisor**: Graceful shutdown, signal handling, dependency validation
+
+### Продвинутые технологии v0.3 ✅ (новое)
+
+**Уровень 1 — Управление рисками:**
+- **Chandelier Exit / Trailing Stop**: адаптивный trailing stop 3×ATR (сильный тренд), 2.5× (умеренный), 1.5× (choppy). Breakeven при +1.5×ATR, partial TP 50% при +2×ATR
+- **Volatility Targeting**: динамический сайзинг size = target_vol / realized_vol × Kelly × regime_mult. 13 режимов, Kelly = 0.25
+- **Alpha Decay Feedback**: мониторинг деградации каждые 60с. Рекомендации: ReduceWeight, ReduceSize, RaiseThresholds, Disable
+- **HTF Real-Time Update**: пересчёт HTF каждый час + экстренное обновление при > 3×ATR
+
+**Уровень 2 — Продвинутые индикаторы:**
+- **CUSUM**: two-sided cumulative sum, drift 0.5σ, threshold 4σ, sample stddev, без look-ahead bias
+- **VPIN**: Volume-Synchronized Probability of Informed Trading, порог 0.7, 10-trade calibration
+- **Volume Profile**: POC + Value Area (70%), 50 уровней, 5000 трейдов lookback
+- **Smart TWAP**: 3-10 слайсов, адаптивный интервал, front-loading 1.2×
+- **Time-of-Day Alpha**: 24-часовой UTC профиль, +0.05 порог в тихие часы
+
+**Уровень 3 — ML/AI:**
+- **Bayesian Online Adaptation**: Normal-Normal conjugate prior, regime-conditioned (70%), Thompson exploration (10%)
+- **Entropy Filter**: Shannon entropy на 4 каналах, порог 0.85, кеширование
+- **Microstructure Fingerprinting**: 5D × 5 buckets = 3125 паттернов, edge threshold -0.1
+- **Liquidation Cascade Prediction**: velocity 40% + volume 30% + depth 30%, порог 0.6
+- **Correlation Monitor**: Pearson correlation с BTC/ETH, short 20 / long 100, risk_mult 0.5
+- **RL Entry Timing (Thompson Sampling)**: 5-arm Beta bandit, decay 0.995
+
+### Исправления ошибок v0.3 ✅
+
+- P&L always 0.0 в alpha decay / fingerprint / Thompson — исправлено
+- SELL position trailing stop initialization — исправлено
+- RNG seeding (bayesian, thompson) — исправлено
+- TWAP NaN/Inf edge cases — исправлено
+- TWAP thread-safe counter — исправлено
+- HTF buffer data races — исправлено
+- CUSUM look-ahead bias + sample stddev — исправлено
+- VPIN calibration on first trade — исправлено
+- Entropy filter caching — исправлено
+- Fingerprint eviction + breakeven bias — исправлено
+- Cascade depth ratio logic — исправлено
+- Correlation no-data ambiguity — исправлено
 
 ---
 
@@ -86,12 +129,17 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 
 | Приоритет | Задача | Описание |
 |-----------|--------|----------|
+| ✅ Готово | HTF периодическое обновление | Пересчёт HTF тренда каждый час + экстренное обновление при > 3×ATR |
+| ✅ Готово | ML/AI модули (6 шт.) | Bayesian, Entropy, Fingerprint, Cascade, Correlation, Thompson |
+| ✅ Готово | Smart TWAP | Адаптивное разбиение крупных ордеров (3-10 слайсов) |
+| ✅ Готово | Chandelier Exit | Адаптивный trailing stop (1.5×–3×ATR) |
+| ✅ Готово | Volatility Targeting | Динамический сайзинг (Kelly × regime_mult) |
+| ✅ Готово | Advanced Indicators | CUSUM, VPIN, Volume Profile, Time-of-Day Alpha |
 | 🔴 Высокий | Файловая персистентность | SQLite или JSON-файловый адаптер для IStorageAdapter |
 | 🔴 Высокий | Приватный WS-канал | Fill events через `wss://ws.bitget.com/v2/ws/private` |
 | 🟡 Средний | Multi-symbol pipeline | Одновременная торговля top-N парами (параллельные pipelines) |
 | 🟡 Средний | Backtest mode | Воспроизведение исторических данных через ReplayEngine |
 | 🟡 Средний | Benchmarks | Латентность pipeline, feature generation, order submission |
-| 🟡 Средний | HTF периодическое обновление | Пересчёт HTF тренда каждые 1-4 часа в реальном времени |
-| 🔵 Низкий | AI Advisory | Интеграция LLM для диагностики и рекомендаций |
+| 🔵 Низкий | AI Advisory LLM | Интеграция LLM для диагностики и рекомендаций |
 | 🔵 Низкий | Tools | Реализация replay_inspector, telemetry_viewer |
 | 🔵 Низкий | Multi-exchange | Абстракция для других бирж (Binance, OKX) |

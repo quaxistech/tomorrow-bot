@@ -35,7 +35,21 @@ Bitget WS → BitgetWsClient → RawWsMessage
 → LocalOrderBook (только события OrderBook)
 → FeatureEngine.on_ticker / on_trade / on_candle
 → FeatureSnapshot (вычисляется по запросу или при каждом тикере)
-→ Market Readiness Gate → HTF Trend Filter → Стратегии
+→ AdvancedFeatureEngine (CUSUM, VPIN, Volume Profile, Time-of-Day Alpha)
+→ Market Readiness Gate → HTF Trend Filter → ML Layer → Стратегии
+```
+
+### 3b. HTF Real-Time Update (новый)
+
+```
+Каждые 60 минут (таймер):
+    → Bitget REST API: /api/v2/spot/market/candles (1h)
+    → пересчёт HTF индикаторов (EMA20/50, RSI14, MACD, ADX14)
+    → обновление htf_trend_direction_ и htf_trend_strength_
+
+Экстренное обновление (при движении > 3×ATR):
+    → немедленный REST-запрос → пересчёт HTF
+    → все буферы защищены мьютексом (thread-safe)
 ```
 
 ---
@@ -169,6 +183,56 @@ Bitget WS → BitgetWsClient → RawWsMessage
 
 ---
 
+### 4b. AdvancedFeatureEngine (новый)
+
+**Расположение:** `src/features/advanced_features.hpp`
+
+Дополняет FeatureEngine продвинутыми индикаторами для обнаружения смены режима,
+токсичности потока и ценовых уровней. Работает параллельно с базовым FeatureEngine.
+
+**Компоненты:**
+
+- **CUSUM (Cumulative Sum)** — Two-sided cumulative sum для раннего обнаружения
+  смены режима. Drift 0.5σ, threshold 4σ. Использует sample stddev (Bessel's correction),
+  без look-ahead bias. Сигнализирует о статистически значимом изменении среднего.
+
+- **VPIN (Volume-Synchronized Probability of Informed Trading)** — оценка
+  вероятности информированной торговли через volume buckets. Порог токсичности 0.7.
+  Калибрация на первых 10 трейдах для надёжности начальных значений.
+
+- **Volume Profile** — POC (Point of Control) + Value Area (70% объёма).
+  50 ценовых уровней, 5000 трейдов lookback. Пересчёт каждые 100 трейдов.
+  Используется для определения уровней поддержки/сопротивления.
+
+- **Time-of-Day Alpha** — 24-часовой UTC профиль с множителями волатильности
+  и альфа-скорами по торговым сессиям:
+  - Азиатская (00:00-08:00 UTC) — пониженная волатильность
+  - Европейская (08:00-16:00 UTC) — средняя волатильность
+  - Американская (16:00-00:00 UTC) — повышенная волатильность
+  - +0.05 к порогу conviction в тихие часы
+
+**Выход:** `AdvancedFeatureSnapshot` (CUSUM signal, VPIN score, POC level, ToD multiplier)
+
+---
+
+### 4c. TWAP Executor (новый)
+
+**Расположение:** `src/execution/twap_executor.hpp`
+
+Адаптивное исполнение крупных ордеров через Time-Weighted Average Price.
+Разбивает ордер на 3-10 слайсов с адаптивным интервалом.
+
+**Алгоритм:**
+- Кол-во слайсов определяется размером ордера (3 min, 10 max)
+- Интервал между слайсами адаптируется к текущему спреду и VPIN
+- Front-loading 1.2× — первый слайс чуть больше остальных
+- Защита от NaN/Inf при edge cases
+- Thread-safe счётчик слайсов
+
+**Выход:** серия market/limit ордеров через ExecutionEngine
+
+---
+
 ### 5. FeatureSnapshot
 
 **Расположение:** `src/features/feature_snapshot.hpp`
@@ -195,16 +259,43 @@ Bitget WS → BitgetWsClient → RawWsMessage
 
 ---
 
+### 7. ML Real-Time Monitoring (новый)
+
+**Расположение:** `src/ml/`
+
+Набор ML-модулей, работающих в реальном времени параллельно с торговым pipeline:
+
+- **Liquidation Cascade Detector** — мониторит три сигнала в реальном времени:
+  velocity (40%), volume spike (30%), depth thinning (30%). При score > 0.6
+  блокирует все входы и может закрыть позиции.
+
+- **Correlation Monitor** — вычисляет Pearson correlation с BTC и ETH
+  в двух окнах (short 20 / long 100). При decorrelation (резкое расхождение)
+  применяет risk_mult = 0.5 к размеру позиции.
+
+- **Alpha Decay Feedback** — мониторит деградацию каждой стратегии каждые 60с.
+  Генерирует рекомендации: ReduceWeight(×0.7), ReduceSize(×0.5), RaiseThresholds(+0.10),
+  Disable(×0.0). Подаёт обратную связь в StrategyAllocator.
+
+- **HTF Real-Time Update** — пересчитывает HTF индикаторы каждый час через REST.
+  Экстренный пересчёт при движении > 3×ATR.
+
+---
+
 ## Гарантии потока данных
 
 | Компонент | Потокобезопасность | Исключения |
 |---|---|---|
 | PairScanner | нет (однопоточный, вызывается до pipeline) | не бросает |
 | HTF Bootstrap | нет (однопоточный, вызывается при старте) | не бросает |
+| HTF Real-Time Update | мьютекс на буферы (thread-safe) | не бросает |
 | BitgetNormalizer | нет (однопоточный) | не бросает |
 | LocalOrderBook | мьютекс на чтение/запись | не бросает |
 | FeatureEngine | нет (однопоточный) | не бросает |
+| AdvancedFeatureEngine | нет (однопоточный) | не бросает |
 | IndicatorEngine | stateless, безопасен | не бросает |
+| TWAP Executor | thread-safe счётчик слайсов | не бросает |
+| ML modules | каждый модуль со своим мьютексом | не бросает |
 
 ## Временны́е метки
 
