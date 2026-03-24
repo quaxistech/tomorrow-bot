@@ -1,0 +1,5 @@
+# Модуль панели управления оператора
+add_library(tb_operator_control STATIC operator_control_plane.cpp)
+target_include_directories(tb_operator_control PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(tb_operator_control PUBLIC tb_common tb_governance)
+target_compile_features(tb_operator_control PUBLIC cxx_std_23)

@@ -1,0 +1,43 @@
+# Tomorrow Bot — бумажный торговый режим (Paper Trading)
+# Секреты НЕ хранятся здесь — используются только ссылки на имена переменных окружения
+# Изменение этого файла меняет хеш конфигурации (config_hash)
+
+trading:
+  mode: paper
+  initial_capital: 10.0               # Совпадает с production ($10 тестовый счёт)
+
+exchange:
+  endpoint_rest: "https://api.bitget.com"
+  endpoint_ws: "wss://ws.bitget.com/v2/ws/public"
+  api_key_ref: "BITGET_API_KEY"
+  api_secret_ref: "BITGET_API_SECRET"
+  passphrase_ref: "BITGET_PASSPHRASE"
+  timeout_ms: 5000
+
+logging:
+  level: "debug"
+  structured_json: true
+  output_path: "logs/paper.log"
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+
+health:
+  enabled: true
+  port: 8080
+
+risk:
+  max_position_notional: 100.0
+  max_daily_loss_pct: 2.0
+  max_drawdown_pct: 5.0
+  kill_switch_enabled: true
+
+pair_selection:
+  mode: auto                       # auto = автоматический выбор, manual = ручной список
+  top_n: 5                         # Сколько лучших пар выбирать
+  min_volume_usdt: 500000          # Мин. 24ч объём (USDT)
+  max_spread_bps: 50               # Макс. спред (базисных пунктов)
+  rotation_interval_hours: 24      # Интервал ротации (часы)
+  blacklist: ""                    # Запрещённые пары (через запятую)

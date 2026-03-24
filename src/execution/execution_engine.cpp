@@ -1,0 +1,352 @@
+#include "execution/execution_engine.hpp"
+#include <sstream>
+
+namespace tb::execution {
+
+// ========== PaperOrderSubmitter ==========
+
+OrderSubmitResult PaperOrderSubmitter::submit_order(const OrderRecord& order) {
+    // Немедленно подтверждаем ордер (симуляция paper trading)
+    OrderSubmitResult result;
+    result.success = true;
+    result.order_id = order.order_id;
+    result.exchange_order_id = OrderId("PAPER-" + std::to_string(next_exchange_id_++));
+    return result;
+}
+
+bool PaperOrderSubmitter::cancel_order(const OrderId& /*order_id*/) {
+    // Всегда успешно в paper mode
+    return true;
+}
+
+// ========== ExecutionEngine ==========
+
+ExecutionEngine::ExecutionEngine(
+    std::shared_ptr<IOrderSubmitter> submitter,
+    std::shared_ptr<portfolio::IPortfolioEngine> portfolio,
+    std::shared_ptr<logging::ILogger> logger,
+    std::shared_ptr<clock::IClock> clock,
+    std::shared_ptr<metrics::IMetricsRegistry> metrics)
+    : submitter_(std::move(submitter))
+    , portfolio_(std::move(portfolio))
+    , logger_(std::move(logger))
+    , clock_(std::move(clock))
+    , metrics_(std::move(metrics))
+{
+}
+
+Result<OrderId> ExecutionEngine::execute(
+    const strategy::TradeIntent& intent,
+    const risk::RiskDecision& risk_decision,
+    const execution_alpha::ExecutionAlphaResult& exec_alpha)
+{
+    // Проверить, что risk decision одобрен
+    if (risk_decision.verdict == risk::RiskVerdict::Denied) {
+        return std::unexpected(TbError::RiskDenied);
+    }
+
+    // Проверить дублирование
+    if (is_duplicate(intent)) {
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    // Создать запись ордера
+    auto order = create_order_record(intent, risk_decision, exec_alpha);
+
+    std::lock_guard lock(mutex_);
+
+    // Создать FSM для ордера
+    auto order_id_str = order.order_id.get();
+    order_fsms_.emplace(order_id_str, OrderFSM(order.order_id));
+
+    // Перевести в PendingAck
+    auto& fsm = order_fsms_.at(order_id_str);
+    if (!fsm.transition(OrderState::PendingAck, "Отправка на биржу")) {
+        logger_->error("Execution", "Не удалось перевести ордер в PendingAck",
+                       {{"order_id", order_id_str}});
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+    order.state = OrderState::PendingAck;
+
+    // Отправить ордер на биржу
+    auto submit_result = submitter_->submit_order(order);
+
+    if (!submit_result.success) {
+        // Перевести в Rejected
+        fsm.transition(OrderState::Rejected, submit_result.error_message);
+        order.state = OrderState::Rejected;
+        order.rejection_reason = submit_result.error_message;
+        orders_[order_id_str] = order;
+
+        logger_->warn("Execution", "Ордер отклонён биржей",
+                      {{"order_id", order_id_str},
+                       {"reason", submit_result.error_message}});
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    // Успешно отправлен
+    order.exchange_order_id = submit_result.exchange_order_id;
+    orders_[order_id_str] = order;
+
+    // Запомнить интент для обнаружения дублей
+    recent_intents_.insert(
+        intent.correlation_id.get() + ":" + intent.symbol.get());
+
+    logger_->info("Execution", "Ордер отправлен",
+                  {{"order_id", order_id_str},
+                   {"exchange_id", submit_result.exchange_order_id.get()},
+                   {"symbol", intent.symbol.get()},
+                   {"side", intent.side == Side::Buy ? "Buy" : "Sell"},
+                   {"quantity", std::to_string(order.original_quantity.get())}});
+
+    if (metrics_) {
+        metrics_->counter("execution_orders_submitted", {})->increment();
+    }
+
+    // Для рыночных ордеров считаем исполнение немедленным:
+    // биржа подтверждает market-ордер сразу, а приватный WebSocket
+    // канал для трекинга fill-ов не реализован. Это безопасное допущение
+    // для spot market-ордеров, которые исполняются мгновенно.
+    if (order.order_type == OrderType::Market) {
+        auto fill_price = order.price.get() > 0.0
+            ? order.price : Price(intent.limit_price.value_or(Price(0.0)));
+        // PendingAck → Filled — допустимый переход в FSM
+        fsm.transition(OrderState::Filled, "Рыночный ордер исполнен");
+        order.state = OrderState::Filled;
+        order.filled_quantity = order.original_quantity;
+        order.remaining_quantity = Quantity(0.0);
+        order.avg_fill_price = fill_price;
+        order.last_updated = clock_->now();
+        orders_[order_id_str] = order;
+
+        // Обновить портфель.
+        // На спотовом рынке SELL закрывает существующую BUY позицию
+        // (короткие позиции на споте невозможны). При BUY — открываем новую.
+        if (portfolio_) {
+            if (order.side == Side::Sell) {
+                // SELL на споте = закрытие длинной позиции.
+                // Рассчитываем реализованную P&L по текущей позиции.
+                auto existing = portfolio_->get_position(order.symbol);
+                double realized_pnl = 0.0;
+                if (existing.has_value()) {
+                    realized_pnl = (fill_price.get() - existing->avg_entry_price.get())
+                                 * order.filled_quantity.get();
+                }
+                portfolio_->close_position(order.symbol, fill_price, realized_pnl);
+                logger_->info("Execution", "Позиция закрыта (SELL fill)",
+                    {{"symbol", order.symbol.get()},
+                     {"realized_pnl", std::to_string(realized_pnl)}});
+            } else {
+                // BUY — открываем новую позицию
+                portfolio::Position pos;
+                pos.symbol = order.symbol;
+                pos.side = order.side;
+                pos.size = order.filled_quantity;
+                pos.avg_entry_price = order.avg_fill_price;
+                pos.current_price = order.avg_fill_price;
+                pos.notional = NotionalValue(
+                    order.filled_quantity.get() * order.avg_fill_price.get());
+                pos.strategy_id = order.strategy_id;
+                pos.opened_at = clock_->now();
+                pos.updated_at = clock_->now();
+                portfolio_->open_position(pos);
+            }
+        }
+
+        logger_->info("Execution", "Рыночный ордер исполнен",
+                      {{"order_id", order_id_str},
+                       {"filled_qty", std::to_string(order.filled_quantity.get())},
+                       {"fill_price", std::to_string(order.avg_fill_price.get())}});
+    }
+
+    return OrderId(order_id_str);
+}
+
+VoidResult ExecutionEngine::cancel(const OrderId& order_id) {
+    std::lock_guard lock(mutex_);
+
+    auto it = orders_.find(order_id.get());
+    if (it == orders_.end()) {
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    auto fsm_it = order_fsms_.find(order_id.get());
+    if (fsm_it == order_fsms_.end()) {
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    // Перевести FSM в CancelPending
+    if (!fsm_it->second.transition(OrderState::CancelPending, "Запрос отмены")) {
+        logger_->warn("Execution", "Невозможно отменить ордер в текущем состоянии",
+                      {{"order_id", order_id.get()},
+                       {"state", to_string(fsm_it->second.current_state())}});
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    it->second.state = OrderState::CancelPending;
+
+    // Отправить запрос отмены
+    bool cancelled = submitter_->cancel_order(order_id);
+    if (cancelled) {
+        fsm_it->second.transition(OrderState::Cancelled, "Отменён");
+        it->second.state = OrderState::Cancelled;
+        it->second.last_updated = clock_->now();
+    }
+
+    return {};
+}
+
+void ExecutionEngine::on_order_update(
+    const OrderId& order_id, OrderState new_state,
+    Quantity filled_qty, Price fill_price)
+{
+    std::lock_guard lock(mutex_);
+
+    auto it = orders_.find(order_id.get());
+    if (it == orders_.end()) {
+        logger_->warn("Execution", "Обновление для неизвестного ордера",
+                      {{"order_id", order_id.get()}});
+        return;
+    }
+
+    auto fsm_it = order_fsms_.find(order_id.get());
+    if (fsm_it == order_fsms_.end()) {
+        return;
+    }
+
+    // Попытка перехода
+    if (!fsm_it->second.transition(new_state, "Обновление от биржи")) {
+        logger_->warn("Execution", "Недопустимый переход",
+                      {{"order_id", order_id.get()},
+                       {"from", to_string(fsm_it->second.current_state())},
+                       {"to", to_string(new_state)}});
+        return;
+    }
+
+    auto& order = it->second;
+    order.state = new_state;
+    order.last_updated = clock_->now();
+
+    // Обновить заполнение
+    if (filled_qty.get() > 0.0) {
+        order.filled_quantity = filled_qty;
+        order.remaining_quantity = Quantity(
+            order.original_quantity.get() - filled_qty.get());
+        if (fill_price.get() > 0.0) {
+            order.avg_fill_price = fill_price;
+        }
+    }
+
+    // При полном заполнении — обновить портфель.
+    // SELL на споте закрывает позицию, BUY открывает новую.
+    if (new_state == OrderState::Filled && portfolio_) {
+        if (order.side == Side::Sell) {
+            auto existing = portfolio_->get_position(order.symbol);
+            double realized_pnl = 0.0;
+            if (existing.has_value()) {
+                realized_pnl = (order.avg_fill_price.get() - existing->avg_entry_price.get())
+                             * order.filled_quantity.get();
+            }
+            portfolio_->close_position(order.symbol, order.avg_fill_price, realized_pnl);
+        } else {
+            portfolio::Position pos;
+            pos.symbol = order.symbol;
+            pos.side = order.side;
+            pos.size = order.filled_quantity;
+            pos.avg_entry_price = order.avg_fill_price;
+            pos.current_price = order.avg_fill_price;
+            pos.notional = NotionalValue(
+                order.filled_quantity.get() * order.avg_fill_price.get());
+            pos.strategy_id = order.strategy_id;
+            pos.opened_at = clock_->now();
+            pos.updated_at = clock_->now();
+            portfolio_->open_position(pos);
+        }
+    }
+
+    logger_->debug("Execution", "Обновление ордера",
+                   {{"order_id", order_id.get()},
+                    {"new_state", to_string(new_state)},
+                    {"filled", std::to_string(order.filled_quantity.get())}});
+}
+
+std::optional<OrderRecord> ExecutionEngine::get_order(const OrderId& order_id) const {
+    std::lock_guard lock(mutex_);
+    auto it = orders_.find(order_id.get());
+    if (it == orders_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::vector<OrderRecord> ExecutionEngine::active_orders() const {
+    std::lock_guard lock(mutex_);
+    std::vector<OrderRecord> result;
+    for (const auto& [_, order] : orders_) {
+        if (order.is_active()) {
+            result.push_back(order);
+        }
+    }
+    return result;
+}
+
+bool ExecutionEngine::is_duplicate(const strategy::TradeIntent& intent) const {
+    std::lock_guard lock(mutex_);
+    const auto key = intent.correlation_id.get() + ":" + intent.symbol.get();
+    return recent_intents_.contains(key);
+}
+
+OrderRecord ExecutionEngine::create_order_record(
+    const strategy::TradeIntent& intent,
+    const risk::RiskDecision& risk_decision,
+    const execution_alpha::ExecutionAlphaResult& exec_alpha)
+{
+    OrderRecord record;
+    record.order_id = OrderId(generate_order_id());
+    record.symbol = intent.symbol;
+    record.side = intent.side;
+    record.strategy_id = intent.strategy_id;
+    record.correlation_id = intent.correlation_id;
+    record.original_quantity = risk_decision.approved_quantity;
+    record.remaining_quantity = risk_decision.approved_quantity;
+    record.created_at = clock_->now();
+    record.last_updated = clock_->now();
+
+    // Определить тип ордера из стиля исполнения
+    switch (exec_alpha.recommended_style) {
+        case execution_alpha::ExecutionStyle::Passive:
+            record.order_type = OrderType::Limit;
+            record.tif = TimeInForce::GoodTillCancel;
+            break;
+        case execution_alpha::ExecutionStyle::Aggressive:
+            record.order_type = OrderType::Market;
+            record.tif = TimeInForce::ImmediateOrCancel;
+            break;
+        case execution_alpha::ExecutionStyle::Hybrid:
+            record.order_type = OrderType::Limit;
+            record.tif = TimeInForce::ImmediateOrCancel;
+            break;
+        case execution_alpha::ExecutionStyle::PostOnly:
+            record.order_type = OrderType::PostOnly;
+            record.tif = TimeInForce::GoodTillCancel;
+            break;
+        case execution_alpha::ExecutionStyle::NoExecution:
+            record.order_type = OrderType::Limit;
+            break;
+    }
+
+    // Установить цену
+    if (exec_alpha.recommended_limit_price) {
+        record.price = *exec_alpha.recommended_limit_price;
+    } else if (intent.limit_price) {
+        record.price = *intent.limit_price;
+    }
+
+    return record;
+}
+
+std::string ExecutionEngine::generate_order_id() {
+    return "ORD-" + std::to_string(next_order_seq_++);
+}
+
+} // namespace tb::execution

@@ -1,0 +1,43 @@
+# Tomorrow Bot — теневой режим (Shadow Mode)
+# Система производит все расчёты и генерирует сигналы,
+# но не отправляет реальные ордера на биржу.
+# Используется для верификации стратегий в production-условиях.
+
+trading:
+  mode: shadow
+
+exchange:
+  endpoint_rest: "https://api.bitget.com"
+  endpoint_ws: "wss://ws.bitget.com/v2/ws/public"
+  api_key_ref: "BITGET_API_KEY"
+  api_secret_ref: "BITGET_API_SECRET"
+  passphrase_ref: "BITGET_PASSPHRASE"
+  timeout_ms: 5000
+
+logging:
+  level: "info"
+  structured_json: true
+  output_path: "/var/log/tomorrow-bot/shadow.log"
+
+metrics:
+  enabled: true
+  port: 9091
+  path: "/metrics"
+
+health:
+  enabled: true
+  port: 8081
+
+risk:
+  max_position_notional: 500.0
+  max_daily_loss_pct: 2.0
+  max_drawdown_pct: 5.0
+  kill_switch_enabled: true
+
+pair_selection:
+  mode: auto
+  top_n: 5
+  min_volume_usdt: 500000
+  max_spread_bps: 50
+  rotation_interval_hours: 24
+  blacklist: ""

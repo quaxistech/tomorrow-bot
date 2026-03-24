@@ -1,0 +1,50 @@
+# Systemd unit файл для Tomorrow Bot
+# Установка: sudo cp tomorrow-bot.service /etc/systemd/system/
+# Активация: sudo systemctl enable --now tomorrow-bot
+
+[Unit]
+Description=Tomorrow Bot — Adaptive Trading System
+Documentation=https://github.com/your-org/tomorrow-bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/tomorrow-bot
+
+# Путь к исполняемому файлу
+ExecStart=/opt/tomorrow-bot/bin/tomorrow-bot --config=/opt/tomorrow-bot/configs/production.yaml
+
+# Graceful shutdown — сначала SIGTERM, затем SIGKILL через 30 секунд
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Автоматический перезапуск при сбое (не при clean exit)
+Restart=on-failure
+RestartSec=5s
+
+# Переменные окружения из файла (СЕКРЕТЫ — не в unit файле!)
+EnvironmentFile=/etc/tomorrow-bot/secrets.env
+
+# Безопасность: ограничение привилегий
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/tomorrow-bot /var/lib/tomorrow-bot
+
+# Ограничения ресурсов
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Логирование через journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tomorrow-bot
+
+[Install]
+WantedBy=multi-user.target

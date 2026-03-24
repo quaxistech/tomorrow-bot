@@ -1,0 +1,24 @@
+# Секреты — НИКОГДА не коммитить
+.env
+api.txt
+
+# Сборка
+build/
+build-check/
+build-debug/
+a.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Логи
+*.log
+/var/log/tomorrow-bot/
+
+# OS
+.DS_Store
+Thumbs.db

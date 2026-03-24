@@ -1,0 +1,44 @@
+# Tomorrow Bot — production режим (РЕАЛЬНЫЕ ДЕНЬГИ!)
+# ВНИМАНИЕ: изменения в этом файле немедленно влияют на торговлю!
+# Все параметры риска установлены строже, чем в других режимах.
+# Требуется явное подтверждение перед применением.
+
+trading:
+  mode: production
+  initial_capital: 10.0             # Реальный капитал на аккаунте ($10)
+
+exchange:
+  endpoint_rest: "https://api.bitget.com"
+  endpoint_ws: "wss://ws.bitget.com/v2/ws/public"
+  api_key_ref: "BITGET_API_KEY"
+  api_secret_ref: "BITGET_API_SECRET"
+  passphrase_ref: "BITGET_PASSPHRASE"
+  timeout_ms: 3000
+
+logging:
+  level: "info"
+  structured_json: true
+  output_path: "logs/production.log"
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+
+health:
+  enabled: true
+  port: 8080
+
+risk:
+  max_position_notional: 10.0     # Только $10 на аккаунте
+  max_daily_loss_pct: 50.0        # Допустимый дневной убыток до $5 (тестирование)
+  max_drawdown_pct: 50.0          # Допустимая просадка до $5 (тестирование)
+  kill_switch_enabled: true
+
+pair_selection:
+  mode: auto                       # auto = автоматический выбор, manual = ручной список
+  top_n: 5                         # Сколько лучших пар выбирать
+  min_volume_usdt: 500000          # Мин. 24ч объём (USDT)
+  max_spread_bps: 50               # Макс. спред (базисных пунктов)
+  rotation_interval_hours: 24      # Интервал ротации (часы)
+  blacklist: ""                    # Запрещённые пары (через запятую)

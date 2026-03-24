@@ -1,0 +1,42 @@
+# Tomorrow Bot — тестовая сеть биржи (Testnet)
+# Реальный API биржи, но тестовые (не реальные) средства.
+# Используется для проверки исполнения ордеров без риска.
+
+trading:
+  mode: testnet
+
+exchange:
+  endpoint_rest: "https://api-sandbox.bitget.com"
+  endpoint_ws: "wss://ws-sandbox.bitget.com/v2/ws/public"
+  api_key_ref: "BITGET_TESTNET_API_KEY"
+  api_secret_ref: "BITGET_TESTNET_API_SECRET"
+  passphrase_ref: "BITGET_TESTNET_PASSPHRASE"
+  timeout_ms: 8000
+
+logging:
+  level: "info"
+  structured_json: true
+  output_path: "/var/log/tomorrow-bot/testnet.log"
+
+metrics:
+  enabled: true
+  port: 9092
+  path: "/metrics"
+
+health:
+  enabled: true
+  port: 8082
+
+risk:
+  max_position_notional: 1000.0
+  max_daily_loss_pct: 3.0
+  max_drawdown_pct: 7.0
+  kill_switch_enabled: true
+
+pair_selection:
+  mode: auto
+  top_n: 5
+  min_volume_usdt: 500000
+  max_spread_bps: 50
+  rotation_interval_hours: 24
+  blacklist: ""

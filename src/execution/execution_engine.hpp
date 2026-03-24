@@ -1,0 +1,95 @@
+#pragma once
+#include "execution/order_types.hpp"
+#include "execution/order_fsm.hpp"
+#include "strategy/strategy_types.hpp"
+#include "risk/risk_types.hpp"
+#include "execution_alpha/execution_alpha_types.hpp"
+#include "portfolio/portfolio_engine.hpp"
+#include "common/result.hpp"
+#include "logging/logger.hpp"
+#include "clock/clock.hpp"
+#include "metrics/metrics_registry.hpp"
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace tb::execution {
+
+/// Интерфейс отправки ордеров на биржу (абстракция для тестирования)
+class IOrderSubmitter {
+public:
+    virtual ~IOrderSubmitter() = default;
+
+    /// Отправить ордер
+    virtual OrderSubmitResult submit_order(const OrderRecord& order) = 0;
+
+    /// Отменить ордер
+    virtual bool cancel_order(const OrderId& order_id) = 0;
+};
+
+/// Реализация для paper/shadow торговли — немедленно подтверждает ордера без отправки на биржу
+class PaperOrderSubmitter : public IOrderSubmitter {
+public:
+    OrderSubmitResult submit_order(const OrderRecord& order) override;
+    bool cancel_order(const OrderId& order_id) override;
+
+private:
+    int next_exchange_id_{1};
+};
+
+/// Движок исполнения ордеров
+class ExecutionEngine {
+public:
+    ExecutionEngine(std::shared_ptr<IOrderSubmitter> submitter,
+                    std::shared_ptr<portfolio::IPortfolioEngine> portfolio,
+                    std::shared_ptr<logging::ILogger> logger,
+                    std::shared_ptr<clock::IClock> clock,
+                    std::shared_ptr<metrics::IMetricsRegistry> metrics);
+
+    /// Отправить ордер на основе одобренного интента + risk decision
+    Result<OrderId> execute(const strategy::TradeIntent& intent,
+                            const risk::RiskDecision& risk_decision,
+                            const execution_alpha::ExecutionAlphaResult& exec_alpha);
+
+    /// Запросить отмену ордера
+    VoidResult cancel(const OrderId& order_id);
+
+    /// Обновить состояние ордера (от биржи)
+    void on_order_update(const OrderId& order_id, OrderState new_state,
+                         Quantity filled_qty = Quantity(0.0),
+                         Price fill_price = Price(0.0));
+
+    /// Получить запись ордера
+    std::optional<OrderRecord> get_order(const OrderId& order_id) const;
+
+    /// Все активные ордера
+    std::vector<OrderRecord> active_orders() const;
+
+    /// Проверка дублирования (не отправлять одинаковый интент дважды)
+    bool is_duplicate(const strategy::TradeIntent& intent) const;
+
+private:
+    /// Создать запись ордера из интента, решения риска и параметров исполнения
+    OrderRecord create_order_record(const strategy::TradeIntent& intent,
+                                     const risk::RiskDecision& risk_decision,
+                                     const execution_alpha::ExecutionAlphaResult& exec_alpha);
+
+    /// Генерировать уникальный идентификатор ордера
+    std::string generate_order_id();
+
+    std::shared_ptr<IOrderSubmitter> submitter_;
+    std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
+    std::shared_ptr<logging::ILogger> logger_;
+    std::shared_ptr<clock::IClock> clock_;
+    std::shared_ptr<metrics::IMetricsRegistry> metrics_;
+
+    std::unordered_map<std::string, OrderRecord> orders_;      ///< По order_id
+    std::unordered_map<std::string, OrderFSM> order_fsms_;     ///< FSM для каждого ордера
+    std::unordered_set<std::string> recent_intents_;           ///< Для обнаружения дублей
+    mutable std::mutex mutex_;
+    int next_order_seq_{1};
+};
+
+} // namespace tb::execution
