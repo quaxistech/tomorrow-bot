@@ -194,7 +194,7 @@ BITGET_PASSPHRASE=ваш_passphrase
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
 | **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
 | **Аналитика** | persistence, replay, telemetry, alpha_decay, shadow, champion_challenger |
-| **Защита** | adversarial_defense, synthetic_scenarios, self_diagnosis, governance, operator_control |
+| **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis, governance, operator_control |
 
 ### Продвинутые технологии v0.3
 
@@ -325,6 +325,11 @@ BITGET_PASSPHRASE=ваш_passphrase
 ├─────────────────────────────────────────────┤
 │ 14. Alpha Decay Feedback                     │
 │    Деградация → ReduceWeight/Disable         │
+├─────────────────────────────────────────────┤
+│ 15. Adversarial Defense v4                   │
+│    14 детекторов, percentile scoring,        │
+│    correlation matrix, multi-TF baselines,   │
+│    hysteresis, regime-aware порог, audit log  │
 └─────────────────────────────────────────────┘
 ```
 
@@ -420,7 +425,7 @@ tomorrow-bot/
 │   ├── shadow/                 # Теневые решения, гипотетический PnL
 │   ├── champion_challenger/    # A/B тестирование стратегий, promotion
 │   ├── self_diagnosis/         # Объяснение решений (human + machine readable)
-│   ├── adversarial_defense/    # 6 видов угроз, cooldown, severity
+│   ├── adversarial_defense/    # 14 детекторов, v4: percentile, correlation, MTF, hysteresis
 │   ├── governance/             # Audit log (15+ типов событий), strategy registry
 │   ├── operator_control/       # 11 команд оператора (kill-switch, shadow, inspect)
 │   └── synthetic_scenarios/    # 9 стресс-сценариев с валидацией
@@ -452,6 +457,7 @@ tomorrow-bot/
 - Production требует `kill_switch_enabled: true`
 - 14 независимых проверок риск-движка перед каждым ордером
 - Chandelier Exit / Trailing Stop — адаптивный стоп (1.5×–3×ATR)
+- Adversarial Defense v4 — 14 детекторов рыночных угроз с автоматической калибровкой
 - Entropy Filter — блокировка торговли при высоком шуме (entropy > 0.85)
 - Liquidation Cascade Detector — аварийная блокировка при каскадных ликвидациях
 - Correlation Monitor — снижение риска при decorrelation с BTC/ETH

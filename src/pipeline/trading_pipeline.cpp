@@ -1638,18 +1638,58 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         adversarial_assessment = adversarial_defense_->assess(
             defense::build_market_condition(snapshot));
 
+        // Критичные действия (VetoTrade/Cooldown) логируем КАЖДЫЙ тик
+        const bool is_critical = (adversarial_assessment.overall_action == adversarial::DefenseAction::VetoTrade ||
+                                  adversarial_assessment.overall_action == adversarial::DefenseAction::Cooldown);
+
         if (adversarial_assessment.overall_action != adversarial::DefenseAction::NoAction &&
-            tick_count_ % 100 == 0) {
+            (is_critical || tick_count_ % 100 == 0)) {
+            // Собираем все типы угроз
+            std::string threat_types;
+            for (const auto& t : adversarial_assessment.threats) {
+                if (!threat_types.empty()) threat_types += ",";
+                threat_types += adversarial::to_string(t.type);
+            }
             const std::string top_reason = adversarial_assessment.threats.empty()
                 ? ""
                 : adversarial_assessment.threats.front().reason;
-            logger_->warn("pipeline", "Adversarial defense active",
+
+            logger_->warn("adversarial", "Defense active",
                 {{"symbol", symbol_.get()},
                  {"action", adversarial::to_string(adversarial_assessment.overall_action)},
-                 {"threats", std::to_string(adversarial_assessment.threats.size())},
+                 {"severity", std::to_string(adversarial_assessment.compound_severity)},
+                 {"regime", adversarial::to_string(adversarial_assessment.regime)},
+                 {"threats", threat_types},
+                 {"threat_count", std::to_string(adversarial_assessment.threats.size())},
                  {"safe", adversarial_assessment.is_safe ? "true" : "false"},
+                 {"hysteresis", adversarial_assessment.hysteresis_active ? "on" : "off"},
+                 {"recovery", adversarial_assessment.in_recovery ? "yes" : "no"},
+                 {"conf_mult", std::to_string(adversarial_assessment.confidence_multiplier)},
+                 {"thr_mult", std::to_string(adversarial_assessment.threshold_multiplier)},
                  {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)},
                  {"reason", top_reason}});
+        }
+
+        // Периодическая диагностика adversarial defense (каждые 500 тиков)
+        if (tick_count_ % 500 == 0) {
+            auto diag = adversarial_defense_->get_diagnostics(symbol_, snapshot.computed_at);
+            auto cal = adversarial_defense_->get_calibration_metrics();
+            logger_->info("adversarial", "Диагностика adversarial defense",
+                {{"symbol", symbol_.get()},
+                 {"regime", adversarial::to_string(diag.regime)},
+                 {"baseline_warm", diag.baseline_warm ? "true" : "false"},
+                 {"baseline_samples", std::to_string(diag.baseline_samples)},
+                 {"spread_ema", std::to_string(diag.spread_ema)},
+                 {"depth_ema", std::to_string(diag.depth_ema)},
+                 {"hysteresis", diag.hysteresis_active ? "on" : "off"},
+                 {"corr_spread_depth", std::to_string(diag.spread_depth_correlation)},
+                 {"corr_spread_flow", std::to_string(diag.spread_flow_correlation)},
+                 {"fast_spread", std::to_string(diag.fast_spread_ema)},
+                 {"slow_spread", std::to_string(diag.slow_spread_ema)},
+                 {"total_assessments", std::to_string(cal.total_assessments)},
+                 {"veto_rate", std::to_string(cal.veto_rate)},
+                 {"veto_count", std::to_string(cal.veto_count)},
+                 {"avg_severity", std::to_string(cal.avg_compound_severity)}});
         }
 
         if (!portfolio_->has_position(symbol_) && !adversarial_assessment.is_safe) {
@@ -1769,6 +1809,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             effective_threshold = std::min(
                 1.0,
                 effective_threshold * adversarial_assessment.threshold_multiplier);
+
+            // Regime-aware: в токсичных условиях дополнительно ужесточаем порог
+            if (adversarial_assessment.regime == adversarial::MarketRegime::Toxic) {
+                effective_threshold = std::min(1.0, effective_threshold + 0.15);
+            } else if (adversarial_assessment.regime == adversarial::MarketRegime::LowLiquidity) {
+                effective_threshold = std::min(1.0, effective_threshold + 0.05);
+            }
         }
 
         // Time-of-Day: корректировка порога в неблагоприятные часы
@@ -1954,9 +2001,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     if (adversarial_defense_ && !is_closing_position && !adversarial_assessment.is_safe) {
-        logger_->warn("pipeline", "Вход заблокирован adversarial defense",
+        logger_->warn("adversarial", "Вход заблокирован",
             {{"symbol", symbol_.get()},
              {"action", adversarial::to_string(adversarial_assessment.overall_action)},
+             {"severity", std::to_string(adversarial_assessment.compound_severity)},
+             {"regime", adversarial::to_string(adversarial_assessment.regime)},
+             {"hysteresis", adversarial_assessment.hysteresis_active ? "on" : "off"},
+             {"pct_severity", std::to_string(adversarial_assessment.percentile_severity)},
              {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)}});
         return;
     }
@@ -2040,12 +2091,22 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 realized_vol_annual, regime.detailed, win_rate, win_loss_ratio);
         }
 
+        // Adversarial defense: confidence + recovery penalty
+        double adversarial_size_mult = 1.0;
+        if (adversarial_defense_) {
+            adversarial_size_mult = adversarial_assessment.confidence_multiplier;
+            // В режиме восстановления после шока — дополнительное ограничение размера
+            if (adversarial_assessment.in_recovery) {
+                adversarial_size_mult = std::min(adversarial_size_mult, 0.5);
+            }
+        }
+
         auto sizing = portfolio_allocator_->compute_size(
             intent, portfolio_->snapshot(),
             uncertainty.size_multiplier *
                 alpha_decay_size_mult_ *
                 correlation_risk_mult *
-                (adversarial_defense_ ? adversarial_assessment.confidence_multiplier : 1.0));
+                adversarial_size_mult);
 
         if (!sizing.approved || sizing.approved_quantity.get() <= 0.0) {
             logger_->debug("pipeline", "Размер позиции не одобрен аллокатором");
