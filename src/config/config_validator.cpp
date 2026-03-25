@@ -148,6 +148,46 @@ void ConfigValidator::validate_adversarial(
     if (cfg.spread_velocity_threshold_bps_per_sec <= 0.0) {
         result.add_error("adversarial_defense.spread_velocity_threshold_bps_per_sec должен быть > 0");
     }
+    // --- Adaptive baseline ---
+    if (cfg.baseline_alpha <= 0.0 || cfg.baseline_alpha >= 1.0) {
+        result.add_error("adversarial_defense.baseline_alpha должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.baseline_warmup_ticks < 1) {
+        result.add_error("adversarial_defense.baseline_warmup_ticks должен быть >= 1");
+    }
+    if (cfg.z_score_spread_threshold <= 0.0) {
+        result.add_error("adversarial_defense.z_score_spread_threshold должен быть > 0");
+    }
+    if (cfg.z_score_depth_threshold <= 0.0) {
+        result.add_error("adversarial_defense.z_score_depth_threshold должен быть > 0");
+    }
+    if (cfg.z_score_ratio_threshold <= 0.0) {
+        result.add_error("adversarial_defense.z_score_ratio_threshold должен быть > 0");
+    }
+    if (cfg.baseline_stale_reset_ms <= 0) {
+        result.add_error("adversarial_defense.baseline_stale_reset_ms должен быть > 0");
+    }
+    // --- Threat memory ---
+    if (cfg.threat_memory_alpha <= 0.0 || cfg.threat_memory_alpha >= 1.0) {
+        result.add_error("adversarial_defense.threat_memory_alpha должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.threat_memory_residual_factor < 0.0 || cfg.threat_memory_residual_factor > 1.0) {
+        result.add_error("adversarial_defense.threat_memory_residual_factor должен быть в [0, 1]");
+    }
+    if (cfg.threat_escalation_ticks < 1) {
+        result.add_error("adversarial_defense.threat_escalation_ticks должен быть >= 1");
+    }
+    if (cfg.threat_escalation_boost < 0.0) {
+        result.add_error("adversarial_defense.threat_escalation_boost должен быть >= 0");
+    }
+    // --- Depth asymmetry ---
+    if (cfg.depth_asymmetry_threshold <= 0.0 || cfg.depth_asymmetry_threshold >= 1.0) {
+        result.add_error("adversarial_defense.depth_asymmetry_threshold должен быть в (0, 1)");
+    }
+    // --- Cross-signal amplification ---
+    if (cfg.cross_signal_amplification < 0.0) {
+        result.add_error("adversarial_defense.cross_signal_amplification должен быть >= 0");
+    }
 }
 
 void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& result) const {

@@ -105,6 +105,26 @@ struct AdversarialDefenseConfig {
 
     // --- Spread velocity ---
     double spread_velocity_threshold_bps_per_sec{50.0};
+
+    // --- Adaptive baseline ---
+    double baseline_alpha{0.01};
+    int64_t baseline_warmup_ticks{200};
+    double z_score_spread_threshold{3.0};
+    double z_score_depth_threshold{3.0};
+    double z_score_ratio_threshold{3.0};
+    int64_t baseline_stale_reset_ms{300'000LL};
+
+    // --- Threat memory ---
+    double threat_memory_alpha{0.15};
+    double threat_memory_residual_factor{0.3};
+    int threat_escalation_ticks{5};
+    double threat_escalation_boost{0.1};
+
+    // --- Depth asymmetry ---
+    double depth_asymmetry_threshold{0.3};
+
+    // --- Cross-signal amplification ---
+    double cross_signal_amplification{0.3};
 };
 
 /// Полная конфигурация приложения

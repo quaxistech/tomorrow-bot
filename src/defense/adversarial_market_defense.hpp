@@ -45,6 +45,22 @@ using AdversarialMarketDefense = adversarial::AdversarialMarketDefense;
         .recovery_duration_ms = cfg.recovery_duration_ms,
         .recovery_confidence_floor = cfg.recovery_confidence_floor,
         .spread_velocity_threshold_bps_per_sec = cfg.spread_velocity_threshold_bps_per_sec,
+        // --- Adaptive baseline ---
+        .baseline_alpha = cfg.baseline_alpha,
+        .baseline_warmup_ticks = cfg.baseline_warmup_ticks,
+        .z_score_spread_threshold = cfg.z_score_spread_threshold,
+        .z_score_depth_threshold = cfg.z_score_depth_threshold,
+        .z_score_ratio_threshold = cfg.z_score_ratio_threshold,
+        .baseline_stale_reset_ms = cfg.baseline_stale_reset_ms,
+        // --- Threat memory ---
+        .threat_memory_alpha = cfg.threat_memory_alpha,
+        .threat_memory_residual_factor = cfg.threat_memory_residual_factor,
+        .threat_escalation_ticks = cfg.threat_escalation_ticks,
+        .threat_escalation_boost = cfg.threat_escalation_boost,
+        // --- Depth asymmetry ---
+        .depth_asymmetry_threshold = cfg.depth_asymmetry_threshold,
+        // --- Cross-signal amplification ---
+        .cross_signal_amplification = cfg.cross_signal_amplification,
     };
 }
 

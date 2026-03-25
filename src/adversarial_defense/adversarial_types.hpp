@@ -18,12 +18,15 @@ enum class ThreatType {
     UnstableOrderBook,     ///< Нестабильный стакан
     SpreadExplosion,       ///< Резкое расширение спреда
     SpreadVelocitySpike,   ///< Быстрое расширение спреда (скорость)
+    DepthAsymmetry,        ///< Сильная асимметрия bid/ask глубины (манипуляция)
     LiquidityVacuum,       ///< Вакуум ликвидности
     ToxicFlow,             ///< Токсичный поток ордеров
+    AnomalousBaseline,     ///< Z-score аномалия относительно адаптивного baseline
     BadBreakoutTrap,       ///< Ловушка ложного пробоя
     StaleMarketData,       ///< Устаревшие или несвежие рыночные данные
     InvalidMarketState,    ///< Некорректные входные рыночные данные
-    PostShockCooldown      ///< Пост-шоковое охлаждение
+    PostShockCooldown,     ///< Пост-шоковое охлаждение
+    ThreatEscalation       ///< Эскалация: устойчивая серия угроз (temporal pattern)
 };
 
 /// Преобразование типа угрозы в строку
@@ -32,12 +35,15 @@ inline std::string to_string(ThreatType t) {
         case ThreatType::UnstableOrderBook:   return "UnstableOrderBook";
         case ThreatType::SpreadExplosion:     return "SpreadExplosion";
         case ThreatType::SpreadVelocitySpike: return "SpreadVelocitySpike";
+        case ThreatType::DepthAsymmetry:      return "DepthAsymmetry";
         case ThreatType::LiquidityVacuum:     return "LiquidityVacuum";
         case ThreatType::ToxicFlow:           return "ToxicFlow";
+        case ThreatType::AnomalousBaseline:   return "AnomalousBaseline";
         case ThreatType::BadBreakoutTrap:     return "BadBreakoutTrap";
         case ThreatType::StaleMarketData:     return "StaleMarketData";
         case ThreatType::InvalidMarketState:  return "InvalidMarketState";
         case ThreatType::PostShockCooldown:   return "PostShockCooldown";
+        case ThreatType::ThreatEscalation:    return "ThreatEscalation";
     }
     return "Unknown";
 }
@@ -61,6 +67,26 @@ inline std::string to_string(DefenseAction a) {
         case DefenseAction::RaiseThreshold:   return "RaiseThreshold";
         case DefenseAction::Cooldown:         return "Cooldown";
         case DefenseAction::AlertOperator:    return "AlertOperator";
+    }
+    return "Unknown";
+}
+
+/// Классификация текущего рыночного режима
+enum class MarketRegime {
+    Unknown,               ///< Недостаточно данных для классификации
+    Normal,                ///< Нормальные условия
+    Volatile,              ///< Повышенная волатильность
+    LowLiquidity,          ///< Пониженная ликвидность
+    Toxic                  ///< Токсичные/враждебные условия
+};
+
+inline std::string to_string(MarketRegime r) {
+    switch (r) {
+        case MarketRegime::Unknown:      return "Unknown";
+        case MarketRegime::Normal:       return "Normal";
+        case MarketRegime::Volatile:     return "Volatile";
+        case MarketRegime::LowLiquidity: return "LowLiquidity";
+        case MarketRegime::Toxic:        return "Toxic";
     }
     return "Unknown";
 }
@@ -111,6 +137,29 @@ struct DefenseAssessment {
     bool cooldown_active{false};               ///< Активен ли период охлаждения
     bool in_recovery{false};                   ///< В фазе post-cooldown recovery
     int64_t cooldown_remaining_ms{0};          ///< Оставшееся время охлаждения (мс)
+    MarketRegime regime{MarketRegime::Unknown}; ///< Текущий рыночный режим
+    double threat_memory_severity{0.0};         ///< EMA-smoothed severity (temporal)
+    bool baseline_warm{false};                 ///< Достаточно ли данных для adaptive baseline
+};
+
+/// Диагностика внутреннего состояния защитной системы (для мониторинга)
+struct DefenseDiagnostics {
+    std::string symbol;
+    MarketRegime regime{MarketRegime::Unknown};
+    double threat_memory_severity{0.0};
+    bool baseline_warm{false};
+    int64_t baseline_samples{0};
+    double spread_ema{0.0};
+    double spread_z{0.0};
+    double depth_ema{0.0};
+    double depth_z{0.0};
+    double ratio_ema{1.0};
+    double ratio_z{0.0};
+    int consecutive_threats{0};
+    int consecutive_safe{0};
+    bool cooldown_active{false};
+    bool in_recovery{false};
+    int64_t cooldown_remaining_ms{0};
 };
 
 /// Конфигурация защитной системы
@@ -141,6 +190,26 @@ struct DefenseConfig {
 
     // --- Spread velocity ---
     double spread_velocity_threshold_bps_per_sec{50.0}; ///< Порог скорости расширения спреда
+
+    // --- Adaptive baseline ---
+    double baseline_alpha{0.01};                   ///< EMA скорость адаптации (~100 тиков half-life)
+    int64_t baseline_warmup_ticks{200};            ///< Мин. тиков до доверия baseline
+    double z_score_spread_threshold{3.0};          ///< Z-score порог для спреда
+    double z_score_depth_threshold{3.0};           ///< Z-score порог для глубины
+    double z_score_ratio_threshold{3.0};           ///< Z-score порог для buy/sell ratio
+    int64_t baseline_stale_reset_ms{300'000};      ///< Сброс baseline при >5 мин без данных
+
+    // --- Threat memory ---
+    double threat_memory_alpha{0.15};              ///< EMA скорость threat memory
+    double threat_memory_residual_factor{0.3};     ///< Влияние memory на confidence при отсутствии текущих угроз
+    int threat_escalation_ticks{5};                ///< Количество consecutive threat тиков до эскалации
+    double threat_escalation_boost{0.1};           ///< Прирост severity за каждый тик эскалации
+
+    // --- Depth asymmetry ---
+    double depth_asymmetry_threshold{0.3};         ///< min(bid,ask)/max(bid,ask) < threshold → угроза
+
+    // --- Cross-signal amplification ---
+    double cross_signal_amplification{0.3};        ///< Сила усиления при опасных комбинациях сигналов
 };
 
 } // namespace tb::adversarial

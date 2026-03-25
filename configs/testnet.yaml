@@ -56,6 +56,22 @@ adversarial_defense:
   recovery_duration_ms: 10000
   recovery_confidence_floor: 0.6
   spread_velocity_threshold_bps_per_sec: 50.0
+  # Adaptive baseline
+  baseline_alpha: 0.01
+  baseline_warmup_ticks: 200
+  z_score_spread_threshold: 3.0
+  z_score_depth_threshold: 3.0
+  z_score_ratio_threshold: 3.0
+  baseline_stale_reset_ms: 300000
+  # Threat memory
+  threat_memory_alpha: 0.15
+  threat_memory_residual_factor: 0.3
+  threat_escalation_ticks: 5
+  threat_escalation_boost: 0.1
+  # Depth asymmetry
+  depth_asymmetry_threshold: 0.3
+  # Cross-signal amplification
+  cross_signal_amplification: 0.3
 
 pair_selection:
   mode: auto

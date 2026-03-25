@@ -286,6 +286,34 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "adversarial_defense.recovery_confidence_floor", "0.6"), 0.6);
     cfg.adversarial_defense.spread_velocity_threshold_bps_per_sec = parse_double(
         get_value(kv, "adversarial_defense.spread_velocity_threshold_bps_per_sec", "50.0"), 50.0);
+    // --- Adaptive baseline ---
+    cfg.adversarial_defense.baseline_alpha = parse_double(
+        get_value(kv, "adversarial_defense.baseline_alpha", "0.01"), 0.01);
+    cfg.adversarial_defense.baseline_warmup_ticks = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.baseline_warmup_ticks", "200"), 200.0));
+    cfg.adversarial_defense.z_score_spread_threshold = parse_double(
+        get_value(kv, "adversarial_defense.z_score_spread_threshold", "3.0"), 3.0);
+    cfg.adversarial_defense.z_score_depth_threshold = parse_double(
+        get_value(kv, "adversarial_defense.z_score_depth_threshold", "3.0"), 3.0);
+    cfg.adversarial_defense.z_score_ratio_threshold = parse_double(
+        get_value(kv, "adversarial_defense.z_score_ratio_threshold", "3.0"), 3.0);
+    cfg.adversarial_defense.baseline_stale_reset_ms = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.baseline_stale_reset_ms", "300000"), 300000.0));
+    // --- Threat memory ---
+    cfg.adversarial_defense.threat_memory_alpha = parse_double(
+        get_value(kv, "adversarial_defense.threat_memory_alpha", "0.15"), 0.15);
+    cfg.adversarial_defense.threat_memory_residual_factor = parse_double(
+        get_value(kv, "adversarial_defense.threat_memory_residual_factor", "0.3"), 0.3);
+    cfg.adversarial_defense.threat_escalation_ticks = static_cast<int>(parse_double(
+        get_value(kv, "adversarial_defense.threat_escalation_ticks", "5"), 5.0));
+    cfg.adversarial_defense.threat_escalation_boost = parse_double(
+        get_value(kv, "adversarial_defense.threat_escalation_boost", "0.1"), 0.1);
+    // --- Depth asymmetry ---
+    cfg.adversarial_defense.depth_asymmetry_threshold = parse_double(
+        get_value(kv, "adversarial_defense.depth_asymmetry_threshold", "0.3"), 0.3);
+    // --- Cross-signal amplification ---
+    cfg.adversarial_defense.cross_signal_amplification = parse_double(
+        get_value(kv, "adversarial_defense.cross_signal_amplification", "0.3"), 0.3);
 
     // Валидация
     ConfigValidator validator;
