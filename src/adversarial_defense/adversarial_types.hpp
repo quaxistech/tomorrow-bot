@@ -3,6 +3,8 @@
  * @brief Типы для защиты от враждебных рыночных условий
  *
  * Определяет структуры угроз, защитных действий и оценки рыночной обстановки.
+ * v4: Percentile scoring, correlation matrix, multi-timeframe, hysteresis,
+ *     event sourcing, auto-calibration.
  */
 #pragma once
 
@@ -15,35 +17,39 @@ namespace tb::adversarial {
 
 /// Тип обнаруженной рыночной угрозы
 enum class ThreatType {
-    UnstableOrderBook,     ///< Нестабильный стакан
-    SpreadExplosion,       ///< Резкое расширение спреда
-    SpreadVelocitySpike,   ///< Быстрое расширение спреда (скорость)
-    DepthAsymmetry,        ///< Сильная асимметрия bid/ask глубины (манипуляция)
-    LiquidityVacuum,       ///< Вакуум ликвидности
-    ToxicFlow,             ///< Токсичный поток ордеров
-    AnomalousBaseline,     ///< Z-score аномалия относительно адаптивного baseline
-    BadBreakoutTrap,       ///< Ловушка ложного пробоя
-    StaleMarketData,       ///< Устаревшие или несвежие рыночные данные
-    InvalidMarketState,    ///< Некорректные входные рыночные данные
-    PostShockCooldown,     ///< Пост-шоковое охлаждение
-    ThreatEscalation       ///< Эскалация: устойчивая серия угроз (temporal pattern)
+    UnstableOrderBook,      ///< Нестабильный стакан
+    SpreadExplosion,        ///< Резкое расширение спреда
+    SpreadVelocitySpike,    ///< Быстрое расширение спреда (скорость)
+    DepthAsymmetry,         ///< Сильная асимметрия bid/ask глубины (манипуляция)
+    LiquidityVacuum,        ///< Вакуум ликвидности
+    ToxicFlow,              ///< Токсичный поток ордеров
+    AnomalousBaseline,      ///< Z-score аномалия относительно адаптивного baseline
+    BadBreakoutTrap,        ///< Ловушка ложного пробоя
+    StaleMarketData,        ///< Устаревшие или несвежие рыночные данные
+    InvalidMarketState,     ///< Некорректные входные рыночные данные
+    PostShockCooldown,      ///< Пост-шоковое охлаждение
+    ThreatEscalation,       ///< Эскалация: устойчивая серия угроз
+    CorrelationBreakdown,   ///< Распад корреляции микроструктурных сигналов
+    TimeframeDivergence     ///< Расхождение multi-timeframe baselines
 };
 
 /// Преобразование типа угрозы в строку
 inline std::string to_string(ThreatType t) {
     switch (t) {
-        case ThreatType::UnstableOrderBook:   return "UnstableOrderBook";
-        case ThreatType::SpreadExplosion:     return "SpreadExplosion";
-        case ThreatType::SpreadVelocitySpike: return "SpreadVelocitySpike";
-        case ThreatType::DepthAsymmetry:      return "DepthAsymmetry";
-        case ThreatType::LiquidityVacuum:     return "LiquidityVacuum";
-        case ThreatType::ToxicFlow:           return "ToxicFlow";
-        case ThreatType::AnomalousBaseline:   return "AnomalousBaseline";
-        case ThreatType::BadBreakoutTrap:     return "BadBreakoutTrap";
-        case ThreatType::StaleMarketData:     return "StaleMarketData";
-        case ThreatType::InvalidMarketState:  return "InvalidMarketState";
-        case ThreatType::PostShockCooldown:   return "PostShockCooldown";
-        case ThreatType::ThreatEscalation:    return "ThreatEscalation";
+        case ThreatType::UnstableOrderBook:    return "UnstableOrderBook";
+        case ThreatType::SpreadExplosion:      return "SpreadExplosion";
+        case ThreatType::SpreadVelocitySpike:  return "SpreadVelocitySpike";
+        case ThreatType::DepthAsymmetry:       return "DepthAsymmetry";
+        case ThreatType::LiquidityVacuum:      return "LiquidityVacuum";
+        case ThreatType::ToxicFlow:            return "ToxicFlow";
+        case ThreatType::AnomalousBaseline:    return "AnomalousBaseline";
+        case ThreatType::BadBreakoutTrap:      return "BadBreakoutTrap";
+        case ThreatType::StaleMarketData:      return "StaleMarketData";
+        case ThreatType::InvalidMarketState:   return "InvalidMarketState";
+        case ThreatType::PostShockCooldown:    return "PostShockCooldown";
+        case ThreatType::ThreatEscalation:     return "ThreatEscalation";
+        case ThreatType::CorrelationBreakdown: return "CorrelationBreakdown";
+        case ThreatType::TimeframeDivergence:  return "TimeframeDivergence";
     }
     return "Unknown";
 }
@@ -124,22 +130,62 @@ struct MarketCondition {
     Timestamp timestamp{0};
 };
 
+/// Запись аудит-лога защитной системы (event sourcing)
+struct DefenseEvent {
+    int64_t timestamp_ms{0};           ///< Время события (мс)
+    std::string symbol;                ///< Символ
+    DefenseAction action{DefenseAction::NoAction};
+    double compound_severity{0.0};
+    double confidence_multiplier{1.0};
+    double threshold_multiplier{1.0};
+    MarketRegime regime{MarketRegime::Unknown};
+    int threat_count{0};               ///< Количество обнаруженных угроз
+    bool is_safe{true};
+    bool hysteresis_active{false};     ///< Активен ли гистерезис в данный момент
+};
+
+/// Метрики калибровки (auto-calibration statistics)
+struct CalibrationMetrics {
+    int64_t total_assessments{0};       ///< Всего оценок
+    int64_t veto_count{0};              ///< Сколько раз сработал VetoTrade
+    int64_t cooldown_count{0};          ///< Сколько раз сработал Cooldown
+    int64_t raise_threshold_count{0};   ///< RaiseThreshold
+    int64_t reduce_confidence_count{0}; ///< ReduceConfidence
+    int64_t safe_count{0};              ///< Безопасные тики
+    double avg_compound_severity{0.0};  ///< Средняя compound severity
+    double max_compound_severity{0.0};  ///< Макс. compound severity
+    double veto_rate{0.0};              ///< Доля veto от всех оценок
+    int64_t hysteresis_activations{0};  ///< Сколько раз вошли в hysteresis zone
+    int64_t hysteresis_deactivations{0};///< Сколько раз вышли из hysteresis zone
+    /// Per-threat type counts
+    int64_t spread_explosion_count{0};
+    int64_t liquidity_vacuum_count{0};
+    int64_t toxic_flow_count{0};
+    int64_t depth_asymmetry_count{0};
+    int64_t correlation_breakdown_count{0};
+    int64_t timeframe_divergence_count{0};
+    int64_t anomalous_baseline_count{0};
+    int64_t escalation_count{0};
+};
+
 /// Результат оценки защитной системы
 struct DefenseAssessment {
     Symbol symbol{""};
     bool is_safe{true};                        ///< Безопасно ли торговать
     double confidence_multiplier{1.0};          ///< Множитель уверенности [0,1]
     double threshold_multiplier{1.0};           ///< Множитель порога [1, +inf)
-    double compound_severity{0.0};              ///< Совокупная severity с учётом взаимодействия угроз
+    double compound_severity{0.0};              ///< Совокупная severity
     std::vector<ThreatDetection> threats;       ///< Обнаруженные угрозы
     DefenseAction overall_action{DefenseAction::NoAction};
     Timestamp assessed_at{0};
-    bool cooldown_active{false};               ///< Активен ли период охлаждения
-    bool in_recovery{false};                   ///< В фазе post-cooldown recovery
-    int64_t cooldown_remaining_ms{0};          ///< Оставшееся время охлаждения (мс)
-    MarketRegime regime{MarketRegime::Unknown}; ///< Текущий рыночный режим
-    double threat_memory_severity{0.0};         ///< EMA-smoothed severity (temporal)
-    bool baseline_warm{false};                 ///< Достаточно ли данных для adaptive baseline
+    bool cooldown_active{false};
+    bool in_recovery{false};
+    int64_t cooldown_remaining_ms{0};
+    MarketRegime regime{MarketRegime::Unknown};
+    double threat_memory_severity{0.0};
+    bool baseline_warm{false};
+    bool hysteresis_active{false};              ///< Гистерезис: текущее состояние danger zone
+    double percentile_severity{0.0};            ///< Severity из percentile scoring [0,1]
 };
 
 /// Диагностика внутреннего состояния защитной системы (для мониторинга)
@@ -160,6 +206,15 @@ struct DefenseDiagnostics {
     bool cooldown_active{false};
     bool in_recovery{false};
     int64_t cooldown_remaining_ms{0};
+    // v4 additions
+    bool hysteresis_active{false};
+    double spread_depth_correlation{0.0};
+    double spread_flow_correlation{0.0};
+    double depth_flow_correlation{0.0};
+    double fast_spread_ema{0.0};
+    double slow_spread_ema{0.0};
+    double spread_percentile{0.0};        ///< Текущий перцентиль спреда
+    CalibrationMetrics calibration;        ///< Метрики калибровки
 };
 
 /// Конфигурация защитной системы
@@ -167,49 +222,71 @@ struct DefenseConfig {
     bool enabled{true};
     bool fail_closed_on_invalid_data{true};
     bool auto_cooldown_on_veto{true};
-    double auto_cooldown_severity{0.85};          ///< Severity, начиная с которой ставим cooldown
-    double spread_explosion_threshold_bps{100.0};  ///< Порог спреда (bps)
-    double spread_normal_bps{20.0};                ///< Нормальный спред (bps)
-    double min_liquidity_depth{50.0};              ///< Мин. нотиональная глубина ликвидности
-    double book_imbalance_threshold{0.8};          ///< Порог |дисбаланса| стакана [-1,1]
-    double book_instability_threshold{0.7};        ///< Порог нестабильности стакана
-    double toxic_flow_ratio_threshold{1.8};        ///< Порог buy/sell ratio
-    double aggressive_flow_threshold{0.8};         ///< Порог агрессивного потока [0,1]
-    double vpin_toxic_threshold{0.7};              ///< Порог VPIN [0,1]
-    int64_t cooldown_duration_ms{30000};           ///< Длительность охлаждения (30с)
-    int64_t post_shock_cooldown_ms{60000};         ///< Охлаждение после шока (60с)
-    int64_t max_market_data_age_ns{2'000'000'000}; ///< Макс. допустимый возраст market data
-    double max_confidence_reduction{0.8};          ///< Макс. снижение confidence [0,1]
-    double max_threshold_expansion{2.0};           ///< Насколько можно поднять порог входа
+    double auto_cooldown_severity{0.85};
+    double spread_explosion_threshold_bps{100.0};
+    double spread_normal_bps{20.0};
+    double min_liquidity_depth{50.0};
+    double book_imbalance_threshold{0.8};
+    double book_instability_threshold{0.7};
+    double toxic_flow_ratio_threshold{1.8};
+    double aggressive_flow_threshold{0.8};
+    double vpin_toxic_threshold{0.7};
+    int64_t cooldown_duration_ms{30000};
+    int64_t post_shock_cooldown_ms{60000};
+    int64_t max_market_data_age_ns{2'000'000'000};
+    double max_confidence_reduction{0.8};
+    double max_threshold_expansion{2.0};
 
     // --- Compound threat & recovery ---
-    double compound_threat_factor{0.5};            ///< Сила компаундинга множественных угроз [0,1]
-    double cooldown_severity_scale{1.5};           ///< Множитель: duration * severity * scale
-    int64_t recovery_duration_ms{10000};           ///< Продолжительность post-cooldown recovery (мс)
-    double recovery_confidence_floor{0.6};         ///< Мин. confidence_multiplier во время recovery
+    double compound_threat_factor{0.5};
+    double cooldown_severity_scale{1.5};
+    int64_t recovery_duration_ms{10000};
+    double recovery_confidence_floor{0.6};
 
     // --- Spread velocity ---
-    double spread_velocity_threshold_bps_per_sec{50.0}; ///< Порог скорости расширения спреда
+    double spread_velocity_threshold_bps_per_sec{50.0};
 
     // --- Adaptive baseline ---
-    double baseline_alpha{0.01};                   ///< EMA скорость адаптации (~100 тиков half-life)
-    int64_t baseline_warmup_ticks{200};            ///< Мин. тиков до доверия baseline
-    double z_score_spread_threshold{3.0};          ///< Z-score порог для спреда
-    double z_score_depth_threshold{3.0};           ///< Z-score порог для глубины
-    double z_score_ratio_threshold{3.0};           ///< Z-score порог для buy/sell ratio
-    int64_t baseline_stale_reset_ms{300'000};      ///< Сброс baseline при >5 мин без данных
+    double baseline_alpha{0.01};
+    int64_t baseline_warmup_ticks{200};
+    double z_score_spread_threshold{3.0};
+    double z_score_depth_threshold{3.0};
+    double z_score_ratio_threshold{3.0};
+    int64_t baseline_stale_reset_ms{300'000};
 
     // --- Threat memory ---
-    double threat_memory_alpha{0.15};              ///< EMA скорость threat memory
-    double threat_memory_residual_factor{0.3};     ///< Влияние memory на confidence при отсутствии текущих угроз
-    int threat_escalation_ticks{5};                ///< Количество consecutive threat тиков до эскалации
-    double threat_escalation_boost{0.1};           ///< Прирост severity за каждый тик эскалации
+    double threat_memory_alpha{0.15};
+    double threat_memory_residual_factor{0.3};
+    int threat_escalation_ticks{5};
+    double threat_escalation_boost{0.1};
 
     // --- Depth asymmetry ---
-    double depth_asymmetry_threshold{0.3};         ///< min(bid,ask)/max(bid,ask) < threshold → угроза
+    double depth_asymmetry_threshold{0.3};
 
     // --- Cross-signal amplification ---
-    double cross_signal_amplification{0.3};        ///< Сила усиления при опасных комбинациях сигналов
+    double cross_signal_amplification{0.3};
+
+    // --- v4: Percentile scoring ---
+    int percentile_window_size{500};           ///< Размер скользящего окна для перцентилей
+    double percentile_severity_threshold{0.95}; ///< Перцентиль, начиная с которого severity > 0
+
+    // --- v4: Correlation matrix ---
+    double correlation_alpha{0.02};             ///< EMA alpha для rolling correlation
+    double correlation_breakdown_threshold{0.4}; ///< Порог |Δcorrelation| для breakdown
+
+    // --- v4: Time-weighted EMA & Multi-timeframe ---
+    double baseline_halflife_fast_ms{30'000.0};   ///< Fast baseline: ~30с
+    double baseline_halflife_medium_ms{300'000.0}; ///< Medium baseline: ~5мин
+    double baseline_halflife_slow_ms{1'800'000.0}; ///< Slow baseline: ~30мин
+    double timeframe_divergence_threshold{2.5};    ///< Z-score расхождение fast vs slow
+
+    // --- v4: Hysteresis ---
+    double hysteresis_enter_severity{0.5};     ///< Вход в danger zone
+    double hysteresis_exit_severity{0.25};     ///< Выход из danger zone
+    double hysteresis_confidence_penalty{0.15}; ///< Штраф confidence в danger zone
+
+    // --- v4: Event sourcing ---
+    int64_t audit_log_max_size{10'000};        ///< Макс. записей в аудит-логе (ring buffer)
 };
 
 } // namespace tb::adversarial

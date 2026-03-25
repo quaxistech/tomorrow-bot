@@ -188,6 +188,47 @@ void ConfigValidator::validate_adversarial(
     if (cfg.cross_signal_amplification < 0.0) {
         result.add_error("adversarial_defense.cross_signal_amplification должен быть >= 0");
     }
+    // --- v4: Percentile scoring ---
+    if (cfg.percentile_window_size < 10) {
+        result.add_error("adversarial_defense.percentile_window_size должен быть >= 10");
+    }
+    if (cfg.percentile_severity_threshold <= 0.0 || cfg.percentile_severity_threshold >= 1.0) {
+        result.add_error("adversarial_defense.percentile_severity_threshold должен быть в (0, 1)");
+    }
+    // --- v4: Correlation matrix ---
+    if (cfg.correlation_alpha <= 0.0 || cfg.correlation_alpha >= 1.0) {
+        result.add_error("adversarial_defense.correlation_alpha должен быть в (0, 1)");
+    }
+    if (cfg.correlation_breakdown_threshold <= 0.0) {
+        result.add_error("adversarial_defense.correlation_breakdown_threshold должен быть > 0");
+    }
+    // --- v4: Multi-timeframe ---
+    if (cfg.baseline_halflife_fast_ms <= 0.0) {
+        result.add_error("adversarial_defense.baseline_halflife_fast_ms должен быть > 0");
+    }
+    if (cfg.baseline_halflife_medium_ms <= cfg.baseline_halflife_fast_ms) {
+        result.add_error("adversarial_defense.baseline_halflife_medium_ms должен быть > fast");
+    }
+    if (cfg.baseline_halflife_slow_ms <= cfg.baseline_halflife_medium_ms) {
+        result.add_error("adversarial_defense.baseline_halflife_slow_ms должен быть > medium");
+    }
+    if (cfg.timeframe_divergence_threshold <= 0.0) {
+        result.add_error("adversarial_defense.timeframe_divergence_threshold должен быть > 0");
+    }
+    // --- v4: Hysteresis ---
+    if (cfg.hysteresis_enter_severity <= 0.0 || cfg.hysteresis_enter_severity >= 1.0) {
+        result.add_error("adversarial_defense.hysteresis_enter_severity должен быть в (0, 1)");
+    }
+    if (cfg.hysteresis_exit_severity < 0.0 || cfg.hysteresis_exit_severity >= cfg.hysteresis_enter_severity) {
+        result.add_error("adversarial_defense.hysteresis_exit_severity должен быть в [0, enter)");
+    }
+    if (cfg.hysteresis_confidence_penalty < 0.0 || cfg.hysteresis_confidence_penalty > 1.0) {
+        result.add_error("adversarial_defense.hysteresis_confidence_penalty должен быть в [0, 1]");
+    }
+    // --- v4: Event sourcing ---
+    if (cfg.audit_log_max_size < 0) {
+        result.add_error("adversarial_defense.audit_log_max_size должен быть >= 0");
+    }
 }
 
 void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& result) const {

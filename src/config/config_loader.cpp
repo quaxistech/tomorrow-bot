@@ -314,6 +314,35 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     // --- Cross-signal amplification ---
     cfg.adversarial_defense.cross_signal_amplification = parse_double(
         get_value(kv, "adversarial_defense.cross_signal_amplification", "0.3"), 0.3);
+    // --- v4: Percentile scoring ---
+    cfg.adversarial_defense.percentile_window_size = static_cast<int>(parse_double(
+        get_value(kv, "adversarial_defense.percentile_window_size", "500"), 500.0));
+    cfg.adversarial_defense.percentile_severity_threshold = parse_double(
+        get_value(kv, "adversarial_defense.percentile_severity_threshold", "0.95"), 0.95);
+    // --- v4: Correlation matrix ---
+    cfg.adversarial_defense.correlation_alpha = parse_double(
+        get_value(kv, "adversarial_defense.correlation_alpha", "0.02"), 0.02);
+    cfg.adversarial_defense.correlation_breakdown_threshold = parse_double(
+        get_value(kv, "adversarial_defense.correlation_breakdown_threshold", "0.4"), 0.4);
+    // --- v4: Multi-timeframe ---
+    cfg.adversarial_defense.baseline_halflife_fast_ms = parse_double(
+        get_value(kv, "adversarial_defense.baseline_halflife_fast_ms", "30000"), 30000.0);
+    cfg.adversarial_defense.baseline_halflife_medium_ms = parse_double(
+        get_value(kv, "adversarial_defense.baseline_halflife_medium_ms", "300000"), 300000.0);
+    cfg.adversarial_defense.baseline_halflife_slow_ms = parse_double(
+        get_value(kv, "adversarial_defense.baseline_halflife_slow_ms", "1800000"), 1800000.0);
+    cfg.adversarial_defense.timeframe_divergence_threshold = parse_double(
+        get_value(kv, "adversarial_defense.timeframe_divergence_threshold", "2.5"), 2.5);
+    // --- v4: Hysteresis ---
+    cfg.adversarial_defense.hysteresis_enter_severity = parse_double(
+        get_value(kv, "adversarial_defense.hysteresis_enter_severity", "0.5"), 0.5);
+    cfg.adversarial_defense.hysteresis_exit_severity = parse_double(
+        get_value(kv, "adversarial_defense.hysteresis_exit_severity", "0.25"), 0.25);
+    cfg.adversarial_defense.hysteresis_confidence_penalty = parse_double(
+        get_value(kv, "adversarial_defense.hysteresis_confidence_penalty", "0.15"), 0.15);
+    // --- v4: Event sourcing ---
+    cfg.adversarial_defense.audit_log_max_size = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.audit_log_max_size", "10000"), 10000.0));
 
     // Валидация
     ConfigValidator validator;

@@ -154,6 +154,32 @@ void validate_config(const DefenseConfig& config) {
     if (config.cross_signal_amplification < 0.0) {
         throw std::invalid_argument("cross_signal_amplification must be >= 0");
     }
+    // --- v4: Percentile scoring ---
+    if (config.percentile_window_size < 10) throw std::invalid_argument("percentile_window_size must be >= 10");
+    if (config.percentile_severity_threshold <= 0.0 || config.percentile_severity_threshold >= 1.0)
+        throw std::invalid_argument("percentile_severity_threshold must be in (0, 1)");
+    // --- v4: Correlation matrix ---
+    if (config.correlation_alpha <= 0.0 || config.correlation_alpha >= 1.0)
+        throw std::invalid_argument("correlation_alpha must be in (0, 1)");
+    if (config.correlation_breakdown_threshold <= 0.0)
+        throw std::invalid_argument("correlation_breakdown_threshold must be > 0");
+    // --- v4: Multi-timeframe ---
+    if (config.baseline_halflife_fast_ms <= 0.0) throw std::invalid_argument("baseline_halflife_fast_ms must be > 0");
+    if (config.baseline_halflife_medium_ms <= config.baseline_halflife_fast_ms)
+        throw std::invalid_argument("baseline_halflife_medium_ms must be > fast");
+    if (config.baseline_halflife_slow_ms <= config.baseline_halflife_medium_ms)
+        throw std::invalid_argument("baseline_halflife_slow_ms must be > medium");
+    if (config.timeframe_divergence_threshold <= 0.0)
+        throw std::invalid_argument("timeframe_divergence_threshold must be > 0");
+    // --- v4: Hysteresis ---
+    if (config.hysteresis_enter_severity <= 0.0 || config.hysteresis_enter_severity >= 1.0)
+        throw std::invalid_argument("hysteresis_enter_severity must be in (0, 1)");
+    if (config.hysteresis_exit_severity < 0.0 || config.hysteresis_exit_severity >= config.hysteresis_enter_severity)
+        throw std::invalid_argument("hysteresis_exit_severity must be in [0, enter_severity)");
+    if (config.hysteresis_confidence_penalty < 0.0 || config.hysteresis_confidence_penalty > 1.0)
+        throw std::invalid_argument("hysteresis_confidence_penalty must be in [0, 1]");
+    // --- v4: Event sourcing ---
+    if (config.audit_log_max_size < 0) throw std::invalid_argument("audit_log_max_size must be >= 0");
 }
 
 } // namespace
@@ -169,6 +195,7 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
     DefenseAssessment result;
     result.symbol = condition.symbol;
     result.assessed_at = condition.timestamp;
+    const auto sym_key = condition.symbol.get();
 
     if (!config_.enabled) {
         return result;
@@ -224,6 +251,12 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
         if (auto threat = detect_anomalous_baseline(condition)) {
             result.threats.push_back(*threat);
         }
+        if (auto threat = detect_correlation_breakdown(condition)) {
+            result.threats.push_back(*threat);
+        }
+        if (auto threat = detect_timeframe_divergence(condition)) {
+            result.threats.push_back(*threat);
+        }
     }
 
     // Threat escalation (uses memory state from previous ticks, runs even if no current threats)
@@ -247,6 +280,14 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
     // Cross-signal amplification: опасные комбинации усиливают severity
     compound_severity = apply_cross_signal_amplification(result.threats, compound_severity);
     result.compound_severity = compound_severity;
+
+    // Percentile-based severity overlay
+    const double pct_severity = compute_percentile_severity_locked(sym_key, condition);
+    result.percentile_severity = pct_severity;
+    if (pct_severity > 0.0) {
+        compound_severity = std::max(compound_severity, compound_severity * 0.7 + pct_severity * 0.3);
+        result.compound_severity = compound_severity;
+    }
 
     // Классификация рыночного режима
     result.regime = classify_regime(condition, compound_severity, result.threats);
@@ -286,9 +327,15 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
             result.confidence_multiplier, recovery_mult);
     }
 
+    // Hysteresis: предотвращает chattering на границе safe/unsafe
+    result.hysteresis_active = update_hysteresis_locked(sym_key, compound_severity);
+    if (result.hysteresis_active && result.is_safe) {
+        result.confidence_multiplier = std::max(
+            0.0, result.confidence_multiplier - config_.hysteresis_confidence_penalty);
+    }
+
     // Threat memory: residual confidence reduction при отсутствии текущих угроз
     // (reads memory from PREVIOUS ticks — updated below)
-    const auto sym_key = condition.symbol.get();
     {
         auto mem_it = threat_memories_.find(sym_key);
         if (mem_it != threat_memories_.end()) {
@@ -350,6 +397,17 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
             result.threat_memory_severity = mem_it->second.ema_severity;
         }
     }
+
+    // Update state trackers (must be after all detection)
+    if (!input_invalid) {
+        update_percentile_window_locked(condition);
+        update_correlation_locked(condition);
+        update_mtf_baselines_locked(condition);
+    }
+
+    // Event sourcing & calibration
+    emit_event_locked(result, to_milliseconds(condition.timestamp));
+    update_calibration_locked(result, result.threats);
 
     return result;
 }
@@ -781,6 +839,28 @@ void AdversarialMarketDefense::cleanup_expired_cooldowns_locked(Timestamp now) {
         }
     }
 
+    // Cleanup stale correlations
+    for (auto it = correlations_.begin(); it != correlations_.end();) {
+        if ((now_ms - it->second.last_update_ms) > 300'000) {
+            it = correlations_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Cleanup stale MTF baselines
+    for (auto it = mtf_baselines_.begin(); it != mtf_baselines_.end();) {
+        if (it->second.slow.last_update_ms > 0 &&
+            (now_ms - it->second.slow.last_update_ms) > config_.baseline_stale_reset_ms) {
+            it = mtf_baselines_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Cleanup stale percentile windows
+    // (piggyback on symbol_tick_state cleanup — if tick state is cleaned, clean percentiles too)
+
     last_cleanup_ms_ = now_ms;
 }
 
@@ -983,26 +1063,28 @@ void AdversarialMarketDefense::update_baseline_locked(const MarketCondition& c) 
     const auto sym_key = c.symbol.get();
     const int64_t now_ms = to_milliseconds(c.timestamp);
     auto& bl = baselines_[sym_key];
-    const double a = config_.baseline_alpha;
 
-    // Сброс при stale baseline
+    // Stale reset
     if (bl.samples > 0 && (now_ms - bl.last_update_ms) > config_.baseline_stale_reset_ms) {
         bl = SymbolBaseline{};
     }
 
-    // Спред
+    // Time-weighted alpha: adapts to tick interval
+    const double dt_ms = (bl.last_update_ms > 0 && bl.samples > 0)
+        ? static_cast<double>(now_ms - bl.last_update_ms) : 0.0;
+    const double a = (bl.samples > 0 && dt_ms > 0.0)
+        ? time_weighted_alpha(1.0 / config_.baseline_alpha * 50.0, dt_ms)
+        : 1.0; // first sample = full init
+
     if (c.spread_valid && is_finite(c.spread_bps)) {
         if (bl.samples == 0) {
             bl.spread_ema = c.spread_bps;
             bl.spread_ema_sq = c.spread_bps * c.spread_bps;
         } else {
-            bl.spread_ema = a * c.spread_bps + (1.0 - a) * bl.spread_ema;
-            bl.spread_ema_sq = a * c.spread_bps * c.spread_bps +
-                               (1.0 - a) * bl.spread_ema_sq;
+            ema_update(bl.spread_ema, bl.spread_ema_sq, c.spread_bps, a);
         }
     }
 
-    // Глубина (min bid/ask)
     if (c.liquidity_valid) {
         const double depth = std::min(c.bid_depth, c.ask_depth);
         if (is_finite(depth) && depth >= 0.0) {
@@ -1010,21 +1092,17 @@ void AdversarialMarketDefense::update_baseline_locked(const MarketCondition& c) 
                 bl.depth_ema = depth;
                 bl.depth_ema_sq = depth * depth;
             } else {
-                bl.depth_ema = a * depth + (1.0 - a) * bl.depth_ema;
-                bl.depth_ema_sq = a * depth * depth + (1.0 - a) * bl.depth_ema_sq;
+                ema_update(bl.depth_ema, bl.depth_ema_sq, depth, a);
             }
         }
     }
 
-    // Buy/sell ratio
     if (c.flow_valid && is_finite(c.buy_sell_ratio) && c.buy_sell_ratio >= 0.0) {
         if (bl.samples == 0) {
             bl.ratio_ema = c.buy_sell_ratio;
             bl.ratio_ema_sq = c.buy_sell_ratio * c.buy_sell_ratio;
         } else {
-            bl.ratio_ema = a * c.buy_sell_ratio + (1.0 - a) * bl.ratio_ema;
-            bl.ratio_ema_sq = a * c.buy_sell_ratio * c.buy_sell_ratio +
-                              (1.0 - a) * bl.ratio_ema_sq;
+            ema_update(bl.ratio_ema, bl.ratio_ema_sq, c.buy_sell_ratio, a);
         }
     }
 
@@ -1199,7 +1277,449 @@ DefenseDiagnostics AdversarialMarketDefense::get_diagnostics(
         }
     }
 
+    // v4: Hysteresis
+    auto hys_it = hysteresis_active_.find(symbol.get());
+    if (hys_it != hysteresis_active_.end()) {
+        diag.hysteresis_active = hys_it->second;
+    }
+
+    // v4: Correlations
+    auto corr_it = correlations_.find(symbol.get());
+    if (corr_it != correlations_.end()) {
+        diag.spread_depth_correlation = corr_it->second.corr_spread_depth();
+        diag.spread_flow_correlation = corr_it->second.corr_spread_flow();
+        diag.depth_flow_correlation = corr_it->second.corr_depth_flow();
+    }
+
+    // v4: Multi-timeframe
+    auto mtf_it = mtf_baselines_.find(symbol.get());
+    if (mtf_it != mtf_baselines_.end()) {
+        diag.fast_spread_ema = mtf_it->second.fast.spread_ema;
+        diag.slow_spread_ema = mtf_it->second.slow.spread_ema;
+    }
+
+    // v4: Percentile
+    auto pct_it = percentile_windows_.find(symbol.get());
+    if (pct_it != percentile_windows_.end() && !pct_it->second.spread_history.empty()) {
+        // Compute current percentile for diagnostics
+        diag.spread_percentile = compute_percentile(
+            pct_it->second.spread_history, diag.spread_ema);
+    }
+
+    // v4: Calibration
+    diag.calibration = calibration_;
+
     return diag;
+}
+
+// --- v4: Static helpers ---
+
+double AdversarialMarketDefense::time_weighted_alpha(double halflife_ms, double dt_ms) {
+    if (dt_ms <= 0.0 || halflife_ms <= 0.0) return 0.0;
+    // alpha = 1 - exp(-dt * ln2 / halflife)
+    return 1.0 - std::exp(-dt_ms * 0.693147180559945 / halflife_ms);
+}
+
+void AdversarialMarketDefense::ema_update(double& ema, double& ema_sq,
+                                           double value, double alpha) {
+    ema = alpha * value + (1.0 - alpha) * ema;
+    ema_sq = alpha * value * value + (1.0 - alpha) * ema_sq;
+}
+
+double AdversarialMarketDefense::compute_percentile(const std::deque<double>& window,
+                                                     double value) {
+    if (window.empty()) return 0.5;
+    int count_below = 0;
+    int count_equal = 0;
+    for (const double v : window) {
+        if (v < value) ++count_below;
+        else if (std::abs(v - value) < 1e-12) ++count_equal;
+    }
+    // Midpoint percentile (Hazen): handles ties correctly
+    return (static_cast<double>(count_below) + 0.5 * static_cast<double>(count_equal))
+           / static_cast<double>(window.size());
+}
+
+// --- v4: Percentile scoring ---
+
+void AdversarialMarketDefense::update_percentile_window_locked(const MarketCondition& c) {
+    if (c.symbol.get().empty()) return;
+    auto& pw = percentile_windows_[c.symbol.get()];
+    const auto max_size = static_cast<size_t>(config_.percentile_window_size);
+
+    if (c.spread_valid && is_finite(c.spread_bps)) {
+        pw.spread_history.push_back(c.spread_bps);
+        if (pw.spread_history.size() > max_size) pw.spread_history.pop_front();
+    }
+    if (c.liquidity_valid) {
+        double depth = std::min(c.bid_depth, c.ask_depth);
+        if (is_finite(depth) && depth >= 0.0) {
+            pw.depth_history.push_back(depth);
+            if (pw.depth_history.size() > max_size) pw.depth_history.pop_front();
+        }
+    }
+    if (c.flow_valid && is_finite(c.buy_sell_ratio) && c.buy_sell_ratio >= 0.0) {
+        pw.ratio_history.push_back(c.buy_sell_ratio);
+        if (pw.ratio_history.size() > max_size) pw.ratio_history.pop_front();
+    }
+}
+
+double AdversarialMarketDefense::compute_percentile_severity_locked(
+    const std::string& symbol, const MarketCondition& c) const {
+
+    auto it = percentile_windows_.find(symbol);
+    if (it == percentile_windows_.end()) return 0.0;
+
+    const auto& pw = it->second;
+    const auto min_window = static_cast<size_t>(config_.percentile_window_size / 4);
+    double max_severity = 0.0;
+
+    // Spread: higher percentile = worse
+    if (c.spread_valid && pw.spread_history.size() >= min_window) {
+        double pct = compute_percentile(pw.spread_history, c.spread_bps);
+        if (pct > config_.percentile_severity_threshold) {
+            double sev = clamp01((pct - config_.percentile_severity_threshold) /
+                                 (1.0 - config_.percentile_severity_threshold));
+            max_severity = std::max(max_severity, sev);
+        }
+    }
+
+    // Depth: lower percentile = worse (inverted)
+    if (c.liquidity_valid && pw.depth_history.size() >= min_window) {
+        double depth = std::min(c.bid_depth, c.ask_depth);
+        double pct = compute_percentile(pw.depth_history, depth);
+        double inv_pct = 1.0 - pct; // invert: low depth = high percentile danger
+        if (inv_pct > config_.percentile_severity_threshold) {
+            double sev = clamp01((inv_pct - config_.percentile_severity_threshold) /
+                                 (1.0 - config_.percentile_severity_threshold));
+            max_severity = std::max(max_severity, sev);
+        }
+    }
+
+    // Ratio: extreme percentile either way = worse
+    if (c.flow_valid && pw.ratio_history.size() >= min_window) {
+        double pct = compute_percentile(pw.ratio_history, c.buy_sell_ratio);
+        double extreme = std::max(pct, 1.0 - pct); // distance from median
+        if (extreme > config_.percentile_severity_threshold) {
+            double sev = clamp01((extreme - config_.percentile_severity_threshold) /
+                                 (1.0 - config_.percentile_severity_threshold));
+            max_severity = std::max(max_severity, sev * 0.7); // ratio gets less weight
+        }
+    }
+
+    return max_severity;
+}
+
+// --- v4: Correlation matrix ---
+
+double AdversarialMarketDefense::CorrelationState::corr_spread_depth() const {
+    double denom = std::sqrt(spread_var * depth_var);
+    return denom < 1e-12 ? 0.0 : spread_depth_cov / denom;
+}
+double AdversarialMarketDefense::CorrelationState::corr_spread_flow() const {
+    double denom = std::sqrt(spread_var * flow_var);
+    return denom < 1e-12 ? 0.0 : spread_flow_cov / denom;
+}
+double AdversarialMarketDefense::CorrelationState::corr_depth_flow() const {
+    double denom = std::sqrt(depth_var * flow_var);
+    return denom < 1e-12 ? 0.0 : depth_flow_cov / denom;
+}
+
+void AdversarialMarketDefense::update_correlation_locked(const MarketCondition& c) {
+    if (c.symbol.get().empty() || !c.spread_valid || !c.liquidity_valid || !c.flow_valid)
+        return;
+
+    const double spread = c.spread_bps;
+    const double depth = std::min(c.bid_depth, c.ask_depth);
+    const double flow = c.buy_sell_ratio;
+    if (!is_finite(spread) || !is_finite(depth) || !is_finite(flow)) return;
+
+    auto& cs = correlations_[c.symbol.get()];
+    const int64_t now_ms = to_milliseconds(c.timestamp);
+    const double dt_ms = (cs.last_update_ms > 0) ? static_cast<double>(now_ms - cs.last_update_ms) : 0.0;
+    const double a = (dt_ms > 0.0 && cs.samples > 0)
+        ? time_weighted_alpha(1.0 / config_.correlation_alpha * 50.0, dt_ms)
+        : 1.0;
+
+    if (cs.samples == 0) {
+        cs.spread_mean = spread;
+        cs.depth_mean = depth;
+        cs.flow_mean = flow;
+        cs.spread_var = 0.0;
+        cs.depth_var = 0.0;
+        cs.flow_var = 0.0;
+        cs.spread_depth_cov = 0.0;
+        cs.spread_flow_cov = 0.0;
+        cs.depth_flow_cov = 0.0;
+    } else {
+        double ds = spread - cs.spread_mean;
+        double dd = depth - cs.depth_mean;
+        double df = flow - cs.flow_mean;
+
+        // Save previous correlations for delta detection
+        cs.prev_spread_depth_corr = cs.corr_spread_depth();
+        cs.prev_spread_flow_corr = cs.corr_spread_flow();
+        cs.prev_depth_flow_corr = cs.corr_depth_flow();
+
+        cs.spread_mean = a * spread + (1.0 - a) * cs.spread_mean;
+        cs.depth_mean = a * depth + (1.0 - a) * cs.depth_mean;
+        cs.flow_mean = a * flow + (1.0 - a) * cs.flow_mean;
+
+        cs.spread_var = a * ds * ds + (1.0 - a) * cs.spread_var;
+        cs.depth_var = a * dd * dd + (1.0 - a) * cs.depth_var;
+        cs.flow_var = a * df * df + (1.0 - a) * cs.flow_var;
+        cs.spread_depth_cov = a * ds * dd + (1.0 - a) * cs.spread_depth_cov;
+        cs.spread_flow_cov = a * ds * df + (1.0 - a) * cs.spread_flow_cov;
+        cs.depth_flow_cov = a * dd * df + (1.0 - a) * cs.depth_flow_cov;
+    }
+
+    cs.samples++;
+    cs.last_update_ms = now_ms;
+}
+
+std::optional<ThreatDetection> AdversarialMarketDefense::detect_correlation_breakdown(
+    const MarketCondition& c) const {
+
+    auto it = correlations_.find(c.symbol.get());
+    if (it == correlations_.end() || it->second.samples < 50) return std::nullopt;
+
+    const auto& cs = it->second;
+    const double threshold = config_.correlation_breakdown_threshold;
+
+    // Check for sudden correlation changes
+    double max_delta = 0.0;
+    std::string detail;
+
+    double d1 = std::abs(cs.corr_spread_depth() - cs.prev_spread_depth_corr);
+    double d2 = std::abs(cs.corr_spread_flow() - cs.prev_spread_flow_corr);
+    double d3 = std::abs(cs.corr_depth_flow() - cs.prev_depth_flow_corr);
+
+    if (d1 > max_delta) { max_delta = d1; detail = "spread-depth Δ=" + format_double(d1, 3); }
+    if (d2 > max_delta) { max_delta = d2; detail = "spread-flow Δ=" + format_double(d2, 3); }
+    if (d3 > max_delta) { max_delta = d3; detail = "depth-flow Δ=" + format_double(d3, 3); }
+
+    if (max_delta < threshold) return std::nullopt;
+
+    double severity = clamp01((max_delta - threshold) / threshold);
+    severity = std::min(severity, 0.7); // cap: correlation is a warning, not hard veto
+
+    return ThreatDetection{
+        .type = ThreatType::CorrelationBreakdown,
+        .severity = severity,
+        .recommended_action = severity_to_action(severity),
+        .reason = "Распад корреляции: " + detail,
+        .detected_at = c.timestamp
+    };
+}
+
+// --- v4: Multi-timeframe baselines ---
+
+void AdversarialMarketDefense::update_mtf_baselines_locked(const MarketCondition& c) {
+    if (c.symbol.get().empty()) return;
+
+    const int64_t now_ms = to_milliseconds(c.timestamp);
+    auto& mtf = mtf_baselines_[c.symbol.get()];
+
+    auto update_single = [&](SymbolBaseline& bl, double halflife_ms) {
+        const double dt_ms = (bl.last_update_ms > 0)
+            ? static_cast<double>(now_ms - bl.last_update_ms) : 0.0;
+        const double a = (bl.samples > 0 && dt_ms > 0.0)
+            ? time_weighted_alpha(halflife_ms, dt_ms)
+            : 1.0;
+
+        if (c.spread_valid && is_finite(c.spread_bps)) {
+            if (bl.samples == 0) {
+                bl.spread_ema = c.spread_bps;
+                bl.spread_ema_sq = c.spread_bps * c.spread_bps;
+            } else {
+                ema_update(bl.spread_ema, bl.spread_ema_sq, c.spread_bps, a);
+            }
+        }
+        if (c.liquidity_valid) {
+            double depth = std::min(c.bid_depth, c.ask_depth);
+            if (is_finite(depth) && depth >= 0.0) {
+                if (bl.samples == 0) {
+                    bl.depth_ema = depth;
+                    bl.depth_ema_sq = depth * depth;
+                } else {
+                    ema_update(bl.depth_ema, bl.depth_ema_sq, depth, a);
+                }
+            }
+        }
+        bl.samples++;
+        bl.last_update_ms = now_ms;
+    };
+
+    update_single(mtf.fast, config_.baseline_halflife_fast_ms);
+    update_single(mtf.medium, config_.baseline_halflife_medium_ms);
+    update_single(mtf.slow, config_.baseline_halflife_slow_ms);
+}
+
+std::optional<ThreatDetection> AdversarialMarketDefense::detect_timeframe_divergence(
+    const MarketCondition& c) const {
+
+    auto it = mtf_baselines_.find(c.symbol.get());
+    if (it == mtf_baselines_.end()) return std::nullopt;
+
+    const auto& mtf = it->second;
+    // Need warm fast AND slow baselines
+    if (mtf.fast.samples < 30 || mtf.slow.samples < 100) return std::nullopt;
+
+    double max_severity = 0.0;
+    std::string detail;
+
+    // Compare fast vs slow spread EMAs using slow's std as reference
+    {
+        double slow_std = mtf.slow.spread_std();
+        double ref_std = std::max(slow_std, std::max(1.0, mtf.slow.spread_ema * 0.02));
+        double z = (mtf.fast.spread_ema - mtf.slow.spread_ema) / ref_std;
+        if (std::abs(z) > config_.timeframe_divergence_threshold) {
+            double sev = clamp01(
+                (std::abs(z) - config_.timeframe_divergence_threshold) /
+                config_.timeframe_divergence_threshold);
+            if (sev > max_severity) {
+                max_severity = sev;
+                detail = "spread fast/slow z=" + format_double(z, 2) +
+                         " (fast=" + format_double(mtf.fast.spread_ema, 2) +
+                         ", slow=" + format_double(mtf.slow.spread_ema, 2) + ")";
+            }
+        }
+    }
+
+    // Compare fast vs slow depth EMAs
+    {
+        double slow_std = mtf.slow.depth_std();
+        double ref_std = std::max(slow_std, std::max(1.0, mtf.slow.depth_ema * 0.02));
+        double z = (mtf.fast.depth_ema - mtf.slow.depth_ema) / ref_std;
+        if (std::abs(z) > config_.timeframe_divergence_threshold) {
+            double sev = clamp01(
+                (std::abs(z) - config_.timeframe_divergence_threshold) /
+                config_.timeframe_divergence_threshold);
+            if (sev > max_severity) {
+                max_severity = sev;
+                detail = "depth fast/slow z=" + format_double(z, 2) +
+                         " (fast=" + format_double(mtf.fast.depth_ema, 2) +
+                         ", slow=" + format_double(mtf.slow.depth_ema, 2) + ")";
+            }
+        }
+    }
+
+    if (max_severity <= 0.0) return std::nullopt;
+
+    max_severity = std::min(max_severity, 0.6); // divergence is a warning signal
+
+    return ThreatDetection{
+        .type = ThreatType::TimeframeDivergence,
+        .severity = max_severity,
+        .recommended_action = severity_to_action(max_severity),
+        .reason = "Multi-TF расхождение: " + detail,
+        .detected_at = c.timestamp
+    };
+}
+
+// --- v4: Hysteresis ---
+
+bool AdversarialMarketDefense::update_hysteresis_locked(
+    const std::string& symbol, double compound_severity) {
+
+    auto& active = hysteresis_active_[symbol];
+
+    if (active) {
+        // Currently in danger zone — exit only below lower threshold
+        if (compound_severity < config_.hysteresis_exit_severity) {
+            active = false;
+            calibration_.hysteresis_deactivations++;
+        }
+    } else {
+        // Currently safe — enter only above upper threshold
+        if (compound_severity > config_.hysteresis_enter_severity) {
+            active = true;
+            calibration_.hysteresis_activations++;
+        }
+    }
+
+    return active;
+}
+
+// --- v4: Event sourcing ---
+
+void AdversarialMarketDefense::emit_event_locked(const DefenseAssessment& result, int64_t now_ms) {
+    if (config_.audit_log_max_size <= 0) return;
+
+    DefenseEvent event;
+    event.timestamp_ms = now_ms;
+    event.symbol = result.symbol.get();
+    event.action = result.overall_action;
+    event.compound_severity = result.compound_severity;
+    event.confidence_multiplier = result.confidence_multiplier;
+    event.threshold_multiplier = result.threshold_multiplier;
+    event.regime = result.regime;
+    event.threat_count = static_cast<int>(result.threats.size());
+    event.is_safe = result.is_safe;
+    event.hysteresis_active = result.hysteresis_active;
+
+    audit_log_.push_back(std::move(event));
+    while (static_cast<int64_t>(audit_log_.size()) > config_.audit_log_max_size) {
+        audit_log_.pop_front();
+    }
+}
+
+std::vector<DefenseEvent> AdversarialMarketDefense::get_audit_log() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {audit_log_.begin(), audit_log_.end()};
+}
+
+// --- v4: Calibration metrics ---
+
+void AdversarialMarketDefense::update_calibration_locked(
+    const DefenseAssessment& result,
+    const std::vector<ThreatDetection>& threats) {
+
+    calibration_.total_assessments++;
+    if (result.is_safe) calibration_.safe_count++;
+
+    switch (result.overall_action) {
+        case DefenseAction::VetoTrade:        calibration_.veto_count++; break;
+        case DefenseAction::Cooldown:         calibration_.cooldown_count++; break;
+        case DefenseAction::RaiseThreshold:   calibration_.raise_threshold_count++; break;
+        case DefenseAction::ReduceConfidence: calibration_.reduce_confidence_count++; break;
+        default: break;
+    }
+
+    // Running average of compound severity
+    double n = static_cast<double>(calibration_.total_assessments);
+    calibration_.avg_compound_severity =
+        calibration_.avg_compound_severity * ((n - 1.0) / n) +
+        result.compound_severity / n;
+    calibration_.max_compound_severity =
+        std::max(calibration_.max_compound_severity, result.compound_severity);
+    calibration_.veto_rate = static_cast<double>(calibration_.veto_count) / n;
+
+    // Per-threat type counts
+    for (const auto& t : threats) {
+        if (t.severity <= 0.0) continue;
+        switch (t.type) {
+            case ThreatType::SpreadExplosion:      calibration_.spread_explosion_count++; break;
+            case ThreatType::LiquidityVacuum:      calibration_.liquidity_vacuum_count++; break;
+            case ThreatType::ToxicFlow:            calibration_.toxic_flow_count++; break;
+            case ThreatType::DepthAsymmetry:       calibration_.depth_asymmetry_count++; break;
+            case ThreatType::CorrelationBreakdown: calibration_.correlation_breakdown_count++; break;
+            case ThreatType::TimeframeDivergence:  calibration_.timeframe_divergence_count++; break;
+            case ThreatType::AnomalousBaseline:    calibration_.anomalous_baseline_count++; break;
+            case ThreatType::ThreatEscalation:     calibration_.escalation_count++; break;
+            default: break;
+        }
+    }
+}
+
+CalibrationMetrics AdversarialMarketDefense::get_calibration_metrics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return calibration_;
+}
+
+void AdversarialMarketDefense::reset_calibration_metrics() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    calibration_ = CalibrationMetrics{};
 }
 
 } // namespace tb::adversarial

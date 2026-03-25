@@ -73,6 +73,23 @@ adversarial_defense:
   depth_asymmetry_threshold: 0.3
   # Cross-signal amplification
   cross_signal_amplification: 0.3
+  # v4: Percentile scoring
+  percentile_window_size: 500
+  percentile_severity_threshold: 0.95
+  # v4: Correlation matrix
+  correlation_alpha: 0.02
+  correlation_breakdown_threshold: 0.4
+  # v4: Multi-timeframe baselines
+  baseline_halflife_fast_ms: 30000
+  baseline_halflife_medium_ms: 300000
+  baseline_halflife_slow_ms: 1800000
+  timeframe_divergence_threshold: 2.5
+  # v4: Hysteresis
+  hysteresis_enter_severity: 0.5
+  hysteresis_exit_severity: 0.25
+  hysteresis_confidence_penalty: 0.15
+  # v4: Event sourcing
+  audit_log_max_size: 10000
 
 pair_selection:
   mode: auto                       # auto = автоматический выбор, manual = ручной список

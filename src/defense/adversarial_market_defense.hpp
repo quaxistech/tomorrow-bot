@@ -61,6 +61,23 @@ using AdversarialMarketDefense = adversarial::AdversarialMarketDefense;
         .depth_asymmetry_threshold = cfg.depth_asymmetry_threshold,
         // --- Cross-signal amplification ---
         .cross_signal_amplification = cfg.cross_signal_amplification,
+        // --- v4: Percentile scoring ---
+        .percentile_window_size = cfg.percentile_window_size,
+        .percentile_severity_threshold = cfg.percentile_severity_threshold,
+        // --- v4: Correlation matrix ---
+        .correlation_alpha = cfg.correlation_alpha,
+        .correlation_breakdown_threshold = cfg.correlation_breakdown_threshold,
+        // --- v4: Multi-timeframe ---
+        .baseline_halflife_fast_ms = cfg.baseline_halflife_fast_ms,
+        .baseline_halflife_medium_ms = cfg.baseline_halflife_medium_ms,
+        .baseline_halflife_slow_ms = cfg.baseline_halflife_slow_ms,
+        .timeframe_divergence_threshold = cfg.timeframe_divergence_threshold,
+        // --- v4: Hysteresis ---
+        .hysteresis_enter_severity = cfg.hysteresis_enter_severity,
+        .hysteresis_exit_severity = cfg.hysteresis_exit_severity,
+        .hysteresis_confidence_penalty = cfg.hysteresis_confidence_penalty,
+        // --- v4: Event sourcing ---
+        .audit_log_max_size = cfg.audit_log_max_size,
     };
 }
 

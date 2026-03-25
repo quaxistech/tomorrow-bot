@@ -1,16 +1,15 @@
 /**
  * @file adversarial_defense.hpp
- * @brief Защита от враждебных рыночных условий
+ * @brief Защита от враждебных рыночных условий — institutional-grade
  *
- * Обнаруживает аномалии и враждебные паттерны в рыночных данных,
- * выдаёт рекомендации по защите торговой системы.
- *
- * Архитектурные принципы:
- * - Adaptive baseline: z-score аномалии относительно скользящей нормы
- * - Threat memory: EMA-smoothed severity для предотвращения осцилляций
- * - Cross-signal amplification: опасные комбинации сигналов усиливают severity
- * - Market regime classification: контекстный мониторинг состояния рынка
- * - Diagnostics API: полная инспекция внутреннего состояния
+ * v4 архитектурные принципы:
+ * - Percentile-based scoring: severity отражает эмпирическую экстремальность
+ * - Rolling correlation matrix: структурный распад = ранний сигнал шока
+ * - Time-weighted EMA: корректная адаптация при неравномерной частоте тиков
+ * - Multi-timeframe baselines: fast/medium/slow + divergence detection
+ * - Hysteresis: предотвращение chattering на границе safe/unsafe
+ * - Event sourcing: полная запись решений для audit и post-trade анализа
+ * - Auto-calibration: сбор метрик FP/TP для рекомендаций по порогам
  */
 #pragma once
 
@@ -18,10 +17,12 @@
 #include "common/types.hpp"
 
 #include <cmath>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace tb::adversarial {
 
@@ -49,6 +50,15 @@ public:
     /// Диагностика внутреннего состояния (для production мониторинга)
     DefenseDiagnostics get_diagnostics(const Symbol& symbol, Timestamp now) const;
 
+    /// Получить аудит-лог (последние N записей)
+    std::vector<DefenseEvent> get_audit_log() const;
+
+    /// Получить метрики калибровки
+    CalibrationMetrics get_calibration_metrics() const;
+
+    /// Сбросить метрики калибровки
+    void reset_calibration_metrics();
+
 private:
     DefenseConfig config_;
     mutable std::mutex mutex_;
@@ -65,7 +75,7 @@ private:
     };
     std::unordered_map<std::string, SymbolTickState> symbol_tick_state_;
 
-    // --- Adaptive baseline (per-symbol EMA statistics) ---
+    // --- Adaptive baseline (per-symbol, time-weighted EMA) ---
     struct SymbolBaseline {
         double spread_ema{0.0};
         double spread_ema_sq{0.0};
@@ -101,6 +111,14 @@ private:
     };
     std::unordered_map<std::string, SymbolBaseline> baselines_;
 
+    // --- Multi-timeframe baselines ---
+    struct MultiTimeframeBaseline {
+        SymbolBaseline fast;   // ~30s
+        SymbolBaseline medium; // ~5min
+        SymbolBaseline slow;   // ~30min
+    };
+    std::unordered_map<std::string, MultiTimeframeBaseline> mtf_baselines_;
+
     // --- Threat memory (temporal smoothing) ---
     struct ThreatMemoryState {
         double ema_severity{0.0};
@@ -109,6 +127,46 @@ private:
         int64_t last_update_ms{0};
     };
     std::unordered_map<std::string, ThreatMemoryState> threat_memories_;
+
+    // --- Rolling percentile window per symbol ---
+    struct PercentileWindow {
+        std::deque<double> spread_history;
+        std::deque<double> depth_history;
+        std::deque<double> ratio_history;
+    };
+    std::unordered_map<std::string, PercentileWindow> percentile_windows_;
+
+    // --- Rolling correlation state ---
+    struct CorrelationState {
+        double spread_depth_cov{0.0};
+        double spread_flow_cov{0.0};
+        double depth_flow_cov{0.0};
+        double spread_var{0.0};
+        double depth_var{0.0};
+        double flow_var{0.0};
+        double spread_mean{0.0};
+        double depth_mean{0.0};
+        double flow_mean{0.0};
+        double prev_spread_depth_corr{0.0};
+        double prev_spread_flow_corr{0.0};
+        double prev_depth_flow_corr{0.0};
+        int64_t samples{0};
+        int64_t last_update_ms{0};
+
+        [[nodiscard]] double corr_spread_depth() const;
+        [[nodiscard]] double corr_spread_flow() const;
+        [[nodiscard]] double corr_depth_flow() const;
+    };
+    std::unordered_map<std::string, CorrelationState> correlations_;
+
+    // --- Hysteresis state ---
+    std::unordered_map<std::string, bool> hysteresis_active_;
+
+    // --- Event sourcing (audit log ring buffer) ---
+    std::deque<DefenseEvent> audit_log_;
+
+    // --- Calibration metrics ---
+    CalibrationMetrics calibration_;
 
     // --- Existing detectors ---
     std::optional<ThreatDetection> detect_invalid_market_state(const MarketCondition& c) const;
@@ -120,14 +178,15 @@ private:
     std::optional<ThreatDetection> detect_toxic_flow(const MarketCondition& c) const;
     std::optional<ThreatDetection> detect_bad_breakout(const MarketCondition& c) const;
 
-    // --- New detectors ---
-    /// Детекция сильной асимметрии bid/ask глубины
+    // --- v3 detectors ---
     std::optional<ThreatDetection> detect_depth_asymmetry(const MarketCondition& c) const;
-    /// Детекция z-score аномалий относительно адаптивного baseline
     std::optional<ThreatDetection> detect_anomalous_baseline(const MarketCondition& c) const;
-    /// Детекция эскалации: устойчивая серия угроз
     std::optional<ThreatDetection> detect_threat_escalation(
         const MarketCondition& c, bool has_current_threats) const;
+
+    // --- v4 detectors ---
+    std::optional<ThreatDetection> detect_correlation_breakdown(const MarketCondition& c) const;
+    std::optional<ThreatDetection> detect_timeframe_divergence(const MarketCondition& c) const;
 
     // --- Cooldown ---
     ThreatDetection check_cooldown(const Symbol& symbol, Timestamp now) const;
@@ -137,8 +196,23 @@ private:
     // --- State updates ---
     void update_symbol_state_locked(const MarketCondition& c);
     void update_baseline_locked(const MarketCondition& c);
+    void update_mtf_baselines_locked(const MarketCondition& c);
     void update_threat_memory_locked(const std::string& symbol, double compound_severity,
                                      bool has_threats, int64_t now_ms);
+    void update_percentile_window_locked(const MarketCondition& c);
+    void update_correlation_locked(const MarketCondition& c);
+
+    // --- Percentile scoring ---
+    double compute_percentile_severity_locked(const std::string& symbol,
+                                              const MarketCondition& c) const;
+
+    // --- Hysteresis ---
+    bool update_hysteresis_locked(const std::string& symbol, double compound_severity);
+
+    // --- Event sourcing ---
+    void emit_event_locked(const DefenseAssessment& result, int64_t now_ms);
+    void update_calibration_locked(const DefenseAssessment& result,
+                                   const std::vector<ThreatDetection>& threats);
 
     // --- Advanced analysis ---
     double compute_recovery_multiplier_locked(const Symbol& symbol, Timestamp now) const;
@@ -146,6 +220,11 @@ private:
         const std::vector<ThreatDetection>& threats, double severity) const;
     MarketRegime classify_regime(const MarketCondition& c, double compound_severity,
                                 const std::vector<ThreatDetection>& threats) const;
+
+    // --- Helpers ---
+    static double time_weighted_alpha(double halflife_ms, double dt_ms);
+    static void ema_update(double& ema, double& ema_sq, double value, double alpha);
+    static double compute_percentile(const std::deque<double>& window, double value);
 };
 
 } // namespace tb::adversarial

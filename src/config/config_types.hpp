@@ -125,6 +125,28 @@ struct AdversarialDefenseConfig {
 
     // --- Cross-signal amplification ---
     double cross_signal_amplification{0.3};
+
+    // --- v4: Percentile scoring ---
+    int percentile_window_size{500};
+    double percentile_severity_threshold{0.95};
+
+    // --- v4: Correlation matrix ---
+    double correlation_alpha{0.02};
+    double correlation_breakdown_threshold{0.4};
+
+    // --- v4: Time-weighted EMA & Multi-timeframe ---
+    double baseline_halflife_fast_ms{30'000.0};
+    double baseline_halflife_medium_ms{300'000.0};
+    double baseline_halflife_slow_ms{1'800'000.0};
+    double timeframe_divergence_threshold{2.5};
+
+    // --- v4: Hysteresis ---
+    double hysteresis_enter_severity{0.5};
+    double hysteresis_exit_severity{0.25};
+    double hysteresis_confidence_penalty{0.15};
+
+    // --- v4: Event sourcing ---
+    int64_t audit_log_max_size{10'000};
 };
 
 /// Полная конфигурация приложения

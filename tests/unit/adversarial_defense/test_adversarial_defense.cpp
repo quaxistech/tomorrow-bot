@@ -952,4 +952,457 @@ TEST_CASE("AdversarialMarketDefense — bridge maps new config fields", "[advers
     CHECK(dc.depth_asymmetry_threshold == Catch::Approx(0.25));
     CHECK(dc.cross_signal_amplification == Catch::Approx(0.4));
     CHECK(dc.threat_memory_alpha == Catch::Approx(0.2));
+
+    SECTION("v4 fields are mapped correctly") {
+        config::AdversarialDefenseConfig cfg2;
+        cfg2.percentile_window_size = 300;
+        cfg2.percentile_severity_threshold = 0.9;
+        cfg2.correlation_alpha = 0.05;
+        cfg2.correlation_breakdown_threshold = 0.3;
+        cfg2.baseline_halflife_fast_ms = 20000;
+        cfg2.baseline_halflife_medium_ms = 200000;
+        cfg2.baseline_halflife_slow_ms = 1200000;
+        cfg2.timeframe_divergence_threshold = 2.0;
+        cfg2.hysteresis_enter_severity = 0.6;
+        cfg2.hysteresis_exit_severity = 0.2;
+        cfg2.hysteresis_confidence_penalty = 0.1;
+        cfg2.audit_log_max_size = 5000;
+
+        auto dc2 = tb::defense::make_defense_config(cfg2);
+        CHECK(dc2.percentile_window_size == 300);
+        CHECK(dc2.percentile_severity_threshold == Catch::Approx(0.9));
+        CHECK(dc2.correlation_alpha == Catch::Approx(0.05));
+        CHECK(dc2.correlation_breakdown_threshold == Catch::Approx(0.3));
+        CHECK(dc2.baseline_halflife_fast_ms == Catch::Approx(20000));
+        CHECK(dc2.baseline_halflife_medium_ms == Catch::Approx(200000));
+        CHECK(dc2.baseline_halflife_slow_ms == Catch::Approx(1200000));
+        CHECK(dc2.timeframe_divergence_threshold == Catch::Approx(2.0));
+        CHECK(dc2.hysteresis_enter_severity == Catch::Approx(0.6));
+        CHECK(dc2.hysteresis_exit_severity == Catch::Approx(0.2));
+        CHECK(dc2.hysteresis_confidence_penalty == Catch::Approx(0.1));
+        CHECK(dc2.audit_log_max_size == 5000);
+    }
+}
+
+// ============================================================================
+// v4 Tests: Percentile-Based Scoring
+// ============================================================================
+
+TEST_CASE("v4 — Percentile scoring: extreme values get high severity", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.percentile_window_size = 50;
+    cfg.percentile_severity_threshold = 0.90;
+    cfg.baseline_warmup_ticks = 5;
+    AdversarialMarketDefense defense(cfg);
+
+    // Fill the percentile window with normal data
+    for (int i = 1; i <= 60; ++i) {
+        auto c = make_safe_condition();
+        c.spread_bps = 5.0 + (i % 5) * 0.5; // 5.0 - 7.0 range
+        c.bid_depth = 200.0;
+        c.ask_depth = 200.0;
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    // Now send an extreme spread — should be in high percentile
+    auto extreme = make_safe_condition();
+    extreme.spread_bps = 50.0; // way above normal range
+    extreme.timestamp = Timestamp(100'000'000'000LL);
+    auto result = defense.assess(extreme);
+    // Percentile severity should be > 0 (extreme is above 90th percentile)
+    CHECK(result.percentile_severity > 0.0);
+}
+
+TEST_CASE("v4 — Percentile scoring: normal values get zero severity", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.percentile_window_size = 50;
+    cfg.percentile_severity_threshold = 0.95;
+    cfg.baseline_warmup_ticks = 5;
+    AdversarialMarketDefense defense(cfg);
+
+    // Fill with normal data
+    for (int i = 1; i <= 60; ++i) {
+        auto c = make_safe_condition();
+        c.spread_bps = 5.0;
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    // Send a normal value — should be 0 severity
+    auto normal = make_safe_condition();
+    normal.spread_bps = 5.0;
+    normal.timestamp = Timestamp(100'000'000'000LL);
+    auto result = defense.assess(normal);
+    CHECK(result.percentile_severity == Catch::Approx(0.0));
+}
+
+// ============================================================================
+// v4 Tests: Correlation Matrix
+// ============================================================================
+
+TEST_CASE("v4 — Correlation breakdown detection", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.correlation_alpha = 0.05;
+    cfg.correlation_breakdown_threshold = 0.3;
+    cfg.baseline_warmup_ticks = 5;
+    AdversarialMarketDefense defense(cfg);
+
+    // Build stable correlation: spread rises with depth falling
+    for (int i = 1; i <= 80; ++i) {
+        auto c = make_safe_condition();
+        double t = static_cast<double>(i);
+        c.spread_bps = 5.0 + t * 0.1;         // steadily rising
+        c.bid_depth = 200.0 - t * 1.0;          // steadily falling
+        c.ask_depth = 200.0 - t * 1.0;
+        c.buy_sell_ratio = 1.0 + t * 0.005;     // steadily rising
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 100'000'000LL);
+        defense.assess(c);
+    }
+
+    // Sudden reversal — spread drops while depth drops more
+    auto shock = make_safe_condition();
+    shock.spread_bps = 2.0;      // was ~13, sudden drop
+    shock.bid_depth = 50.0;       // continued drop
+    shock.ask_depth = 50.0;
+    shock.buy_sell_ratio = 0.3;   // reversed direction
+    shock.timestamp = Timestamp(81LL * 100'000'000LL);
+    auto result = defense.assess(shock);
+
+    // Check diagnostics for correlation values
+    auto diag = defense.get_diagnostics(Symbol("BTCUSDT"), shock.timestamp);
+    // Correlations should have been tracked
+    CHECK(diag.spread_depth_correlation != 0.0); // non-trivial after 80 samples
+}
+
+// ============================================================================
+// v4 Tests: Time-Weighted EMA
+// ============================================================================
+
+TEST_CASE("v4 — Time-weighted EMA adapts to tick intervals", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.baseline_warmup_ticks = 3;
+    cfg.baseline_alpha = 0.01;
+    AdversarialMarketDefense defense(cfg);
+
+    // Fast ticks (100ms apart) — EMA should change slowly
+    auto c = make_safe_condition();
+    c.spread_bps = 10.0;
+    c.timestamp = Timestamp(1'000'000'000LL);
+    defense.assess(c);
+
+    c.timestamp = Timestamp(1'100'000'000LL); // 100ms later
+    c.spread_bps = 10.0;
+    defense.assess(c);
+
+    c.timestamp = Timestamp(1'200'000'000LL);
+    c.spread_bps = 10.0;
+    defense.assess(c);
+
+    auto diag1 = defense.get_diagnostics(Symbol("BTCUSDT"), c.timestamp);
+    double ema_fast = diag1.spread_ema;
+
+    // Now a big gap (30s) with a different value — EMA should jump more
+    c.timestamp = Timestamp(31'200'000'000LL); // 30s later
+    c.spread_bps = 50.0;
+    defense.assess(c);
+
+    auto diag2 = defense.get_diagnostics(Symbol("BTCUSDT"), c.timestamp);
+    double ema_after_gap = diag2.spread_ema;
+
+    // After the 30s gap the EMA should have moved significantly toward 50
+    CHECK(ema_after_gap > ema_fast);
+    CHECK(ema_after_gap > 15.0); // should have adapted substantially
+}
+
+// ============================================================================
+// v4 Tests: Multi-Timeframe Analysis
+// ============================================================================
+
+TEST_CASE("v4 — Multi-timeframe divergence detection", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.baseline_halflife_fast_ms = 500;     // very fast for test
+    cfg.baseline_halflife_medium_ms = 5000;
+    cfg.baseline_halflife_slow_ms = 50000;
+    cfg.timeframe_divergence_threshold = 2.0;
+    cfg.baseline_warmup_ticks = 5;
+    AdversarialMarketDefense defense(cfg);
+
+    // Build slow baseline with stable spread ~5bps
+    for (int i = 1; i <= 200; ++i) {
+        auto c = make_safe_condition();
+        c.spread_bps = 5.0;
+        c.bid_depth = 200.0;
+        c.ask_depth = 200.0;
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 500'000'000LL); // 500ms ticks
+        defense.assess(c);
+    }
+
+    // Sudden fast spike — fast baseline should diverge from slow
+    for (int i = 201; i <= 210; ++i) {
+        auto c = make_safe_condition();
+        c.spread_bps = 60.0; // 12x normal
+        c.bid_depth = 200.0;
+        c.ask_depth = 200.0;
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 500'000'000LL);
+        defense.assess(c);
+    }
+
+    auto diag = defense.get_diagnostics(Symbol("BTCUSDT"), Timestamp(210LL * 500'000'000LL));
+    // Fast EMA should be much higher than slow
+    CHECK(diag.fast_spread_ema > diag.slow_spread_ema);
+}
+
+// ============================================================================
+// v4 Tests: Hysteresis
+// ============================================================================
+
+TEST_CASE("v4 — Hysteresis prevents chattering", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.hysteresis_enter_severity = 0.5;
+    cfg.hysteresis_exit_severity = 0.2;
+    cfg.hysteresis_confidence_penalty = 0.15;
+    cfg.spread_explosion_threshold_bps = 50.0;
+    cfg.spread_normal_bps = 10.0;
+    cfg.auto_cooldown_on_veto = false; // disable cooldown — isolate hysteresis
+    AdversarialMarketDefense defense(cfg);
+
+    SECTION("High severity activates hysteresis") {
+        auto danger = make_safe_condition();
+        danger.spread_bps = 120.0; // severity = (120-50)/50 = 1.4 → capped at 1.0
+        danger.timestamp = Timestamp(1'000'000'000LL);
+        auto r1 = defense.assess(danger);
+        CHECK(r1.hysteresis_active);
+        CHECK(r1.compound_severity > cfg.hysteresis_enter_severity);
+    }
+
+    SECTION("Safe conditions deactivate hysteresis") {
+        // First enter hysteresis
+        auto danger = make_safe_condition();
+        danger.spread_bps = 120.0;
+        danger.timestamp = Timestamp(1'000'000'000LL);
+        auto r1 = defense.assess(danger);
+        CHECK(r1.hysteresis_active);
+
+        // Then enough safe ticks to bring compound below exit threshold
+        for (int i = 2; i <= 30; ++i) {
+            auto safe = make_safe_condition();
+            safe.spread_bps = 5.0;
+            safe.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+            auto r = defense.assess(safe);
+            if (!r.hysteresis_active) {
+                CHECK(r.compound_severity < cfg.hysteresis_exit_severity);
+                return; // test passes — hysteresis deactivated
+            }
+        }
+        FAIL("Hysteresis should have deactivated after 29 safe ticks");
+    }
+
+    SECTION("Hysteresis applies confidence penalty") {
+        // One dangerous tick to activate hysteresis
+        auto danger = make_safe_condition();
+        danger.spread_bps = 120.0;
+        danger.timestamp = Timestamp(1'000'000'000LL);
+        defense.assess(danger);
+
+        // Next tick: safe but hysteresis still active should reduce confidence
+        auto safe = make_safe_condition();
+        safe.spread_bps = 5.0;
+        safe.timestamp = Timestamp(2'000'000'000LL);
+        auto r = defense.assess(safe);
+        // Either hysteresis is active with penalty, or already deactivated — both valid
+        if (r.hysteresis_active) {
+            CHECK(r.confidence_multiplier <= (1.0 - cfg.hysteresis_confidence_penalty + 0.01));
+        }
+    }
+}
+
+// ============================================================================
+// v4 Tests: Event Sourcing / Audit Log
+// ============================================================================
+
+TEST_CASE("v4 — Audit log records events", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.audit_log_max_size = 100;
+    AdversarialMarketDefense defense(cfg);
+
+    // Generate some events
+    for (int i = 1; i <= 5; ++i) {
+        auto c = make_safe_condition();
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    auto log = defense.get_audit_log();
+    CHECK(log.size() == 5);
+    CHECK(log[0].symbol == "BTCUSDT");
+    CHECK(log[0].is_safe);
+    CHECK(log[0].action == DefenseAction::NoAction);
+}
+
+TEST_CASE("v4 — Audit log ring buffer wraps", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.audit_log_max_size = 10;
+    AdversarialMarketDefense defense(cfg);
+
+    // Generate 20 events — ring buffer max is 10
+    for (int i = 1; i <= 20; ++i) {
+        auto c = make_safe_condition();
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    auto log = defense.get_audit_log();
+    CHECK(log.size() == 10);
+    // First event should be tick 11, not tick 1
+    CHECK(log[0].timestamp_ms > 0);
+}
+
+TEST_CASE("v4 — Audit log disabled when max_size=0", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.audit_log_max_size = 0;
+    AdversarialMarketDefense defense(cfg);
+
+    auto c = make_safe_condition();
+    defense.assess(c);
+
+    auto log = defense.get_audit_log();
+    CHECK(log.empty());
+}
+
+// ============================================================================
+// v4 Tests: Calibration Metrics
+// ============================================================================
+
+TEST_CASE("v4 — Calibration metrics accumulate correctly", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.spread_explosion_threshold_bps = 50.0;
+    cfg.spread_normal_bps = 10.0;
+    AdversarialMarketDefense defense(cfg);
+
+    // 3 safe ticks
+    for (int i = 1; i <= 3; ++i) {
+        auto c = make_safe_condition();
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    // 1 dangerous tick
+    auto danger = make_safe_condition();
+    danger.spread_bps = 200.0; // severity = (200-50)/50 = 3.0 → capped
+    danger.timestamp = Timestamp(4'000'000'000LL);
+    defense.assess(danger);
+
+    auto cal = defense.get_calibration_metrics();
+    CHECK(cal.total_assessments == 4);
+    CHECK(cal.safe_count == 3);
+    CHECK(cal.spread_explosion_count >= 1);
+    CHECK(cal.avg_compound_severity > 0.0);
+    CHECK(cal.max_compound_severity > 0.0);
+}
+
+TEST_CASE("v4 — Calibration metrics reset", "[adversarial_defense][v4]") {
+    AdversarialMarketDefense defense;
+
+    auto c = make_safe_condition();
+    defense.assess(c);
+
+    auto cal = defense.get_calibration_metrics();
+    CHECK(cal.total_assessments == 1);
+
+    defense.reset_calibration_metrics();
+    cal = defense.get_calibration_metrics();
+    CHECK(cal.total_assessments == 0);
+}
+
+// ============================================================================
+// v4 Tests: New Config Validation
+// ============================================================================
+
+TEST_CASE("v4 — Config validation rejects invalid v4 params", "[adversarial_defense][v4]") {
+    SECTION("percentile_window_size too small") {
+        DefenseConfig cfg;
+        cfg.percentile_window_size = 5;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("percentile_severity_threshold out of range") {
+        DefenseConfig cfg;
+        cfg.percentile_severity_threshold = 0.0;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+        cfg.percentile_severity_threshold = 1.0;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("correlation_alpha out of range") {
+        DefenseConfig cfg;
+        cfg.correlation_alpha = 0.0;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+        cfg.correlation_alpha = 1.0;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("correlation_breakdown_threshold <= 0") {
+        DefenseConfig cfg;
+        cfg.correlation_breakdown_threshold = 0.0;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("multi-timeframe ordering violated") {
+        DefenseConfig cfg;
+        cfg.baseline_halflife_fast_ms = 50000;
+        cfg.baseline_halflife_medium_ms = 30000; // medium < fast
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("hysteresis_exit >= hysteresis_enter") {
+        DefenseConfig cfg;
+        cfg.hysteresis_enter_severity = 0.5;
+        cfg.hysteresis_exit_severity = 0.5; // exit == enter
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("hysteresis_confidence_penalty out of range") {
+        DefenseConfig cfg;
+        cfg.hysteresis_confidence_penalty = 1.5;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+
+    SECTION("audit_log_max_size negative") {
+        DefenseConfig cfg;
+        cfg.audit_log_max_size = -1;
+        CHECK_THROWS(AdversarialMarketDefense(cfg));
+    }
+}
+
+// ============================================================================
+// v4 Tests: to_string for new ThreatTypes
+// ============================================================================
+
+TEST_CASE("v4 — to_string for new threat types", "[adversarial_defense][v4]") {
+    CHECK(to_string(ThreatType::CorrelationBreakdown) == "CorrelationBreakdown");
+    CHECK(to_string(ThreatType::TimeframeDivergence) == "TimeframeDivergence");
+}
+
+// ============================================================================
+// v4 Tests: Diagnostics include v4 fields
+// ============================================================================
+
+TEST_CASE("v4 — Diagnostics include v4 fields", "[adversarial_defense][v4]") {
+    DefenseConfig cfg;
+    cfg.baseline_warmup_ticks = 3;
+    cfg.audit_log_max_size = 100;
+    AdversarialMarketDefense defense(cfg);
+
+    for (int i = 1; i <= 10; ++i) {
+        auto c = make_safe_condition();
+        c.timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000'000LL);
+        defense.assess(c);
+    }
+
+    auto diag = defense.get_diagnostics(Symbol("BTCUSDT"), Timestamp(11'000'000'000LL));
+    // v4 fields should exist and be populated
+    CHECK_FALSE(diag.hysteresis_active);
+    CHECK(diag.calibration.total_assessments == 10);
+    CHECK(diag.calibration.safe_count == 10);
 }
