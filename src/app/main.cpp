@@ -176,6 +176,27 @@ int main(int argc, const char* argv[]) {
                             try { usd_val = std::stod(std::string(obj["usdtValue"].as_string())); }
                             catch (...) {}
                         }
+
+                        // Fallback: если usdtValue ненадёжен (0), запрашиваем тикер
+                        if (usd_val < 0.01 && avail > 0.0) {
+                            std::string sym = coin + "USDT";
+                            auto tresp = auth_rest->get("/api/v2/spot/market/tickers?symbol=" + sym);
+                            if (tresp.success) {
+                                try {
+                                    auto tdoc = boost::json::parse(tresp.body);
+                                    auto& tobj = tdoc.as_object();
+                                    if (tobj.at("code").as_string() == "00000") {
+                                        auto& tdata = tobj.at("data").as_array();
+                                        if (!tdata.empty()) {
+                                            double px = std::stod(std::string(
+                                                tdata[0].as_object().at("lastPr").as_string()));
+                                            usd_val = avail * px;
+                                        }
+                                    }
+                                } catch (...) {}
+                            }
+                        }
+
                         if (usd_val < 0.50) continue;
 
                         std::string symbol = coin + "USDT";

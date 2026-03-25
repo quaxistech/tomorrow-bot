@@ -1553,6 +1553,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     // 0i. Thompson Sampling: проверяем отложенный вход
+    bool thompson_bypass = false;  // Если pending entry активирован — пропустить Thompson ниже
     if (pending_entry_.has_value()) {
         auto& pe = *pending_entry_;
         --pe.wait_periods_remaining;
@@ -1566,9 +1567,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             if (snapshot.mid_price.get() > 0.0) {
                 pe.intent.limit_price = snapshot.mid_price;
             }
-            // Здесь не исполняем напрямую — позволяем пройти через основной pipeline ниже,
-            // сбрасываем pending и продолжаем обработку тика как обычно
+            // Сбрасываем pending и помечаем bypass, чтобы Thompson ниже
+            // НЕ создал новый pending (иначе бесконечный цикл Wait1)
             pending_entry_.reset();
+            thompson_bypass = true;
         } else {
             // Ещё ждём — пропускаем тик
             return;
@@ -1769,8 +1771,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     // 8d. Thompson Sampling: выбираем момент входа
+    // thompson_bypass = true когда pending entry только что активировался —
+    // повторно вызывать Thompson нельзя, иначе бесконечный цикл Wait→Activate→Wait
     ml::EntryAction thompson_action = ml::EntryAction::EnterNow;
-    if (thompson_sampler_) {
+    if (thompson_sampler_ && !thompson_bypass) {
         thompson_action = thompson_sampler_->select_action();
         int wait = ml::wait_periods(thompson_action);
 
