@@ -68,11 +68,14 @@ AllocationResult RegimeAwareAllocator::allocate(
         alloc.weight *= uncertainty.size_multiplier;
         alloc.size_multiplier = uncertainty.size_multiplier;
 
-        // 4. Отключаем стратегии с низким весом
-        if (alloc.weight < 0.1) {
+        // 4. Отключаем стратегии с очень низким весом.
+        // Порог 0.001: при экстремальных условиях (LiquidityStress+LiquidityVacuum)
+        // min weight = 0.2 × 0.05 × 0.2 = 0.002. Порог должен быть ниже,
+        // чтобы хотя бы одна стратегия оставалась активной — иначе вето на часы.
+        if (alloc.weight < 0.001) {
             alloc.is_enabled = false;
             if (!alloc.reason.empty()) alloc.reason += " | ";
-            alloc.reason += "Вес ниже порога (< 0.1)";
+            alloc.reason += "Вес ниже порога (< 0.001)";
         }
 
         result.allocations.push_back(std::move(alloc));
@@ -101,6 +104,21 @@ AllocationResult RegimeAwareAllocator::allocate(
                 << " стратегий активны, uncertainty_size_mult="
                 << uncertainty.size_multiplier;
     result.explanation = explanation.str();
+
+    // Если все стратегии отключены — логируем причины для диагностики
+    if (result.enabled_count == 0) {
+        for (const auto& a : result.allocations) {
+            logger_->info("Allocator", "Стратегия отключена",
+                {{"id", a.strategy_id.get()},
+                 {"weight", std::to_string(a.weight)},
+                 {"enabled", a.is_enabled ? "true" : "false"},
+                 {"reason", a.reason}});
+        }
+        logger_->info("Allocator", "Все стратегии отключены!",
+            {{"uncertainty_size_mult", std::to_string(uncertainty.size_multiplier)},
+             {"enabled", std::to_string(result.enabled_count)},
+             {"total", std::to_string(strategies.size())}});
+    }
 
     logger_->debug("Allocator", result.explanation,
                    {{"enabled", std::to_string(result.enabled_count)},

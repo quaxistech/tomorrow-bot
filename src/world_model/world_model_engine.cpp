@@ -345,11 +345,11 @@ std::vector<StrategySuitability> RuleBasedWorldModelEngine::compute_suitability(
             add("vol_expansion",       0.3, "Волатильность уже высока");
             break;
         case WorldState::LiquidityVacuum:
-            add("momentum",            0.0, "Вакуум ликвидности — торговля опасна");
-            add("mean_reversion",      0.0, "Вакуум ликвидности — торговля опасна");
-            add("breakout",            0.0, "Вакуум ликвидности — торговля опасна");
-            add("microstructure_scalp",0.0, "Вакуум ликвидности — торговля опасна");
-            add("vol_expansion",       0.0, "Вакуум ликвидности — торговля опасна");
+            add("momentum",            0.05, "Вакуум ликвидности — торговля опасна");
+            add("mean_reversion",      0.05, "Вакуум ликвидности — торговля опасна");
+            add("breakout",            0.05, "Вакуум ликвидности — торговля опасна");
+            add("microstructure_scalp",0.0,  "Вакуум ликвидности — скальпинг невозможен");
+            add("vol_expansion",       0.05, "Вакуум ликвидности — торговля опасна");
             break;
         case WorldState::ToxicMicrostructure:
             add("momentum",            0.1, "Токсичный поток искажает сигналы");

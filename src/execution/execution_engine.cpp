@@ -150,17 +150,25 @@ Result<OrderId> ExecutionEngine::execute(
         if (portfolio_) {
             if (order.side == Side::Sell) {
                 // SELL на споте = закрытие длинной позиции.
-                // Рассчитываем реализованную P&L по текущей позиции.
+                // Рассчитываем реализованную P&L с учётом комиссий Bitget.
+                // Bitget spot: 0.1% taker fee на каждую сторону сделки.
+                constexpr double kTakerFeePct = 0.001; // 0.1%
                 auto existing = portfolio_->get_position(order.symbol);
                 double realized_pnl = 0.0;
                 if (existing.has_value()) {
-                    realized_pnl = (fill_price.get() - existing->avg_entry_price.get())
-                                 * order.filled_quantity.get();
+                    double entry_cost = existing->avg_entry_price.get()
+                                      * order.filled_quantity.get();
+                    double exit_proceeds = fill_price.get()
+                                         * order.filled_quantity.get();
+                    double buy_fee  = entry_cost * kTakerFeePct;
+                    double sell_fee = exit_proceeds * kTakerFeePct;
+                    realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
                 }
                 portfolio_->close_position(order.symbol, fill_price, realized_pnl);
                 logger_->info("Execution", "Позиция закрыта (SELL fill)",
                     {{"symbol", order.symbol.get()},
-                     {"realized_pnl", std::to_string(realized_pnl)}});
+                     {"realized_pnl", std::to_string(realized_pnl)},
+                     {"fee_deducted", "0.2%"}});
             } else {
                 // BUY — открываем новую позицию
                 portfolio::Position pos;

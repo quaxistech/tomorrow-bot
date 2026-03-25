@@ -338,23 +338,82 @@ void TradingPipeline::sync_balance_from_exchange() {
              {"per_pipeline", std::to_string(capital_per_pipeline)},
              {"num_pipelines", std::to_string(num_pipelines_)}});
 
-        // Если есть base coin — зарегистрировать как позицию.
-        // Bitget API часто возвращает usdtValue=0 даже для реальных балансов,
-        // поэтому всегда создаём позицию для ненулевых балансов.
-        // Реальная фильтрация пыли происходит в check_position_stop_loss()
-        // после получения цен (notional < $0.50 → автоочистка).
+        // Если есть base coin — зарегистрировать как позицию,
+        // но ТОЛЬКО если notional стоимость > $0.50 (не пыль).
+        // usdtValue из API НЕНАДЁЖЕН (часто возвращает "0"),
+        // поэтому используем fallback: запрос тикера для расчёта notional.
         if (base_available > 0.0) {
-            portfolio::Position base_pos;
-            base_pos.symbol = symbol_;
-            base_pos.side = Side::Buy;
-            base_pos.size = Quantity(base_available);
-            base_pos.avg_entry_price = Price(0.0);  // Неизвестна, обновится по тику
-            base_pos.opened_at = clock_->now();
-            base_pos.strategy_id = StrategyId("sync_from_exchange");
-            portfolio_->open_position(base_pos);
+            double estimated_notional = 0.0;
+            // Попробуем получить usdtValue из API
+            for (const auto& item : data) {
+                auto& asset2 = item.as_object();
+                std::string coin2(asset2.at("coin").as_string());
+                if (coin2 == base_coin && asset2.contains("usdtValue")) {
+                    try {
+                        estimated_notional = std::stod(
+                            std::string(asset2.at("usdtValue").as_string()));
+                    } catch (...) {}
+                    break;
+                }
+            }
 
-            logger_->info("pipeline", "Восстановлена позиция с биржи",
-                {{"coin", base_coin}, {"size", std::to_string(base_available)}});
+            // Fallback: если usdtValue ненадёжен (0), запрашиваем рыночную цену
+            if (estimated_notional < 0.01 && base_available > 0.0) {
+                auto ticker_resp = rest_client_->get(
+                    "/api/v2/spot/market/tickers?symbol=" + symbol_.get());
+                if (ticker_resp.success) {
+                    try {
+                        auto tdoc = boost::json::parse(ticker_resp.body);
+                        auto& tobj = tdoc.as_object();
+                        if (tobj.at("code").as_string() == "00000") {
+                            auto& tdata = tobj.at("data").as_array();
+                            if (!tdata.empty()) {
+                                double last_price = std::stod(std::string(
+                                    tdata[0].as_object().at("lastPr").as_string()));
+                                estimated_notional = base_available * last_price;
+                                logger_->info("pipeline", "Notional рассчитан по тикеру (usdtValue=0)",
+                                    {{"coin", base_coin},
+                                     {"size", std::to_string(base_available)},
+                                     {"price", std::to_string(last_price)},
+                                     {"notional", std::to_string(estimated_notional)}});
+                            }
+                        }
+                    } catch (...) {
+                        logger_->warn("pipeline", "Не удалось получить тикер для dust-фильтра",
+                            {{"symbol", symbol_.get()}});
+                    }
+                }
+            }
+
+            constexpr double kDustThreshold = 0.50;  // $0.50 — минимальная реальная позиция
+            if (estimated_notional >= kDustThreshold) {
+                // Для entry price используем текущую рыночную цену (лучше чем 0.0):
+                // — позволяет корректно работать trailing stop, time exit, PnL
+                // — стоп-лосс и breakeven считают от "entry", при 0.0 всё отключается
+                double entry_price_estimate = (estimated_notional > 0.01 && base_available > 0.0)
+                    ? estimated_notional / base_available
+                    : 0.0;
+
+                portfolio::Position base_pos;
+                base_pos.symbol = symbol_;
+                base_pos.side = Side::Buy;
+                base_pos.size = Quantity(base_available);
+                base_pos.avg_entry_price = Price(entry_price_estimate);
+                base_pos.opened_at = clock_->now();
+                base_pos.strategy_id = StrategyId("sync_from_exchange");
+                portfolio_->open_position(base_pos);
+
+                logger_->info("pipeline", "Восстановлена позиция с биржи",
+                    {{"coin", base_coin},
+                     {"size", std::to_string(base_available)},
+                     {"entry_price", std::to_string(entry_price_estimate)},
+                     {"notional", std::to_string(estimated_notional)}});
+            } else {
+                logger_->info("pipeline", "Пылевой баланс проигнорирован",
+                    {{"coin", base_coin},
+                     {"size", std::to_string(base_available)},
+                     {"notional", std::to_string(estimated_notional)}});
+            }
         }
 
     } catch (const std::exception& e) {
@@ -1166,12 +1225,20 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         risk_decision.verdict = risk::RiskVerdict::Approved;
         risk_decision.summary = "STOP-LOSS: " + reason;
 
-        auto exec_alpha = execution_alpha_->evaluate(close_intent, snapshot);
+        // Stop-loss bypass: не используем execution_alpha для экстренных ордеров.
+        // ExecutionAlpha может блокировать ордер ("NoExecution: условия неблагоприятны"),
+        // но стоп-лосс ОБЯЗАН исполниться для ограничения убытков.
+        execution_alpha::ExecutionAlphaResult exec_alpha;
+        exec_alpha.should_execute = true;
+        exec_alpha.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
+        exec_alpha.urgency_score = 1.0;
+        exec_alpha.rationale = "STOP-LOSS: bypass execution alpha";
 
         // Обновляем cooldown стоп-лосса ПЕРЕД отправкой (даже при ошибке — не спамить)
         last_stop_loss_time_ns_ = now_ns;
         // Также обновляем общий cooldown — стоп-лосс это тоже ордер
         last_order_time_ns_ = now_ns;
+        last_activity_ns_.store(now_ns, std::memory_order_relaxed);
 
         auto order_result = execution_engine_->execute(close_intent, risk_decision, exec_alpha);
         if (order_result) {
@@ -1239,6 +1306,7 @@ bool TradingPipeline::start() {
 
     gateway_->start();
     running_ = true;
+    last_activity_ns_.store(clock_->now().get(), std::memory_order_relaxed);
 
     logger_->info("pipeline", "Торговый pipeline запущен. Подключение к бирже...");
     return true;
@@ -1256,6 +1324,20 @@ void TradingPipeline::stop() {
 
 bool TradingPipeline::is_connected() const {
     return gateway_ && gateway_->is_connected();
+}
+
+bool TradingPipeline::has_open_position() const {
+    if (!portfolio_) return false;
+    auto pos = portfolio_->get_position(symbol_);
+    if (!pos.has_value()) return false;
+    return pos->size.get() > 0.0;
+}
+
+bool TradingPipeline::is_idle(int64_t threshold_ns) const {
+    int64_t last = last_activity_ns_.load(std::memory_order_relaxed);
+    if (last == 0) return false; // ещё не было ни одного тика
+    int64_t now = clock_->now().get();
+    return (now - last) > threshold_ns;
 }
 
 // ==================== Alpha Decay Feedback ====================
@@ -1539,7 +1621,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     // 5. Высокая неопределённость — торговля приостановлена
     if (uncertainty.recommended_action == uncertainty::UncertaintyAction::NoTrade) {
-        logger_->debug("pipeline", "Торговля приостановлена: высокая неопределённость");
+        if (tick_count_ % 200 == 0) {
+            logger_->info("pipeline", "Торговля приостановлена: Extreme неопределённость",
+                {{"aggregate", std::to_string(uncertainty.aggregate_score)},
+                 {"size_mult", std::to_string(uncertainty.size_multiplier)}});
+        }
         return;
     }
 
@@ -1609,9 +1695,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         symbol_, intents, allocation, regime, world, uncertainty);
 
     if (!decision.trade_approved || !decision.final_intent.has_value()) {
-        if (tick_count_ % 500 == 0) {
-            logger_->debug("pipeline", "Нет одобренных сигналов",
-                {{"tick", std::to_string(tick_count_)}});
+        if (tick_count_ % 200 == 0) {
+            logger_->info("pipeline", "Комитет не одобрил сигнал",
+                {{"tick", std::to_string(tick_count_)},
+                 {"trade_approved", decision.trade_approved ? "true" : "false"},
+                 {"has_intent", decision.final_intent.has_value() ? "true" : "false"},
+                 {"rationale", decision.rationale}});
         }
         return;
     }
@@ -1654,11 +1743,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         if (intent.conviction < effective_threshold) {
-            logger_->debug("pipeline", "Conviction ниже порога (alpha decay adj)",
-                {{"conviction", std::to_string(intent.conviction)},
-                 {"threshold", std::to_string(effective_threshold)},
-                 {"decay_adj", std::to_string(alpha_decay_threshold_adj_)},
-                 {"tod_score", std::to_string(snapshot.technical.tod_alpha_score)}});
+            if (tick_count_ % 200 == 0) {
+                logger_->info("pipeline", "Conviction ниже порога",
+                    {{"conviction", std::to_string(intent.conviction)},
+                     {"threshold", std::to_string(effective_threshold)},
+                     {"decay_adj", std::to_string(alpha_decay_threshold_adj_)},
+                     {"bayesian_adj", std::to_string(bayesian_conviction_adj)},
+                     {"strategy", intent.strategy_id.get()}});
+            }
             return;
         }
     }
@@ -1942,6 +2034,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // Устанавливаем cooldown ПЕРЕД отправкой — чтобы даже при ошибке
     // не спамить биржу повторными запросами.
     last_order_time_ns_ = clock_->now().get();
+    last_activity_ns_.store(last_order_time_ns_, std::memory_order_relaxed);
 
     auto order_result = execution_engine_->execute(intent, risk_decision, exec_alpha);
     if (order_result) {

@@ -85,6 +85,15 @@ public:
     /// Подключён ли WebSocket
     bool is_connected() const;
 
+    /// Есть ли открытая позиция (нельзя убивать pipeline с позицией)
+    bool has_open_position() const;
+
+    /// Pipeline простаивает (нет сделок и нет сигналов дольше threshold_ns)
+    bool is_idle(int64_t threshold_ns) const;
+
+    /// Время последней успешной торговой активности (ns epoch)
+    int64_t last_activity_time_ns() const { return last_activity_ns_.load(std::memory_order_relaxed); }
+
 private:
     /// Callback от MarketDataGateway при готовом FeatureSnapshot
     void on_feature_snapshot(features::FeatureSnapshot snapshot);
@@ -165,6 +174,9 @@ private:
     std::atomic<bool> running_{false};
     std::mutex pipeline_mutex_;
     uint64_t tick_count_{0};
+
+    /// Время последней торговой активности (ордер, non-veto сигнал)
+    std::atomic<int64_t> last_activity_ns_{0};
 
     /// Время последнего отправленного ордера (для cooldown между сделками)
     int64_t last_order_time_ns_{0};

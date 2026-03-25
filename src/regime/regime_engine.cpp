@@ -340,11 +340,13 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
         case DetailedRegime::LiquidityStress:
         case DetailedRegime::SpreadInstability:
         case DetailedRegime::ToxicFlow:
-            add("momentum",            false, 0.0, "Стресс — все стратегии отключены");
-            add("mean_reversion",      false, 0.0, "Стресс — все стратегии отключены");
-            add("breakout",            false, 0.0, "Стресс — все стратегии отключены");
-            add("microstructure_scalp",false, 0.0, "Стресс — все стратегии отключены");
-            add("vol_expansion",       false, 0.0, "Стресс — все стратегии отключены");
+            // Стрессовые режимы: большинство стратегий отключены,
+            // но mean_reversion оставляем с минимальным весом — рынок может отскочить.
+            add("momentum",            false, 0.0, "Стресс — momentum отключён");
+            add("mean_reversion",      true,  0.2, "Стресс — mean reversion возможен на отскоке");
+            add("breakout",            false, 0.0, "Стресс — breakout отключён");
+            add("microstructure_scalp",false, 0.0, "Стресс — скальпинг отключён");
+            add("vol_expansion",       false, 0.0, "Стресс — vol_expansion отключён");
             break;
         case DetailedRegime::AnomalyEvent:
             add("momentum",            false, 0.0, "Аномалия — торговля приостановлена");

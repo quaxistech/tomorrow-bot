@@ -27,6 +27,8 @@
 #include <vector>
 #include <span>
 #include <unordered_map>
+#include <thread>
+#include <chrono>
 
 namespace {
 
@@ -270,13 +272,12 @@ int main(int argc, const char* argv[]) {
 
     // ---- 5.6. Запуск ротации пар (каждые N часов) ----
     pair_scanner->start_rotation([&logger](const std::vector<std::string>& new_symbols) {
-        // При ротации логируем новые пары (пока без горячей замены pipeline)
         std::string symbols_str;
         for (const auto& s : new_symbols) {
             if (!symbols_str.empty()) symbols_str += ", ";
             symbols_str += s;
         }
-        logger->info("main", "Ротация пар завершена. Новые лучшие пары: " + symbols_str,
+        logger->info("main", "Плановая ротация завершена. Лучшие пары: " + symbols_str,
             {{"count", std::to_string(new_symbols.size())}});
     });
 
@@ -287,6 +288,135 @@ int main(int argc, const char* argv[]) {
             {{"error", ex.what()}});
         return 2;
     }
+
+    // ---- 5.7. Динамическая ротация при простое pipeline ----
+    // Фоновый поток проверяет каждые 5 минут: если ВСЕ pipeline простаивают
+    // (нет торговли > 30 мин) и нет открытых позиций — пересканировать рынок
+    // и заменить pipeline на новые символы.
+    // Профессиональный throttling: максимум 1 ресканирование каждые 30 минут.
+    constexpr int64_t kIdleThresholdNs = 30LL * 60 * 1'000'000'000LL;  // 30 мин
+    constexpr int kIdleCheckIntervalSec = 300;                          // 5 мин между проверками
+    constexpr int64_t kMinRescanIntervalNs = 30LL * 60 * 1'000'000'000LL; // 30 мин между ресканами
+
+    std::atomic<bool> idle_monitor_running{true};
+    int64_t last_rescan_ns = comp.clock->now().get();
+
+    std::thread idle_monitor_thread([&]() {
+        while (idle_monitor_running.load()) {
+            // Спим по 10 секунд, проверяя флаг остановки
+            for (int elapsed = 0; elapsed < kIdleCheckIntervalSec && idle_monitor_running.load();
+                 elapsed += 10) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+            }
+            if (!idle_monitor_running.load()) break;
+
+            // Throttle: не ресканировать чаще чем раз в 30 мин
+            int64_t now_ns = comp.clock->now().get();
+            if ((now_ns - last_rescan_ns) < kMinRescanIntervalNs) continue;
+
+            // Проверяем: все ли pipeline простаивают и нет ли открытых позиций
+            bool all_idle = true;
+            bool any_has_position = false;
+            for (const auto& p : pipelines) {
+                if (p->has_open_position()) {
+                    any_has_position = true;
+                    all_idle = false;
+                    break;
+                }
+                if (!p->is_idle(kIdleThresholdNs)) {
+                    all_idle = false;
+                }
+            }
+
+            if (!all_idle || any_has_position) continue;
+
+            logger->warn("main", "Все pipeline простаивают > 30 мин. Запуск ресканирования...",
+                {{"pipeline_count", std::to_string(pipelines.size())}});
+
+            try {
+                auto rescan = pair_scanner->scan();
+                if (rescan.selected.empty()) {
+                    logger->warn("main", "Ресканирование не нашло подходящих пар");
+                    last_rescan_ns = comp.clock->now().get();
+                    continue;
+                }
+
+                // Проверяем: новые символы отличаются от текущих?
+                bool symbols_changed = false;
+                if (rescan.selected.size() != active_symbols.size()) {
+                    symbols_changed = true;
+                } else {
+                    for (size_t i = 0; i < rescan.selected.size(); ++i) {
+                        if (rescan.selected[i] != active_symbols[i]) {
+                            symbols_changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!symbols_changed) {
+                    logger->info("main", "Ресканирование: пары не изменились, оставляем текущие");
+                    last_rescan_ns = comp.clock->now().get();
+                    continue;
+                }
+
+                // Символы изменились — горячая замена pipeline
+                std::string old_str, new_str;
+                for (const auto& s : active_symbols) {
+                    if (!old_str.empty()) old_str += ", ";
+                    old_str += s;
+                }
+                for (const auto& s : rescan.selected) {
+                    if (!new_str.empty()) new_str += ", ";
+                    new_str += s;
+                }
+                logger->warn("main", "Горячая замена пар: [" + old_str + "] → [" + new_str + "]");
+
+                // 1. Останавливаем старые pipeline
+                for (auto& p : pipelines) {
+                    p->stop();
+                }
+                pipelines.clear();
+
+                // 2. Обновляем precision из нового сканирования
+                symbol_precisions.clear();
+                for (const auto& ps : rescan.ranked_pairs) {
+                    symbol_precisions[ps.symbol] = {ps.quantity_precision, ps.price_precision};
+                }
+
+                // 3. Обновляем список активных символов
+                active_symbols = rescan.selected;
+
+                // 4. Создаём и запускаем новые pipeline
+                for (size_t i = 0; i < active_symbols.size(); ++i) {
+                    const auto& sym = active_symbols[i];
+                    auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
+                        config, comp.secret_provider, comp.logger, comp.clock,
+                        comp.metrics, comp.health, sym);
+
+                    auto prec_it = symbol_precisions.find(sym);
+                    if (prec_it != symbol_precisions.end()) {
+                        pipeline->set_symbol_precision(prec_it->second.first, prec_it->second.second);
+                    }
+                    pipeline->set_num_pipelines(static_cast<int>(active_symbols.size()));
+                    pipeline->start();
+                    pipelines.push_back(std::move(pipeline));
+
+                    logger->info("main", "Новый pipeline создан для " + sym,
+                        {{"index", std::to_string(i + 1)},
+                         {"total", std::to_string(active_symbols.size())}});
+                }
+
+                last_rescan_ns = comp.clock->now().get();
+                logger->info("main", "Горячая замена завершена",
+                    {{"new_count", std::to_string(active_symbols.size())}});
+
+            } catch (const std::exception& e) {
+                logger->error("main", "Ошибка при ресканировании: " + std::string(e.what()));
+                last_rescan_ns = comp.clock->now().get(); // throttle даже при ошибке
+            }
+        }
+    });
 
     // ---- 6. Ожидание завершения ----
     {
@@ -303,7 +433,15 @@ int main(int argc, const char* argv[]) {
 
     // ---- 7. Корректное завершение ----
     logger->info("main", "Начало процедуры завершения работы...");
+    idle_monitor_running.store(false);
+    if (idle_monitor_thread.joinable()) {
+        idle_monitor_thread.join();
+    }
     pair_scanner->stop_rotation();
+    // Останавливаем pipeline вручную (supervisor может не знать о горячих заменах)
+    for (auto& p : pipelines) {
+        p->stop();
+    }
     supervisor.stop();
     logger->info("main", "Tomorrow Bot завершил работу");
 

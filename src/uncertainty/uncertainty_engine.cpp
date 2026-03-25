@@ -47,9 +47,10 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     auto action = level_to_action(level);
 
     // Множители на основе агрегированного скора.
-    // size_multiplier [0.1, 1.0]: при высокой неопределённости уменьшаем размер.
+    // size_multiplier [0.2, 1.0]: при высокой неопределённости уменьшаем размер позиции,
+    // но не блокируем торговлю полностью — это задача allocator threshold.
     // threshold_multiplier [1.0, 2.0]: при высокой неопределённости требуем выше conviction.
-    double size_mult = std::max(0.1, 1.0 - agg);
+    double size_mult = std::max(0.2, 1.0 - agg);
     double threshold_mult = 1.0 + agg;
 
     // Формируем пояснение
@@ -235,8 +236,8 @@ double RuleBasedUncertaintyEngine::aggregate(const UncertaintyDimensions& dims) 
 UncertaintyLevel RuleBasedUncertaintyEngine::score_to_level(double score) const {
     if (score < 0.3) return UncertaintyLevel::Low;
     if (score < 0.5) return UncertaintyLevel::Moderate;
-    if (score < 0.7) return UncertaintyLevel::High;
-    return UncertaintyLevel::Extreme;
+    if (score < 0.75) return UncertaintyLevel::High;
+    return UncertaintyLevel::Extreme;  // >0.75: действительно экстремальная неопределённость
 }
 
 UncertaintyAction RuleBasedUncertaintyEngine::level_to_action(UncertaintyLevel level) const {
