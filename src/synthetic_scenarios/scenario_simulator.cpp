@@ -190,7 +190,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_spread_explosion(
             .bid_depth = 100.0,
             .ask_depth = 100.0,
             .book_instability = progress * 0.5,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -216,7 +216,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_stale_feed_burst(
             .bid_depth = 80.0,
             .ask_depth = 80.0,
             .book_instability = 0.1,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = !step.feed_stale,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -241,7 +241,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_reconnect_storm(
             .bid_depth = 60.0,
             .ask_depth = 60.0,
             .book_instability = step.connection_lost ? 0.6 : 0.1,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = !step.connection_lost,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -266,7 +266,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_order_book_desync
             .bid_depth = 100.0 * (1.0 - progress * 0.8),
             .ask_depth = 100.0 * (1.0 - progress * 0.7),
             .book_instability = progress * cfg.intensity,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = (i < cfg.duration_steps / 2),
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -295,7 +295,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_exchange_slowdown
             .bid_depth = 80.0,
             .ask_depth = 80.0,
             .book_instability = 0.2,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -320,7 +320,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_reject_storm(
             .bid_depth = 70.0,
             .ask_depth = 70.0,
             .book_instability = 0.3,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -348,7 +348,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_liquidity_collaps
             .bid_depth = depth,
             .ask_depth = depth * 0.8,
             .book_instability = progress * 0.5,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -374,7 +374,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_ai_timeout_storm(
             .bid_depth = 100.0,
             .ask_depth = 100.0,
             .book_instability = 0.1,
-            .buy_sell_ratio = 0.5,
+            .buy_sell_ratio = 1.0,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };
@@ -399,7 +399,7 @@ std::vector<ScenarioStep> SyntheticScenarioSimulator::generate_execution_toxicit
             .bid_depth = 100.0 * (1.0 - progress * 0.7),
             .ask_depth = 100.0 * (1.0 - progress * 0.5),
             .book_instability = progress * 0.6,
-            .buy_sell_ratio = 0.5 + progress * 0.45 * cfg.intensity,
+            .buy_sell_ratio = 1.0 + progress * 1.4 * cfg.intensity,
             .book_valid = true,
             .timestamp = Timestamp(static_cast<int64_t>(i) * 1'000'000)
         };

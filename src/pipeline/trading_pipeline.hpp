@@ -23,6 +23,7 @@
 #include "strategy/microstructure_scalp/microstructure_scalp_strategy.hpp"
 #include "strategy_allocator/strategy_allocator.hpp"
 #include "decision/decision_aggregation_engine.hpp"
+#include "defense/adversarial_market_defense.hpp"
 #include "portfolio_allocator/portfolio_allocator.hpp"
 #include "portfolio/portfolio_engine.hpp"
 #include "execution_alpha/execution_alpha_engine.hpp"
@@ -130,6 +131,7 @@ private:
     std::shared_ptr<strategy::StrategyRegistry> strategy_registry_;
     std::shared_ptr<strategy_allocator::IStrategyAllocator> strategy_allocator_;
     std::shared_ptr<decision::IDecisionAggregationEngine> decision_engine_;
+    std::shared_ptr<defense::AdversarialMarketDefense> adversarial_defense_;
 
     // Исполнение
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;

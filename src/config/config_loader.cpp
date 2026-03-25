@@ -239,6 +239,54 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.pair_selection.blacklist = parse_list(
         get_value(kv, "pair_selection.blacklist", ""));
 
+    // Секция adversarial_defense
+    auto adv_enabled_str = get_value(kv, "adversarial_defense.enabled", "true");
+    cfg.adversarial_defense.enabled = (adv_enabled_str != "false" && adv_enabled_str != "0");
+    auto adv_fail_closed_str = get_value(kv, "adversarial_defense.fail_closed_on_invalid_data", "true");
+    cfg.adversarial_defense.fail_closed_on_invalid_data =
+        (adv_fail_closed_str != "false" && adv_fail_closed_str != "0");
+    auto adv_auto_cd_str = get_value(kv, "adversarial_defense.auto_cooldown_on_veto", "true");
+    cfg.adversarial_defense.auto_cooldown_on_veto =
+        (adv_auto_cd_str != "false" && adv_auto_cd_str != "0");
+    cfg.adversarial_defense.auto_cooldown_severity = parse_double(
+        get_value(kv, "adversarial_defense.auto_cooldown_severity", "0.85"), 0.85);
+    cfg.adversarial_defense.spread_explosion_threshold_bps = parse_double(
+        get_value(kv, "adversarial_defense.spread_explosion_threshold_bps", "100.0"), 100.0);
+    cfg.adversarial_defense.spread_normal_bps = parse_double(
+        get_value(kv, "adversarial_defense.spread_normal_bps", "20.0"), 20.0);
+    cfg.adversarial_defense.min_liquidity_depth = parse_double(
+        get_value(kv, "adversarial_defense.min_liquidity_depth", "50.0"), 50.0);
+    cfg.adversarial_defense.book_imbalance_threshold = parse_double(
+        get_value(kv, "adversarial_defense.book_imbalance_threshold", "0.8"), 0.8);
+    cfg.adversarial_defense.book_instability_threshold = parse_double(
+        get_value(kv, "adversarial_defense.book_instability_threshold", "0.7"), 0.7);
+    cfg.adversarial_defense.toxic_flow_ratio_threshold = parse_double(
+        get_value(kv, "adversarial_defense.toxic_flow_ratio_threshold", "1.8"), 1.8);
+    cfg.adversarial_defense.aggressive_flow_threshold = parse_double(
+        get_value(kv, "adversarial_defense.aggressive_flow_threshold", "0.8"), 0.8);
+    cfg.adversarial_defense.vpin_toxic_threshold = parse_double(
+        get_value(kv, "adversarial_defense.vpin_toxic_threshold", "0.7"), 0.7);
+    cfg.adversarial_defense.cooldown_duration_ms = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.cooldown_duration_ms", "30000"), 30000.0));
+    cfg.adversarial_defense.post_shock_cooldown_ms = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.post_shock_cooldown_ms", "60000"), 60000.0));
+    cfg.adversarial_defense.max_market_data_age_ns = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.max_market_data_age_ns", "2000000000"), 2'000'000'000.0));
+    cfg.adversarial_defense.max_confidence_reduction = parse_double(
+        get_value(kv, "adversarial_defense.max_confidence_reduction", "0.8"), 0.8);
+    cfg.adversarial_defense.max_threshold_expansion = parse_double(
+        get_value(kv, "adversarial_defense.max_threshold_expansion", "2.0"), 2.0);
+    cfg.adversarial_defense.compound_threat_factor = parse_double(
+        get_value(kv, "adversarial_defense.compound_threat_factor", "0.5"), 0.5);
+    cfg.adversarial_defense.cooldown_severity_scale = parse_double(
+        get_value(kv, "adversarial_defense.cooldown_severity_scale", "1.5"), 1.5);
+    cfg.adversarial_defense.recovery_duration_ms = static_cast<int64_t>(parse_double(
+        get_value(kv, "adversarial_defense.recovery_duration_ms", "10000"), 10000.0));
+    cfg.adversarial_defense.recovery_confidence_floor = parse_double(
+        get_value(kv, "adversarial_defense.recovery_confidence_floor", "0.6"), 0.6);
+    cfg.adversarial_defense.spread_velocity_threshold_bps_per_sec = parse_double(
+        get_value(kv, "adversarial_defense.spread_velocity_threshold_bps_per_sec", "50.0"), 50.0);
+
     // Валидация
     ConfigValidator validator;
     auto validation = validator.validate(cfg);

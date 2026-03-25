@@ -84,6 +84,8 @@ TradingPipeline::TradingPipeline(
     // 5. Аллокация стратегий и решения
     strategy_allocator_ = std::make_shared<strategy_allocator::RegimeAwareAllocator>(logger_, clock_);
     decision_engine_ = std::make_shared<decision::CommitteeDecisionEngine>(logger_, clock_);
+    adversarial_defense_ = std::make_shared<defense::AdversarialMarketDefense>(
+        defense::make_defense_config(config_.adversarial_defense));
 
     // 5.5. Монитор деградации альфы
     alpha_decay_monitor_ = std::make_shared<alpha_decay::AlphaDecayMonitor>();
@@ -1631,6 +1633,30 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         return;
     }
 
+    adversarial::DefenseAssessment adversarial_assessment;
+    if (adversarial_defense_) {
+        adversarial_assessment = adversarial_defense_->assess(
+            defense::build_market_condition(snapshot));
+
+        if (adversarial_assessment.overall_action != adversarial::DefenseAction::NoAction &&
+            tick_count_ % 100 == 0) {
+            const std::string top_reason = adversarial_assessment.threats.empty()
+                ? ""
+                : adversarial_assessment.threats.front().reason;
+            logger_->warn("pipeline", "Adversarial defense active",
+                {{"symbol", symbol_.get()},
+                 {"action", adversarial::to_string(adversarial_assessment.overall_action)},
+                 {"threats", std::to_string(adversarial_assessment.threats.size())},
+                 {"safe", adversarial_assessment.is_safe ? "true" : "false"},
+                 {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)},
+                 {"reason", top_reason}});
+        }
+
+        if (!portfolio_->has_position(symbol_) && !adversarial_assessment.is_safe) {
+            return;
+        }
+    }
+
     // 6. Аллокация стратегий по текущему режиму
     auto allocation = strategy_allocator_->allocate(
         strategy_registry_->active(), regime, world, uncertainty);
@@ -1738,6 +1764,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         double effective_threshold = kDefaultConvictionThreshold
                                    + alpha_decay_threshold_adj_
                                    + bayesian_conviction_adj;
+
+        if (adversarial_defense_) {
+            effective_threshold = std::min(
+                1.0,
+                effective_threshold * adversarial_assessment.threshold_multiplier);
+        }
 
         // Time-of-Day: корректировка порога в неблагоприятные часы
         if (snapshot.technical.tod_valid && snapshot.technical.tod_alpha_score < -0.2) {
@@ -1921,6 +1953,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         intent.limit_price = snapshot.mid_price;
     }
 
+    if (adversarial_defense_ && !is_closing_position && !adversarial_assessment.is_safe) {
+        logger_->warn("pipeline", "Вход заблокирован adversarial defense",
+            {{"symbol", symbol_.get()},
+             {"action", adversarial::to_string(adversarial_assessment.overall_action)},
+             {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)}});
+        return;
+    }
+
     risk::RiskDecision risk_decision;
     risk_decision.decided_at = clock_->now();
 
@@ -2002,7 +2042,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         auto sizing = portfolio_allocator_->compute_size(
             intent, portfolio_->snapshot(),
-            uncertainty.size_multiplier * alpha_decay_size_mult_ * correlation_risk_mult);
+            uncertainty.size_multiplier *
+                alpha_decay_size_mult_ *
+                correlation_risk_mult *
+                (adversarial_defense_ ? adversarial_assessment.confidence_multiplier : 1.0));
 
         if (!sizing.approved || sizing.approved_quantity.get() <= 0.0) {
             logger_->debug("pipeline", "Размер позиции не одобрен аллокатором");

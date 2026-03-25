@@ -77,6 +77,36 @@ struct PairSelectionConfig {
     std::vector<std::string> blacklist;          ///< Символы, запрещённые для торговли
 };
 
+/// Runtime-настройки защиты от враждебных рыночных условий
+struct AdversarialDefenseConfig {
+    bool enabled{true};
+    bool fail_closed_on_invalid_data{true};
+    bool auto_cooldown_on_veto{true};
+    double auto_cooldown_severity{0.85};
+    double spread_explosion_threshold_bps{100.0};
+    double spread_normal_bps{20.0};
+    double min_liquidity_depth{50.0};
+    double book_imbalance_threshold{0.8};
+    double book_instability_threshold{0.7};
+    double toxic_flow_ratio_threshold{1.8};
+    double aggressive_flow_threshold{0.8};
+    double vpin_toxic_threshold{0.7};
+    int64_t cooldown_duration_ms{30000};
+    int64_t post_shock_cooldown_ms{60000};
+    int64_t max_market_data_age_ns{2'000'000'000LL};
+    double max_confidence_reduction{0.8};
+    double max_threshold_expansion{2.0};
+
+    // --- Compound threat & recovery ---
+    double compound_threat_factor{0.5};
+    double cooldown_severity_scale{1.5};
+    int64_t recovery_duration_ms{10000};
+    double recovery_confidence_floor{0.6};
+
+    // --- Spread velocity ---
+    double spread_velocity_threshold_bps_per_sec{50.0};
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
     ExchangeConfig       exchange;       ///< Настройки биржи
@@ -85,7 +115,8 @@ struct AppConfig {
     HealthConfig         health;         ///< Настройки проверки здоровья
     RiskConfig           risk;           ///< Настройки риск-менеджера
     TradingModeConfig    trading;        ///< Настройки режима торговли
-    PairSelectionConfig  pair_selection;  ///< Настройки выбора торговых пар
+    PairSelectionConfig  pair_selection; ///< Настройки выбора торговых пар
+    AdversarialDefenseConfig adversarial_defense; ///< Защита от враждебных market conditions
     std::string          config_hash;    ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

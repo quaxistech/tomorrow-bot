@@ -24,6 +24,7 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_strategy
     tb_strategy_allocator
     tb_decision
+    tb_adversarial_defense
     tb_portfolio_allocator
     tb_portfolio
     tb_execution_alpha

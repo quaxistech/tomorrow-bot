@@ -14,6 +14,7 @@ VoidResult ConfigValidator::validate(const AppConfig& cfg) const {
     validate_logging(cfg.logging, result);
     validate_metrics(cfg.metrics, result);
     validate_risk(cfg.risk, result);
+    validate_adversarial(cfg.adversarial_defense, result);
     validate_cross(cfg, result);
 
     if (!result.valid) {
@@ -88,6 +89,64 @@ void ConfigValidator::validate_risk(const RiskConfig& cfg, ValidationResult& res
     // Дневной убыток не должен превышать просадку
     if (cfg.max_daily_loss_pct > cfg.max_drawdown_pct) {
         result.add_error("risk.max_daily_loss_pct не может превышать max_drawdown_pct");
+    }
+}
+
+void ConfigValidator::validate_adversarial(
+    const AdversarialDefenseConfig& cfg, ValidationResult& result) const {
+    if (cfg.spread_explosion_threshold_bps <= 0.0) {
+        result.add_error("adversarial_defense.spread_explosion_threshold_bps должен быть > 0");
+    }
+    if (cfg.spread_normal_bps <= 0.0) {
+        result.add_error("adversarial_defense.spread_normal_bps должен быть > 0");
+    }
+    if (cfg.min_liquidity_depth <= 0.0) {
+        result.add_error("adversarial_defense.min_liquidity_depth должен быть > 0");
+    }
+    if (cfg.book_imbalance_threshold <= 0.0 || cfg.book_imbalance_threshold > 1.0) {
+        result.add_error("adversarial_defense.book_imbalance_threshold должен быть в диапазоне (0, 1]");
+    }
+    if (cfg.book_instability_threshold < 0.0 || cfg.book_instability_threshold >= 1.0) {
+        result.add_error("adversarial_defense.book_instability_threshold должен быть в диапазоне [0, 1)");
+    }
+    if (cfg.toxic_flow_ratio_threshold <= 1.0) {
+        result.add_error("adversarial_defense.toxic_flow_ratio_threshold должен быть > 1.0");
+    }
+    if (cfg.aggressive_flow_threshold <= 0.5 || cfg.aggressive_flow_threshold >= 1.0) {
+        result.add_error("adversarial_defense.aggressive_flow_threshold должен быть в диапазоне (0.5, 1.0)");
+    }
+    if (cfg.vpin_toxic_threshold <= 0.0 || cfg.vpin_toxic_threshold > 1.0) {
+        result.add_error("adversarial_defense.vpin_toxic_threshold должен быть в диапазоне (0, 1]");
+    }
+    if (cfg.cooldown_duration_ms <= 0 || cfg.post_shock_cooldown_ms <= 0) {
+        result.add_error("adversarial_defense cooldown должен быть > 0");
+    }
+    if (cfg.max_market_data_age_ns <= 0) {
+        result.add_error("adversarial_defense.max_market_data_age_ns должен быть > 0");
+    }
+    if (cfg.auto_cooldown_severity < 0.0 || cfg.auto_cooldown_severity > 1.0) {
+        result.add_error("adversarial_defense.auto_cooldown_severity должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.max_confidence_reduction < 0.0 || cfg.max_confidence_reduction > 1.0) {
+        result.add_error("adversarial_defense.max_confidence_reduction должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.max_threshold_expansion < 0.0) {
+        result.add_error("adversarial_defense.max_threshold_expansion должен быть >= 0");
+    }
+    if (cfg.compound_threat_factor < 0.0 || cfg.compound_threat_factor > 1.0) {
+        result.add_error("adversarial_defense.compound_threat_factor должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.cooldown_severity_scale < 1.0) {
+        result.add_error("adversarial_defense.cooldown_severity_scale должен быть >= 1.0");
+    }
+    if (cfg.recovery_duration_ms < 0) {
+        result.add_error("adversarial_defense.recovery_duration_ms должен быть >= 0");
+    }
+    if (cfg.recovery_confidence_floor < 0.0 || cfg.recovery_confidence_floor > 1.0) {
+        result.add_error("adversarial_defense.recovery_confidence_floor должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.spread_velocity_threshold_bps_per_sec <= 0.0) {
+        result.add_error("adversarial_defense.spread_velocity_threshold_bps_per_sec должен быть > 0");
     }
 }
 

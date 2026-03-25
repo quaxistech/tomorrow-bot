@@ -57,6 +57,9 @@ private:
     /// Валидация настроек риск-менеджера
     void validate_risk(const RiskConfig& cfg, ValidationResult& result) const;
 
+    /// Валидация настроек adversarial defense
+    void validate_adversarial(const AdversarialDefenseConfig& cfg, ValidationResult& result) const;
+
     /// Межкомпонентная валидация (совместимость настроек)
     void validate_cross(const AppConfig& cfg, ValidationResult& result) const;
 };

@@ -34,6 +34,30 @@ risk:
   max_drawdown_pct: 5.0
   kill_switch_enabled: true
 
+adversarial_defense:
+  enabled: true
+  fail_closed_on_invalid_data: true
+  auto_cooldown_on_veto: true
+  auto_cooldown_severity: 0.85
+  spread_explosion_threshold_bps: 60
+  spread_normal_bps: 15
+  min_liquidity_depth: 250
+  book_imbalance_threshold: 0.75
+  book_instability_threshold: 0.65
+  toxic_flow_ratio_threshold: 1.8
+  aggressive_flow_threshold: 0.8
+  vpin_toxic_threshold: 0.72
+  cooldown_duration_ms: 30000
+  post_shock_cooldown_ms: 60000
+  max_market_data_age_ns: 2000000000
+  max_confidence_reduction: 0.75
+  max_threshold_expansion: 1.5
+  compound_threat_factor: 0.5
+  cooldown_severity_scale: 1.5
+  recovery_duration_ms: 10000
+  recovery_confidence_floor: 0.6
+  spread_velocity_threshold_bps_per_sec: 50.0
+
 pair_selection:
   mode: auto
   top_n: 5
