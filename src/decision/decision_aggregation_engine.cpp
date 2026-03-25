@@ -200,7 +200,9 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     // --- 6. Одобряем ---
     record.trade_approved = true;
     record.final_intent = *best.intent;
-    record.final_conviction = best.weighted_score;
+    // final_conviction хранит conviction стратегии (не weighted_score),
+    // чтобы downstream consumers получали реальную уверенность [0,1]
+    record.final_conviction = best.intent->conviction;
     record.correlation_id = best.intent->correlation_id;
 
     rationale << "Одобрено: " << best.intent->strategy_id.get()

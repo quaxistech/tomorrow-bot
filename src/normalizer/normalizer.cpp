@@ -191,10 +191,11 @@ void BitgetNormalizer::process_raw_message(const exchange::bitget::RawWsMessage&
         int64_t interval_ms = 60'000; // 1m по умолчанию
         if (interval == "5m") interval_ms = 300'000;
         else if (interval == "15m") interval_ms = 900'000;
-        else if (interval == "1H") interval_ms = 3'600'000;
+        else if (interval == "1h" || interval == "1H") interval_ms = 3'600'000;
 
-        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        // Используем инжектированный clock вместо system_clock для корректной работы
+        // в replay/backtest режимах
+        auto now_ms = clock_->now().get() / 1'000'000; // ns -> ms
 
         for (const auto& item : *data_arr) {
             const auto* arr = item.if_array();

@@ -332,13 +332,12 @@ TEST_CASE("Risk: Правило 9 — Частота ордеров → Throttle
 TEST_CASE("Risk: Правило 10 — Подряд убытки → Denied", "[risk]") {
     auto engine = make_risk_engine();
 
-    // Зафиксировать 5 убытков подряд (= лимит)
-    for (int i = 0; i < 5; ++i) {
-        engine->record_trade_result(true);
-    }
+    // consecutive_losses теперь отслеживаются в PortfolioEngine
+    auto portfolio = make_clean_portfolio();
+    portfolio.pnl.consecutive_losses = 5; // = лимит
 
     auto decision = engine->evaluate(
-        make_intent(), make_sizing(), make_clean_portfolio(),
+        make_intent(), make_sizing(), portfolio,
         make_clean_features(), make_clean_exec_alpha());
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);

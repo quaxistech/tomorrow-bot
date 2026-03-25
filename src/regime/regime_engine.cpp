@@ -195,25 +195,26 @@ DetailedRegime RuleBasedRegimeEngine::classify_detailed(const features::FeatureS
         bool uptrend = tech.ema_20 > tech.ema_50;
         bool downtrend = tech.ema_20 < tech.ema_50;
 
-        // StrongUptrend: EMA20 > EMA50, ADX > 30, RSI 50-70
+        // StrongUptrend: EMA20 > EMA50, ADX > 30
+        // RSI > 70 допустим — это тренд-продолжение с перекупленностью
         if (uptrend && tech.adx > 30.0 &&
-            tech.rsi_valid && tech.rsi_14 >= 50.0 && tech.rsi_14 <= 70.0) {
+            tech.rsi_valid && tech.rsi_14 >= 50.0) {
             return DetailedRegime::StrongUptrend;
         }
 
-        // WeakUptrend: EMA20 > EMA50, ADX 20-30
-        if (uptrend && tech.adx >= 20.0 && tech.adx <= 30.0) {
+        // WeakUptrend: EMA20 > EMA50, ADX 18-30 (закрыт гэп [18,20))
+        if (uptrend && tech.adx >= 18.0 && tech.adx <= 30.0) {
             return DetailedRegime::WeakUptrend;
         }
 
-        // StrongDowntrend: EMA20 < EMA50, ADX > 30, RSI 30-50
+        // StrongDowntrend: EMA20 < EMA50, ADX > 30
         if (downtrend && tech.adx > 30.0 &&
-            tech.rsi_valid && tech.rsi_14 >= 30.0 && tech.rsi_14 <= 50.0) {
+            tech.rsi_valid && tech.rsi_14 <= 50.0) {
             return DetailedRegime::StrongDowntrend;
         }
 
-        // WeakDowntrend: EMA20 < EMA50, ADX 20-30
-        if (downtrend && tech.adx >= 20.0 && tech.adx <= 30.0) {
+        // WeakDowntrend: EMA20 < EMA50, ADX 18-30 (закрыт гэп [18,20))
+        if (downtrend && tech.adx >= 18.0 && tech.adx <= 30.0) {
             return DetailedRegime::WeakDowntrend;
         }
     }

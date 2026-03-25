@@ -37,7 +37,7 @@ risk:
 
 pair_selection:
   mode: auto                       # auto = автоматический выбор, manual = ручной список
-  top_n: 5                         # Сколько лучших пар выбирать
+  top_n: 2                         # 2 пары = больше капитала на каждую ($15)
   min_volume_usdt: 500000          # Мин. 24ч объём (USDT)
   max_spread_bps: 50               # Макс. спред (базисных пунктов)
   rotation_interval_hours: 24      # Интервал ротации (часы)

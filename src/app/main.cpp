@@ -19,7 +19,9 @@
 #include "pipeline/trading_pipeline.hpp"
 #include "pair_scanner/pair_scanner.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
+#include "security/secret_provider.hpp"
 #include "common/enums.hpp"
+#include <boost/json.hpp>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -134,18 +136,86 @@ int main(int argc, const char* argv[]) {
     std::vector<std::string> active_symbols;
     if (!scan_result.selected.empty()) {
         active_symbols = scan_result.selected;
+    } else {
+        active_symbols.push_back("BTCUSDT");
+        logger->warn("main", "Сканер не нашёл подходящих пар. Используется BTCUSDT по умолчанию");
+    }
+
+    // ---- 4.5. Проверка удерживаемых активов на бирже ----
+    // Если есть открытые позиции (ненулевые балансы), принудительно включаем их символы.
+    // Это предотвращает "сиротские" позиции, которые никто не отслеживает.
+    if (config.trading.mode == tb::TradingMode::Production ||
+        config.trading.mode == tb::TradingMode::Testnet) {
+        try {
+            auto api_key_res = comp.secret_provider->get_secret(tb::security::SecretRef{"BITGET_API_KEY"});
+            auto api_secret_res = comp.secret_provider->get_secret(tb::security::SecretRef{"BITGET_API_SECRET"});
+            auto passphrase_res = comp.secret_provider->get_secret(tb::security::SecretRef{"BITGET_PASSPHRASE"});
+
+            if (api_key_res && api_secret_res && passphrase_res) {
+                auto auth_rest = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
+                    config.exchange.endpoint_rest,
+                    *api_key_res, *api_secret_res, *passphrase_res,
+                    logger, config.exchange.timeout_ms);
+
+                auto resp = auth_rest->get("/api/v2/spot/account/assets");
+                if (resp.status_code == 200) {
+                    auto root = boost::json::parse(resp.body);
+                    auto& data = root.as_object()["data"].as_array();
+                    std::vector<std::string> held_symbols;
+
+                    for (auto& asset : data) {
+                        auto& obj = asset.as_object();
+                        std::string coin(obj["coin"].as_string());
+                        double avail = std::stod(std::string(obj["available"].as_string()));
+                        if (coin == "USDT" || avail <= 0.0) continue;
+
+                        double usd_val = 0.0;
+                        if (obj.contains("usdtValue")) {
+                            try { usd_val = std::stod(std::string(obj["usdtValue"].as_string())); }
+                            catch (...) {}
+                        }
+                        if (usd_val < 0.50) continue;
+
+                        std::string symbol = coin + "USDT";
+                        held_symbols.push_back(symbol);
+
+                        bool already_selected = false;
+                        for (const auto& s : active_symbols) {
+                            if (s == symbol) { already_selected = true; break; }
+                        }
+                        if (!already_selected) {
+                            active_symbols.push_back(symbol);
+                            logger->warn("main",
+                                "Принудительно добавлен символ с открытой позицией: " + symbol,
+                                {{"coin", coin},
+                                 {"balance", std::to_string(avail)},
+                                 {"usdt_value", std::to_string(usd_val)}});
+                        }
+                    }
+                    if (!held_symbols.empty()) {
+                        std::string held_str;
+                        for (const auto& s : held_symbols) {
+                            if (!held_str.empty()) held_str += ", ";
+                            held_str += s;
+                        }
+                        logger->info("main", "Удерживаемые активы: " + held_str);
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            logger->warn("main", "Не удалось проверить удерживаемые активы",
+                {{"error", e.what()}});
+        }
+    }
+
+    {
         std::string symbols_str;
         for (const auto& s : active_symbols) {
             if (!symbols_str.empty()) symbols_str += ", ";
             symbols_str += s;
         }
-        logger->info("main", "Выбрано пар для торговли: " + std::to_string(active_symbols.size()),
-            {{"symbols", symbols_str},
-             {"total_scanned", std::to_string(scan_result.total_pairs_found)},
-             {"after_filter", std::to_string(scan_result.pairs_after_filter)}});
-    } else {
-        active_symbols.push_back("BTCUSDT");
-        logger->warn("main", "Сканер не нашёл подходящих пар. Используется BTCUSDT по умолчанию");
+        logger->info("main", "Финальный список символов: " + std::to_string(active_symbols.size()),
+            {{"symbols", symbols_str}});
     }
 
     // Собираем precision для cada выбранного символа из результатов сканирования

@@ -92,12 +92,13 @@ void InMemoryPortfolioEngine::close_position(
     realized_pnl_today_ += realized_pnl;
     trades_today_++;
 
-    // Отслеживать серию убытков
+    // Отслеживать серию убытков (breakeven = 0.0 не считается ни убытком, ни прибылью)
     if (realized_pnl < 0.0) {
         consecutive_losses_++;
-    } else {
+    } else if (realized_pnl > 0.0) {
         consecutive_losses_ = 0;
     }
+    // При breakeven (pnl == 0.0) не меняем consecutive_losses_
 
     logger_->info("Portfolio", "Закрыта позиция",
                   {{"symbol", symbol.get()},

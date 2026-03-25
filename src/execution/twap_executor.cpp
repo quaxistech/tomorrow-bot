@@ -33,6 +33,12 @@ bool SmartTwapExecutor::should_use_twap(
 
     // Нотионал ордера
     double order_notional = intent.suggested_quantity.get() * mid;
+
+    // Для малых ордеров (< $10) TWAP не нужен — одним ордером дешевле
+    if (order_notional < 10.0) {
+        return false;
+    }
+
     // Нотионал доступной ликвидности
     double liquidity_notional = liquidity * mid;
 
@@ -75,6 +81,21 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
             config_.min_slices + ratio * (config_.max_slices - config_.min_slices) * 10.0);
     }
     num_slices = std::clamp(num_slices, config_.min_slices, config_.max_slices);
+
+    // Ограничение: каждый слайс должен иметь нотионал >= $1.10 (минимум Bitget)
+    if (mid > 0.0) {
+        constexpr double kMinSliceNotional = 1.10;
+        double total_notional = total * mid;
+        size_t max_by_notional = std::max(
+            static_cast<size_t>(1),
+            static_cast<size_t>(total_notional / kMinSliceNotional));
+        if (num_slices > max_by_notional) {
+            num_slices = max_by_notional;
+            logger_->debug("TWAP", "Слайсы ограничены минимальным нотионалом",
+                {{"num_slices", std::to_string(num_slices)},
+                 {"total_notional", std::to_string(total_notional)}});
+        }
+    }
 
     // Распределение объёма с фронтлоадингом:
     // первый слайс = 1.2× среднего, последний = 0.8× среднего

@@ -154,6 +154,7 @@ void ProductionRiskEngine::record_trade_result(bool is_loss) {
 
 void ProductionRiskEngine::check_kill_switch(RiskDecision& decision) const {
     if (kill_switch_active_.load()) {
+        std::lock_guard lock(mutex_);
         decision.verdict = RiskVerdict::Denied;
         decision.kill_switch_active = true;
         decision.reasons.push_back({

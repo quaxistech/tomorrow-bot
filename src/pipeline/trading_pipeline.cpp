@@ -136,12 +136,14 @@ TradingPipeline::TradingPipeline(
     // 7. Размер позиции (адаптация под размер капитала)
     portfolio_allocator::HierarchicalAllocator::Config alloc_cfg;
     alloc_cfg.budget.global_budget = config_.trading.initial_capital;
-    // Для маленьких аккаунтов (< $100) — ослабляем лимиты концентрации,
-    // чтобы не блокировать минимальные ордера биржи ($5 USDT)
+    // Для маленьких аккаунтов (< $100) — ослабляем лимиты концентрации
+    // и повышаем target_vol, чтобы не блокировать минимальные ордера биржи ($1 USDT)
     if (config_.trading.initial_capital < 100.0) {
         alloc_cfg.max_concentration_pct = 0.80;
         alloc_cfg.max_strategy_allocation_pct = 0.80;
         alloc_cfg.budget.symbol_budget_pct = 0.80;
+        alloc_cfg.target_annual_vol = 0.50;       // 50% — адекватнее для крипто
+        alloc_cfg.min_size_multiplier = 0.25;     // Не ниже 25% от базового размера
     }
     portfolio_allocator_ = std::make_shared<portfolio_allocator::HierarchicalAllocator>(
         alloc_cfg, logger_);
@@ -336,9 +338,11 @@ void TradingPipeline::sync_balance_from_exchange() {
              {"per_pipeline", std::to_string(capital_per_pipeline)},
              {"num_pipelines", std::to_string(num_pipelines_)}});
 
-        // Если есть base coin в достаточном количестве — зарегистрировать как позицию.
-        // Пылевые остатки игнорируем.
-        constexpr double kMinTradeableValue = 1.0;  // $1 минимум
+        // Если есть base coin — зарегистрировать как позицию.
+        // Bitget API часто возвращает usdtValue=0 даже для реальных балансов,
+        // поэтому всегда создаём позицию для ненулевых балансов.
+        // Реальная фильтрация пыли происходит в check_position_stop_loss()
+        // после получения цен (notional < $0.50 → автоочистка).
         if (base_available > 0.0) {
             portfolio::Position base_pos;
             base_pos.symbol = symbol_;
@@ -704,31 +708,52 @@ void TradingPipeline::compute_htf_trend(const std::vector<double>& closes) {
         }
     }
 
-    // --- ADX (упрощённый, 14 периодов) ---
-    // Для ADX нам нужны highs/lows, но у нас только closes.
-    // Используем изменения closes как прокси для направленного движения.
+    // --- ADX (14 периодов) с True Range из highs/lows ---
+    // Используем реальные highs/lows если доступны, иначе fallback на closes.
     {
         const size_t period = 14;
+        bool have_hlc = (htf_highs_buffer_.size() == n && htf_lows_buffer_.size() == n);
         std::vector<double> dx_vals;
-        double sum_up = 0.0, sum_down = 0.0;
+        double sum_plus_dm = 0.0, sum_minus_dm = 0.0, sum_tr = 0.0;
 
         for (size_t i = 1; i < n; ++i) {
-            double diff = closes[i] - closes[i - 1];
-            double up_move = std::max(0.0, diff);
-            double down_move = std::max(0.0, -diff);
+            double plus_dm = 0.0, minus_dm = 0.0, tr = 0.0;
 
-            if (i <= period) {
-                sum_up += up_move;
-                sum_down += down_move;
+            if (have_hlc) {
+                // Proper Directional Movement с highs/lows
+                double up_move = htf_highs_buffer_[i] - htf_highs_buffer_[i - 1];
+                double down_move = htf_lows_buffer_[i - 1] - htf_lows_buffer_[i];
+                plus_dm = (up_move > down_move && up_move > 0.0) ? up_move : 0.0;
+                minus_dm = (down_move > up_move && down_move > 0.0) ? down_move : 0.0;
+                // True Range
+                double hl = htf_highs_buffer_[i] - htf_lows_buffer_[i];
+                double hc = std::abs(htf_highs_buffer_[i] - closes[i - 1]);
+                double lc = std::abs(htf_lows_buffer_[i] - closes[i - 1]);
+                tr = std::max({hl, hc, lc});
             } else {
-                sum_up = sum_up - sum_up / period + up_move;
-                sum_down = sum_down - sum_down / period + down_move;
+                // Fallback: closes-only прокси
+                double diff = closes[i] - closes[i - 1];
+                plus_dm = std::max(0.0, diff);
+                minus_dm = std::max(0.0, -diff);
+                tr = std::abs(diff);
             }
 
-            if (i >= period) {
-                double di_sum = sum_up + sum_down;
+            if (i <= period) {
+                sum_plus_dm += plus_dm;
+                sum_minus_dm += minus_dm;
+                sum_tr += tr;
+            } else {
+                sum_plus_dm = sum_plus_dm - sum_plus_dm / period + plus_dm;
+                sum_minus_dm = sum_minus_dm - sum_minus_dm / period + minus_dm;
+                sum_tr = sum_tr - sum_tr / period + tr;
+            }
+
+            if (i >= period && sum_tr > 0.0) {
+                double plus_di = sum_plus_dm / sum_tr * 100.0;
+                double minus_di = sum_minus_dm / sum_tr * 100.0;
+                double di_sum = plus_di + minus_di;
                 if (di_sum > 0.0) {
-                    dx_vals.push_back(std::abs(sum_up - sum_down) / di_sum * 100.0);
+                    dx_vals.push_back(std::abs(plus_di - minus_di) / di_sum * 100.0);
                 }
             }
         }
@@ -876,7 +901,8 @@ void TradingPipeline::reset_trailing_state() {
     breakeven_activated_ = false;
     partial_tp_taken_ = false;
     initial_position_size_ = 0.0;
-    current_trail_mult_ = 3.0;
+    current_trail_mult_ = 2.0;
+    position_entry_time_ns_ = 0;
 }
 
 void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snapshot) {
@@ -892,9 +918,10 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
         double entry = pos.avg_entry_price.get();
         if (entry <= 0.0 || price <= 0.0) continue;
 
-        // Запоминаем начальный размер при первом обновлении
+        // Запоминаем начальный размер и время входа при первом обновлении
         if (initial_position_size_ <= 0.0) {
             initial_position_size_ = pos.size.get();
+            position_entry_time_ns_ = clock_->now().get();
         }
 
         // ATR должен быть валидным
@@ -902,13 +929,14 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
         double atr = snapshot.technical.atr_14;
 
         // Адаптивный ATR-множитель по режиму рынка (ADX)
+        // Для 1-мин скальпинга используем плотные стопы (1.0–2.0×ATR)
         if (snapshot.technical.adx_valid) {
             if (snapshot.technical.adx > 30.0) {
-                current_trail_mult_ = 3.0;   // Сильный тренд → широкий trail (держим профит)
+                current_trail_mult_ = 2.0;   // Сильный тренд → средний trail
             } else if (snapshot.technical.adx > 20.0) {
-                current_trail_mult_ = 2.5;   // Умеренный тренд
+                current_trail_mult_ = 1.5;   // Умеренный тренд → плотный trail
             } else {
-                current_trail_mult_ = 1.5;   // Боковик → узкий trail (выходим быстро)
+                current_trail_mult_ = 1.0;   // Боковик → очень узкий trail
             }
         }
 
@@ -1015,7 +1043,22 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         }
         bool fixed_stop_triggered = loss_pct_of_capital >= kMaxLossPerTradePct;
 
-        if (!trailing_stop_triggered && !partial_tp_triggered && !fixed_stop_triggered) continue;
+        // === 4. Time-based exit: закрытие по таймауту ===
+        bool time_exit_triggered = false;
+        if (position_entry_time_ns_ > 0) {
+            int64_t now_check = clock_->now().get();
+            int64_t hold_duration = now_check - position_entry_time_ns_;
+            // Убыточная позиция > 15 мин → закрыть
+            if (pos.unrealized_pnl < 0.0 && hold_duration >= kMaxHoldLossNs) {
+                time_exit_triggered = true;
+            }
+            // Любая позиция > 60 мин → закрыть
+            if (hold_duration >= kMaxHoldAbsoluteNs) {
+                time_exit_triggered = true;
+            }
+        }
+
+        if (!trailing_stop_triggered && !partial_tp_triggered && !fixed_stop_triggered && !time_exit_triggered) continue;
 
         // === Стоп/TP сработал: проверяем возможность закрытия ===
 
@@ -1028,11 +1071,12 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             return true;
         }
 
-        // Используем размер из портфеля, а не общий баланс BTC
-        double actual_qty = pos.size.get();
+        // Для SELL всегда используем РЕАЛЬНЫЙ баланс с биржи,
+        // а не портфель — портфель может расходиться из-за комиссий/частичных ордеров
+        double actual_qty = query_asset_balance(extract_base_coin(symbol_.get()));
         if (actual_qty <= 0.0) {
-            // Фолбэк на реальный баланс если портфель не имеет данных
-            actual_qty = query_asset_balance(extract_base_coin(symbol_.get()));
+            // Фолбэк на портфель если API недоступен
+            actual_qty = pos.size.get();
         }
         if (actual_qty < 0.00001) {
             // Токен уже продан (стоп-лосс сработал ранее), но позиция
@@ -1044,6 +1088,17 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             portfolio_->close_position(symbol_, pos.current_price, pos.unrealized_pnl);
             reset_trailing_state();
             return true;
+        }
+        // Пылевая позиция (< $0.50) — невозможно продать, пропускаем
+        double actual_notional = actual_qty * price;
+        if (actual_notional < 0.50) {
+            logger_->debug("pipeline", "Пылевая позиция, пропускаем стоп-лосс",
+                {{"notional", std::to_string(actual_notional)},
+                 {"symbol", symbol_.get()}});
+            // Очищаем позицию из портфеля чтобы не блокировать новые сделки
+            portfolio_->close_position(symbol_, pos.current_price, pos.unrealized_pnl);
+            reset_trailing_state();
+            return false;
         }
 
         // Определяем количество и причину закрытия
@@ -1069,6 +1124,10 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         } else if (trailing_stop_triggered) {
             reason = "TRAILING_STOP: цена " + std::to_string(price)
                    + " прошла стоп " + std::to_string(current_stop_level_);
+        } else if (time_exit_triggered) {
+            int64_t hold_dur = clock_->now().get() - position_entry_time_ns_;
+            reason = "TIME_EXIT: hold=" + std::to_string(hold_dur / 60'000'000'000LL)
+                   + "min, PnL=" + std::to_string(pos.unrealized_pnl);
         } else {
             reason = "FIXED_STOP: убыток " + std::to_string(loss_pct_of_capital) + "% капитала";
         }
@@ -1090,8 +1149,11 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         close_intent.symbol = symbol_;
         close_intent.side = Side::Sell;
         close_intent.conviction = 1.0;  // Максимальная уверенность — это стоп/TP
-        close_intent.strategy_id = StrategyId(partial_tp_triggered && !trailing_stop_triggered
-                                              ? "partial_tp" : "stop_loss");
+        close_intent.urgency = 1.0;     // Максимальная срочность → market order
+        close_intent.strategy_id = StrategyId(
+            partial_tp_triggered && !trailing_stop_triggered ? "partial_tp"
+            : time_exit_triggered ? "time_exit"
+            : "stop_loss");
         close_intent.limit_price = snapshot.mid_price;
         close_intent.suggested_quantity = Quantity(close_qty);
         // Уникальный correlation_id для предотвращения дублирования
@@ -1273,9 +1335,11 @@ void TradingPipeline::record_trade_for_decay(
     if (!alpha_decay_monitor_) return;
 
     alpha_decay::TradeOutcome outcome;
-    // Конвертируем P&L в basis points (примерная конвертация)
-    outcome.pnl_bps = pnl * 100.0;
-    outcome.slippage_bps = 0.0;  // TODO: реальный slippage из execution_alpha
+    // Конвертируем абсолютную P&L ($) в basis points относительно капитала.
+    // pnl_bps = (pnl / capital) * 10000
+    double capital = portfolio_->snapshot().total_capital;
+    outcome.pnl_bps = (capital > 0.0) ? (pnl / capital * 10000.0) : 0.0;
+    outcome.slippage_bps = 0.0;
     outcome.conviction = conviction;
     outcome.timestamp = clock_->now();
 
@@ -1720,12 +1784,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         bool intent_is_buy = (intent.side == Side::Buy);
 
-        // Минимальный торгуемый размер BTC на Bitget (~$5 USDT, ~0.00001 BTC).
+        // Минимальный торгуемый нотионал на Bitget ($1 USDT).
         // Пылевые остатки ниже этого порога не считаются реальной позицией.
-        constexpr double kMinTradeableBtc = 0.00001;
+        constexpr double kMinTradeableNotional = 0.50;  // $0.50 — ниже невозможно продать
+        double position_notional = position_size.get() * snapshot.mid_price.get();
 
-        // Нельзя SELL на спот без реальной длинной позиции (>= min order)
-        bool has_real_position = has_position && position_size.get() >= kMinTradeableBtc;
+        // Нельзя SELL на спот без реальной длинной позиции (>= min notional)
+        bool has_real_position = has_position && position_notional >= kMinTradeableNotional;
         if (!intent_is_buy && (!has_real_position || !position_is_long)) {
             logger_->debug("pipeline",
                 "Пропуск SELL: нет длинной позиции для продажи",
@@ -1734,10 +1799,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         // Не наращиваем позицию в том же направлении.
-        // Пылевые позиции (< min order) игнорируем — они не могут быть проданы
+        // Пылевые позиции (< min notional) игнорируем — они не могут быть проданы
         // и не должны блокировать новые ордера.
         if (has_position && (position_is_long == intent_is_buy)
-            && position_size.get() >= kMinTradeableBtc) {
+            && position_notional >= kMinTradeableNotional) {
             logger_->debug("pipeline",
                 "Пропуск: уже есть позиция в том же направлении",
                 {{"symbol", symbol_.get()},
@@ -1746,8 +1811,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             return;
         }
 
-        // SELL при открытой BUY = закрытие позиции
-        if (!intent_is_buy && has_position && position_is_long) {
+        // SELL при открытой BUY = закрытие позиции (только если нотионал достаточный)
+        if (!intent_is_buy && has_position && position_is_long
+            && position_notional >= kMinTradeableNotional) {
             is_closing_position = true;
             closing_qty = position_size;
             position_size_for_log = position_size.get();
@@ -1761,6 +1827,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     risk::RiskDecision risk_decision;
     risk_decision.decided_at = clock_->now();
+
+    // Для маленьких аккаунтов (< $100) гарантируем быстрое исполнение:
+    // urgency >= 0.8 → Aggressive → market order.
+    // Стоимость проскальзывания на $15 ордере ~ 0.01%, стоимость
+    // незаполненного лимитного ордера (потерянный вход) гораздо выше.
+    if (intent.side == Side::Buy && portfolio_->snapshot().total_capital < 100.0) {
+        intent.urgency = std::max(intent.urgency, 0.8);
+    }
 
     // Execution alpha — вычисляем один раз для всех ветвей
     auto exec_alpha = execution_alpha_->evaluate(intent, snapshot);
@@ -1802,8 +1876,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             double realized_vol_annual = 0.0;
             if (snapshot.technical.volatility_valid && snapshot.technical.volatility_20 > 0.0) {
                 // volatility_20 — реализованная 20-периодная волатильность (std dev доходностей).
-                // Аннуализация: × sqrt(365) для дневных баров
-                realized_vol_annual = snapshot.technical.volatility_20 * std::sqrt(365.0);
+                // Данные приходят из 1-минутных свечей, поэтому аннуализация:
+                // × sqrt(минут_в_году) = sqrt(365 * 24 * 60) = sqrt(525600) ≈ 725.3
+                realized_vol_annual = snapshot.technical.volatility_20 * std::sqrt(525600.0);
             }
 
             // Реальные win_rate/win_loss_ratio из alpha_decay_monitor

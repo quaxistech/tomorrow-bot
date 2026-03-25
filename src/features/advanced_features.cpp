@@ -270,7 +270,7 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
     snapshot.technical.session_hour_utc = hour;
     size_t h = static_cast<size_t>(hour);
     snapshot.technical.tod_volatility_mult = tod_cfg_.vol_multipliers.at(h);
-    snapshot.technical.tod_volume_mult = tod_cfg_.vol_multipliers.at(h);
+    snapshot.technical.tod_volume_mult = tod_cfg_.alpha_scores.at(h);
     snapshot.technical.tod_alpha_score = tod_cfg_.alpha_scores.at(h);
     snapshot.technical.tod_valid = true;
 }

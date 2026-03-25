@@ -315,7 +315,7 @@ std::vector<OrderRecord> ExecutionEngine::active_orders() const {
     return result;
 }
 
-bool ExecutionEngine::is_duplicate(const strategy::TradeIntent& intent) const {
+bool ExecutionEngine::is_duplicate(const strategy::TradeIntent& intent) {
     std::lock_guard lock(mutex_);
     const auto key = intent.correlation_id.get() + ":" + intent.symbol.get();
 

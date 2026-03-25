@@ -216,16 +216,18 @@ std::optional<Price> RuleBasedExecutionAlpha::compute_limit_price(
         return std::nullopt;
     }
 
-    // Для пассивного стиля — ставим на best bid/ask с небольшим смещением
-    double offset = spread * 0.3; // 30% от спреда внутрь
+    // Для пассивного стиля — ставим на best bid/ask (не внутрь спреда)
+    // Buy: ставим чуть ниже best bid (вглубь стакана для maker)
+    // Sell: ставим чуть выше best ask (вглубь стакана для maker)
+    double offset = spread * 0.2; // 20% от спреда от best bid/ask наружу
     double limit;
 
     if (intent.side == Side::Buy) {
-        // Покупка — ниже mid
-        limit = mid - (spread / 2.0) + offset;
+        // Покупка — на best bid или чуть ниже (maker)
+        limit = mid - (spread / 2.0) - offset;
     } else {
-        // Продажа — выше mid
-        limit = mid + (spread / 2.0) - offset;
+        // Продажа — на best ask или чуть выше (maker)
+        limit = mid + (spread / 2.0) + offset;
     }
 
     return Price(limit);

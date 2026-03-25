@@ -92,7 +92,7 @@ TEST_CASE("WorldModel: ChopNoise — низкий ADX, средний RSI", "[wo
     auto result = engine.update(snap);
 
     REQUIRE(result.state == WorldState::ChopNoise);
-    REQUIRE(result.label == WorldStateLabel::Stable);
+    REQUIRE(result.label == WorldStateLabel::Transitioning);
 }
 
 TEST_CASE("WorldModel: ExhaustionSpike — экстремальный RSI", "[world_model]") {
@@ -154,7 +154,7 @@ TEST_CASE("WorldModel: to_label корректность маппинга", "[wo
     REQUIRE(WorldModelSnapshot::to_label(WorldState::LiquidityVacuum) == WorldStateLabel::Disrupted);
     REQUIRE(WorldModelSnapshot::to_label(WorldState::ToxicMicrostructure) == WorldStateLabel::Disrupted);
     REQUIRE(WorldModelSnapshot::to_label(WorldState::Unknown) == WorldStateLabel::Unknown);
-    REQUIRE(WorldModelSnapshot::to_label(WorldState::ChopNoise) == WorldStateLabel::Stable);
+    REQUIRE(WorldModelSnapshot::to_label(WorldState::ChopNoise) == WorldStateLabel::Transitioning);
 }
 
 TEST_CASE("WorldModel: current_state возвращает последний снимок", "[world_model]") {

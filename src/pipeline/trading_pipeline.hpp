@@ -169,12 +169,12 @@ private:
     /// Время последнего отправленного ордера (для cooldown между сделками)
     int64_t last_order_time_ns_{0};
     /// Минимальный интервал между ордерами: 30 секунд
-    static constexpr int64_t kOrderCooldownNs = 30'000'000'000LL;
+    static constexpr int64_t kOrderCooldownNs = 10'000'000'000LL;
 
     /// Счётчик последовательных отклонений ордеров (для экспоненциального backoff)
     int consecutive_rejections_{0};
     /// Максимальный backoff: 10 минут
-    static constexpr int64_t kMaxRejectionBackoffNs = 600'000'000'000LL;
+    static constexpr int64_t kMaxRejectionBackoffNs = 120'000'000'000LL;
 
     /// Время последнего стоп-лосс ордера (отдельный cooldown от обычных сделок).
     /// Стоп-лосс — экстренный механизм, его нельзя блокировать обычным cooldown'ом,
@@ -296,7 +296,13 @@ private:
     /// Начальный размер позиции (для расчёта partial close)
     double initial_position_size_{0.0};
     /// Текущий ATR-множитель для trailing stop (адаптивный)
-    double current_trail_mult_{3.0};
+    double current_trail_mult_{2.0};
+    /// Время входа в позицию (nanoseconds) — для time-based exit
+    int64_t position_entry_time_ns_{0};
+    /// Максимальное время удержания убыточной позиции: 15 минут
+    static constexpr int64_t kMaxHoldLossNs = 15LL * 60 * 1'000'000'000LL;
+    /// Максимальное время удержания любой позиции: 60 минут
+    static constexpr int64_t kMaxHoldAbsoluteNs = 60LL * 60 * 1'000'000'000LL;
 
     /// Обновить trailing stop для текущей позиции
     void update_trailing_stop(const features::FeatureSnapshot& snapshot);

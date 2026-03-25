@@ -147,6 +147,22 @@ SizingResult HierarchicalAllocator::compute_size(
     qty = std::max(qty, 0.0);
     final_notional = qty * price;
 
+    // Enforce minimum order notional ($1.10 USDT — above Bitget's $1 minimum)
+    constexpr double kMinOrderNotional = 1.10;
+    if (final_notional > 0.0 && final_notional < kMinOrderNotional && price > 0.0) {
+        double min_qty = kMinOrderNotional / price;
+        if (min_qty * price <= max_from_capital) {
+            qty = min_qty;
+            final_notional = qty * price;
+            result.was_reduced = false;
+            result.reduction_reason = "Увеличен до минимального ордера биржи";
+        } else {
+            result.approved = false;
+            result.reduction_reason = "Недостаточно капитала для минимального ордера биржи";
+            return result;
+        }
+    }
+
     result.approved_quantity = Quantity(qty);
     result.approved_notional = NotionalValue(final_notional);
     result.size_as_pct_of_capital = (portfolio.total_capital > 0.0)

@@ -50,7 +50,7 @@ WorldStateLabel WorldModelSnapshot::to_label(WorldState s) {
         case WorldState::ToxicMicrostructure:
             return WorldStateLabel::Disrupted;
         case WorldState::ChopNoise:
-            return WorldStateLabel::Stable;
+            return WorldStateLabel::Transitioning;
         case WorldState::Unknown:
             return WorldStateLabel::Unknown;
     }
@@ -165,7 +165,9 @@ WorldState RuleBasedWorldModelEngine::classify_state(const features::FeatureSnap
     if (micro.spread_valid && micro.spread_bps > 50.0) {
         return WorldState::LiquidityVacuum;
     }
-    if (micro.liquidity_valid && micro.liquidity_ratio > 5.0 &&
+    // liquidity_ratio = min(bid,ask) / ((bid+ask)/2), диапазон [0, 1].
+    // Значение < 0.3 означает сильный перекос глубины стакана.
+    if (micro.liquidity_valid && micro.liquidity_ratio < 0.3 &&
         micro.spread_valid && micro.spread_bps > 20.0) {
         return WorldState::LiquidityVacuum;
     }

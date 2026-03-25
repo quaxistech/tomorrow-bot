@@ -35,7 +35,8 @@ double returns_std_dev(const std::vector<double>& prices, std::size_t n) {
         const double diff = r - mean;
         variance += diff * diff;
     }
-    variance /= count;
+    // Используем несмещённую оценку дисперсии (n-1) для выборочного std dev
+    variance /= (count > 1.0 ? count - 1.0 : count);
     return std::sqrt(variance);
 }
 
@@ -224,25 +225,25 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
     // Волатильность: стандартное отклонение логарифмических доходностей
     if (close.size() >= 6) {  // 6 цен -> 5 доходностей
         tf.volatility_5 = returns_std_dev(close, 5);
-        tf.volatility_valid = true;
     }
     if (close.size() >= 21) {  // 21 цена -> 20 доходностей
         tf.volatility_20 = returns_std_dev(close, 20);
-        tf.volatility_valid = true;
     }
+    // volatility_valid только когда обе волатильности вычислены
+    tf.volatility_valid = (close.size() >= 21);
 
     // Моментум: (close[-1] - close[-n]) / close[-n]
     const double last_close = close.back();
     if (close.size() >= 6) {
         const double prev_5 = close[close.size() - 6];
         tf.momentum_5 = (prev_5 > 0.0) ? (last_close - prev_5) / prev_5 : 0.0;
-        tf.momentum_valid = true;
     }
     if (close.size() >= 21) {
         const double prev_20 = close[close.size() - 21];
         tf.momentum_20 = (prev_20 > 0.0) ? (last_close - prev_20) / prev_20 : 0.0;
-        tf.momentum_valid = true;
     }
+    // momentum_valid только когда оба моментума вычислены
+    tf.momentum_valid = (close.size() >= 21);
 
     return tf;
 }
