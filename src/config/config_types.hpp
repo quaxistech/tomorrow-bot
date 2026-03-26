@@ -152,10 +152,24 @@ struct AdversarialDefenseConfig {
     int64_t audit_log_max_size{10'000};
 };
 
-/// Настройки движка принятия решений (conviction, конфликт-разрешение)
+/// Настройки движка принятия решений (conviction, конфликт-разрешение, advanced features)
 struct DecisionConfig {
     double min_conviction_threshold{0.28};      ///< Мин. conviction для одобрения сделки
     double conflict_dominance_threshold{0.60};  ///< Мин. доминирование одного направления (BUY/SELL) при конфликте
+
+    // === Advanced features (professional-grade) ===
+    bool enable_regime_threshold_scaling{true};   ///< Адаптивный порог по режиму рынка
+    bool enable_regime_dominance_scaling{true};   ///< Адаптивный порог доминирования по режиму
+    bool enable_time_decay{true};                 ///< Time decay для stale-сигналов
+    double time_decay_halflife_ms{700.0};         ///< Период полураспада conviction (мс)
+    bool enable_ensemble_conviction{true};        ///< Ансамблевый бонус при согласии стратегий
+    double ensemble_agreement_bonus{0.08};        ///< Бонус за каждую согласную стратегию
+    double ensemble_max_bonus{0.20};              ///< Макс. бонус от ансамбля
+    bool enable_portfolio_awareness{true};        ///< Учёт просадки/серии убытков в пороге
+    double drawdown_boost_scale{0.10};            ///< +10% к порогу за каждые 5% просадки
+    bool enable_execution_cost_modeling{true};     ///< Пенальти conviction за spread/slippage
+    double max_acceptable_cost_bps{80.0};          ///< Вето если execution cost > N bps
+    bool enable_time_skew_detection{true};        ///< Детекция рассинхронизации состояний
 };
 
 /// Настройки управления позицией (стоп-лосс, тейк-профит, тайминг)

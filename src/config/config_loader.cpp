@@ -408,6 +408,32 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.decision.conflict_dominance_threshold = parse_double(
         get_value(kv, "decision.conflict_dominance_threshold", "0.60"), 0.60);
 
+    // Advanced decision features
+    cfg.decision.enable_regime_threshold_scaling = (
+        get_value(kv, "decision.enable_regime_threshold_scaling", "true") != "false");
+    cfg.decision.enable_regime_dominance_scaling = (
+        get_value(kv, "decision.enable_regime_dominance_scaling", "true") != "false");
+    cfg.decision.enable_time_decay = (
+        get_value(kv, "decision.enable_time_decay", "true") != "false");
+    cfg.decision.time_decay_halflife_ms = parse_double(
+        get_value(kv, "decision.time_decay_halflife_ms", "700"), 700.0);
+    cfg.decision.enable_ensemble_conviction = (
+        get_value(kv, "decision.enable_ensemble_conviction", "true") != "false");
+    cfg.decision.ensemble_agreement_bonus = parse_double(
+        get_value(kv, "decision.ensemble_agreement_bonus", "0.08"), 0.08);
+    cfg.decision.ensemble_max_bonus = parse_double(
+        get_value(kv, "decision.ensemble_max_bonus", "0.20"), 0.20);
+    cfg.decision.enable_portfolio_awareness = (
+        get_value(kv, "decision.enable_portfolio_awareness", "true") != "false");
+    cfg.decision.drawdown_boost_scale = parse_double(
+        get_value(kv, "decision.drawdown_boost_scale", "0.10"), 0.10);
+    cfg.decision.enable_execution_cost_modeling = (
+        get_value(kv, "decision.enable_execution_cost_modeling", "true") != "false");
+    cfg.decision.max_acceptable_cost_bps = parse_double(
+        get_value(kv, "decision.max_acceptable_cost_bps", "80"), 80.0);
+    cfg.decision.enable_time_skew_detection = (
+        get_value(kv, "decision.enable_time_skew_detection", "true") != "false");
+
     // ============================================================
     // Trading Params (position management)
     // ============================================================

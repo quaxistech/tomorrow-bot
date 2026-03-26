@@ -48,7 +48,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Telemetry**: Structured decision envelope
 - **AlphaDecay**: Rolling metrics (expectancy, hit-rate, slippage), drift detection, Z-scores
 - **Shadow**: Теневые решения, гипотетический PnL в bps
-- **ChampionChallenger**: A/B сравнение стратегий, promotion/rejection
+    - **ChampionChallenger v2**: net P&L (gross-fee-slippage), drawdown tracking, hit rate, pre-promotion audit (4 критерия), observer callbacks, Prometheus metrics, persistence
 - **SelfDiagnosis**: Объяснение решений (structured + human-readable)
 - **AdversarialDefense**: 6 видов угроз (spread explosion, liquidity vacuum, toxic flow и др.)
 - **SyntheticScenarios**: 9 стресс-сценариев с валидацией реакций

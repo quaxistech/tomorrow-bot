@@ -39,6 +39,7 @@
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
 #include "alpha_decay/alpha_decay_monitor.hpp"
+#include "champion_challenger/champion_challenger_engine.hpp"
 #include "ai/ai_advisory_engine.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
@@ -151,6 +152,9 @@ private:
 
     /// Мониторинг деградации альфа-сигнала стратегий
     std::shared_ptr<alpha_decay::AlphaDecayMonitor> alpha_decay_monitor_;
+
+    /// Champion-Challenger A/B тестирование стратегий
+    std::shared_ptr<champion_challenger::ChampionChallengerEngine> cc_engine_;
 
     /// Продвинутый движок features (CUSUM, VPIN, Volume Profile, Time-of-Day)
     std::shared_ptr<features::AdvancedFeatureEngine> advanced_features_;
@@ -360,15 +364,23 @@ private:
     /// Интервал проверки alpha decay (каждые 60 секунд)
     static constexpr int64_t kAlphaDecayCheckIntervalNs = 60'000'000'000LL;
 
+    /// Последний результат execution alpha — нужен для C/C fee estimation при закрытии позиции
+    std::optional<execution_alpha::ExecutionAlphaResult> last_exec_alpha_;
+    /// Интервал периодической проверки C/C статуса (каждые 5 минут)
+    static constexpr int64_t kCCCheckIntervalNs = 300'000'000'000LL;
+    int64_t last_cc_check_ns_{0};
+
     /// Минимальный порог conviction для открытия новой позиции
     static constexpr double kDefaultConvictionThreshold = 0.3;
 
     /// Проверить alpha decay для всех стратегий и обновить множители
     void check_alpha_decay_feedback();
-    /// Записать результат закрытой сделки в alpha decay monitor
+    /// Записать результат закрытой сделки в alpha decay monitor и champion_challenger
     void record_trade_for_decay(const StrategyId& strategy_id, double pnl, double conviction);
     /// Обновить MAE для текущей позиции на текущем тике
     void update_current_mae(double current_price, bool is_long);
+    /// Периодически проверять C/C рекомендации и логировать статус
+    void check_champion_challenger_status();
 };
 
 

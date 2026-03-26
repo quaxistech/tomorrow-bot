@@ -85,10 +85,27 @@ TradingPipeline::TradingPipeline(
 
     // 5. Аллокация стратегий и решения
     strategy_allocator_ = std::make_shared<strategy_allocator::RegimeAwareAllocator>(logger_, clock_);
+
+    // Advanced decision config — маппинг из AppConfig
+    decision::AdvancedDecisionConfig adv_decision;
+    adv_decision.enable_regime_threshold_scaling = config_.decision.enable_regime_threshold_scaling;
+    adv_decision.enable_regime_dominance_scaling = config_.decision.enable_regime_dominance_scaling;
+    adv_decision.enable_time_decay = config_.decision.enable_time_decay;
+    adv_decision.time_decay_halflife_ms = config_.decision.time_decay_halflife_ms;
+    adv_decision.enable_ensemble_conviction = config_.decision.enable_ensemble_conviction;
+    adv_decision.ensemble_agreement_bonus = config_.decision.ensemble_agreement_bonus;
+    adv_decision.ensemble_max_bonus = config_.decision.ensemble_max_bonus;
+    adv_decision.enable_portfolio_awareness = config_.decision.enable_portfolio_awareness;
+    adv_decision.drawdown_boost_scale = config_.decision.drawdown_boost_scale;
+    adv_decision.enable_execution_cost_modeling = config_.decision.enable_execution_cost_modeling;
+    adv_decision.max_acceptable_cost_bps = config_.decision.max_acceptable_cost_bps;
+    adv_decision.enable_time_skew_detection = config_.decision.enable_time_skew_detection;
+
     decision_engine_ = std::make_shared<decision::CommitteeDecisionEngine>(
         logger_, clock_,
         config_.decision.min_conviction_threshold,
-        config_.decision.conflict_dominance_threshold);
+        config_.decision.conflict_dominance_threshold,
+        adv_decision);
     adversarial_defense_ = std::make_shared<defense::AdversarialMarketDefense>(
         defense::make_defense_config(config_.adversarial_defense));
 
@@ -110,6 +127,45 @@ TradingPipeline::TradingPipeline(
             alpha_decay::DecayConfig{}, metrics_, decay_storage);
         // Восстанавливаем историю из хранилища (если оно подключено)
         alpha_decay_monitor_->restore_from_storage();
+    }
+
+    // 5.5b. Champion-Challenger A/B тестирование стратегий
+    {
+        std::shared_ptr<persistence::IStorageAdapter> cc_storage;
+        if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
+            try {
+                cc_storage = persistence::make_postgres_adapter(pg_url);
+            } catch (...) {
+                // storage недоступен — работаем in-memory
+            }
+        }
+
+        champion_challenger::ChampionChallengerConfig cc_cfg;
+        cc_cfg.min_evaluation_trades = 30;   // Снижен для более быстрой обратной связи
+        cc_cfg.promotion_threshold   = 0.20; // +20% чистый net P&L delta
+        cc_cfg.rejection_threshold   = -0.10;
+        cc_cfg.min_hit_rate          = 0.40; // 40% прибыльных сделок — минимум для spot
+        cc_cfg.max_drawdown_bps      = -600.0; // просадка не хуже -600bps
+        cc_cfg.min_regime_samples    = 3;
+
+        cc_engine_ = std::make_shared<champion_challenger::ChampionChallengerEngine>(
+            cc_cfg, logger_, metrics_, cc_storage);
+
+        // Регистрируем пары стратегий для A/B сравнения:
+        //  momentum (champion) vs mean_reversion (challenger) — оба работают live,
+        //  сравниваем по накопленным результатам за период оценки.
+        //  breakout (champion) vs vol_expansion (challenger) — аналогично.
+        (void)cc_engine_->register_challenger(
+            StrategyId("momentum"),
+            StrategyId("mean_reversion"),
+            StrategyVersion(1));
+        (void)cc_engine_->register_challenger(
+            StrategyId("breakout"),
+            StrategyId("vol_expansion"),
+            StrategyVersion(1));
+
+        logger_->info("pipeline", "Champion-Challenger инициализирован",
+            {{"pairs", "momentum/mean_reversion, breakout/vol_expansion"}});
     }
 
     // 5.5a. AI Advisory Engine
@@ -1591,6 +1647,41 @@ void TradingPipeline::record_trade_for_decay(
 
     alpha_decay_monitor_->record_trade_outcome(strategy_id, outcome);
 
+    // Champion-Challenger: записываем net P&L (gross - fee - slippage) для честного сравнения
+    if (cc_engine_) {
+        // Оцениваем комиссию по типу исполнения (maker=2bps, taker=6bps, hybrid=4bps)
+        double fee_bps = 4.0; // default: hybrid
+        if (last_exec_alpha_.has_value()) {
+            using ES = execution_alpha::ExecutionStyle;
+            switch (last_exec_alpha_->recommended_style) {
+                case ES::Passive:    fee_bps = 2.0; break;
+                case ES::Aggressive: fee_bps = 6.0; break;
+                default:             fee_bps = 4.0; break;
+            }
+        }
+
+        champion_challenger::PnLBreakdown breakdown{
+            .gross_pnl_bps = outcome.pnl_bps,
+            .fee_bps       = fee_bps,
+            .slippage_bps  = current_position_slippage_bps_
+        };
+
+        const std::string regime_str = std::string{to_string(outcome.regime)};
+        const std::string sid        = std::string{strategy_id.get()};
+
+        // Проверяем, является ли стратегия champion-ом или challenger-ом
+        const bool is_challenger = (sid == "mean_reversion" || sid == "vol_expansion");
+
+        if (is_challenger) {
+            (void)cc_engine_->record_challenger_outcome(
+                strategy_id, breakdown, regime_str, conviction);
+        } else if (sid == "momentum" || sid == "breakout") {
+            (void)cc_engine_->record_champion_outcome(
+                strategy_id, breakdown, regime_str);
+        }
+        // microstructure_scalp — вне C/C пар, не записываем
+    }
+
     logger_->debug("AlphaDecay", "Результат сделки записан",
         {{"strategy",    std::string{strategy_id.get()}},
          {"pnl_bps",     std::to_string(outcome.pnl_bps)},
@@ -1620,6 +1711,57 @@ void TradingPipeline::update_current_mae(double current_price, bool is_long) {
     }
     if (adverse_bps > current_max_adverse_excursion_bps_) {
         current_max_adverse_excursion_bps_ = adverse_bps;
+    }
+}
+
+void TradingPipeline::check_champion_challenger_status() {
+    if (!cc_engine_) return;
+
+    const int64_t now_ns = clock_->now().get();
+    if (last_cc_check_ns_ > 0 &&
+        (now_ns - last_cc_check_ns_) < kCCCheckIntervalNs) return;
+    last_cc_check_ns_ = now_ns;
+
+    // Проверяем пары стратегий
+    const std::vector<std::pair<StrategyId, StrategyId>> pairs = {
+        {StrategyId("momentum"),     StrategyId("mean_reversion")},
+        {StrategyId("breakout"),     StrategyId("vol_expansion")}
+    };
+
+    for (const auto& [champion, challenger] : pairs) {
+        // Получаем отчёт по champion-стратегии
+        auto report = cc_engine_->evaluate(champion);
+        if (!report) continue;
+
+        const auto champ_str = std::string{champion.get()};
+        const auto chall_str = std::string{challenger.get()};
+
+        // Проверяем, нужен ли промоушен или отклонение challenger-а
+        if (cc_engine_->should_promote(challenger)) {
+            logger_->warn("CC", "Challenger готов к промоушену",
+                {{"champion",   champ_str},
+                 {"challenger", chall_str}});
+            (void)cc_engine_->promote(challenger);
+
+        } else if (cc_engine_->should_reject(challenger)) {
+            logger_->warn("CC", "Challenger отклонён — уступает champion-у",
+                {{"champion",   champ_str},
+                 {"challenger", chall_str}});
+            (void)cc_engine_->reject(challenger);
+        }
+
+        // Логируем сводный отчёт
+        for (const auto& entry : report->challengers) {
+            const auto& cm = entry.challenger_metrics;
+            logger_->info("CC", "Сводка C/C",
+                {{"champion",      champ_str},
+                 {"challenger",    chall_str},
+                 {"chall_net_pnl", std::to_string(cm.net_pnl_bps)},
+                 {"chall_hitrate", std::to_string(cm.hit_rate())},
+                 {"chall_dd",      std::to_string(cm.max_drawdown_bps)},
+                 {"trades",        std::to_string(cm.decision_count)},
+                 {"status",        champion_challenger::to_string(entry.status)}});
+        }
     }
 }
 
@@ -1708,6 +1850,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     // 0d. Alpha Decay: периодическая проверка деградации стратегий
     check_alpha_decay_feedback();
+    check_champion_challenger_status();
 
     // 0e. Периодическое обновление HTF индикаторов (каждый час или экстренно)
     maybe_update_htf(snapshot);
@@ -1969,9 +2112,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
     }
 
-    // 8. Агрегация решений комитетом
+    // 8. Агрегация решений комитетом (с portfolio/features context)
     auto decision = decision_engine_->aggregate(
-        symbol_, intents, allocation, regime, world, uncertainty, ai_result);
+        symbol_, intents, allocation, regime, world, uncertainty, ai_result,
+        portfolio_->snapshot(), snapshot);
 
     if (!decision.trade_approved || !decision.final_intent.has_value()) {
         if (tick_count_ % 200 == 0) {
@@ -2574,6 +2718,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             current_position_slippage_bps_ = snapshot.execution_context.estimated_slippage_bps;
             // Fix: сбрасываем MAE для новой позиции
             current_max_adverse_excursion_bps_ = 0.0;
+            // Сохраняем exec_alpha для C/C fee estimation при закрытии позиции
+            last_exec_alpha_ = exec_alpha;
             reset_trailing_state();
             double entry_price = snapshot.mid_price.get();
             highest_price_since_entry_ = entry_price;

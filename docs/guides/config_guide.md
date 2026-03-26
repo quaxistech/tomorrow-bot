@@ -235,6 +235,44 @@ ml:
     initial_beta: 1.0             # Начальный β (Beta distribution)
 ```
 
+### decision (новое — профессиональный модуль решений)
+```yaml
+decision:
+  min_conviction_threshold: 0.28    # Базовый порог conviction (до множителей)
+  conflict_dominance_threshold: 0.60 # Порог доминирования при конфликте BUY/SELL
+
+  # Режимно-адаптивный порог conviction
+  enable_regime_threshold_scaling: true
+  # Множители: StrongTrend=0.90, Chop=1.35, Anomaly=1.50, Stress=1.25
+
+  # Режимно-адаптивный порог доминирования
+  enable_regime_dominance_scaling: true
+  # Множители: Trending=0.55, Chop=0.72, Stress=0.80
+
+  # Time decay — устаревшие сигналы теряют conviction
+  enable_time_decay: true
+  time_decay_halflife_ms: 700.0     # Период полураспада (мс)
+
+  # Ensemble conviction — бонус за согласие нескольких стратегий
+  enable_ensemble_conviction: true
+  ensemble_agreement_bonus: 0.08    # Бонус за каждую согласную стратегию
+  ensemble_max_bonus: 0.20          # Макс. бонус от ансамбля
+
+  # Portfolio awareness — учёт состояния портфеля
+  enable_portfolio_awareness: true
+  drawdown_boost_scale: 0.10        # +10% к порогу за каждые 5% просадки
+  # consecutive_loss_boost: 0.03    # +3% к порогу за каждый последовательный убыток
+  # drawdown_max_boost: 0.25        # Макс. повышение порога от просадки
+
+  # Execution cost modeling — учёт стоимости исполнения
+  enable_execution_cost_modeling: true
+  max_acceptable_cost_bps: 80.0     # Вето если spread+slippage > 80 bps
+
+  # Time-skew detection — обнаружение рассинхронизации состояний
+  enable_time_skew_detection: true
+  # max_state_skew_ns: 200000000    # 200мс максимальная рассинхронизация
+```
+
 ## Настройка API-ключей
 
 Создайте файл `.env` в корне проекта:

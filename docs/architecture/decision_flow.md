@@ -47,9 +47,10 @@ StrategyAllocator
     + Bayesian Online Adaptation (обновление параметров в реальном времени)
 
 DecisionAggregationEngine
-    aggregate(symbol, intents, allocation, regime, world, uncertainty) → DecisionRecord
-    (голосование комитета с вето-логикой)
-    conviction threshold = dynamic (base 0.35 + alpha_decay_adj + tod_adj)
+    aggregate(symbol, intents, allocation, regime, world, uncertainty,
+             ai_advisory?, portfolio?, features?) → DecisionRecord
+    (комитетное голосование с regime-adaptive thresholds, ensemble conviction,
+     time decay, execution cost modeling, portfolio awareness)
 
 Cascade Check (аварийная блокировка) ← score > 0.6 → блок всех входов
     │
@@ -145,18 +146,85 @@ HTF Trend Filter (финальный барьер)
 
 ### 6. DecisionAggregationEngine (`tb::decision`)
 
-Комитетное голосование:
-1. Глобальные вето (UncertaintyAction::NoTrade, все стратегии отключены)
-2. Для каждого интента: weighted_score = conviction × weight
-3. Конфликт BUY/SELL → вето
-4. Лучший weighted_score > dynamic threshold
-5. Формирование `DecisionRecord` с полным объяснением
+Профессиональный комитетный движок принятия решений с адаптивными порогами,
+ансамблевой conviction, учётом стоимости исполнения и портфельным контекстом.
 
-**Динамический порог conviction:**
-- Base threshold = 0.35
-- + alpha_decay_adj (до +0.10 при деградации стратегии)
-- + tod_adj (+0.05 в тихие часы по Time-of-Day Alpha)
-- Итого: 0.35 – 0.50 в зависимости от контекста
+**Сигнатура:**
+```cpp
+aggregate(symbol, intents, allocation, regime, world, uncertainty,
+          ai_advisory?, portfolio?, features?) → DecisionRecord
+```
+
+**Конвейер решения (10 этапов):**
+
+1. **Time-skew detection** — проверяет рассинхронизацию между regime/uncertainty
+   снапшотами (порог 200мс). Предупреждение в лог при обнаружении.
+
+2. **Глобальные вето:**
+   - `UncertaintyAction::NoTrade` → полный запрет
+   - Все стратегии отключены аллокатором
+   - AI Advisory с severity ≥ порог вето
+
+3. **Execution cost estimation** — моделирует стоимость входа:
+   - `spread_bps` из микроструктуры
+   - `slippage_bps` из execution context
+   - Вето если `total_cost_bps > max_acceptable_cost_bps` (по умолчанию 80 bps)
+
+4. **Scoring с time decay + cost penalty:**
+   - Time decay: `conviction × exp(-ln(2)/halflife × age_ms)` (halflife 700мс)
+   - Execution cost penalty: `(spread+slippage)/10000 × 0.5`
+   - `weighted_score = effective_conviction × weight`
+
+5. **Разрешение конфликтов BUY/SELL:**
+   - Regime-adaptive dominance threshold (55% в тренде, 80% в стрессе)
+   - Вето при отсутствии доминирующего направления
+
+6. **Эффективный порог conviction:**
+   - Base threshold × uncertainty.threshold_multiplier
+   - × regime factor (0.90 для StrongUptrend … 1.50 для AnomalyEvent)
+   - + drawdown boost (до +0.25 при глубокой просадке + серии убытков)
+
+7. **AI Advisory adjustment** — коррекция conviction по AI рекомендациям
+
+8. **Ensemble conviction bonus:**
+   - Бонус за согласие нескольких стратегий (diminishing returns: 0.08 × 0.6^i)
+   - Максимум +0.20 от ансамбля
+   - Записывается в `EnsembleMetrics` (aligned_count, agreement_ratio, bonus)
+
+9. **Threshold check** — `adjusted_conviction ≥ effective_threshold`
+   - `approval_gap = conviction - threshold` (для near-miss анализа)
+   - Structured `RejectionReason` при отказе
+
+10. **Формирование DecisionRecord** с полным rationale для аудита
+
+**Таблица режимных множителей conviction threshold:**
+
+| Режим | Множитель | Логика |
+|-------|-----------|--------|
+| StrongUptrend/Downtrend | 0.90 | В сильном тренде порог снижен |
+| WeakUptrend/Downtrend | 1.00 | Нейтральный |
+| MeanReversion | 1.10 | Осторожность при возврате к среднему |
+| VolatilityExpansion | 0.95 | Лёгкое снижение (движения быстрые) |
+| LowVolCompression | 1.05 | Слегка повышен (мало возможностей) |
+| LiquidityStress | 1.25 | Значительно повышен |
+| SpreadInstability | 1.20 | Нестабильный спред — осторожность |
+| Chop | 1.35 | Шум — высокий порог |
+| AnomalyEvent | 1.50 | Аномалия — максимальная осторожность |
+| ToxicFlow | 1.40 | Токсичный поток — почти запрет |
+
+**Категории отклонения (RejectionReason):**
+- `None` — одобрено
+- `LowConviction` — conviction ниже порога
+- `GlobalUncertaintyVeto` — экстремальная неопределённость
+- `SignalConflict` — конфликт BUY/SELL без доминирования
+- `AllStrategiesDisabled` — аллокатор отключил все стратегии
+- `NoValidIntents` — нет торговых намерений
+- `ExecutionCostTooHigh` — издержки исполнения выше допустимого
+- `AIAdvisoryVeto` — AI рекомендует воздержаться
+- `DrawdownLimit` — просадка превышает лимит
+- `RegimeUnsafe` — режим не подходит для торговли
+
+**Все фичи управляются через `AdvancedDecisionConfig`** (все включены по умолчанию).
 
 ### 7. HTF Trend Filter (новый, финальный барьер)
 
