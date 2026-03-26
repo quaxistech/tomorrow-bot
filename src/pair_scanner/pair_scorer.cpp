@@ -6,14 +6,17 @@
 namespace tb::pair_scanner {
 
 // ========================================================================
-// Pair Scorer v3 — ТОЛЬКО РАСТУЩИЕ МОНЕТЫ для спотовой торговли
+// Pair Scorer v4 — ACCELERATION-BASED coin selection
 // ========================================================================
 //
-// Философия: на СПОТ мы можем зарабатывать ТОЛЬКО на росте цены.
-// Поэтому momentum — это 40% всего скора. Падающие монеты
-// отсеиваются жёстким фильтром.
+// Key insight: selecting coins by 24h change picks coins that ALREADY
+// pumped (selection bias). Instead we detect MOMENTUM ACCELERATION:
+// coins where 4h rate of change exceeds the average 24h rate, meaning
+// the move is INTENSIFYING, not exhausting.
 //
-// Веса: Momentum(40) + Trend(25) + Tradability(25) + Quality(10) = 100
+// Anti-pump filter: coins up 30%+ with decaying 4h momentum are skipped.
+//
+// Weights: Momentum(40) + Trend(25) + Tradability(25) + Quality(10) = 100
 // ========================================================================
 
 PairScore PairScorer::score(const TickerData& ticker,
@@ -30,6 +33,24 @@ PairScore PairScorer::score(const TickerData& ticker,
     // На споте падающая монета = гарантированный убыток.
     // ═══════════════════════════════════════════════════════════════
     if (ticker.change_24h_pct < -1.0) {
+        result.total_score = -1.0;
+        result.filtered_out = true;
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ANTI-PUMP FILTER: coin pumped 30%+ in 24h but 4h momentum is
+    // <20% of the 24h rate → pump is exhausted, buying the top.
+    // Hard cap: >20% 24h change = absolute reject (already extended)
+    // ═══════════════════════════════════════════════════════════════
+    if (ticker.change_24h_pct > 20.0) {
+        result.total_score = -1.0;
+        result.filtered_out = true;
+        return result;
+    }
+    double roc_4h_filter = compute_roc(candles, 4);
+    if (ticker.change_24h_pct > 10.0 &&
+        roc_4h_filter < ticker.change_24h_pct * 0.25) {
         result.total_score = -1.0;
         result.filtered_out = true;
         return result;
@@ -54,6 +75,23 @@ PairScore PairScorer::score(const TickerData& ticker,
                      + result.quality_score;
 
     // ═══════════════════════════════════════════════════════════════
+    // STAGNATION FILTER: монеты с 24h change < 1% (абсолютное значение)
+    // слишком вялые для скальпинга — стратегии не найдут сигналов.
+    // Исключаем также стейблкоины (24h change ~0).
+    // ═══════════════════════════════════════════════════════════════
+    if (std::abs(ticker.change_24h_pct) < 1.0) {
+        raw_total *= 0.3;  // Сильный штраф за стагнацию
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEADY GAINERS BONUS: монеты +2%..+10% за 24ч с бычьим трендом —
+    // идеальный диапазон для momentum/breakout стратегий.
+    // ═══════════════════════════════════════════════════════════════
+    if (ticker.change_24h_pct >= 2.0 && ticker.change_24h_pct <= 10.0) {
+        raw_total += 8.0;  // Бонус за "золотую зону" движения
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // ШТРАФНОЙ МНОЖИТЕЛЬ: если 24h change отрицательный (но > -1%),
     // значит монета стагнирует — снижаем общий скор на 50%.
     // ═══════════════════════════════════════════════════════════════
@@ -66,46 +104,44 @@ PairScore PairScorer::score(const TickerData& ticker,
 }
 
 // ========== Momentum Score (0-40) ==========
-// ГЛАВНЫЙ критерий: ROC 24h (20) + краткосрочный ROC 4h (10) + EMA slope (10).
-// Для спота: чем выше рост — тем лучше.
+// Rewards ACCELERATION, not magnitude. We want coins that just started
+// moving, not ones that already pumped.
+//
+// Components: Recent 4h momentum (20) + Acceleration (15) + Fresh start (5).
 
 double PairScorer::compute_momentum_score(const TickerData& ticker,
                                            const std::vector<CandleData>& candles) const {
     double score = 0.0;
 
-    // --- Компонент 1: ROC за 24ч из тикера (0-20 баллов) ---
-    // Это ГЛАВНАЯ метрика. +2% → 8, +5% → 15, +10%+ → 20
     double roc_24h = ticker.change_24h_pct;
-    if (roc_24h > 0.0) {
-        // Логарифмическая шкала: быстро растёт до 5%, потом замедляется
-        // +1% → 6, +2% → 9, +5% → 15, +10% → 18, +15%+ → 20
-        score += std::clamp(std::log1p(roc_24h) * 7.4, 0.0, 20.0);
-    } else {
-        // Отрицательный ROC = штраф (но монета прошла фильтр, значит > -1%)
-        // -0.5% → -2, -1% → -4
-        score += std::max(-8.0, roc_24h * 4.0);
-    }
-
-    // --- Компонент 2: Краткосрочный ROC за 4 свечи (0-10 баллов) ---
-    // Ускорение роста за последние 4 часа (подтверждение momentum)
     double roc_4h = compute_roc(candles, 4);
+
+    // --- Component 1: Recent 4h momentum (0-20 pts) ---
+    // Focus on RECENT price action, not 24h which includes stale history.
+    // +0.5% → ~6, +1% → ~10, +2% → ~16, +3%+ → 20
     if (roc_4h > 0.0) {
-        // +0.5% за 4ч → 3.5, +1% → 5.8, +2%+ → 10
-        score += std::clamp(std::log1p(roc_4h) * 8.3, 0.0, 10.0);
+        score += std::clamp(std::log1p(roc_4h) * 14.5, 0.0, 20.0);
     } else {
-        // Замедление роста — небольшой штраф
-        score += std::max(-4.0, roc_4h * 2.0);
+        score += std::max(-8.0, roc_4h * 4.0);
     }
 
-    // --- Компонент 3: EMA slope за 12 свечей (0-10 баллов) ---
-    // Подтверждение устойчивого тренда (EMA растёт = тренд устойчив)
-    double slope = compute_ema_slope(candles, 12);
-    if (slope > 0.0) {
-        // slope 0.1% → 4, 0.2% → 7, 0.3%+ → 10
-        score += std::clamp(slope * 35.0, 0.0, 10.0);
+    // --- Component 2: Acceleration (0-15 pts) ---
+    // Is 4h rate of change FASTER than the average rate over 24h?
+    // accel > 0 means momentum is increasing (coin just started pumping).
+    // roc_24h/6 normalizes 24h change to a 4h-equivalent average rate.
+    double avg_4h_rate = roc_24h / 6.0;
+    double accel = roc_4h - avg_4h_rate;
+    if (accel > 0.0) {
+        score += std::clamp(std::log1p(accel) * 14.0, 0.0, 15.0);
     } else {
-        // Падающий EMA — штраф
-        score += std::max(-5.0, slope * 20.0);
+        // Decelerating — mild penalty
+        score += std::max(-5.0, accel * 2.0);
+    }
+
+    // --- Component 3: Fresh start bonus (0-5 pts) ---
+    // Coin just started moving: moderate 24h change but meaningful 4h action.
+    if (roc_24h < 10.0 && roc_4h > 0.5) {
+        score += std::clamp(roc_4h * 2.5, 0.0, 5.0);
     }
 
     return std::clamp(score, 0.0, 40.0);

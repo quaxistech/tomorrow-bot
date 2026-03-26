@@ -2,20 +2,23 @@
 
 /**
  * @file pair_scorer.hpp
- * @brief Алгоритм скоринга торговых пар v3 — ТОЛЬКО растущие монеты.
+ * @brief Алгоритм скоринга торговых пар v4 — acceleration-based selection.
  *
  * Для спотовой торговли прибыль = только от роста цены.
- * Поэтому главный критерий — MOMENTUM (рост за 24ч).
+ * Вместо отбора монет по magnitude (уже pumped), ищем УСКОРЕНИЕ:
+ * монеты, где 4h momentum выше среднего 24h темпа = рост усиливается.
  *
- * ЖЁСТКИЙ ФИЛЬТР: монеты с 24h change < -1% отбрасываются.
+ * ЖЁСТКИЕ ФИЛЬТРЫ:
+ * - 24h change < -1% → отбрасывается
+ * - 24h change > 30% но 4h ROC < 15% от 24h → exhausted pump, отбрасывается
  *
  * Веса:
- * 1. Momentum Score (0-40) — ROC 24h + краткосрочный импульс (ГЛАВНЫЙ)
+ * 1. Momentum Score (0-40) — recent 4h ROC (20) + acceleration (15) + fresh start (5)
  * 2. Trend Score (0-25) — бычье направление + сила тренда
  * 3. Tradability Score (0-25) — ликвидность + спред + волатильность
  * 4. Quality Score (0-10) — чистота ценового движения
  *
- * ИТОГО: 0-100 баллов. Растущие монеты >> стабильные >> падающие.
+ * ИТОГО: 0-100 баллов.
  */
 
 #include "pair_scanner_types.hpp"
@@ -29,7 +32,7 @@ public:
     PairScore score(const TickerData& ticker,
                     const std::vector<CandleData>& candles) const;
 
-    /// Momentum score (0-40): ROC 24h + краткосрочное ускорение + EMA slope
+    /// Momentum score (0-40): recent 4h ROC + acceleration + fresh start bonus
     double compute_momentum_score(const TickerData& ticker,
                                    const std::vector<CandleData>& candles) const;
 

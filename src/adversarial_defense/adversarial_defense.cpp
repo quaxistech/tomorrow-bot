@@ -59,6 +59,12 @@ constexpr int64_t kCooldownCleanupIntervalMs = 60'000;
     return DefenseAction::ReduceConfidence;
 }
 
+/// Версия без VetoTrade — для некритичных детекторов (микро-кап нормы)
+[[nodiscard]] DefenseAction severity_to_action_soft(double severity) {
+    if (severity >= 0.4) return DefenseAction::RaiseThreshold;
+    return DefenseAction::ReduceConfidence;
+}
+
 void validate_config(const DefenseConfig& config) {
     if (config.spread_explosion_threshold_bps <= 0.0) {
         throw std::invalid_argument("spread_explosion_threshold_bps must be > 0");
@@ -595,7 +601,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_spread_velocity(
     return ThreatDetection{
         .type = ThreatType::SpreadVelocitySpike,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Скорость расширения спреда " + format_double(velocity_bps_per_sec, 1) +
                   " bps/s превышает порог " +
                   format_double(config_.spread_velocity_threshold_bps_per_sec, 1),
@@ -619,7 +625,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_liquidity_vacuum
     return ThreatDetection{
         .type = ThreatType::LiquidityVacuum,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Минимальная глубина " + format_double(min_depth) +
                   " ниже порога " + format_double(config_.min_liquidity_depth),
         .detected_at = c.timestamp
@@ -711,7 +717,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_toxic_flow(
     return ThreatDetection{
         .type = ThreatType::ToxicFlow,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Токсичный поток: ratio=" + format_double(c.buy_sell_ratio) +
                   ", aggressive=" + format_double(c.aggressive_flow) +
                   ", vpin=" + format_double(c.vpin),
@@ -943,7 +949,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_depth_asymmetry(
     return ThreatDetection{
         .type = ThreatType::DepthAsymmetry,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Асимметрия глубины: bid=" + format_double(c.bid_depth) +
                   ", ask=" + format_double(c.ask_depth) +
                   ", ratio=" + format_double(ratio),
@@ -1022,7 +1028,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_anomalous_baseli
     return ThreatDetection{
         .type = ThreatType::AnomalousBaseline,
         .severity = max_severity,
-        .recommended_action = severity_to_action(max_severity),
+        .recommended_action = severity_to_action_soft(max_severity),
         .reason = "Z-score аномалия: " + anomaly_detail,
         .detected_at = c.timestamp
     };
@@ -1048,7 +1054,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_threat_escalatio
     return ThreatDetection{
         .type = ThreatType::ThreatEscalation,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Эскалация: " + std::to_string(mem.consecutive_threats) +
                   " consecutive threatening ticks",
         .detected_at = c.timestamp
@@ -1506,7 +1512,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_correlation_brea
     return ThreatDetection{
         .type = ThreatType::CorrelationBreakdown,
         .severity = severity,
-        .recommended_action = severity_to_action(severity),
+        .recommended_action = severity_to_action_soft(severity),
         .reason = "Распад корреляции: " + detail,
         .detected_at = c.timestamp
     };
@@ -1611,7 +1617,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_timeframe_diverg
     return ThreatDetection{
         .type = ThreatType::TimeframeDivergence,
         .severity = max_severity,
-        .recommended_action = severity_to_action(max_severity),
+        .recommended_action = severity_to_action_soft(max_severity),
         .reason = "Multi-TF расхождение: " + detail,
         .detected_at = c.timestamp
     };

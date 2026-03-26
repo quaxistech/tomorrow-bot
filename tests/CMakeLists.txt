@@ -22,6 +22,7 @@ add_subdirectory(unit/regime)
 add_subdirectory(unit/uncertainty)
 add_subdirectory(unit/strategy)
 add_subdirectory(unit/decision)
+add_subdirectory(unit/ai)
 
 add_subdirectory(unit/execution_alpha)
 add_subdirectory(unit/opportunity_cost)

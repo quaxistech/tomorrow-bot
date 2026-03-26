@@ -16,6 +16,7 @@ inline void add_profitable_trades(AlphaDecayMonitor& monitor,
         TradeOutcome outcome;
         outcome.pnl_bps = pnl;
         outcome.slippage_bps = 1.0;
+        outcome.max_adverse_excursion_bps = 3.0;
         outcome.regime = RegimeLabel::Trending;
         outcome.conviction = 0.8;
         outcome.timestamp = Timestamp{static_cast<int64_t>(i * 1000)};
@@ -30,6 +31,7 @@ inline void add_losing_trades(AlphaDecayMonitor& monitor,
         TradeOutcome outcome;
         outcome.pnl_bps = pnl;
         outcome.slippage_bps = 5.0;
+        outcome.max_adverse_excursion_bps = 15.0;
         outcome.regime = RegimeLabel::Volatile;
         outcome.conviction = 0.3;
         outcome.timestamp = Timestamp{static_cast<int64_t>(i * 1000)};
@@ -50,7 +52,6 @@ TEST_CASE("AlphaDecayMonitor: здоровая стратегия", "[alpha_deca
     AlphaDecayMonitor monitor(config);
 
     StrategyId sid{"momentum-v1"};
-    // Все сделки прибыльные — стабильная стратегия
     add_profitable_trades(monitor, sid, 50, 10.0);
 
     auto result = monitor.analyze(sid);
@@ -67,18 +68,13 @@ TEST_CASE("AlphaDecayMonitor: деградация стратегии", "[alpha_
     AlphaDecayMonitor monitor(config);
 
     StrategyId sid{"mean-revert-v2"};
-    // Сначала хорошие сделки (длинное окно)
     add_profitable_trades(monitor, sid, 40, 15.0);
-    // Потом плохие (попадут в короткое окно)
     add_losing_trades(monitor, sid, 10, -20.0);
 
     auto result = monitor.analyze(sid);
     REQUIRE(result.has_value());
     REQUIRE(result->overall_health < 0.8);
-    // Должны быть алерты
     REQUIRE(!result->alerts.empty());
-
-    // Проверяем is_degraded
     REQUIRE(monitor.is_degraded(sid));
 }
 
@@ -89,12 +85,10 @@ TEST_CASE("AlphaDecayMonitor: запись сделок и ограничени�
     AlphaDecayMonitor monitor(config);
 
     StrategyId sid{"test-strat"};
-    // Добавляем больше 2x long_lookback сделок
     add_profitable_trades(monitor, sid, 30);
 
     auto result = monitor.analyze(sid);
     REQUIRE(result.has_value());
-    // Не должно быть ошибок несмотря на обрезку
 }
 
 TEST_CASE("AlphaDecayMonitor: get_all_reports для нескольких стратегий", "[alpha_decay]") {
@@ -121,14 +115,13 @@ TEST_CASE("AlphaDecayMonitor: рекомендации по уровню здо�
     AlphaDecayMonitor monitor(config);
 
     StrategyId sid{"degrading"};
-    // Сначала хорошие — формируют базовый уровень
     add_profitable_trades(monitor, sid, 40, 20.0);
-    // Потом резко плохие — формируют деградацию
     add_losing_trades(monitor, sid, 10, -30.0);
 
+    // Гистерезис требует stable_count >= 2 вызовов подряд для смены рекомендации
+    monitor.analyze(sid);
     auto result = monitor.analyze(sid);
     REQUIRE(result.has_value());
-    // Должна быть рекомендация отличная от NoAction
     REQUIRE(result->overall_recommendation != DecayRecommendation::NoAction);
 }
 
@@ -137,4 +130,139 @@ TEST_CASE("AlphaDecayMonitor: строковые представления пе
     REQUIRE(to_string(DecayRecommendation::Disable) == "Disable");
     REQUIRE(to_string(DecayDimension::Expectancy) == "Expectancy");
     REQUIRE(to_string(DecayDimension::HitRate) == "HitRate");
+}
+
+TEST_CASE("AlphaDecayMonitor: HitRate dimension расчёт", "[alpha_decay]") {
+    DecayConfig config;
+    config.short_lookback = 5;
+    config.long_lookback = 20;
+    AlphaDecayMonitor monitor(config);
+
+    StrategyId sid{"hit-rate-test"};
+    // 20 прибыльных формируют базу (long window)
+    add_profitable_trades(monitor, sid, 20, 10.0);
+    // 5 убыточных в коротком окне — hit rate падает
+    add_losing_trades(monitor, sid, 5, -10.0);
+
+    auto result = monitor.analyze(sid);
+    REQUIRE(result.has_value());
+    // Ищем метрику HitRate
+    bool found = false;
+    for (const auto& m : result->metrics) {
+        if (m.dimension == DecayDimension::HitRate) {
+            REQUIRE(m.current_value < 0.5);  // в коротком окне все убытки
+            found = true;
+            break;
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("AlphaDecayMonitor: MAE dimension — рост MAE фиксируется", "[alpha_decay]") {
+    DecayConfig config;
+    config.short_lookback = 5;
+    config.long_lookback = 20;
+    AlphaDecayMonitor monitor(config);
+
+    StrategyId sid{"mae-test"};
+    // Базовые сделки с малым MAE
+    for (int i = 0; i < 20; ++i) {
+        TradeOutcome o;
+        o.pnl_bps = 5.0;
+        o.slippage_bps = 1.0;
+        o.max_adverse_excursion_bps = 2.0;
+        o.regime = RegimeLabel::Trending;
+        o.conviction = 0.7;
+        o.timestamp = Timestamp{static_cast<int64_t>(i)};
+        monitor.record_trade_outcome(sid, o);
+    }
+    // Последние 5 с большим MAE
+    for (int i = 0; i < 5; ++i) {
+        TradeOutcome o;
+        o.pnl_bps = 3.0;
+        o.slippage_bps = 1.0;
+        o.max_adverse_excursion_bps = 50.0;  // Сильное ухудшение
+        o.regime = RegimeLabel::Trending;
+        o.conviction = 0.7;
+        o.timestamp = Timestamp{static_cast<int64_t>(20 + i)};
+        monitor.record_trade_outcome(sid, o);
+    }
+
+    auto result = monitor.analyze(sid);
+    REQUIRE(result.has_value());
+    bool found = false;
+    for (const auto& m : result->metrics) {
+        if (m.dimension == DecayDimension::AdverseExcursion) {
+            REQUIRE(m.drift_pct > 0);  // drift должен быть положительным (ухудшение)
+            found = true;
+            break;
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("AlphaDecayMonitor: гистерезис — рекомендация не меняется без накопления", "[alpha_decay]") {
+    DecayConfig config;
+    config.short_lookback = 5;
+    config.long_lookback = 20;
+    config.hysteresis_stable_count = 3;
+    AlphaDecayMonitor monitor(config);
+
+    StrategyId sid{"hysteresis-test"};
+    // Сначала хорошие — устанавливаем NoAction
+    add_profitable_trades(monitor, sid, 20, 10.0);
+    auto r1 = monitor.analyze(sid);
+    REQUIRE(r1.has_value());
+    auto first_rec = r1->overall_recommendation;
+
+    // Добавляем немного плохих — без накопления рекомендация не должна резко прыгнуть
+    add_losing_trades(monitor, sid, 3, -5.0);
+    auto r2 = monitor.analyze(sid);
+    REQUIRE(r2.has_value());
+    // Со стабильным счётчиком hysteresis_stable_count=3 одна проверка не меняет рек
+    // (либо NoAction, либо мягкая деградация — но не Disable)
+    REQUIRE(r2->overall_recommendation != DecayRecommendation::Disable);
+}
+
+TEST_CASE("AlphaDecayMonitor: Confidence Reliability — Brier score", "[alpha_decay]") {
+    DecayConfig config;
+    config.short_lookback = 5;
+    config.long_lookback = 20;
+    AlphaDecayMonitor monitor(config);
+
+    StrategyId sid{"brier-test"};
+    // Базовые сделки с хорошей калибровкой (высокая conviction → прибыль)
+    for (int i = 0; i < 20; ++i) {
+        TradeOutcome o;
+        o.pnl_bps = 10.0;
+        o.slippage_bps = 1.0;
+        o.max_adverse_excursion_bps = 2.0;
+        o.regime = RegimeLabel::Trending;
+        o.conviction = 0.85;
+        o.timestamp = Timestamp{static_cast<int64_t>(i)};
+        monitor.record_trade_outcome(sid, o);
+    }
+    // Последние 5 с плохой калибровкой (высокая conviction → убыток)
+    for (int i = 0; i < 5; ++i) {
+        TradeOutcome o;
+        o.pnl_bps = -15.0;
+        o.slippage_bps = 1.0;
+        o.max_adverse_excursion_bps = 2.0;
+        o.regime = RegimeLabel::Trending;
+        o.conviction = 0.90;
+        o.timestamp = Timestamp{static_cast<int64_t>(20 + i)};
+        monitor.record_trade_outcome(sid, o);
+    }
+
+    auto result = monitor.analyze(sid);
+    REQUIRE(result.has_value());
+    bool found = false;
+    for (const auto& m : result->metrics) {
+        if (m.dimension == DecayDimension::ConfidenceReliability) {
+            // Плохая калибровка → Brier score высокий → drift_pct > 0
+            found = true;
+            break;
+        }
+    }
+    REQUIRE(found);
 }

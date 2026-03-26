@@ -6,9 +6,13 @@ namespace tb::decision {
 
 CommitteeDecisionEngine::CommitteeDecisionEngine(
     std::shared_ptr<logging::ILogger> logger,
-    std::shared_ptr<clock::IClock> clock)
+    std::shared_ptr<clock::IClock> clock,
+    double conviction_threshold,
+    double dominance_threshold)
     : logger_(std::move(logger))
     , clock_(std::move(clock))
+    , conviction_threshold_(conviction_threshold)
+    , dominance_threshold_(dominance_threshold)
 {}
 
 DecisionRecord CommitteeDecisionEngine::aggregate(
@@ -17,7 +21,8 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     const strategy_allocator::AllocationResult& allocation,
     const regime::RegimeSnapshot& regime,
     const world_model::WorldModelSnapshot& world,
-    const uncertainty::UncertaintySnapshot& uncertainty) {
+    const uncertainty::UncertaintySnapshot& uncertainty,
+    const std::optional<ai::AIAdvisoryResult>& ai_advisory) {
 
     DecisionRecord record;
     record.symbol = symbol;
@@ -68,6 +73,53 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         logger_->info("Decision", "Глобальное вето: " + record.rationale,
                       {{"symbol", symbol.get()}});
         return record;
+    }
+
+    // --- 1.5 AI Advisory processing ---
+    if (ai_advisory.has_value() && !ai_advisory->empty()) {
+        record.ai_advisories = ai_advisory->advisories;
+        record.ai_confidence_adjustment = ai_advisory->total_confidence_adjustment;
+        record.ai_veto_recommended = ai_advisory->has_veto;
+        record.advisory_state = ai_advisory->advisory_state;
+        record.advisory_size_multiplier = ai_advisory->advisory_size_multiplier;
+
+        // Жёсткое вето — полный запрет торговли
+        if (ai_advisory->advisory_state == ai::AdvisoryState::Veto) {
+            VetoReason veto;
+            veto.source = "ai_advisory";
+            veto.reason = "AI Advisory: высокая серьёзность предупреждений (severity=" +
+                std::to_string(ai_advisory->max_severity) + ")";
+            veto.severity = ai_advisory->max_severity;
+            record.global_vetoes.push_back(veto);
+            rationale << "AI ВЕТО: " << ai_advisory->advisories.front().insight << ". ";
+
+            record.trade_approved = false;
+            record.rationale = rationale.str();
+            for (const auto& intent : intents) {
+                StrategyContribution contrib;
+                contrib.strategy_id = intent.strategy_id;
+                contrib.intent = intent;
+                contrib.was_vetoed = true;
+                contrib.veto_reasons = record.global_vetoes;
+                record.contributions.push_back(std::move(contrib));
+            }
+            logger_->warn("Decision", "AI Advisory вето",
+                {{"symbol", symbol.get()},
+                 {"severity", std::to_string(ai_advisory->max_severity)},
+                 {"advisories_count", std::to_string(ai_advisory->advisories.size())}});
+            return record;
+        }
+
+        // Режим осторожности — торговля разрешена с уменьшенным размером позиции
+        if (ai_advisory->advisory_state == ai::AdvisoryState::Caution) {
+            rationale << "AI CAUTION: size_mult=" << ai_advisory->advisory_size_multiplier
+                      << " severity=" << ai_advisory->max_severity << ". ";
+            logger_->info("Decision", "AI Advisory режим осторожности",
+                {{"symbol", symbol.get()},
+                 {"severity", std::to_string(ai_advisory->max_severity)},
+                 {"size_mult", std::to_string(ai_advisory->advisory_size_multiplier)},
+                 {"ensemble_count", std::to_string(ai_advisory->ensemble_count)}});
+        }
     }
 
     // --- 2. Обработка каждого интента ---
@@ -134,7 +186,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
                           (buy_total + sell_total + 1e-10);
 
         // Если нет явного доминирования (< 60%) — вето, рынок неопределён
-        if (dominance < 0.60) {
+        if (dominance < dominance_threshold_) {
             VetoReason conflict_veto;
             conflict_veto.source = "conflict";
             conflict_veto.reason = "Конфликт сигналов без доминирующего направления";
@@ -185,13 +237,23 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     // weighted_score уже нормализован на число стратегий и становится
     // слишком малым при 4-5 активных стратегиях.
     // Weight используется только для ранжирования (кто из кандидатов лучший).
-    double threshold = kDefaultThreshold * uncertainty.threshold_multiplier;
+    double threshold = conviction_threshold_ * uncertainty.threshold_multiplier;
 
-    if (best.intent->conviction < threshold) {
+    // AI Advisory confidence adjustment: корректируем conviction лучшего кандидата
+    double ai_adj = 0.0;
+    if (ai_advisory.has_value()) {
+        ai_adj = ai_advisory->total_confidence_adjustment;
+    }
+    double adjusted_conviction = best.intent->conviction + ai_adj;
+
+    if (adjusted_conviction < threshold) {
         record.trade_approved = false;
         rationale << "Лучший кандидат (" << best.intent->strategy_id.get()
-                  << ") с conviction=" << best.intent->conviction
-                  << " ниже порога=" << threshold;
+                  << ") с conviction=" << best.intent->conviction;
+        if (ai_adj != 0.0) {
+            rationale << " (AI adj=" << ai_adj << " → " << adjusted_conviction << ")";
+        }
+        rationale << " ниже порога=" << threshold;
         record.rationale = rationale.str();
         logger_->debug("Decision", record.rationale, {{"symbol", symbol.get()}});
         return record;
@@ -202,18 +264,21 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     record.final_intent = *best.intent;
     // final_conviction хранит conviction стратегии (не weighted_score),
     // чтобы downstream consumers получали реальную уверенность [0,1]
-    record.final_conviction = best.intent->conviction;
+    record.final_conviction = adjusted_conviction;
     record.correlation_id = best.intent->correlation_id;
 
     rationale << "Одобрено: " << best.intent->strategy_id.get()
               << " [" << best.intent->signal_name << "]"
-              << " conviction=" << best.intent->conviction
-              << " weight=" << best.weight
+              << " conviction=" << best.intent->conviction;
+    if (ai_adj != 0.0) {
+        rationale << " (AI adj=" << ai_adj << " → " << adjusted_conviction << ")";
+    }
+    rationale << " weight=" << best.weight
               << " weighted_score=" << best.weighted_score
               << " threshold=" << threshold;
     record.rationale = rationale.str();
 
-    logger_->info("Decision", "Торговля одобрена: " + best.intent->strategy_id.get(),
+    logger_->debug("Decision", "Торговля одобрена: " + best.intent->strategy_id.get(),
                   {{"symbol", symbol.get()},
                    {"side", best.intent->side == Side::Buy ? "BUY" : "SELL"},
                    {"conviction", std::to_string(record.final_conviction)}});

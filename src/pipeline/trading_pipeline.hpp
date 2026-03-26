@@ -39,6 +39,7 @@
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
 #include "alpha_decay/alpha_decay_monitor.hpp"
+#include "ai/ai_advisory_engine.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
 #include "ml/microstructure_fingerprint.hpp"
@@ -49,6 +50,8 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <string>
 
 namespace tb::pipeline {
 
@@ -132,6 +135,9 @@ private:
     std::shared_ptr<strategy_allocator::IStrategyAllocator> strategy_allocator_;
     std::shared_ptr<decision::IDecisionAggregationEngine> decision_engine_;
     std::shared_ptr<defense::AdversarialMarketDefense> adversarial_defense_;
+
+    /// AI Advisory движок — правиловый/ML анализ рыночных условий
+    std::shared_ptr<ai::IAIAdvisoryEngine> ai_advisory_;
 
     // Исполнение
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
@@ -332,10 +338,23 @@ private:
     double current_position_conviction_{0.0};
     /// Thompson action при открытии текущей позиции (для корректной записи reward)
     ml::EntryAction current_entry_thompson_action_{ml::EntryAction::EnterNow};
-    /// Текущий множитель размера из alpha decay (1.0 = нет корректировки)
+
+    /// Проскальзывание при входе в текущую позицию (бп)
+    double current_position_slippage_bps_{0.0};
+
+    /// Max Adverse Excursion текущей позиции (бп, нарастающий итог)
+    double current_max_adverse_excursion_bps_{0.0};
+
+    /// Множители размера по стратегиям (per-strategy, не глобальный)
+    std::unordered_map<std::string, double> alpha_decay_size_mult_per_strategy_;
+    /// Добавки к порогу conviction по стратегиям
+    std::unordered_map<std::string, double> alpha_decay_threshold_adj_per_strategy_;
+
+    /// Глобальный множитель: минимум по всем стратегиям (для combined_size_mult)
     double alpha_decay_size_mult_{1.0};
-    /// Текущая добавка к порогу conviction из alpha decay
+    /// Глобальная добавка к порогу conviction (максимум по всем стратегиям)
     double alpha_decay_threshold_adj_{0.0};
+
     /// Timestamp последней проверки alpha decay (не проверять каждый тик)
     int64_t last_alpha_decay_check_ns_{0};
     /// Интервал проверки alpha decay (каждые 60 секунд)
@@ -348,6 +367,9 @@ private:
     void check_alpha_decay_feedback();
     /// Записать результат закрытой сделки в alpha decay monitor
     void record_trade_for_decay(const StrategyId& strategy_id, double pnl, double conviction);
+    /// Обновить MAE для текущей позиции на текущем тике
+    void update_current_mae(double current_price, bool is_long);
 };
+
 
 } // namespace tb::pipeline

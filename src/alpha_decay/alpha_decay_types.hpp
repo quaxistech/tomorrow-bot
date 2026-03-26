@@ -62,11 +62,12 @@ enum class DecayDimension {
 
 /// Результат одной сделки
 struct TradeOutcome {
-    double pnl_bps{0.0};           ///< P&L в базисных пунктах
-    double slippage_bps{0.0};      ///< Проскальзывание (бп)
-    RegimeLabel regime{RegimeLabel::Unclear}; ///< Режим рынка
-    double conviction{0.0};         ///< Убеждённость модели
-    Timestamp timestamp{0};         ///< Время сделки
+    double pnl_bps{0.0};                    ///< P&L в базисных пунктах
+    double slippage_bps{0.0};               ///< Проскальзывание (бп)
+    double max_adverse_excursion_bps{0.0};  ///< Максимальное неблагоприятное отклонение (бп)
+    RegimeLabel regime{RegimeLabel::Unclear};///< Режим рынка на момент входа
+    double conviction{0.0};                  ///< Убеждённость модели [0, 1]
+    Timestamp timestamp{0};                  ///< Время сделки
 };
 
 /// Метрика деградации по одному измерению
@@ -102,13 +103,19 @@ struct AlphaDecayReport {
 
 /// Конфигурация мониторинга деградации
 struct DecayConfig {
-    size_t short_lookback{20};              ///< Короткое окно (сделки)
-    size_t long_lookback{100};              ///< Длинное окно (сделки)
-    double expectancy_drift_threshold{0.3}; ///< Порог дрейфа ожидаемой доходности
-    double hit_rate_drift_threshold{0.15};  ///< Порог дрейфа процента прибыльных
-    double z_score_alert_threshold{2.0};    ///< Порог Z-скора для алерта
-    double health_critical_threshold{0.3};  ///< Критический порог здоровья
-    double health_warning_threshold{0.5};   ///< Предупредительный порог здоровья
+    size_t short_lookback{20};                  ///< Короткое окно (сделки)
+    size_t long_lookback{100};                  ///< Длинное окно (сделки)
+    size_t min_regime_samples{5};               ///< Минимум сделок для анализа по режиму
+    double expectancy_drift_threshold{0.3};     ///< Порог дрейфа ожидаемой доходности
+    double hit_rate_drift_threshold{0.15};      ///< Порог дрейфа процента прибыльных
+    double slippage_drift_threshold{0.3};       ///< Порог роста проскальзывания
+    double mae_drift_threshold{0.25};           ///< Порог роста MAE
+    double confidence_brier_threshold{0.35};    ///< Порог ухудшения Brier-скора
+    double z_score_alert_threshold{2.0};        ///< Порог Z-скора для алерта
+    double health_critical_threshold{0.3};      ///< Критический порог здоровья
+    double health_warning_threshold{0.5};       ///< Предупредительный порог здоровья
+    double health_shadow_threshold{0.15};       ///< Порог перевода в теневой режим
+    int hysteresis_stable_count{2};             ///< Кол-во подряд проверок для смены рекомендации
 };
 
 } // namespace tb::alpha_decay

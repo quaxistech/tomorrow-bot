@@ -5,7 +5,7 @@
 
 trading:
   mode: production
-  initial_capital: 10.0             # Реальный капитал на аккаунте ($10)
+  initial_capital: 30.0             # Реальный капитал на аккаунте (~$30 USDT)
 
 exchange:
   endpoint_rest: "https://api.bitget.com"
@@ -30,26 +30,43 @@ health:
   port: 8080
 
 risk:
-  max_position_notional: 10.0     # Только $10 на аккаунте
-  max_daily_loss_pct: 50.0        # Допустимый дневной убыток до $5 (тестирование)
-  max_drawdown_pct: 50.0          # Допустимая просадка до $5 (тестирование)
+  max_position_notional: 15.0      # До $15 на одну позицию (50% капитала)
+  max_daily_loss_pct: 10.0         # Макс. $3 дневной убыток
+  max_drawdown_pct: 20.0           # Макс. $6 просадка
   kill_switch_enabled: true
+
+# === Настройки движка принятия решений (высокий win-rate) ===
+decision:
+  min_conviction_threshold: 0.40    # Raised from 0.25: only trade strong signals (EMA-filtered strategies)
+  conflict_dominance_threshold: 0.68 # Требуем более чёткое доминирование
+
+# === Управление позицией (научные параметры) ===
+trading_params:
+  atr_stop_multiplier: 3.0          # Chandelier Exit 3.0 ATR — дать позициям дышать
+  max_loss_per_trade_pct: 2.0       # Safety net: макс. 2% капитала на сделку
+  breakeven_atr_threshold: 2.0      # Trailing после +2.0 ATR — не активировать на мини-профите
+  partial_tp_atr_threshold: 4.0     # TP на 4×ATR → R:R = 4.0/3.0 = 1.33
+  partial_tp_fraction: 0.5          # 50% позиции на частичном TP
+  max_hold_loss_minutes: 35         # 35 мин: больше времени для отскока (20 мин отрезало TRADOOR)
+  max_hold_absolute_minutes: 60     # 60 мин: дать тренду развиться
+  order_cooldown_seconds: 120       # 2 мин между ордерами
+  stop_loss_cooldown_seconds: 900   # 15 мин после стоп-лосса — не входить в тот же откат
 
 adversarial_defense:
   enabled: true
   fail_closed_on_invalid_data: true
-  auto_cooldown_on_veto: true
-  auto_cooldown_severity: 0.85
-  spread_explosion_threshold_bps: 60
-  spread_normal_bps: 15
-  min_liquidity_depth: 500
-  book_imbalance_threshold: 0.75
-  book_instability_threshold: 0.65
-  toxic_flow_ratio_threshold: 1.8
-  aggressive_flow_threshold: 0.8
-  vpin_toxic_threshold: 0.72
-  cooldown_duration_ms: 30000
-  post_shock_cooldown_ms: 60000
+  auto_cooldown_on_veto: false
+  auto_cooldown_severity: 0.92
+  spread_explosion_threshold_bps: 80
+  spread_normal_bps: 20
+  min_liquidity_depth: 300
+  book_imbalance_threshold: 0.82
+  book_instability_threshold: 0.75
+  toxic_flow_ratio_threshold: 2.5
+  aggressive_flow_threshold: 0.92
+  vpin_toxic_threshold: 0.82
+  cooldown_duration_ms: 15000
+  post_shock_cooldown_ms: 30000
   max_market_data_age_ns: 2000000000
   max_confidence_reduction: 0.75
   max_threshold_expansion: 1.5
@@ -68,8 +85,8 @@ adversarial_defense:
   # Threat memory
   threat_memory_alpha: 0.15
   threat_memory_residual_factor: 0.3
-  threat_escalation_ticks: 5
-  threat_escalation_boost: 0.1
+  threat_escalation_ticks: 20
+  threat_escalation_boost: 0.03
   # Depth asymmetry
   depth_asymmetry_threshold: 0.3
   # Cross-signal amplification
@@ -94,8 +111,31 @@ adversarial_defense:
 
 pair_selection:
   mode: auto                       # auto = автоматический выбор, manual = ручной список
-  top_n: 2                         # 2 пары = больше капитала на каждую ($15)
+  top_n: 3                         # 3 пары = ~$9 на каждую, больше прибыли за fee-drag
   min_volume_usdt: 500000          # Мин. 24ч объём (USDT)
   max_spread_bps: 50               # Макс. спред (базисных пунктов)
   rotation_interval_hours: 24      # Интервал ротации (часы)
-  blacklist: ""                    # Запрещённые пары (через запятую)
+  blacklist: "USDCUSDT,DAIUSDT,TUSDUSDT,USDPUSDT,FDUSDUSDT,EURCUSDT,PYUSDUSDT,BGBUSDT"
+
+ai_advisory:
+  enabled: true                      # AI Advisory включён
+  timeout_ms: 1000                   # Таймаут обработки (мс)
+  max_confidence_adjustment: 0.08    # Reduced: -0.15 was too punitive for micro-cap
+  veto_severity_threshold: 0.95      # Вето только при экстремальных угрозах
+  cooldown_ms: 10000                 # Кулдаун между advisory
+  # Пороги детекторов (ослаблены для micro-cap)
+  volatility_ratio_threshold: 3.5    # Micro-cap волатильность высокая — норма
+  rsi_overbought: 85.0              # Мемкоины часто RSI>80
+  rsi_oversold: 15.0                # Мемкоины часто RSI<20
+  spread_anomaly_bps: 80.0          # Широкий спред нормален
+  liquidity_ratio_min: 0.15         # Низкая ликвидность нормальна
+  vpin_toxic_threshold: 0.85        # VPIN высокий на thin markets
+  book_imbalance_threshold: 0.85    # Перекос стакана нормален
+  book_instability_threshold: 0.85  # Нестабильность стакана нормальна
+  # Hysteresis / ensemble / caution — настроено для micro-cap
+  caution_severity_threshold: 0.65   # Выше обычного — мемкоины генерируют больше шума
+  hysteresis_clear_ticks: 4          # 4 чистых тика для сброса (консервативно)
+  ensemble_escalation_count: 3       # 3+ детектора → эскалация severity
+  ensemble_escalation_bonus: 0.12    # Небольшой бонус: не хотим лишних вето
+  caution_size_multiplier: 0.4       # Режим осторожности: 40% размера позиции
+  use_severity_weighted_adjustment: true

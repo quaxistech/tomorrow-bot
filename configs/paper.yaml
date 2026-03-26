@@ -98,3 +98,42 @@ pair_selection:
   max_spread_bps: 50               # Макс. спред (базисных пунктов)
   rotation_interval_hours: 24      # Интервал ротации (часы)
   blacklist: ""                    # Запрещённые пары (через запятую)
+
+ai_advisory:
+  enabled: true                      # AI Advisory включён
+  timeout_ms: 2000                   # Таймаут обработки (мс)
+  max_confidence_adjustment: 0.5     # Макс. суммарная корректировка уверенности
+  veto_severity_threshold: 0.8       # Severity >= X → рекомендация вето
+  cooldown_ms: 5000                  # Кулдаун между одинаковыми рекомендациями (мс)
+  # Пороги детекторов
+  volatility_ratio_threshold: 3.0    # vol5/vol20 ratio для аномалии
+  rsi_overbought: 85.0              # RSI > X → перекупленность
+  rsi_oversold: 15.0                # RSI < X → перепроданность
+  spread_anomaly_bps: 50.0          # Спред > X bps → аномалия
+  liquidity_ratio_min: 0.3          # Ликвидность < X → предупреждение
+  vpin_toxic_threshold: 0.7         # VPIN > X → токсичный поток
+  book_imbalance_threshold: 0.7     # |imbalance| > X → перекос стакана
+  book_instability_threshold: 0.7   # instability > X → нестабильный стакан
+  # Hysteresis / ensemble / caution
+  caution_severity_threshold: 0.55   # Мягкий порог для режима осторожности
+  hysteresis_clear_ticks: 3          # 3 чистых тика для сброса состояния
+  ensemble_escalation_count: 3       # 3+ детектора → эскалация severity
+  ensemble_escalation_bonus: 0.15    # Бонус к severity при эскалации ансамбля
+  caution_size_multiplier: 0.5       # Режим осторожности: 50% размера позиции
+  use_severity_weighted_adjustment: true
+
+# Настройки решений (paper: дефолтные значения)
+decision:
+  min_conviction_threshold: 0.28
+  conflict_dominance_threshold: 0.60
+
+# Управление позицией (paper: дефолтные значения)
+trading_params:
+  atr_stop_multiplier: 2.0
+  max_loss_per_trade_pct: 1.0
+  breakeven_atr_threshold: 1.5
+  partial_tp_atr_threshold: 2.0
+  partial_tp_fraction: 0.5
+  max_hold_loss_minutes: 15
+  max_hold_absolute_minutes: 60
+  order_cooldown_seconds: 10

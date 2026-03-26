@@ -144,6 +144,50 @@ BITGET_PASSPHRASE=ваш_passphrase
 
 Бот автоматически загружает `.env` при запуске. Файл защищён `.gitignore`.
 
+### Настройка PostgreSQL (для Alpha Decay Persistence)
+
+Alpha Decay Monitor использует PostgreSQL для персистентности истории сделок и восстановления
+после перезапуска. Если `POSTGRES_URL` не задан — модуль работает только в памяти.
+
+```bash
+# Установка PostgreSQL (если не установлен)
+sudo apt install -y postgresql libpqxx-dev
+
+# Создание базы данных для бота
+sudo -u postgres psql -c "CREATE USER tbbot WITH PASSWORD 'your_password';"
+sudo -u postgres psql -c "CREATE DATABASE tomorrow_bot OWNER tbbot;"
+
+# Добавьте в .env:
+POSTGRES_URL=host=localhost dbname=tomorrow_bot user=tbbot password=your_password
+
+# Таблицы создаются автоматически при первом запуске:
+#   tb_journal   — append-only журнал сигналов и сделок
+#   tb_snapshots — снапшоты состояния стратегий
+```
+
+Схема таблиц (DDL создаётся автоматически):
+
+```sql
+-- Журнал событий (индексирован по типу и strategy_id)
+CREATE TABLE IF NOT EXISTS tb_journal (
+    id          BIGSERIAL PRIMARY KEY,
+    ts_ns       BIGINT NOT NULL,
+    entry_type  INT NOT NULL,
+    strategy_id TEXT NOT NULL DEFAULT '',
+    symbol      TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tj_type_strat ON tb_journal(entry_type, strategy_id);
+CREATE INDEX IF NOT EXISTS idx_tj_ts ON tb_journal(ts_ns);
+
+-- Снапшоты (последнее значение по ключу)
+CREATE TABLE IF NOT EXISTS tb_snapshots (
+    key         TEXT PRIMARY KEY,
+    ts_ns       BIGINT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+```
+
 ### Запуск
 
 ```bash
@@ -204,7 +248,7 @@ BITGET_PASSPHRASE=ваш_passphrase
 |-----------|----------|
 | **Chandelier Exit / Trailing Stop** | Адаптивный trailing stop: 3×ATR (сильный тренд ADX>30), 2.5× (умеренный), 1.5× (choppy). Breakeven при +1.5×ATR прибыли. Partial TP 50% при +2×ATR. Стоп только подтягивается, никогда не откатывается |
 | **Volatility Targeting** | Динамический сайзинг: size = target_vol / realized_vol × Kelly × regime_mult. 13 режимов с множителями 0.1–1.0. Kelly fraction = 0.25 (консервативно) |
-| **Alpha Decay Feedback** | Мониторинг деградации стратегий. Recommendations: ReduceWeight(×0.7), ReduceSize(×0.5, +0.05 threshold), RaiseThresholds(+0.10), Disable(×0.0). Проверка каждые 60с |
+| **Alpha Decay Feedback** | Профессиональный мониторинг деградации по 7 измерениям: Expectancy, HitRate, SlippageAdjusted, ExecutionQuality, RegimeConditioned, ConfidenceReliability (Brier score), AdverseExcursion (MAE). Per-strategy множители размера/порогов. Гистерезис (stable_count≥2). Экспорт метрик в Prometheus. Персистентность истории в PostgreSQL. Рекомендации: ReduceWeight(×0.7), ReduceSize(×0.5, +0.05 threshold), RaiseThresholds(+0.10), Disable(×0.0). Проверка каждые 60с |
 | **HTF Real-Time Update** | Пересчёт HTF индикаторов каждый час через REST + экстренное обновление при движении > 3×ATR |
 
 #### Уровень 2 — Продвинутые индикаторы
@@ -421,7 +465,7 @@ tomorrow-bot/
 │   ├── persistence/            # EventJournal + SnapshotStore (IStorageAdapter)
 │   ├── replay/                 # ReplayEngine с state machine
 │   ├── telemetry/              # Исследовательская телеметрия (envelope)
-│   ├── alpha_decay/            # Мониторинг деградации (expectancy, hit-rate, slippage)
+│   ├── alpha_decay/            # Мониторинг деградации (7 измерений: expectancy, hit-rate, slippage, MAE, Brier, regime, execution quality). PostgreSQL persistence
 │   ├── shadow/                 # Теневые решения, гипотетический PnL
 │   ├── champion_challenger/    # A/B тестирование стратегий, promotion
 │   ├── self_diagnosis/         # Объяснение решений (human + machine readable)

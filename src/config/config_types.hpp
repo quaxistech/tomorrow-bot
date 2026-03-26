@@ -9,11 +9,14 @@
 #pragma once
 
 #include "common/types.hpp"
+#include "ai/ai_advisory_types.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
 
 namespace tb::config {
+
+using ai::AIAdvisoryConfig;
 
 /// Настройки подключения к бирже
 struct ExchangeConfig {
@@ -149,6 +152,25 @@ struct AdversarialDefenseConfig {
     int64_t audit_log_max_size{10'000};
 };
 
+/// Настройки движка принятия решений (conviction, конфликт-разрешение)
+struct DecisionConfig {
+    double min_conviction_threshold{0.28};      ///< Мин. conviction для одобрения сделки
+    double conflict_dominance_threshold{0.60};  ///< Мин. доминирование одного направления (BUY/SELL) при конфликте
+};
+
+/// Настройки управления позицией (стоп-лосс, тейк-профит, тайминг)
+struct TradingParamsConfig {
+    double atr_stop_multiplier{2.0};            ///< Множитель ATR для trailing stop (Chandelier Exit)
+    double max_loss_per_trade_pct{1.0};         ///< Макс. убыток на сделку (% от капитала)
+    double breakeven_atr_threshold{1.5};        ///< ATR-профит для переноса стопа в breakeven
+    double partial_tp_atr_threshold{2.0};       ///< ATR-профит для частичного тейк-профита
+    double partial_tp_fraction{0.5};            ///< Доля позиции для частичного TP (0.5 = 50%)
+    int max_hold_loss_minutes{15};              ///< Макс. удержание убыточной позиции (минуты)
+    int max_hold_absolute_minutes{60};          ///< Макс. удержание любой позиции (минуты)
+    int order_cooldown_seconds{10};             ///< Кулдаун между ордерами (секунды)
+    int stop_loss_cooldown_seconds{300};        ///< Кулдаун после стоп-лосса (секунды)
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
     ExchangeConfig       exchange;       ///< Настройки биржи
@@ -159,6 +181,9 @@ struct AppConfig {
     TradingModeConfig    trading;        ///< Настройки режима торговли
     PairSelectionConfig  pair_selection; ///< Настройки выбора торговых пар
     AdversarialDefenseConfig adversarial_defense; ///< Защита от враждебных market conditions
+    AIAdvisoryConfig     ai_advisory;    ///< AI Advisory — правиловый/ML анализ
+    DecisionConfig       decision;       ///< Настройки движка принятия решений
+    TradingParamsConfig  trading_params;  ///< Настройки управления позицией
     std::string          config_hash;    ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

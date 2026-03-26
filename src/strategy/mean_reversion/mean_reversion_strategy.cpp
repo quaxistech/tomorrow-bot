@@ -39,6 +39,13 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
         return std::nullopt;
     }
 
+    // REGIME DETECTION: Mean reversion ONLY works in ranging markets (ADX < 25).
+    // ADX >= 40: block only in very strong trends
+    // ADX 25-40 allowed — inner strong_downtrend filter checks MACD for safety
+    if (tech.adx_valid && tech.adx >= 40.0) {
+        return std::nullopt;
+    }
+
     TradeIntent intent;
     intent.strategy_id = StrategyId("mean_reversion");
     intent.strategy_version = StrategyVersion(1);
@@ -54,9 +61,9 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
         ? (last_price - tech.bb_lower) / bb_range
         : 0.5;
 
-    // BUY: цена в нижних 30% BB + RSI < 40 (расширенная зона перепроданности)
-    // На 1m таймфрейме цена редко доходит до экстремумов BB — используем мягкий порог.
-    if (bb_pos < 0.30 && tech.rsi_14 < 40.0) {
+    // BUY: цена в нижних 35% BB + RSI < 43 (расширенная зона для 1m таймфрейма)
+    // На 1m RSI редко доходит до экстремумов — используем адаптивный порог
+    if (bb_pos < 0.35 && tech.rsi_14 < 43.0) {
 
         // === Фильтр 1: Сильный нисходящий тренд ===
         // ADX > 30 + EMA20 < EMA50 = выраженный нисходящий тренд.
@@ -95,10 +102,10 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
         intent.limit_price = Price(tech.bb_lower);
 
         // Conviction: градуированный расчёт на основе глубины перепроданности.
-        // rsi_factor: чем ниже RSI, тем сильнее сигнал (0.0 при RSI=40, 1.0 при RSI=15)
-        // bb_factor: чем ниже bb_pos, тем сильнее сигнал (0.0 при 0.30, ~1.0 при 0.0)
-        double rsi_factor = (40.0 - tech.rsi_14) / 25.0;
-        double bb_factor = (0.30 - bb_pos) / 0.30;
+        // rsi_factor: чем ниже RSI, тем сильнее сигнал (0.0 при RSI=43, 1.0 при RSI=15)
+        // bb_factor: чем ниже bb_pos, тем сильнее сигнал (0.0 при 0.35, ~1.0 при 0.0)
+        double rsi_factor = (43.0 - tech.rsi_14) / 28.0;
+        double bb_factor = (0.35 - bb_pos) / 0.35;
         double base_conviction = std::clamp(0.25 + 0.35 * rsi_factor + 0.25 * bb_factor, 0.0, 1.0);
 
         // Mean reversion — контр-трендовая стратегия.
@@ -112,7 +119,7 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
         intent.entry_score = intent.conviction * 0.85;
         intent.urgency = std::min(1.0, (40.0 - tech.rsi_14) / 25.0);
 
-        logger_->info("MeanReversion", "Сигнал BUY (перепроданность)",
+        logger_->debug("MeanReversion", "Сигнал BUY (перепроданность)",
                        {{"rsi", std::to_string(tech.rsi_14)},
                         {"bb_pos", std::to_string(bb_pos)},
                         {"conviction", std::to_string(intent.conviction)},
@@ -122,7 +129,7 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
     }
 
     // === SELL: Градуированный вход по mean reversion (перекупленность) ===
-    if (bb_pos > 0.80 && tech.rsi_14 > 65.0) {
+    if (bb_pos > 0.75 && tech.rsi_14 > 60.0) {
 
         // === Фильтр: Сильный восходящий тренд ===
         if (tech.ema_valid && tech.adx_valid) {
@@ -157,8 +164,8 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
         intent.limit_price = Price(tech.bb_upper);
 
         // Conviction: симметрично BUY
-        double rsi_factor = (tech.rsi_14 - 65.0) / 20.0;
-        double bb_factor = (bb_pos - 0.80) / 0.30;
+        double rsi_factor = (tech.rsi_14 - 60.0) / 25.0;
+        double bb_factor = (bb_pos - 0.75) / 0.30;
         double base_conviction = std::clamp(0.25 + 0.35 * rsi_factor + 0.25 * bb_factor, 0.0, 1.0);
 
         // Бонус за медвежий MACD
@@ -168,9 +175,9 @@ std::optional<TradeIntent> MeanReversionStrategy::evaluate(const StrategyContext
 
         intent.conviction = base_conviction;
         intent.entry_score = intent.conviction * 0.85;
-        intent.urgency = std::min(1.0, (tech.rsi_14 - 65.0) / 25.0);
+        intent.urgency = std::min(1.0, (tech.rsi_14 - 60.0) / 30.0);
 
-        logger_->info("MeanReversion", "Сигнал SELL (перекупленность)",
+        logger_->debug("MeanReversion", "Сигнал SELL (перекупленность)",
                        {{"rsi", std::to_string(tech.rsi_14)},
                         {"bb_pos", std::to_string(bb_pos)},
                         {"conviction", std::to_string(intent.conviction)}});

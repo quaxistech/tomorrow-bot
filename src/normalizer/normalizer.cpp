@@ -274,8 +274,9 @@ std::optional<NormalizedTrade> BitgetNormalizer::parse_trade(
     trade.price    = tb::Price{to_double(raw.price)};
     trade.size     = tb::Quantity{to_double(raw.size)};
     trade.side     = (raw.side == "sell") ? tb::Side::Sell : tb::Side::Buy;
-    // Агрессор определяется по стороне: в Bitget маркет-тейкер всегда агрессор
-    trade.is_aggressive = true;
+    // Aggressive = sell-side taker (market sell hitting bids = selling pressure)
+    // aggressive_flow > 0.5 means more sell pressure, < 0.5 means buy pressure
+    trade.is_aggressive = (raw.side == "sell");
 
     return trade;
 }

@@ -68,49 +68,115 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
     intent.symbol = context.features.symbol;
     intent.generated_at = clock_->now();
 
+    // EMA trend context — breakout against trend is high-risk
+    bool trend_bearish = false;
+    bool trend_bullish = false;
+    if (tech.ema_valid) {
+        trend_bearish = (tech.ema_20 < tech.ema_50);
+        trend_bullish = (tech.ema_20 > tech.ema_50);
+    }
+
     // Пробой вверх: цена выше верхней BB
     if (last_price > tech.bb_upper) {
+        // Block BUY breakout against BEAR trend — likely false breakout
+        if (trend_bearish) {
+            logger_->debug("Breakout", "BUY пробой отклонён — медвежий тренд EMA",
+                {{"ema20", std::to_string(tech.ema_20)},
+                 {"ema50", std::to_string(tech.ema_50)}});
+            return std::nullopt;
+        }
+
+        // Volume confirmation: OBV must confirm breakout direction
+        // Reference: Katz & McCormick — breakout without volume = false breakout
+        bool volume_ok = true;
+        if (tech.obv_valid && tech.obv_normalized < 0.0) {
+            volume_ok = false;  // OBV diverging from price → likely false breakout
+        }
+        if (!volume_ok) {
+            logger_->debug("Breakout", "Пробой вверх отклонён — OBV не подтверждает",
+                {{"obv_norm", std::to_string(tech.obv_normalized)}});
+            return std::nullopt;
+        }
+
+        // ADX confirmation: ADX should be rising (trend forming)
+        // ADX < 20 during breakout = weak, likely to fail
+        if (tech.adx_valid && tech.adx < 20.0) {
+            logger_->debug("Breakout", "Пробой вверх отклонён — ADX слишком низкий",
+                {{"adx", std::to_string(tech.adx)}});
+            return std::nullopt;
+        }
+
         intent.side = Side::Buy;
-        intent.signal_name = "bb_breakout_up";
+        intent.signal_name = "bb_breakout_up_v2";
         intent.reason_codes = {"compression_detected", "expansion_confirmed", "price_above_upper_bb"};
 
         // Conviction: сила расширения
         double expansion_strength = std::min(1.0, (current_bw / min_bw - 1.0) / 3.0);
-        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 1.0);
+        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 0.85);
 
         // Подтверждение momentum
         if (tech.momentum_valid && tech.momentum_5 > 0.0) {
-            intent.conviction = std::min(1.0, intent.conviction + 0.15);
+            intent.conviction = std::min(0.85, intent.conviction + 0.15);
             intent.reason_codes.push_back("momentum_confirmed");
         }
 
-        intent.entry_score = intent.conviction * 0.75;
+        // ADX strength bonus
+        if (tech.adx_valid && tech.adx > 30.0) {
+            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+            intent.reason_codes.push_back("strong_trend");
+        }
+
+        // Volume confirmation bonus
+        if (tech.obv_valid && tech.obv_normalized > 0.5) {
+            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+            intent.reason_codes.push_back("volume_surge");
+        }
+
+        intent.entry_score = intent.conviction * 0.80;
         intent.urgency = 0.8; // Пробои срочные
 
-        logger_->debug("Breakout", "Сигнал BUY (пробой вверх)",
+        logger_->info("Breakout", "Сигнал BUY v2 (пробой вверх)",
                        {{"bandwidth_expansion", std::to_string(current_bw / min_bw)},
-                        {"conviction", std::to_string(intent.conviction)}});
+                        {"conviction", std::to_string(intent.conviction)},
+                        {"adx", std::to_string(tech.adx_valid ? tech.adx : -1.0)}});
         return intent;
     }
 
     // Пробой вниз: цена ниже нижней BB
     if (last_price < tech.bb_lower) {
+        // Volume confirmation for downside breakout
+        bool volume_ok = true;
+        if (tech.obv_valid && tech.obv_normalized > 0.0) {
+            volume_ok = false;  // OBV diverging
+        }
+        if (!volume_ok) {
+            return std::nullopt;
+        }
+
+        if (tech.adx_valid && tech.adx < 20.0) {
+            return std::nullopt;
+        }
+
         intent.side = Side::Sell;
-        intent.signal_name = "bb_breakout_down";
+        intent.signal_name = "bb_breakout_down_v2";
         intent.reason_codes = {"compression_detected", "expansion_confirmed", "price_below_lower_bb"};
 
         double expansion_strength = std::min(1.0, (current_bw / min_bw - 1.0) / 3.0);
-        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 1.0);
+        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 0.85);
 
         if (tech.momentum_valid && tech.momentum_5 < 0.0) {
-            intent.conviction = std::min(1.0, intent.conviction + 0.15);
+            intent.conviction = std::min(0.85, intent.conviction + 0.15);
             intent.reason_codes.push_back("momentum_confirmed");
         }
 
-        intent.entry_score = intent.conviction * 0.75;
+        if (tech.adx_valid && tech.adx > 30.0) {
+            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+        }
+
+        intent.entry_score = intent.conviction * 0.80;
         intent.urgency = 0.8;
 
-        logger_->debug("Breakout", "Сигнал SELL (пробой вниз)",
+        logger_->info("Breakout", "Сигнал SELL v2 (пробой вниз)",
                        {{"bandwidth_expansion", std::to_string(current_bw / min_bw)},
                         {"conviction", std::to_string(intent.conviction)}});
         return intent;

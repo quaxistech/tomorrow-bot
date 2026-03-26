@@ -112,13 +112,14 @@ ScanResult PairScanner::scan() {
         return result;
     }
 
-    // Шаг 4: Для каждого кандидата загружаем свечи и считаем скоринг
-    // КРИТИЧЕСКИ ВАЖНО: сортируем по 24h change (убывание), чтобы
-    // РАСТУЩИЕ монеты получили приоритет на загрузку свечей.
-    // Раньше сортировали по volume — из-за этого BTC всегда был в топ-30.
+    // Шаг 4: Для каждого кандидата загружаем свечи и считаем скоринг.
+    // Сортируем по 24h VOLUME (убывание): берём самые ликвидные пары
+    // для загрузки свечей. Не сортируем по 24h change — это отбирает
+    // монеты, которые УЖЕ pumped (selection bias / buying at peaks).
+    // Научный отбор (ускорение, fresh start) делается в scorer.
     std::sort(candidates.begin(), candidates.end(),
         [](const TickerData& a, const TickerData& b) {
-            return a.change_24h_pct > b.change_24h_pct;
+            return a.quote_volume_24h > b.quote_volume_24h;
         });
 
     const size_t kMaxCandidatesForCandles = 30;
@@ -162,8 +163,8 @@ ScanResult PairScanner::scan() {
         result.selected.push_back(result.ranked_pairs[i].symbol);
     }
 
-    // Лог результатов (формат v3: Mom/Trend/Trade/Qual)
-    logger_->info(kComp, "=== РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ v3 (ТОЛЬКО РАСТУЩИЕ) ===");
+    // Лог результатов (формат v4: Mom/Trend/Trade/Qual — acceleration-based)
+    logger_->info(kComp, "=== РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ v4 (ACCELERATION-BASED) ===");
     for (int i = 0; i < static_cast<int>(result.ranked_pairs.size()) && i < 10; ++i) {
         const auto& s = result.ranked_pairs[i];
         std::ostringstream oss;

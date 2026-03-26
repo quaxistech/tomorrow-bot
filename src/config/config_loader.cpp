@@ -344,6 +344,92 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.adversarial_defense.audit_log_max_size = static_cast<int64_t>(parse_double(
         get_value(kv, "adversarial_defense.audit_log_max_size", "10000"), 10000.0));
 
+    // Секция ai_advisory
+    auto ai_enabled_str = get_value(kv, "ai_advisory.enabled", "false");
+    cfg.ai_advisory.enabled = (ai_enabled_str == "true" || ai_enabled_str == "1");
+    cfg.ai_advisory.timeout_ms = static_cast<int>(parse_double(
+        get_value(kv, "ai_advisory.timeout_ms", "2000"), 2000.0));
+    cfg.ai_advisory.max_confidence_adjustment = parse_double(
+        get_value(kv, "ai_advisory.max_confidence_adjustment", "0.5"), 0.5);
+    cfg.ai_advisory.veto_severity_threshold = parse_double(
+        get_value(kv, "ai_advisory.veto_severity_threshold", "0.8"), 0.8);
+    cfg.ai_advisory.cooldown_ms = static_cast<int64_t>(parse_double(
+        get_value(kv, "ai_advisory.cooldown_ms", "5000"), 5000.0));
+    // Detector thresholds
+    cfg.ai_advisory.thresholds.volatility_ratio_threshold = parse_double(
+        get_value(kv, "ai_advisory.volatility_ratio_threshold", "3.0"), 3.0);
+    cfg.ai_advisory.thresholds.volatility_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.volatility_confidence_adj", "-0.3"), -0.3);
+    cfg.ai_advisory.thresholds.rsi_overbought = parse_double(
+        get_value(kv, "ai_advisory.rsi_overbought", "85.0"), 85.0);
+    cfg.ai_advisory.thresholds.rsi_oversold = parse_double(
+        get_value(kv, "ai_advisory.rsi_oversold", "15.0"), 15.0);
+    cfg.ai_advisory.thresholds.rsi_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.rsi_confidence_adj", "-0.15"), -0.15);
+    cfg.ai_advisory.thresholds.spread_anomaly_bps = parse_double(
+        get_value(kv, "ai_advisory.spread_anomaly_bps", "50.0"), 50.0);
+    cfg.ai_advisory.thresholds.spread_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.spread_confidence_adj", "-0.25"), -0.25);
+    cfg.ai_advisory.thresholds.liquidity_ratio_min = parse_double(
+        get_value(kv, "ai_advisory.liquidity_ratio_min", "0.3"), 0.3);
+    cfg.ai_advisory.thresholds.liquidity_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.liquidity_confidence_adj", "-0.2"), -0.2);
+    cfg.ai_advisory.thresholds.vpin_toxic_threshold = parse_double(
+        get_value(kv, "ai_advisory.vpin_toxic_threshold", "0.7"), 0.7);
+    cfg.ai_advisory.thresholds.vpin_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.vpin_confidence_adj", "-0.25"), -0.25);
+    cfg.ai_advisory.thresholds.book_imbalance_threshold = parse_double(
+        get_value(kv, "ai_advisory.book_imbalance_threshold", "0.7"), 0.7);
+    cfg.ai_advisory.thresholds.book_imbalance_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.book_imbalance_confidence_adj", "-0.15"), -0.15);
+    cfg.ai_advisory.thresholds.book_instability_threshold = parse_double(
+        get_value(kv, "ai_advisory.book_instability_threshold", "0.7"), 0.7);
+    cfg.ai_advisory.thresholds.book_instability_confidence_adj = parse_double(
+        get_value(kv, "ai_advisory.book_instability_confidence_adj", "-0.15"), -0.15);
+    // Hysteresis, ensemble escalation, caution mode
+    cfg.ai_advisory.caution_severity_threshold = parse_double(
+        get_value(kv, "ai_advisory.caution_severity_threshold", "0.55"), 0.55);
+    cfg.ai_advisory.hysteresis_clear_ticks = static_cast<int>(parse_double(
+        get_value(kv, "ai_advisory.hysteresis_clear_ticks", "3"), 3.0));
+    cfg.ai_advisory.ensemble_escalation_count = static_cast<int>(parse_double(
+        get_value(kv, "ai_advisory.ensemble_escalation_count", "3"), 3.0));
+    cfg.ai_advisory.ensemble_escalation_bonus = parse_double(
+        get_value(kv, "ai_advisory.ensemble_escalation_bonus", "0.15"), 0.15);
+    cfg.ai_advisory.caution_size_multiplier = parse_double(
+        get_value(kv, "ai_advisory.caution_size_multiplier", "0.5"), 0.5);
+    cfg.ai_advisory.use_severity_weighted_adjustment = (
+        get_value(kv, "ai_advisory.use_severity_weighted_adjustment", "true") != "false");
+
+    // ============================================================
+    // Decision Engine
+    // ============================================================
+    cfg.decision.min_conviction_threshold = parse_double(
+        get_value(kv, "decision.min_conviction_threshold", "0.28"), 0.28);
+    cfg.decision.conflict_dominance_threshold = parse_double(
+        get_value(kv, "decision.conflict_dominance_threshold", "0.60"), 0.60);
+
+    // ============================================================
+    // Trading Params (position management)
+    // ============================================================
+    cfg.trading_params.atr_stop_multiplier = parse_double(
+        get_value(kv, "trading_params.atr_stop_multiplier", "2.0"), 2.0);
+    cfg.trading_params.max_loss_per_trade_pct = parse_double(
+        get_value(kv, "trading_params.max_loss_per_trade_pct", "1.0"), 1.0);
+    cfg.trading_params.breakeven_atr_threshold = parse_double(
+        get_value(kv, "trading_params.breakeven_atr_threshold", "1.5"), 1.5);
+    cfg.trading_params.partial_tp_atr_threshold = parse_double(
+        get_value(kv, "trading_params.partial_tp_atr_threshold", "2.0"), 2.0);
+    cfg.trading_params.partial_tp_fraction = parse_double(
+        get_value(kv, "trading_params.partial_tp_fraction", "0.5"), 0.5);
+    cfg.trading_params.max_hold_loss_minutes = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.max_hold_loss_minutes", "15"), 15));
+    cfg.trading_params.max_hold_absolute_minutes = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.max_hold_absolute_minutes", "60"), 60));
+    cfg.trading_params.order_cooldown_seconds = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.order_cooldown_seconds", "10"), 10));
+    cfg.trading_params.stop_loss_cooldown_seconds = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.stop_loss_cooldown_seconds", "300"), 300));
+
     // Валидация
     ConfigValidator validator;
     auto validation = validator.validate(cfg);

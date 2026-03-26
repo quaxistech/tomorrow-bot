@@ -98,3 +98,26 @@ pair_selection:
   max_spread_bps: 50
   rotation_interval_hours: 24
   blacklist: ""
+
+ai_advisory:
+  enabled: true                      # AI Advisory включён
+  timeout_ms: 2000                   # Таймаут обработки (мс)
+  max_confidence_adjustment: 0.5     # Макс. суммарная корректировка уверенности
+  veto_severity_threshold: 0.8       # Severity >= X → рекомендация вето
+  cooldown_ms: 5000                  # Кулдаун между одинаковыми рекомендациями (мс)
+  # Пороги детекторов
+  volatility_ratio_threshold: 3.0    # vol5/vol20 ratio для аномалии
+  rsi_overbought: 85.0              # RSI > X → перекупленность
+  rsi_oversold: 15.0                # RSI < X → перепроданность
+  spread_anomaly_bps: 50.0          # Спред > X bps → аномалия
+  liquidity_ratio_min: 0.3          # Ликвидность < X → предупреждение
+  vpin_toxic_threshold: 0.7         # VPIN > X → токсичный поток
+  book_imbalance_threshold: 0.7     # |imbalance| > X → перекос стакана
+  book_instability_threshold: 0.7   # instability > X → нестабильный стакан
+  # Hysteresis / ensemble / caution
+  caution_severity_threshold: 0.55
+  hysteresis_clear_ticks: 3
+  ensemble_escalation_count: 3
+  ensemble_escalation_bonus: 0.15
+  caution_size_multiplier: 0.5
+  use_severity_weighted_adjustment: true
