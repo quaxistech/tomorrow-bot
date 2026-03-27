@@ -23,6 +23,17 @@ public:
         double uncertainty_size_multiplier
     ) = 0;
 
+    /// Рассчитать размер позиции с полным контекстом (preferred API)
+    virtual SizingResult compute_size_v2(
+        const strategy::TradeIntent& intent,
+        const portfolio::PortfolioSnapshot& portfolio,
+        const AllocationContext& context,
+        double uncertainty_size_multiplier
+    ) {
+        // Default: delegate to old API for backward compat
+        return compute_size(intent, portfolio, uncertainty_size_multiplier);
+    }
+
     /// Установить рыночный контекст для volatility targeting (вызывается перед compute_size)
     virtual void set_market_context(double realized_vol_annualized,
                                     regime::DetailedRegime current_regime,
@@ -50,6 +61,15 @@ public:
         double kelly_fraction{0.25};            ///< Доля от Kelly (четверть = консервативно)
         double min_size_multiplier{0.1};        ///< Минимальный множитель размера (10% от базового)
         double max_size_multiplier{2.0};        ///< Максимальный множитель (200% от базового)
+
+        // === Drawdown Scaling ===
+        double drawdown_scale_start_pct{5.0};     ///< Начало снижения размера при просадке (%)
+        double drawdown_scale_max_pct{15.0};      ///< Полная остановка при просадке (%)
+        double drawdown_min_size_fraction{0.1};   ///< Минимальная доля размера при макс просадке
+
+        // === Liquidity ===
+        double max_adv_participation_pct{0.02};   ///< Макс доля от среднедневного объёма (2%)
+        double max_book_participation_pct{0.10};  ///< Макс доля от глубины стакана (10%)
     };
 
     HierarchicalAllocator(Config config,
@@ -58,6 +78,13 @@ public:
     SizingResult compute_size(
         const strategy::TradeIntent& intent,
         const portfolio::PortfolioSnapshot& portfolio,
+        double uncertainty_size_multiplier
+    ) override;
+
+    SizingResult compute_size_v2(
+        const strategy::TradeIntent& intent,
+        const portfolio::PortfolioSnapshot& portfolio,
+        const AllocationContext& context,
         double uncertainty_size_multiplier
     ) override;
 
@@ -80,8 +107,26 @@ private:
     /// Рассчитать множитель на основе волатильности, Kelly-критерия и режима
     double compute_volatility_multiplier() const;
 
+    /// Рассчитать множитель vol targeting из AllocationContext (без stateful полей)
+    double compute_volatility_multiplier(const AllocationContext& ctx) const;
+
     /// Рассчитать поправку на режим рынка
     double compute_regime_multiplier() const;
+
+    /// Рассчитать поправку на режим рынка из AllocationContext
+    double compute_regime_multiplier(regime::DetailedRegime regime) const;
+
+    /// Рассчитать масштаб размера при просадке (линейная интерполяция)
+    double compute_drawdown_scale(double current_drawdown_pct) const;
+
+    /// Рассчитать лимит ликвидности (нотионал)
+    double compute_liquidity_cap(double price, const AllocationContext& context) const;
+
+    /// Применить exchange filters к результату
+    void apply_exchange_filters(double& qty, double price,
+                                const ExchangeFilters& filters,
+                                double available_capital,
+                                SizingResult& result) const;
 
     Config config_;                            ///< Конфигурация аллокатора
     std::shared_ptr<logging::ILogger> logger_; ///< Логгер

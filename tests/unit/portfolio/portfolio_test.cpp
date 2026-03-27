@@ -218,3 +218,133 @@ TEST_CASE("Portfolio: Снимок содержит все позиции", "[po
     REQUIRE(snap.total_capital == 10000.0);
     REQUIRE(snap.exposure.open_positions_count == 2);
 }
+
+// ==================== Phase 1: Cash Reserve Accounting ====================
+
+TEST_CASE("Portfolio: reserve_cash уменьшает available_cash", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    bool ok = portfolio->reserve_cash(
+        OrderId("ORD-1"), Symbol("BTCUSDT"), 500.0, 0.5, StrategyId("test"));
+    REQUIRE(ok);
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.reserved_for_orders, WithinAbs(500.5, 0.01));
+    REQUIRE_THAT(ledger.available_cash, WithinAbs(499.5, 0.01));
+}
+
+TEST_CASE("Portfolio: reserve_cash отклоняет при недостатке средств", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(100.0);
+
+    bool ok = portfolio->reserve_cash(
+        OrderId("ORD-1"), Symbol("BTCUSDT"), 200.0, 0.2, StrategyId("test"));
+    REQUIRE_FALSE(ok);
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.reserved_for_orders, WithinAbs(0.0, 0.01));
+    REQUIRE_THAT(ledger.available_cash, WithinAbs(100.0, 0.01));
+}
+
+TEST_CASE("Portfolio: release_cash возвращает резерв", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("BTCUSDT"), 300.0, 0.3);
+    portfolio->release_cash(OrderId("ORD-1"));
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.reserved_for_orders, WithinAbs(0.0, 0.01));
+    REQUIRE_THAT(ledger.available_cash, WithinAbs(1000.0, 0.01));
+}
+
+TEST_CASE("Portfolio: release_cash для неизвестного ордера — no-op", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+    portfolio->release_cash(OrderId("ORD-UNKNOWN"));
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.available_cash, WithinAbs(1000.0, 0.01));
+}
+
+TEST_CASE("Portfolio: multiple reserves и partial release", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("BTCUSDT"), 200.0, 0.2);
+    portfolio->reserve_cash(OrderId("ORD-2"), Symbol("ETHUSDT"), 300.0, 0.3);
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.reserved_for_orders, WithinAbs(500.5, 0.01));
+    REQUIRE_THAT(ledger.available_cash, WithinAbs(499.5, 0.01));
+
+    // Release only one
+    portfolio->release_cash(OrderId("ORD-1"));
+    ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.reserved_for_orders, WithinAbs(300.3, 0.01));
+}
+
+TEST_CASE("Portfolio: record_fee уменьшает available_cash", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->record_fee(Symbol("BTCUSDT"), 1.5, OrderId("ORD-1"));
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.fees_accrued_today, WithinAbs(1.5, 0.01));
+}
+
+TEST_CASE("Portfolio: pending_orders возвращает список", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("BTCUSDT"), 200.0, 0.2);
+    portfolio->reserve_cash(OrderId("ORD-2"), Symbol("ETHUSDT"), 300.0, 0.3);
+
+    auto pending = portfolio->pending_orders();
+    REQUIRE(pending.size() == 2);
+}
+
+TEST_CASE("Portfolio: event_log записывает события", "[portfolio][events]") {
+    auto portfolio = make_portfolio(1000.0);
+    auto pos = make_position("BTCUSDT", Side::Buy, 0.1, 50000.0);
+
+    portfolio->open_position(pos);
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("ETHUSDT"), 200.0, 0.2);
+    portfolio->release_cash(OrderId("ORD-1"));
+    portfolio->record_fee(Symbol("BTCUSDT"), 0.5);
+    portfolio->close_position(Symbol("BTCUSDT"), Price(51000.0), 100.0);
+
+    auto events = portfolio->recent_events(100);
+    REQUIRE(events.size() >= 4);
+}
+
+TEST_CASE("Portfolio: check_invariants проходит после нормальных операций", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(10000.0);
+
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("BTCUSDT"), 5000.0, 5.0);
+    REQUIRE(portfolio->check_invariants());
+
+    portfolio->release_cash(OrderId("ORD-1"));
+    REQUIRE(portfolio->check_invariants());
+}
+
+TEST_CASE("Portfolio: snapshot содержит cash ledger данные", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->reserve_cash(OrderId("ORD-1"), Symbol("BTCUSDT"), 300.0, 0.3);
+
+    auto snap = portfolio->snapshot();
+    REQUIRE(snap.pending_buy_count == 1);
+    REQUIRE_THAT(snap.cash.reserved_for_orders, WithinAbs(300.3, 0.01));
+    REQUIRE(snap.pending_orders.size() == 1);
+}
+
+TEST_CASE("Portfolio: reset_daily очищает fee и cash счётчики", "[portfolio][cash]") {
+    auto portfolio = make_portfolio(1000.0);
+
+    portfolio->record_fee(Symbol("BTCUSDT"), 2.0);
+    portfolio->add_realized_pnl(50.0);
+
+    portfolio->reset_daily();
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.fees_accrued_today, WithinAbs(0.0, 0.01));
+
+    auto pnl_after = portfolio->pnl();
+    REQUIRE_THAT(pnl_after.realized_pnl_today, WithinAbs(0.0, 0.01));
+}

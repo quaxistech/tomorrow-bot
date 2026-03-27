@@ -28,6 +28,7 @@ add_subdirectory(unit/ml)
 add_subdirectory(unit/execution_alpha)
 add_subdirectory(unit/opportunity_cost)
 add_subdirectory(unit/portfolio)
+add_subdirectory(unit/portfolio_allocator)
 add_subdirectory(unit/risk)
 add_subdirectory(unit/execution)
 

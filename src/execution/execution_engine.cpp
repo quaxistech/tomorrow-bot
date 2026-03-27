@@ -3,6 +3,9 @@
 
 namespace tb::execution {
 
+// Bitget spot: 0.1% taker fee на каждую сторону сделки
+static constexpr double kTakerFeePct = 0.001;
+
 // ========== PaperOrderSubmitter ==========
 
 OrderSubmitResult PaperOrderSubmitter::submit_order(const OrderRecord& order) {
@@ -94,6 +97,22 @@ Result<OrderId> ExecutionEngine::execute(
         }
     }
 
+    // Зарезервировать cash для BUY-ордера
+    if (order.side == Side::Buy && portfolio_) {
+        double notional = order.original_quantity.get() *
+            (order.price.get() > 0.0 ? order.price.get() : market_fill_price.get());
+        double estimated_fee = notional * kTakerFeePct;
+        if (!portfolio_->reserve_cash(order.order_id, order.symbol, notional, estimated_fee, order.strategy_id)) {
+            logger_->warn("Execution", "Недостаточно cash для резервирования",
+                {{"order_id", order_id_str}, {"notional", std::to_string(notional)}});
+            fsm.transition(OrderState::Rejected, "Недостаточно cash");
+            order.state = OrderState::Rejected;
+            order.rejection_reason = "Insufficient cash for reserve";
+            orders_[order_id_str] = order;
+            return std::unexpected(TbError::ExecutionFailed);
+        }
+    }
+
     // Отправить ордер на биржу
     auto submit_result = submitter_->submit_order(order);
 
@@ -103,6 +122,11 @@ Result<OrderId> ExecutionEngine::execute(
         order.state = OrderState::Rejected;
         order.rejection_reason = submit_result.error_message;
         orders_[order_id_str] = order;
+
+        // Освободить зарезервированный cash
+        if (order.side == Side::Buy && portfolio_) {
+            portfolio_->release_cash(order.order_id);
+        }
 
         logger_->warn("Execution", "Ордер отклонён биржей",
                       {{"order_id", order_id_str},
@@ -151,8 +175,6 @@ Result<OrderId> ExecutionEngine::execute(
             if (order.side == Side::Sell) {
                 // SELL на споте = закрытие длинной позиции.
                 // Рассчитываем реализованную P&L с учётом комиссий Bitget.
-                // Bitget spot: 0.1% taker fee на каждую сторону сделки.
-                constexpr double kTakerFeePct = 0.001; // 0.1%
                 auto existing = portfolio_->get_position(order.symbol);
                 double realized_pnl = 0.0;
                 if (existing.has_value()) {
@@ -165,6 +187,9 @@ Result<OrderId> ExecutionEngine::execute(
                     realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
                 }
                 portfolio_->close_position(order.symbol, fill_price, realized_pnl);
+                // Зафиксировать комиссию SELL-стороны
+                double sell_fee = fill_price.get() * order.filled_quantity.get() * kTakerFeePct;
+                portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
                 logger_->info("Execution", "Позиция закрыта (SELL fill)",
                     {{"symbol", order.symbol.get()},
                      {"realized_pnl", std::to_string(realized_pnl)},
@@ -183,6 +208,10 @@ Result<OrderId> ExecutionEngine::execute(
                 pos.opened_at = clock_->now();
                 pos.updated_at = clock_->now();
                 portfolio_->open_position(pos);
+                // Освободить резерв (fill потребляет cash) и зафиксировать комиссию
+                portfolio_->release_cash(order.order_id);
+                double buy_fee = order.filled_quantity.get() * fill_price.get() * kTakerFeePct;
+                portfolio_->record_fee(order.symbol, buy_fee, order.order_id);
             }
         }
 
@@ -224,6 +253,10 @@ VoidResult ExecutionEngine::cancel(const OrderId& order_id) {
         fsm_it->second.transition(OrderState::Cancelled, "Отменён");
         it->second.state = OrderState::Cancelled;
         it->second.last_updated = clock_->now();
+        // Освободить зарезервированный cash
+        if (it->second.side == Side::Buy && portfolio_) {
+            portfolio_->release_cash(order_id);
+        }
     }
 
     return {};
@@ -260,6 +293,12 @@ void ExecutionEngine::on_order_update(
     order.state = new_state;
     order.last_updated = clock_->now();
 
+    // Освободить резерв при терминальных состояниях без fill
+    if ((new_state == OrderState::Cancelled || new_state == OrderState::Rejected ||
+         new_state == OrderState::Expired) && order.side == Side::Buy && portfolio_) {
+        portfolio_->release_cash(order_id);
+    }
+
     // Обновить заполнение
     if (filled_qty.get() > 0.0) {
         order.filled_quantity = filled_qty;
@@ -277,10 +316,16 @@ void ExecutionEngine::on_order_update(
             auto existing = portfolio_->get_position(order.symbol);
             double realized_pnl = 0.0;
             if (existing.has_value()) {
-                realized_pnl = (order.avg_fill_price.get() - existing->avg_entry_price.get())
-                             * order.filled_quantity.get();
+                double entry_cost = existing->avg_entry_price.get() * order.filled_quantity.get();
+                double exit_proceeds = order.avg_fill_price.get() * order.filled_quantity.get();
+                double buy_fee = entry_cost * kTakerFeePct;
+                double sell_fee = exit_proceeds * kTakerFeePct;
+                realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
             }
             portfolio_->close_position(order.symbol, order.avg_fill_price, realized_pnl);
+            // Зафиксировать комиссию
+            double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kTakerFeePct;
+            portfolio_->record_fee(order.symbol, sell_fee, OrderId(order_id.get()));
         } else {
             portfolio::Position pos;
             pos.symbol = order.symbol;
@@ -294,6 +339,10 @@ void ExecutionEngine::on_order_update(
             pos.opened_at = clock_->now();
             pos.updated_at = clock_->now();
             portfolio_->open_position(pos);
+            // Освободить резерв и зафиксировать комиссию
+            portfolio_->release_cash(order_id);
+            double buy_fee = order.filled_quantity.get() * order.avg_fill_price.get() * kTakerFeePct;
+            portfolio_->record_fee(order.symbol, buy_fee, order_id);
         }
     }
 

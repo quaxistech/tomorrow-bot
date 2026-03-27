@@ -98,6 +98,34 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 
 ---
 
+### Институциональное управление портфелем v0.4 ✅ (новое)
+
+**Portfolio Engine — Cash Reserve Accounting:**
+- **CashLedger**: Полный институциональный учёт cash (total, available, reserved, fees, PnL gross/net)
+- **Reserve/Release**: Pre-trade cash reservation (reserve_cash/release_cash) — блокировка средств до исполнения
+- **Fee Tracking**: Учёт комиссий per-trade через record_fee(), суммарные комиссии за день
+- **PendingOrderInfo**: Трекинг всех активных ордеров с зарезервированным cash
+- **Event Sourcing**: PortfolioEvent audit log (10 типов событий, кольцевой буфер 10k)
+- **Invariant Checks**: check_invariants() верифицирует available >= 0, reserves = sum(pending)
+- **Backward Compatible**: Все существующие API работают без изменений
+
+**Portfolio Allocator — Professional Sizing:**
+- **compute_size_v2()**: Новый API с полным AllocationContext (замена stateful set_market_context)
+- **ExchangeFilters**: Per-symbol trading rules (min/max qty, lot step, min notional, tick size, fee rates)
+- **Drawdown Scaling**: Линейное снижение размера при просадке (5%→15% = 100%→10% размера)
+- **Liquidity Constraints**: Ограничение по ADV participation (2%) и глубине стакана (10%)
+- **Constraint Audit Trail**: Полная трассировка каждого ограничения (вход, выход, лимит, binding)
+- **Fee-Aware Sizing**: expected_fee и fee_adjusted_notional в результате
+- **Utility Functions**: round_quantity_down(), round_price(), validate_order_filters()
+
+**Execution Engine — Reserve Integration:**
+- **Pre-trade Reserve**: reserve_cash() вызывается перед submit_order() для BUY-ордеров
+- **Release on Cancel/Reject**: Автоматическое освобождение при отмене/reject/expire
+- **Fee Consistency Fix**: on_order_update() теперь учитывает комиссии (было: без комиссий)
+- **record_fee()**: Комиссии фиксируются при каждом fill (BUY и SELL стороны)
+
+---
+
 ## Ограничения ⚠️
 
 ### Persistence — только в памяти

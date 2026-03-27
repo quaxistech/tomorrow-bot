@@ -57,6 +57,11 @@ Normalizer (JSON → типизированные события)
   ├──► ExecutionAlphaEngine (passive/aggressive/hybrid, urgency, slice plan)
   ├──► OpportunityCostEngine (10 правил scoring, портфельный контекст, Execute/Defer/Suppress/Upgrade)
   └──► PortfolioAllocator (global → regime → strategy → symbol бюджет)
+        │  ├── compute_size() — legacy API (backward compat)
+        │  ├── compute_size_v2() — AllocationContext + ExchangeFilters
+        │  ├── Drawdown Scaling (линейное снижение при просадке)
+        │  ├── Liquidity Constraints (ADV + book depth caps)
+        │  └── Constraint Audit Trail (полная трассировка)
         │
         ▼
   RiskEngine (14 жёстких проверок — ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА)
@@ -69,10 +74,16 @@ Normalizer (JSON → типизированные события)
   ExecutionEngine (Order FSM: 10 состояний)
   │  ├── IOrderSubmitter (interface)
   │  ├── PaperOrderSubmitter (paper/shadow mode)
-  │  └── BitgetOrderSubmitter → BitgetRestClient → Bitget REST API
+  │  ├── BitgetOrderSubmitter → BitgetRestClient → Bitget REST API
+  │  └── Pre-trade reserve_cash() → release_cash() on cancel/fill
   │
   ▼
-  PortfolioEngine (positions, PnL, exposure)
+  PortfolioEngine (positions, PnL, exposure, cash reserve accounting)
+     ├── CashLedger (total/available/reserved/fees)
+     ├── PendingOrderInfo tracking
+     ├── Fee recording (record_fee)
+     ├── Event sourcing (PortfolioEvent audit log)
+     └── Invariant checks (check_invariants)
 ```
 
 ### Аналитика и защита (параллельно pipeline)
