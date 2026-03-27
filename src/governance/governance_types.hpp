@@ -38,7 +38,9 @@ enum class AuditEventType {
     StrategyRetired,        ///< Стратегия выведена из эксплуатации
     AutoActionRequested,    ///< Автодействие от alpha_decay / self_diagnosis
     PolicyDenied,           ///< Политика отклонила действие
-    ConfigRollback          ///< Откат конфигурации выполнен
+    ConfigRollback,         ///< Откат конфигурации выполнен
+    ShadowDecisionRecorded, ///< Записано теневое решение
+    ShadowComparisonGenerated ///< Сгенерировано shadow vs live сравнение
 };
 
 /// Преобразование типа события в строку
@@ -67,6 +69,8 @@ inline std::string to_string(AuditEventType t) {
         case AuditEventType::AutoActionRequested:    return "AutoActionRequested";
         case AuditEventType::PolicyDenied:           return "PolicyDenied";
         case AuditEventType::ConfigRollback:         return "ConfigRollback";
+        case AuditEventType::ShadowDecisionRecorded: return "ShadowDecisionRecorded";
+        case AuditEventType::ShadowComparisonGenerated: return "ShadowComparisonGenerated";
     }
     return "Unknown";
 }

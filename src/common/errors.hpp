@@ -48,6 +48,9 @@ enum class TbError {
     PersistenceError,           ///< Ошибка сохранения данных
     ReplayError,                ///< Ошибка воспроизведения данных
 
+    // --- Shadow ---
+    ShadowDisabled,             ///< Shadow-режим отключён или заблокирован kill switch
+
     // --- TA-Lib ---
     TaLibInitFailed,            ///< Не удалось инициализировать TA-Lib
     TaLibSmokeFailed,           ///< Дымовой тест TA-Lib провалился
@@ -100,6 +103,8 @@ public:
                 return "Ошибка персистентности данных";
             case TbError::ReplayError:
                 return "Ошибка воспроизведения данных";
+            case TbError::ShadowDisabled:
+                return "Shadow-режим отключён";
             case TbError::TaLibInitFailed:
                 return "Ошибка инициализации TA-Lib";
             case TbError::TaLibSmokeFailed:
