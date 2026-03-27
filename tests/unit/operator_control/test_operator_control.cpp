@@ -8,6 +8,8 @@
 #include "operator_control/operator_control_plane.hpp"
 #include "operator_control/operator_types.hpp"
 #include "governance/governance_audit_layer.hpp"
+#include "logging/logger.hpp"
+#include "clock/monotonic_clock.hpp"
 
 using namespace tb;
 using namespace tb::operator_control;
@@ -15,7 +17,9 @@ using namespace tb::governance;
 
 /// Создание стандартного набора: governance + operator control
 static auto make_control_plane() {
-    auto gov = std::make_shared<GovernanceAuditLayer>();
+    auto logger = logging::create_console_logger(logging::LogLevel::Warn);
+    auto clk = clock::create_monotonic_clock();
+    auto gov = std::make_shared<GovernanceAuditLayer>(std::move(logger), std::move(clk));
     auto ctrl = std::make_unique<OperatorControlPlane>(gov);
     return std::make_pair(std::move(gov), std::move(ctrl));
 }

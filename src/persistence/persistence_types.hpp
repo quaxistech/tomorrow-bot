@@ -20,7 +20,8 @@ enum class JournalEntryType {
     PortfolioChange,    ///< Изменение портфеля
     StrategySignal,     ///< Сигнал стратегии
     SystemEvent,        ///< Системное событие
-    TelemetrySnapshot   ///< Снимок телеметрии
+    TelemetrySnapshot,  ///< Снимок телеметрии
+    GovernanceEvent     ///< Событие governance-слоя
 };
 
 /// Строковое представление типа записи
@@ -34,6 +35,7 @@ enum class JournalEntryType {
         case JournalEntryType::StrategySignal:    return "StrategySignal";
         case JournalEntryType::SystemEvent:       return "SystemEvent";
         case JournalEntryType::TelemetrySnapshot: return "TelemetrySnapshot";
+        case JournalEntryType::GovernanceEvent:   return "GovernanceEvent";
     }
     return "Unknown";
 }
@@ -55,7 +57,8 @@ enum class SnapshotType {
     RiskCounters,    ///< Счётчики риска
     StrategyMeta,    ///< Метаданные стратегий
     WorldState,      ///< Состояние мира
-    FullSystem       ///< Полный снимок системы
+    FullSystem,       ///< Полный снимок системы
+    GovernanceState   ///< Снимок governance-состояния
 };
 
 /// Строковое представление типа снимка
@@ -65,7 +68,8 @@ enum class SnapshotType {
         case SnapshotType::RiskCounters: return "RiskCounters";
         case SnapshotType::StrategyMeta: return "StrategyMeta";
         case SnapshotType::WorldState:   return "WorldState";
-        case SnapshotType::FullSystem:   return "FullSystem";
+        case SnapshotType::FullSystem:       return "FullSystem";
+        case SnapshotType::GovernanceState:  return "GovernanceState";
     }
     return "Unknown";
 }
