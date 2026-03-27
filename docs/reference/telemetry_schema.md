@@ -35,14 +35,19 @@ ResearchTelemetry — структурированная система сбор
 |------|-----|----------|
 | features_json | string | Сериализованный FeatureSnapshot (JSON) |
 
-### Состояние мира / Режим / Неопределённость
+### Состояние мира / Режим / Неопределённость (v2)
 | Поле | Тип | Описание |
 |------|-----|----------|
 | world_state | string | Состояние мира (WorldState) |
 | regime_label | string | Режим рынка (DetailedRegime) |
 | regime_confidence | double | Уверенность в классификации [0,1] |
-| uncertainty_level | string | Уровень неопределённости |
-| uncertainty_score | double | Агрегированный скор [0,1] |
+| uncertainty_level | string | Уровень неопределённости (Low/Moderate/High/Extreme) |
+| uncertainty_score | double | Мгновенный агрегированный скор [0,1] |
+| uncertainty_persistent_score | double | EMA-сглаженный скор (фильтрация шума) [0,1] |
+| uncertainty_spike_score | double | Разница instant - persistent (детекция скачков) |
+| uncertainty_execution_mode | string | Рекомендация: Normal/Conservative/DefensiveOnly/HaltNewEntries |
+| uncertainty_calibration_confidence | double | Доверие к калибровке модели [0,1] |
+| uncertainty_top_drivers | string | JSON массив top-3 drivers (dimension, score, label) |
 
 ### Стратегия и решение
 | Поле | Тип | Описание |

@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **Рыночные данные** | exchange/bitget (WS+REST), market_data, normalizer, order_book, buffers, indicators, features |
 | **Выбор пар** | pair_scanner (автоматический выбор лучших торговых пар) |
 | **Продвинутые признаки** | advanced_features (CUSUM, VPIN, Volume Profile, Time-of-Day Alpha) |
-| **Интеллект** | world_model, regime, uncertainty, strategy (×5), strategy_allocator, decision, ai |
+| **Интеллект** | world_model, regime, uncertainty (v2: 9 измерений, stateful, ML/portfolio-aware), strategy (×5), strategy_allocator, decision, ai |
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
 | **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
 | **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow (v2.0: виртуальное исполнение, fill simulation, multi-leg positions, configurable eval windows, Prometheus metrics, PostgreSQL persistence), champion_challenger |
@@ -261,7 +261,13 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **Smart TWAP** | Адаптивное разбиение крупных ордеров на 3-10 слайсов. Интервал адаптируется к спреду и VPIN. Front-loading 1.2× |
 | **Time-of-Day Alpha** | 24-часовой UTC профиль: множители волатильности и альфа-скоры по сессиям (азиатская, европейская, американская). +0.05 к порогу в тихие часы |
 
-#### Уровень 3 — ML/AI
+#### Уровень 3 — Uncertainty Engine v2
+
+| Технология | Описание |
+|-----------|----------|
+| **Uncertainty Engine v2** | 9-мерная оценка неопределённости: regime, signal, data quality, execution, portfolio, ML, correlation, transition, operational. Stateful модель с EMA-сглаживанием, гистерезисом, shock memory, cooldown. Интеграция в risk engine (3 uncertainty-aware проверки), execution alpha и execution engine. ML-aware: потребляет signal quality, cascade probability, correlation breaks. Нелинейная агрегация с regime-specific amplifiers и tail stress. Production observability: top drivers, execution mode recommendations, диагностика. [Подробнее →](docs/architecture/uncertainty_engine.md) |
+
+#### Уровень 4 — ML/AI
 
 | Технология | Описание |
 |-----------|----------|
@@ -620,7 +626,7 @@ tomorrow-bot/
 │   ├── pair_scanner/           # Автовыбор лучших торговых пар (объём, спред, ATR)
 │   ├── world_model/            # 9 состояний мира, fragility, tendency
 │   ├── regime/                 # 13 режимов рынка, confidence, stability
-│   ├── uncertainty/            # 4-мерная неопределённость
+│   ├── uncertainty/            # Uncertainty Engine v2: 9-мерная неопределённость, stateful (EMA, hysteresis, shock memory)
 │   ├── strategy/               # 9 стратегий с тренд-фильтрацией
 │   ├── strategy_allocator/     # Аллокация по режимам и world suitability
 │   ├── decision/               # Комитетное голосование, вето, conviction (порог 0.35)

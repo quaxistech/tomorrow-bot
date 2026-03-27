@@ -20,8 +20,11 @@ FeatureSnapshot
     ├─→ WorldModelEngine      → WorldModelSnapshot
     ├─→ RegimeEngine          → RegimeSnapshot
     │
-    └─→ UncertaintyEngine     → UncertaintySnapshot
-         (принимает FeatureSnapshot + RegimeSnapshot + WorldModelSnapshot)
+    └─→ UncertaintyEngine v2  → UncertaintySnapshot
+         (принимает FeatureSnapshot + RegimeSnapshot + WorldModelSnapshot
+          + PortfolioSnapshot + MlSignalSnapshot)
+         9 измерений, stateful: EMA, hysteresis, shock memory, cooldown
+         → execution mode recommendations, top drivers, diagnostics
 
 AdvancedFeatureEngine
     ├─→ CUSUM                 → regime change signal
@@ -97,16 +100,42 @@ HTF Trend Filter (финальный барьер)
 - `should_enable` — включить/отключить стратегию
 - `weight_multiplier` — множитель веса
 
-### 3. UncertaintyEngine (`tb::uncertainty`)
+### 3. UncertaintyEngine v2 (`tb::uncertainty`)
 
-Оценивает неопределённость по 5 измерениям:
-- Режим (1 - confidence)
-- Сигналы (конфликты индикаторов)
-- Качество данных (стакан, свежесть)
-- Исполнение (спред, проскальзывание)
-- Портфель (Фаза 4)
+9-мерная stateful оценка неопределённости с нелинейной агрегацией.
+
+**Измерения:**
+
+| # | Измерение | Вес | Источник |
+|---|-----------|-----|----------|
+| 1 | Regime | 0.25 | RegimeSnapshot (1 - confidence) |
+| 2 | Signal | 0.20 | FeatureSnapshot (конфликты RSI/MACD/EMA) |
+| 3 | Data Quality | 0.10 | FeatureSnapshot (стакан, свежесть, спред) |
+| 4 | Execution | 0.10 | FeatureSnapshot (спред, ликвидность, slippage) |
+| 5 | Portfolio | 0.10 | PortfolioSnapshot (концентрация, exposure, drawdown) |
+| 6 | ML | 0.10 | MlSignalSnapshot (signal quality, cascade) |
+| 7 | Correlation | 0.05 | MlSignalSnapshot (correlation breaks) |
+| 8 | Transition | 0.05 | RegimeSnapshot (transition confidence, stability) |
+| 9 | Operational | 0.05 | FeatureSnapshot (feed freshness, infrastructure) |
+
+**Stateful модель:**
+- EMA-сглаживание (`persistent_score`) для фильтрации шума
+- Гистерезис (up: 0.03, down: 0.05) — предотвращает осцилляцию между уровнями
+- Shock memory — отслеживает серии экстремальных оценок
+- Cooldown — рекомендация паузы после 3+ Extreme подряд
+
+**Агрегация:** взвешенная сумма + regime-specific amplifiers (volatile: data/exec ×1.5; unclear: all ×1.2) + tail stress (+0.05 за каждый dimension > 0.8).
+
+**Интеграции:**
+- Risk Engine: 3 uncertainty-aware проверки (limits, cooldown, execution mode)
+- Execution Alpha: модификация стиля и urgency
+- Execution Engine: size/threshold guards
+
+**Execution mode recommendations:** Normal → Conservative → DefensiveOnly → HaltNewEntries
 
 Результат → `UncertaintyAction`: Normal / ReducedSize / HigherThreshold / NoTrade
+
+[Подробная документация →](../../docs/architecture/uncertainty_engine.md)
 
 ### 4. Стратегии (`tb::strategy`)
 
