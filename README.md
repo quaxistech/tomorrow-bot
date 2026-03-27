@@ -3,7 +3,7 @@
 Производственная адаптивная торговая операционная система для биржи Bitget.
 Написана на C++23, развёртывается на Ubuntu 24.04.
 
-**Версия**: 0.3.0 | **Статус**: Production | **Тесты**: 293 тестов
+**Версия**: 0.3.0 | **Статус**: Production | **Тесты**: 407 тестов
 
 ---
 
@@ -129,7 +129,7 @@ cmake --build . -j$(nproc)
 
 ```bash
 cd build-check
-ctest --output-on-failure -j8   # 293 тестов
+ctest --output-on-failure -j8   # 407 тестов
 ```
 
 ### Конфигурация API-ключей
@@ -237,7 +237,7 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **Интеллект** | world_model, regime, uncertainty, strategy (×5), strategy_allocator, decision, ai |
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
 | **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
-| **Аналитика** | persistence, replay, telemetry, alpha_decay, shadow, champion_challenger |
+| **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow, champion_challenger |
 | **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis, governance (runtime control plane), operator_control |
 
 ### Продвинутые технологии v0.3
@@ -580,7 +580,7 @@ tomorrow-bot/
 │   ├── execution/              # FSM (10 состояний), Paper/Bitget submitter, TWAP executor
 │   ├── pipeline/               # TradingPipeline + HTF Trend Filter + Market Readiness
 │   ├── persistence/            # EventJournal + SnapshotStore (IStorageAdapter)
-│   ├── replay/                 # ReplayEngine с state machine
+│   ├── replay/                 # ReplayEngine (pause/resume/seek, 4 режима, hooks) + BacktestEngine (fill simulation, equity curve, Sharpe/Sortino/Calmar)
 │   ├── telemetry/              # Исследовательская телеметрия (envelope)
 │   ├── alpha_decay/            # Мониторинг деградации (7 измерений: expectancy, hit-rate, slippage, MAE, Brier, regime, execution quality). PostgreSQL persistence
 │   ├── shadow/                 # Теневые решения, гипотетический PnL
@@ -590,7 +590,7 @@ tomorrow-bot/
 │   ├── governance/             # Runtime control plane: governance gate, halt modes, incident FSM, strategy lifecycle, durable audit (23 event types)
 │   ├── operator_control/       # 11 команд оператора (kill-switch, shadow, inspect)
 │   └── synthetic_scenarios/    # 9 стресс-сценариев с валидацией
-├── tests/                      # 293 теста (unit + integration + scenario)
+├── tests/                      # 407 тестов (unit + integration + scenario)
 │   ├── unit/                   # Модульные тесты
 │   ├── integration/            # Интеграционные тесты
 │   ├── mocks/                  # Моки (exchange, persistence)
