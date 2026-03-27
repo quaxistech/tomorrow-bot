@@ -6,6 +6,7 @@
 #include "portfolio_allocator/allocation_types.hpp"
 #include "features/feature_snapshot.hpp"
 #include "execution_alpha/execution_alpha_types.hpp"
+#include "uncertainty/uncertainty_types.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
@@ -167,7 +168,7 @@ TEST_CASE("Risk: Чистое состояние → Approved", "[risk]") {
     auto engine = make_risk_engine();
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Approved);
     REQUIRE(decision.reasons.empty());
@@ -179,7 +180,7 @@ TEST_CASE("Risk: Правило 1 — Kill switch → Denied", "[risk]") {
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     REQUIRE(decision.kill_switch_active);
@@ -196,7 +197,7 @@ TEST_CASE("Risk: Правило 2 — Макс дневной убыток → D
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -213,7 +214,7 @@ TEST_CASE("Risk: Правило 3 — Макс просадка → Denied", "[r
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -230,7 +231,7 @@ TEST_CASE("Risk: Правило 4 — Макс позиций → Denied", "[ris
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -247,7 +248,7 @@ TEST_CASE("Risk: Правило 5 — Макс экспозиция → Denied",
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -264,7 +265,7 @@ TEST_CASE("Risk: Правило 6 — Макс номинал → ReduceSize", "
 
     auto decision = engine->evaluate(
         make_intent(), sizing, make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     // Должен быть ReduceSize (не Denied, т.к. можно уменьшить)
     bool has_max_notional = false;
@@ -284,7 +285,7 @@ TEST_CASE("Risk: Правило 7 — Макс плечо → Denied", "[risk]")
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -301,7 +302,7 @@ TEST_CASE("Risk: Правило 8 — Макс проскальзывание �
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), exec_alpha);
+        make_clean_features(), exec_alpha, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -321,7 +322,7 @@ TEST_CASE("Risk: Правило 9 — Частота ордеров → Throttle
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Throttled);
     bool found = false;
@@ -340,7 +341,7 @@ TEST_CASE("Risk: Правило 10 — Подряд убытки → Denied", "[
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -357,7 +358,7 @@ TEST_CASE("Risk: Правило 11 — Устаревшие данные → Den
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        features, make_clean_exec_alpha());
+        features, make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -374,7 +375,7 @@ TEST_CASE("Risk: Правило 12 — Невалидный стакан → Den
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        features, make_clean_exec_alpha());
+        features, make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -391,7 +392,7 @@ TEST_CASE("Risk: Правило 13 — Широкий спред → Denied", "[
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        features, make_clean_exec_alpha());
+        features, make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -409,7 +410,7 @@ TEST_CASE("Risk: Правило 14 — Низкая ликвидность → D
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        features, make_clean_exec_alpha());
+        features, make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -432,7 +433,7 @@ TEST_CASE("Risk: Множественные нарушения → все при
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        features, make_clean_exec_alpha());
+        features, make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     REQUIRE(decision.reasons.size() >= 3);
@@ -459,7 +460,7 @@ TEST_CASE("Risk: Деактивация kill switch", "[risk]") {
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
     REQUIRE(decision.verdict == RiskVerdict::Approved);
 }
 
@@ -489,7 +490,7 @@ TEST_CASE("Risk: Правило 16 — Бюджет стратегии → Denie
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -517,7 +518,7 @@ TEST_CASE("Risk: Правило 17 — Концентрация символа �
 
     auto decision = engine->evaluate(
         intent, make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -547,7 +548,7 @@ TEST_CASE("Risk: Правило 18 — Однонаправленные пози
 
     auto decision = engine->evaluate(
         intent, make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -567,7 +568,7 @@ TEST_CASE("Risk: Правило 19 — UTC cutoff → Denied", "[risk]") {
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -589,7 +590,7 @@ TEST_CASE("Risk: Правило 20 — Оборачиваемость → Thrott
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Throttled);
     bool found = false;
@@ -609,7 +610,7 @@ TEST_CASE("Risk: Правило 21 — Реализованный дневной
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), portfolio,
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Denied);
     bool found = false;
@@ -634,7 +635,7 @@ TEST_CASE("Risk: Правило 22 — Интервал сделок → Throttl
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.verdict == RiskVerdict::Throttled);
     bool found = false;
@@ -719,7 +720,7 @@ TEST_CASE("Risk: set_current_regime меняет scaling factor", "[risk]") {
 
     auto decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.regime_scaling_factor == Catch::Approx(0.5));
 
@@ -727,7 +728,7 @@ TEST_CASE("Risk: set_current_regime меняет scaling factor", "[risk]") {
 
     decision = engine->evaluate(
         make_intent(), make_sizing(), make_clean_portfolio(),
-        make_clean_features(), make_clean_exec_alpha());
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
     REQUIRE(decision.regime_scaling_factor == Catch::Approx(1.2));
 }

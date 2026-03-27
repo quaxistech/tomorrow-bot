@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/catch_approx.hpp>
 #include "execution_alpha/execution_alpha_engine.hpp"
+#include "uncertainty/uncertainty_types.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
@@ -146,7 +147,7 @@ TEST_CASE("ExecutionAlpha: Широкий спред → NoExecution", "[executi
     // Спред 60 бп > макс 50 бп
     auto features = make_features(60.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
     REQUIRE_FALSE(result.should_execute);
@@ -157,7 +158,7 @@ TEST_CASE("ExecutionAlpha: Высокая срочность → Aggressive", "[
     auto intent = make_intent(0.9, 0.8); // Высокая срочность
     auto features = make_features(5.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::Aggressive);
     REQUIRE(result.should_execute);
@@ -169,7 +170,7 @@ TEST_CASE("ExecutionAlpha: Низкая срочность, узкий спре�
     auto intent = make_intent(0.2, 0.5); // Низкая срочность
     auto features = make_features(5.0);  // Узкий спред
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::Passive);
     REQUIRE(result.should_execute);
@@ -181,7 +182,7 @@ TEST_CASE("ExecutionAlpha: Токсичный поток → NoExecution", "[exe
     // Высокий aggressive_flow + book_instability + умеренный спред → высокий adverse selection
     auto features = make_features(40.0, 0.9, 0.9);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
     REQUIRE_FALSE(result.should_execute);
@@ -192,7 +193,7 @@ TEST_CASE("ExecutionAlpha: Вероятность заполнения в доп
     auto intent = make_intent(0.5, 0.7);
     auto features = make_features(5.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.quality.fill_probability >= 0.0);
     REQUIRE(result.quality.fill_probability <= 1.0);
@@ -203,7 +204,7 @@ TEST_CASE("ExecutionAlpha: Лимитная цена корректна для �
     auto intent = make_intent(0.2, 0.5);
     auto features = make_features(5.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::Passive);
     REQUIRE(result.recommended_limit_price.has_value());
@@ -232,7 +233,7 @@ TEST_CASE("ExecutionAlpha: VPIN токсичен → NoExecution", "[execution_a
     features.microstructure.vpin_valid = true;
     features.microstructure.vpin_toxic = true;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
     REQUIRE_FALSE(result.should_execute);
@@ -250,7 +251,7 @@ TEST_CASE("ExecutionAlpha: VPIN используется → vpin_used=true", "[
     features.microstructure.vpin_valid = true;
     features.microstructure.vpin_toxic = false;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.vpin_used);
@@ -274,7 +275,7 @@ TEST_CASE("ExecutionAlpha: Благоприятный имбаланс стак�
     features.microstructure.book_imbalance_5 = 0.60;
     features.microstructure.book_imbalance_valid = true;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     // С благоприятным имбалансом и умеренной срочностью должен выбрать Passive
     REQUIRE(result.should_execute);
@@ -296,7 +297,7 @@ TEST_CASE("ExecutionAlpha: Неблагоприятный имбаланс → �
     features.microstructure.book_imbalance_5 = -0.60; // Сильно против нас
     features.microstructure.book_imbalance_valid = true;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.directional_imbalance < -0.30);
@@ -312,14 +313,14 @@ TEST_CASE("ExecutionAlpha: CUSUM сигнал увеличивает срочн�
     auto features_no_cusum = make_features(5.0);
     features_no_cusum.technical.cusum_valid = false;
     features_no_cusum.technical.cusum_regime_change = false;
-    auto result_no_cusum = engine.evaluate(intent_no_cusum, features_no_cusum);
+    auto result_no_cusum = engine.evaluate(intent_no_cusum, features_no_cusum, uncertainty::UncertaintySnapshot{});
 
     // С CUSUM
     auto intent_cusum = make_intent(0.3, 0.6);
     auto features_cusum = make_features(5.0);
     features_cusum.technical.cusum_valid = true;
     features_cusum.technical.cusum_regime_change = true;
-    auto result_cusum = engine.evaluate(intent_cusum, features_cusum);
+    auto result_cusum = engine.evaluate(intent_cusum, features_cusum, uncertainty::UncertaintySnapshot{});
 
     // CUSUM должен повысить срочность
     REQUIRE(result_cusum.urgency_score > result_no_cusum.urgency_score);
@@ -342,7 +343,7 @@ TEST_CASE("ExecutionAlpha: PostOnly при идеальных условиях",
     features.microstructure.vpin_valid = true;
     features.microstructure.vpin_toxic = false;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     REQUIRE(result.recommended_style == ExecutionStyle::PostOnly);
@@ -356,7 +357,7 @@ TEST_CASE("ExecutionAlpha: Невалидные данные (mid_price=0) → N
     // Испорченные данные
     features.mid_price = Price(0.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
     REQUIRE_FALSE(result.should_execute);
@@ -373,7 +374,7 @@ TEST_CASE("ExecutionAlpha: DecisionFactors заполняются коррект
     features.microstructure.book_imbalance_5 = 0.20;
     features.microstructure.book_imbalance_valid = true;
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     const auto& df = result.decision_factors;
@@ -404,8 +405,8 @@ TEST_CASE("ExecutionAlpha: Data-driven fill_prob варьируется с ус�
     auto features_wide = make_features(13.0);
     features_wide.microstructure.bid_depth_5_notional = 5000.0;
 
-    auto result_tight = engine.evaluate(intent_buy, features_tight);
-    auto result_wide  = engine.evaluate(intent_buy, features_wide);
+    auto result_tight = engine.evaluate(intent_buy, features_tight, uncertainty::UncertaintySnapshot{});
+    auto result_wide  = engine.evaluate(intent_buy, features_wide, uncertainty::UncertaintySnapshot{});
 
     // Оба должны исполниться, но tight должен иметь выше fill_prob
     if (result_tight.should_execute && result_wide.should_execute) {
@@ -419,7 +420,7 @@ TEST_CASE("ExecutionAlpha: Aggressive → нет лимитной цены", "[e
     auto intent = make_intent(0.95, 0.9); // Очень высокая срочность → Aggressive
     auto features = make_features(5.0);
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.recommended_style == ExecutionStyle::Aggressive);
     // Для рыночного ордера лимитная цена не нужна
@@ -437,7 +438,7 @@ TEST_CASE("ExecutionAlpha: weighted_mid используется при нали
     // Взвешенная средняя немного отличается от mid
     features.microstructure.weighted_mid_price = 50010.0; // Bid-heavy → weighted_mid выше
 
-    auto result = engine.evaluate(intent, features);
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.weighted_mid_used);

@@ -1,7 +1,9 @@
 #include "risk/risk_engine.hpp"
+#include "uncertainty/uncertainty_types.hpp"
 #include "governance/governance_audit_layer.hpp"
 #include "order_book/order_book_types.hpp"
 #include "common/constants.hpp"
+#include "common/enums.hpp"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -28,7 +30,8 @@ RiskDecision ProductionRiskEngine::evaluate(
     const portfolio_allocator::SizingResult& sizing,
     const portfolio::PortfolioSnapshot& portfolio,
     const features::FeatureSnapshot& features,
-    const execution_alpha::ExecutionAlphaResult& exec_alpha)
+    const execution_alpha::ExecutionAlphaResult& exec_alpha,
+    const uncertainty::UncertaintySnapshot& uncertainty)
 {
     RiskDecision decision;
     decision.decided_at = clock_->now();
@@ -107,6 +110,15 @@ RiskDecision ProductionRiskEngine::evaluate(
 
     // 23. Масштабирование лимитов по режиму
     check_regime_scaled_limits(decision);
+
+    // 24. Лимиты неопределённости
+    check_uncertainty_limits(uncertainty, sizing, decision);
+
+    // 25. Кулдаун неопределённости
+    check_uncertainty_cooldown(uncertainty, decision);
+
+    // 26. Режим исполнения неопределённости
+    check_uncertainty_execution_mode(uncertainty, intent, decision);
 
     // Рассчитать утилизацию рисков
     if (portfolio.total_capital > 0.0) {
@@ -806,6 +818,82 @@ void ProductionRiskEngine::check_regime_scaled_limits(RiskDecision& decision) co
     // Если режим стрессовый (scale < 1.0) и утилизация рисков высокая,
     // добавляем предупреждение в decision
     decision.regime_scaling_factor = regime_scale_factor_;
+}
+
+// ========== Проверки неопределённости (24-26) ==========
+
+void ProductionRiskEngine::check_uncertainty_limits(
+    const uncertainty::UncertaintySnapshot& uncertainty,
+    const portfolio_allocator::SizingResult& sizing,
+    RiskDecision& decision) const
+{
+    // При High/Extreme неопределённости ужесточаем max_notional
+    if (uncertainty.level != UncertaintyLevel::High &&
+        uncertainty.level != UncertaintyLevel::Extreme) {
+        return;
+    }
+
+    const double adjusted_max = config_.max_position_notional * uncertainty.size_multiplier;
+    const double notional = sizing.approved_notional.get();
+
+    if (notional > adjusted_max) {
+        if (decision.verdict == RiskVerdict::Approved) {
+            decision.verdict = RiskVerdict::ReduceSize;
+        }
+
+        const double ratio = adjusted_max / notional;
+        decision.approved_quantity = Quantity(
+            decision.approved_quantity.get() * ratio);
+
+        decision.reasons.push_back({
+            "UNCERTAINTY_LIMIT",
+            "Неопределённость " + std::string(to_string(uncertainty.level)) +
+            " — номинал " + std::to_string(notional) +
+            " превышает скорректированный лимит " + std::to_string(adjusted_max) +
+            " (множитель=" + std::to_string(uncertainty.size_multiplier) + ")",
+            0.8
+        });
+    }
+}
+
+void ProductionRiskEngine::check_uncertainty_cooldown(
+    const uncertainty::UncertaintySnapshot& uncertainty,
+    RiskDecision& decision) const
+{
+    if (!uncertainty.cooldown.active) return;
+
+    // Кулдаун активен — добавляем предупреждение и троттлим новые сделки
+    if (decision.verdict == RiskVerdict::Approved) {
+        decision.verdict = RiskVerdict::Throttled;
+    }
+
+    decision.reasons.push_back({
+        "UNCERTAINTY_COOLDOWN",
+        "Кулдаун неопределённости активен — " + uncertainty.cooldown.trigger_reason +
+        " (осталось " + std::to_string(uncertainty.cooldown.remaining_ns / 1'000'000'000LL) + "с"
+        ", decay=" + std::to_string(uncertainty.cooldown.decay_factor) + ")",
+        0.7
+    });
+}
+
+void ProductionRiskEngine::check_uncertainty_execution_mode(
+    const uncertainty::UncertaintySnapshot& uncertainty,
+    const strategy::TradeIntent& intent,
+    RiskDecision& decision) const
+{
+    if (uncertainty.execution_mode != uncertainty::ExecutionModeRecommendation::HaltNewEntries) {
+        return;
+    }
+
+    // HaltNewEntries — запрещаем новые входы (BUY), но разрешаем закрытие (SELL)
+    if (intent.side == Side::Buy) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "UNCERTAINTY_HALT",
+            "Режим неопределённости HaltNewEntries — новые входы запрещены",
+            1.0
+        });
+    }
 }
 
 } // namespace tb::risk

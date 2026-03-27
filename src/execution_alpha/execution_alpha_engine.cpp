@@ -1,4 +1,5 @@
 #include "execution_alpha/execution_alpha_engine.hpp"
+#include "uncertainty/uncertainty_types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -23,7 +24,8 @@ RuleBasedExecutionAlpha::RuleBasedExecutionAlpha(
 
 ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
     const strategy::TradeIntent& intent,
-    const features::FeatureSnapshot& features)
+    const features::FeatureSnapshot& features,
+    const uncertainty::UncertaintySnapshot& uncertainty)
 {
     ExecutionAlphaResult result;
     result.computed_at = clock_->now();
@@ -39,8 +41,45 @@ ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
         return result;
     }
 
+    // ── 1b. Проверка неопределённости ──────────────────────────────────────
+    // HaltNewEntries → блокируем исполнение
+    if (uncertainty.execution_mode == uncertainty::ExecutionModeRecommendation::HaltNewEntries) {
+        result.should_execute = false;
+        result.recommended_style = ExecutionStyle::NoExecution;
+        result.rationale = "NoExecution: режим неопределённости HaltNewEntries";
+        logger_->warn("ExecutionAlpha", "Отказ: HaltNewEntries",
+            {{"symbol", intent.symbol.get()}});
+        return result;
+    }
+
+    // DefensiveOnly + вход (BUY) → блокируем
+    if (uncertainty.execution_mode == uncertainty::ExecutionModeRecommendation::DefensiveOnly &&
+        intent.side == Side::Buy) {
+        result.should_execute = false;
+        result.recommended_style = ExecutionStyle::NoExecution;
+        result.rationale = "NoExecution: режим DefensiveOnly — только защитные операции";
+        logger_->warn("ExecutionAlpha", "Отказ: DefensiveOnly, новый вход заблокирован",
+            {{"symbol", intent.symbol.get()}});
+        return result;
+    }
+
+    // Extreme → блокируем исполнение
+    if (uncertainty.level == UncertaintyLevel::Extreme) {
+        result.should_execute = false;
+        result.recommended_style = ExecutionStyle::NoExecution;
+        result.rationale = "NoExecution: экстремальная неопределённость";
+        logger_->warn("ExecutionAlpha", "Отказ: Extreme uncertainty",
+            {{"symbol", intent.symbol.get()},
+             {"aggregate_score", std::to_string(uncertainty.aggregate_score)}});
+        return result;
+    }
+
     // ── 2. Расчёт срочности (с декомпозицией в DecisionFactors) ──────────
     result.urgency_score = compute_urgency(intent, features, result.decision_factors);
+
+    // ── 2b. Коррекция срочности по неопределённости ────────────────────────
+    // Масштабируем срочность вниз при повышенной неопределённости
+    result.urgency_score *= uncertainty.size_multiplier;
 
     // ── 3. Adverse selection (однократный расчёт, кешируется в factors) ──
     double adverse = estimate_adverse_selection(features, result.decision_factors);
@@ -62,6 +101,12 @@ ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
              {"adverse", std::to_string(adverse)},
              {"spread_bps", std::to_string(features.microstructure.spread_bps)}});
         return result;
+    }
+
+    // ── 5b. High неопределённость → предпочтение пассивного стиля ──────────
+    if (uncertainty.level == UncertaintyLevel::High &&
+        result.recommended_style == ExecutionStyle::Aggressive) {
+        result.recommended_style = ExecutionStyle::Passive;
     }
 
     // ── 6. Оценка качества исполнения ──────────────────────────────────────

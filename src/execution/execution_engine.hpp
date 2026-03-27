@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace tb::uncertainty { struct UncertaintySnapshot; }
+
 namespace tb::execution {
 
 /// Интерфейс отправки ордеров на биржу (абстракция для тестирования)
@@ -51,7 +53,8 @@ public:
     /// Отправить ордер на основе одобренного интента + risk decision
     Result<OrderId> execute(const strategy::TradeIntent& intent,
                             const risk::RiskDecision& risk_decision,
-                            const execution_alpha::ExecutionAlphaResult& exec_alpha);
+                            const execution_alpha::ExecutionAlphaResult& exec_alpha,
+                            const uncertainty::UncertaintySnapshot& uncertainty);
 
     /// Запросить отмену ордера
     VoidResult cancel(const OrderId& order_id);
@@ -74,7 +77,8 @@ private:
     /// Создать запись ордера из интента, решения риска и параметров исполнения
     OrderRecord create_order_record(const strategy::TradeIntent& intent,
                                      const risk::RiskDecision& risk_decision,
-                                     const execution_alpha::ExecutionAlphaResult& exec_alpha);
+                                     const execution_alpha::ExecutionAlphaResult& exec_alpha,
+                                     const uncertainty::UncertaintySnapshot& uncertainty);
 
     /// Генерировать уникальный идентификатор ордера
     std::string generate_order_id();

@@ -1540,7 +1540,8 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         last_order_time_ns_ = now_ns;
         last_activity_ns_.store(now_ns, std::memory_order_relaxed);
 
-        auto order_result = execution_engine_->execute(close_intent, risk_decision, exec_alpha);
+        auto order_result = execution_engine_->execute(close_intent, risk_decision, exec_alpha,
+            uncertainty::UncertaintySnapshot{});  // Стоп-лосс обходит неопределённость
         if (order_result) {
             risk_engine_->record_order_sent();
             logger_->warn("pipeline", is_full_close
@@ -2063,14 +2064,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             auto slice_intent = twap_executor_->get_next_slice(twap, snapshot, now_ms);
             if (slice_intent) {
                 // Исполняем слайс через обычный pipeline (размер уже рассчитан)
-                auto exec_alpha = execution_alpha_->evaluate(*slice_intent, snapshot);
+                // TWAP слайсы используют дефолтную неопределённость — размер уже зафиксирован
+                uncertainty::UncertaintySnapshot twap_uncertainty{};
+                auto exec_alpha = execution_alpha_->evaluate(*slice_intent, snapshot, twap_uncertainty);
                 risk::RiskDecision slice_risk;
                 slice_risk.decided_at = clock_->now();
                 slice_risk.approved_quantity = slice_intent->suggested_quantity;
                 slice_risk.verdict = risk::RiskVerdict::Approved;
                 slice_risk.summary = "TWAP slice";
 
-                auto result = execution_engine_->execute(*slice_intent, slice_risk, exec_alpha);
+                auto result = execution_engine_->execute(*slice_intent, slice_risk, exec_alpha, twap_uncertainty);
                 if (result) {
                     risk_engine_->record_order_sent();
                     twap_executor_->record_slice_fill(twap, twap.next_slice - 1,
@@ -2749,7 +2752,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     // Execution alpha — вычисляем один раз для всех ветвей
-    auto exec_alpha = execution_alpha_->evaluate(intent, snapshot);
+    auto exec_alpha = execution_alpha_->evaluate(intent, snapshot, uncertainty);
 
     if (is_closing_position) {
         // Закрытие позиции ОБЯЗАНО исполниться → market order.
@@ -2940,7 +2943,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         // 11. Проверка риск-движком — ОБЯЗАТЕЛЬНА для новых позиций
         risk_decision = risk_engine_->evaluate(
-            intent, sizing, portfolio_->snapshot(), snapshot, exec_alpha);
+            intent, sizing, portfolio_->snapshot(), snapshot, exec_alpha, uncertainty);
 
         if (risk_decision.verdict == risk::RiskVerdict::Denied ||
             risk_decision.verdict == risk::RiskVerdict::Throttled) {
@@ -2990,7 +2993,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     last_order_time_ns_ = clock_->now().get();
     last_activity_ns_.store(last_order_time_ns_, std::memory_order_relaxed);
 
-    auto order_result = execution_engine_->execute(intent, risk_decision, exec_alpha);
+    auto order_result = execution_engine_->execute(intent, risk_decision, exec_alpha, uncertainty);
     if (order_result) {
         consecutive_rejections_ = 0;  // Успешный ордер — сброс backoff
         risk_engine_->record_order_sent();

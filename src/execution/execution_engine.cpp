@@ -1,4 +1,6 @@
 #include "execution/execution_engine.hpp"
+#include "uncertainty/uncertainty_types.hpp"
+#include "common/enums.hpp"
 #include <sstream>
 
 namespace tb::execution {
@@ -41,7 +43,8 @@ ExecutionEngine::ExecutionEngine(
 Result<OrderId> ExecutionEngine::execute(
     const strategy::TradeIntent& intent,
     const risk::RiskDecision& risk_decision,
-    const execution_alpha::ExecutionAlphaResult& exec_alpha)
+    const execution_alpha::ExecutionAlphaResult& exec_alpha,
+    const uncertainty::UncertaintySnapshot& uncertainty)
 {
     // Проверить, что risk decision одобрен
     if (risk_decision.verdict == risk::RiskVerdict::Denied ||
@@ -57,13 +60,32 @@ Result<OrderId> ExecutionEngine::execute(
         return std::unexpected(TbError::ExecutionFailed);
     }
 
+    // Проверка уровня неопределённости
+    if (uncertainty.level == UncertaintyLevel::Extreme) {
+        logger_->warn("Execution", "Неопределённость слишком высока для исполнения",
+            {{"level", std::string(to_string(uncertainty.level))},
+             {"aggregate_score", std::to_string(uncertainty.aggregate_score)}});
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
+    if (uncertainty.cooldown.active) {
+        logger_->warn("Execution", "Кулдаун неопределённости активен — продолжаем (risk handles deny)",
+            {{"reason", uncertainty.cooldown.trigger_reason},
+             {"remaining_s", std::to_string(uncertainty.cooldown.remaining_ns / 1'000'000'000LL)}});
+    }
+
+    logger_->debug("Execution", "Аудит неопределённости",
+        {{"level", std::string(to_string(uncertainty.level))},
+         {"size_multiplier", std::to_string(uncertainty.size_multiplier)},
+         {"execution_mode", uncertainty::to_string(uncertainty.execution_mode)}});
+
     // Проверить дублирование
     if (is_duplicate(intent)) {
         return std::unexpected(TbError::ExecutionFailed);
     }
 
     // Создать запись ордера
-    auto order = create_order_record(intent, risk_decision, exec_alpha);
+    auto order = create_order_record(intent, risk_decision, exec_alpha, uncertainty);
 
     std::lock_guard lock(mutex_);
 
@@ -393,7 +415,8 @@ bool ExecutionEngine::is_duplicate(const strategy::TradeIntent& intent) {
 OrderRecord ExecutionEngine::create_order_record(
     const strategy::TradeIntent& intent,
     const risk::RiskDecision& risk_decision,
-    const execution_alpha::ExecutionAlphaResult& exec_alpha)
+    const execution_alpha::ExecutionAlphaResult& exec_alpha,
+    const uncertainty::UncertaintySnapshot& uncertainty)
 {
     OrderRecord record;
     record.order_id = OrderId(generate_order_id());

@@ -4,6 +4,7 @@
 #include "execution/order_fsm.hpp"
 #include "execution/order_types.hpp"
 #include "portfolio/portfolio_engine.hpp"
+#include "uncertainty/uncertainty_types.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
@@ -225,7 +226,8 @@ TEST_CASE("ExecutionEngine: Создание ордера корректно", "
     exec_alpha.recommended_style = execution_alpha::ExecutionStyle::Passive;
     exec_alpha.recommended_limit_price = Price(49990.0);
 
-    auto result = engine.execute(intent, risk_decision, exec_alpha);
+    auto result = engine.execute(intent, risk_decision, exec_alpha,
+        uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.has_value());
     auto order = engine.get_order(*result);
@@ -259,7 +261,8 @@ TEST_CASE("ExecutionEngine: Risk denied → ошибка", "[execution][engine]"
 
     execution_alpha::ExecutionAlphaResult exec_alpha;
 
-    auto result = engine.execute(intent, risk_decision, exec_alpha);
+    auto result = engine.execute(intent, risk_decision, exec_alpha,
+        uncertainty::UncertaintySnapshot{});
     REQUIRE_FALSE(result.has_value());
 }
 
@@ -290,11 +293,13 @@ TEST_CASE("ExecutionEngine: Обнаружение дубликатов", "[exec
     exec_alpha.recommended_style = execution_alpha::ExecutionStyle::Passive;
 
     // Первый ордер — успех
-    auto result1 = engine.execute(intent, risk_decision, exec_alpha);
+    auto result1 = engine.execute(intent, risk_decision, exec_alpha,
+        uncertainty::UncertaintySnapshot{});
     REQUIRE(result1.has_value());
 
     // Второй с тем же correlation_id + symbol — дубликат
-    auto result2 = engine.execute(intent, risk_decision, exec_alpha);
+    auto result2 = engine.execute(intent, risk_decision, exec_alpha,
+        uncertainty::UncertaintySnapshot{});
     REQUIRE_FALSE(result2.has_value());
 }
 

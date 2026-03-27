@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 namespace tb::governance { class GovernanceAuditLayer; }
+namespace tb::uncertainty { struct UncertaintySnapshot; }
 
 namespace tb::risk {
 
@@ -30,7 +31,8 @@ public:
         const portfolio_allocator::SizingResult& sizing,
         const portfolio::PortfolioSnapshot& portfolio,
         const features::FeatureSnapshot& features,
-        const execution_alpha::ExecutionAlphaResult& exec_alpha
+        const execution_alpha::ExecutionAlphaResult& exec_alpha,
+        const uncertainty::UncertaintySnapshot& uncertainty
     ) = 0;
 
     /// Активировать аварийный выключатель
@@ -84,7 +86,8 @@ public:
         const portfolio_allocator::SizingResult& sizing,
         const portfolio::PortfolioSnapshot& portfolio,
         const features::FeatureSnapshot& features,
-        const execution_alpha::ExecutionAlphaResult& exec_alpha
+        const execution_alpha::ExecutionAlphaResult& exec_alpha,
+        const uncertainty::UncertaintySnapshot& uncertainty
     ) override;
 
     void activate_kill_switch(const std::string& reason) override;
@@ -203,6 +206,20 @@ private:
 
     /// Проверка 23: Масштабирование лимитов по режиму (модифицирует decision)
     void check_regime_scaled_limits(RiskDecision& decision) const;
+
+    /// Проверка 24: Лимиты неопределённости — ужесточение max_notional при High/Extreme
+    void check_uncertainty_limits(const uncertainty::UncertaintySnapshot& uncertainty,
+                                  const portfolio_allocator::SizingResult& sizing,
+                                  RiskDecision& decision) const;
+
+    /// Проверка 25: Кулдаун неопределённости — троттлинг новых сделок при активном cooldown
+    void check_uncertainty_cooldown(const uncertainty::UncertaintySnapshot& uncertainty,
+                                    RiskDecision& decision) const;
+
+    /// Проверка 26: Режим исполнения неопределённости — запрет новых входов при HaltNewEntries
+    void check_uncertainty_execution_mode(const uncertainty::UncertaintySnapshot& uncertainty,
+                                          const strategy::TradeIntent& intent,
+                                          RiskDecision& decision) const;
 
     ExtendedRiskConfig config_;
     std::shared_ptr<logging::ILogger> logger_;

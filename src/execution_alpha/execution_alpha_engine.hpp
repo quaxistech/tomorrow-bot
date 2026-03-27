@@ -7,6 +7,8 @@
 #include "metrics/metrics_registry.hpp"
 #include <memory>
 
+namespace tb::uncertainty { struct UncertaintySnapshot; }
+
 namespace tb::execution_alpha {
 
 /// Интерфейс движка исполнительной альфы
@@ -17,7 +19,8 @@ public:
     /// Оценить параметры исполнения для данного намерения
     virtual ExecutionAlphaResult evaluate(
         const strategy::TradeIntent& intent,
-        const features::FeatureSnapshot& features) = 0;
+        const features::FeatureSnapshot& features,
+        const uncertainty::UncertaintySnapshot& uncertainty) = 0;
 };
 
 /// Реализация на основе правил (production-grade)
@@ -64,7 +67,8 @@ public:
 
     ExecutionAlphaResult evaluate(
         const strategy::TradeIntent& intent,
-        const features::FeatureSnapshot& features) override;
+        const features::FeatureSnapshot& features,
+        const uncertainty::UncertaintySnapshot& uncertainty) override;
 
 private:
     /// Проверить минимальное качество данных для принятия решений.
