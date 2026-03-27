@@ -137,3 +137,24 @@ trading_params:
   max_hold_loss_minutes: 15
   max_hold_absolute_minutes: 60
   order_cooldown_seconds: 10
+
+# ── Исполнительная альфа ──────────────────────────────────────────────────────
+execution_alpha:
+  max_spread_bps_passive: 15.0
+  max_spread_bps_any: 50.0
+  adverse_selection_threshold: 0.7
+  urgency_passive_threshold: 0.5
+  urgency_aggressive_threshold: 0.8
+  large_order_slice_threshold: 0.10
+  vpin_toxic_threshold: 0.65
+  vpin_weight: 0.40
+  imbalance_favorable_threshold: 0.30
+  imbalance_unfavorable_threshold: 0.30
+  use_weighted_mid_price: true
+  limit_price_passive_bps: 3.0
+  urgency_cusum_boost: 0.15
+  urgency_tod_weight: 0.10
+  min_fill_probability_passive: 0.25
+  postonly_spread_threshold_bps: 4.5
+  postonly_urgency_max: 0.35
+  postonly_adverse_max: 0.35

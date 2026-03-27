@@ -139,3 +139,31 @@ ai_advisory:
   ensemble_escalation_bonus: 0.12    # Небольшой бонус: не хотим лишних вето
   caution_size_multiplier: 0.4       # Режим осторожности: 40% размера позиции
   use_severity_weighted_adjustment: true
+
+# ── Исполнительная альфа ──────────────────────────────────────────────────────
+execution_alpha:
+  # Базовые пороги
+  max_spread_bps_passive: 12.0          # Production: чуть строже (BTC ликвидный)
+  max_spread_bps_any: 40.0
+  adverse_selection_threshold: 0.65     # Строже в production
+  urgency_passive_threshold: 0.5
+  urgency_aggressive_threshold: 0.8
+  large_order_slice_threshold: 0.08     # Нарезать при 8% от глубины
+  # VPIN
+  vpin_toxic_threshold: 0.65
+  vpin_weight: 0.40
+  # Дисбаланс стакана
+  imbalance_favorable_threshold: 0.30
+  imbalance_unfavorable_threshold: 0.30
+  # Лимитная цена
+  use_weighted_mid_price: true
+  limit_price_passive_bps: 3.0
+  # Срочность
+  urgency_cusum_boost: 0.15
+  urgency_tod_weight: 0.10
+  # Вероятность заполнения
+  min_fill_probability_passive: 0.25
+  # PostOnly условия (нулевая комиссия)
+  postonly_spread_threshold_bps: 4.0
+  postonly_urgency_max: 0.30
+  postonly_adverse_max: 0.30

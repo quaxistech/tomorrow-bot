@@ -456,6 +456,44 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.trading_params.stop_loss_cooldown_seconds = static_cast<int>(parse_double(
         get_value(kv, "trading_params.stop_loss_cooldown_seconds", "300"), 300));
 
+    // ── Исполнительная альфа (execution_alpha) ────────────────────────────
+    cfg.execution_alpha.max_spread_bps_passive = parse_double(
+        get_value(kv, "execution_alpha.max_spread_bps_passive", "15.0"), 15.0);
+    cfg.execution_alpha.max_spread_bps_any = parse_double(
+        get_value(kv, "execution_alpha.max_spread_bps_any", "50.0"), 50.0);
+    cfg.execution_alpha.adverse_selection_threshold = parse_double(
+        get_value(kv, "execution_alpha.adverse_selection_threshold", "0.7"), 0.7);
+    cfg.execution_alpha.urgency_passive_threshold = parse_double(
+        get_value(kv, "execution_alpha.urgency_passive_threshold", "0.5"), 0.5);
+    cfg.execution_alpha.urgency_aggressive_threshold = parse_double(
+        get_value(kv, "execution_alpha.urgency_aggressive_threshold", "0.8"), 0.8);
+    cfg.execution_alpha.large_order_slice_threshold = parse_double(
+        get_value(kv, "execution_alpha.large_order_slice_threshold", "0.1"), 0.1);
+    cfg.execution_alpha.vpin_toxic_threshold = parse_double(
+        get_value(kv, "execution_alpha.vpin_toxic_threshold", "0.65"), 0.65);
+    cfg.execution_alpha.vpin_weight = parse_double(
+        get_value(kv, "execution_alpha.vpin_weight", "0.40"), 0.40);
+    cfg.execution_alpha.imbalance_favorable_threshold = parse_double(
+        get_value(kv, "execution_alpha.imbalance_favorable_threshold", "0.30"), 0.30);
+    cfg.execution_alpha.imbalance_unfavorable_threshold = parse_double(
+        get_value(kv, "execution_alpha.imbalance_unfavorable_threshold", "0.30"), 0.30);
+    cfg.execution_alpha.use_weighted_mid_price =
+        (get_value(kv, "execution_alpha.use_weighted_mid_price", "true") != "false");
+    cfg.execution_alpha.limit_price_passive_bps = parse_double(
+        get_value(kv, "execution_alpha.limit_price_passive_bps", "3.0"), 3.0);
+    cfg.execution_alpha.urgency_cusum_boost = parse_double(
+        get_value(kv, "execution_alpha.urgency_cusum_boost", "0.15"), 0.15);
+    cfg.execution_alpha.urgency_tod_weight = parse_double(
+        get_value(kv, "execution_alpha.urgency_tod_weight", "0.10"), 0.10);
+    cfg.execution_alpha.min_fill_probability_passive = parse_double(
+        get_value(kv, "execution_alpha.min_fill_probability_passive", "0.25"), 0.25);
+    cfg.execution_alpha.postonly_spread_threshold_bps = parse_double(
+        get_value(kv, "execution_alpha.postonly_spread_threshold_bps", "4.5"), 4.5);
+    cfg.execution_alpha.postonly_urgency_max = parse_double(
+        get_value(kv, "execution_alpha.postonly_urgency_max", "0.35"), 0.35);
+    cfg.execution_alpha.postonly_adverse_max = parse_double(
+        get_value(kv, "execution_alpha.postonly_adverse_max", "0.35"), 0.35);
+
     // Валидация
     ConfigValidator validator;
     auto validation = validator.validate(cfg);

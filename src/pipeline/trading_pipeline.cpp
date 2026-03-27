@@ -233,9 +233,30 @@ TradingPipeline::TradingPipeline(
     portfolio_allocator_ = std::make_shared<portfolio_allocator::HierarchicalAllocator>(
         alloc_cfg, logger_);
 
-    // 8. Execution alpha
-    execution_alpha_ = std::make_shared<execution_alpha::RuleBasedExecutionAlpha>(
-        execution_alpha::RuleBasedExecutionAlpha::Config{}, logger_, clock_, metrics_);
+    // 8. Execution alpha — инициализируется из конфигурации (не хардкод)
+    {
+        execution_alpha::RuleBasedExecutionAlpha::Config ea_cfg;
+        ea_cfg.max_spread_bps_passive          = config_.execution_alpha.max_spread_bps_passive;
+        ea_cfg.max_spread_bps_any              = config_.execution_alpha.max_spread_bps_any;
+        ea_cfg.adverse_selection_threshold     = config_.execution_alpha.adverse_selection_threshold;
+        ea_cfg.urgency_passive_threshold       = config_.execution_alpha.urgency_passive_threshold;
+        ea_cfg.urgency_aggressive_threshold    = config_.execution_alpha.urgency_aggressive_threshold;
+        ea_cfg.large_order_slice_threshold     = config_.execution_alpha.large_order_slice_threshold;
+        ea_cfg.vpin_toxic_threshold            = config_.execution_alpha.vpin_toxic_threshold;
+        ea_cfg.vpin_weight                     = config_.execution_alpha.vpin_weight;
+        ea_cfg.imbalance_favorable_threshold   = config_.execution_alpha.imbalance_favorable_threshold;
+        ea_cfg.imbalance_unfavorable_threshold = config_.execution_alpha.imbalance_unfavorable_threshold;
+        ea_cfg.use_weighted_mid_price          = config_.execution_alpha.use_weighted_mid_price;
+        ea_cfg.limit_price_passive_bps         = config_.execution_alpha.limit_price_passive_bps;
+        ea_cfg.urgency_cusum_boost             = config_.execution_alpha.urgency_cusum_boost;
+        ea_cfg.urgency_tod_weight              = config_.execution_alpha.urgency_tod_weight;
+        ea_cfg.min_fill_probability_passive    = config_.execution_alpha.min_fill_probability_passive;
+        ea_cfg.postonly_spread_threshold_bps   = config_.execution_alpha.postonly_spread_threshold_bps;
+        ea_cfg.postonly_urgency_max            = config_.execution_alpha.postonly_urgency_max;
+        ea_cfg.postonly_adverse_max            = config_.execution_alpha.postonly_adverse_max;
+        execution_alpha_ = std::make_shared<execution_alpha::RuleBasedExecutionAlpha>(
+            std::move(ea_cfg), logger_, clock_, metrics_);
+    }
 
     // 9. Риск-движок
     risk::ExtendedRiskConfig risk_cfg;
@@ -2679,15 +2700,22 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
     }
 
-    // 11a. Smart TWAP: разбиваем крупные ордера на слайсы
-    if (twap_executor_ && twap_executor_->should_use_twap(intent, snapshot)) {
+    // 11a. Smart TWAP: разбиваем крупные ордера на слайсы.
+    // Execution Alpha является основным арбитром: если он рекомендует нарезку
+    // (slice_plan.has_value()), это учитывается в приоритете над оценкой TWAP.
+    const bool exec_alpha_wants_twap = exec_alpha.slice_plan.has_value();
+    const bool twap_independently_triggered = twap_executor_
+        && twap_executor_->should_use_twap(intent, snapshot);
+
+    if ((exec_alpha_wants_twap || twap_independently_triggered) && twap_executor_) {
         auto twap_plan = twap_executor_->create_twap_plan(
             intent, snapshot, risk_decision.approved_quantity);
         twap_executor_->active_twap() = twap_plan;
         logger_->info("pipeline", "Активирован Smart TWAP",
             {{"symbol", symbol_.get()},
              {"total_qty", std::to_string(twap_plan.total_qty.get())},
-             {"slices", std::to_string(twap_plan.slices.size())}});
+             {"slices", std::to_string(twap_plan.slices.size())},
+             {"trigger", exec_alpha_wants_twap ? "execution_alpha" : "twap_engine"}});
         return;  // Первый слайс отправится на следующем тике
     }
 

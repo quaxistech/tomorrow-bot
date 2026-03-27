@@ -17,6 +17,10 @@ RuleBasedExecutionAlpha::RuleBasedExecutionAlpha(
 {
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// evaluate — главная точка входа
+// ─────────────────────────────────────────────────────────────────────────────
+
 ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
     const strategy::TradeIntent& intent,
     const features::FeatureSnapshot& features)
@@ -24,214 +28,479 @@ ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
     ExecutionAlphaResult result;
     result.computed_at = clock_->now();
 
-    // Рассчитать срочность
-    result.urgency_score = compute_urgency(intent, features);
-
-    // Определить стиль исполнения
-    result.recommended_style = determine_style(intent, features);
-
-    // Если стиль = NoExecution, отказаться от исполнения
-    if (result.recommended_style == ExecutionStyle::NoExecution) {
+    // ── 1. Валидация данных ────────────────────────────────────────────────
+    if (!validate_features(features)) {
         result.should_execute = false;
-        result.rationale = "Условия слишком токсичны для исполнения";
-        logger_->warn("ExecutionAlpha", "NoExecution: условия рынка неблагоприятны",
-                       {{"symbol", intent.symbol.get()}});
+        result.recommended_style = ExecutionStyle::NoExecution;
+        result.decision_factors.features_complete = false;
+        result.rationale = "NoExecution: недостаточное качество данных (mid_price или spread невалидны)";
+        logger_->warn("ExecutionAlpha", "Отказ: невалидные данные",
+            {{"symbol", intent.symbol.get()}});
         return result;
     }
 
-    // Оценить качество исполнения
-    result.quality = estimate_quality(result.recommended_style, features);
+    // ── 2. Расчёт срочности (с декомпозицией в DecisionFactors) ──────────
+    result.urgency_score = compute_urgency(intent, features, result.decision_factors);
 
-    // Рассчитать лимитную цену
+    // ── 3. Adverse selection (однократный расчёт, кешируется в factors) ──
+    double adverse = estimate_adverse_selection(features, result.decision_factors);
+
+    // ── 4. Направленный дисбаланс стакана ─────────────────────────────────
+    double dir_imbalance = get_directional_imbalance(intent.side, features);
+    result.decision_factors.directional_imbalance = dir_imbalance;
+    result.decision_factors.imbalance_used = features.microstructure.book_imbalance_valid;
+
+    // ── 5. Выбор стиля исполнения ──────────────────────────────────────────
+    result.recommended_style = determine_style(
+        intent, features, result.urgency_score, adverse, dir_imbalance);
+
+    if (result.recommended_style == ExecutionStyle::NoExecution) {
+        result.should_execute = false;
+        result.rationale = "NoExecution: рыночные условия слишком токсичны";
+        logger_->warn("ExecutionAlpha", "NoExecution: токсичные условия",
+            {{"symbol", intent.symbol.get()},
+             {"adverse", std::to_string(adverse)},
+             {"spread_bps", std::to_string(features.microstructure.spread_bps)}});
+        return result;
+    }
+
+    // ── 6. Оценка качества исполнения ──────────────────────────────────────
+    result.quality = estimate_quality(
+        result.recommended_style, intent, features, adverse, dir_imbalance);
+
+    // ── 7. Рекомендуемая лимитная цена ────────────────────────────────────
+    bool weighted_mid_used = false;
     result.recommended_limit_price = compute_limit_price(
-        result.recommended_style, intent, features);
+        result.recommended_style, intent, features, weighted_mid_used);
+    result.decision_factors.weighted_mid_used = weighted_mid_used;
 
-    // Рассчитать план нарезки
+    // ── 8. План нарезки ───────────────────────────────────────────────────
     result.slice_plan = compute_slice_plan(intent, features);
 
-    // Сформировать обоснование
-    std::ostringstream oss;
-    oss << "Стиль=" << to_string(result.recommended_style)
-        << " срочность=" << result.urgency_score
-        << " стоимость=" << result.quality.total_cost_bps << "бп"
-        << " P(fill)=" << result.quality.fill_probability;
-    result.rationale = oss.str();
+    // ── 9. Обоснование (структурированное) ────────────────────────────────
+    {
+        std::ostringstream oss;
+        oss << "style=" << to_string(result.recommended_style)
+            << " urgency=" << result.urgency_score
+            << " adverse=" << adverse
+            << " imbalance=" << dir_imbalance
+            << " cost_bps=" << result.quality.total_cost_bps
+            << " fill_p=" << result.quality.fill_probability;
+        if (result.decision_factors.vpin_used) {
+            oss << " vpin=" << features.microstructure.vpin;
+        }
+        if (result.slice_plan) {
+            oss << " slices=" << result.slice_plan->num_slices;
+        }
+        result.rationale = oss.str();
+    }
 
     result.should_execute = true;
 
+    // ── 10. Метрики (counter + histograms) ────────────────────────────────
     if (metrics_) {
         metrics_->counter("execution_alpha_evaluations",
-                          {{"style", to_string(result.recommended_style)}})->increment();
+            {{"style", to_string(result.recommended_style)}})->increment();
+
+        static const std::vector<double> kUrgencyBuckets{
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+        metrics_->histogram("execution_alpha_urgency_score", kUrgencyBuckets, {})
+                ->observe(result.urgency_score);
+
+        static const std::vector<double> kFillProbBuckets{
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+        metrics_->histogram("execution_alpha_fill_probability", kFillProbBuckets, {})
+                ->observe(result.quality.fill_probability);
+
+        static const std::vector<double> kCostBuckets{
+            0.0, 2.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0};
+        metrics_->histogram("execution_alpha_total_cost_bps", kCostBuckets, {})
+                ->observe(result.quality.total_cost_bps);
+
+        static const std::vector<double> kAdverseBuckets{
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+        metrics_->histogram("execution_alpha_adverse_selection", kAdverseBuckets, {})
+                ->observe(adverse);
     }
 
     return result;
 }
 
-ExecutionStyle RuleBasedExecutionAlpha::determine_style(
-    const strategy::TradeIntent& intent,
+// ─────────────────────────────────────────────────────────────────────────────
+// validate_features — минимальная проверка качества данных
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool RuleBasedExecutionAlpha::validate_features(
     const features::FeatureSnapshot& features) const
 {
-    const double spread_bps = features.microstructure.spread_bps;
-    const double adverse = estimate_adverse_selection(features);
-    const double urgency = compute_urgency(intent, features);
+    if (features.mid_price.get() <= 0.0) return false;
+    if (!features.microstructure.spread_valid) return false;
+    if (features.microstructure.spread_bps < 0.0) return false;
+    return true;
+}
 
-    // Правило 1: Слишком широкий спред → отказ
+// ─────────────────────────────────────────────────────────────────────────────
+// determine_style — выбор стиля с учётом VPIN, имбаланса, PostOnly условий
+// ─────────────────────────────────────────────────────────────────────────────
+
+ExecutionStyle RuleBasedExecutionAlpha::determine_style(
+    const strategy::TradeIntent& intent,
+    const features::FeatureSnapshot& features,
+    double urgency,
+    double adverse_score,
+    double directional_imbalance) const
+{
+    const double spread_bps = features.microstructure.spread_bps;
+
+    // ── Правило 1: Слишком широкий спред → отказ ─────────────────────────
     if (spread_bps > config_.max_spread_bps_any) {
         return ExecutionStyle::NoExecution;
     }
 
-    // Правило 2: Высокий риск неблагоприятного отбора → отказ
-    if (adverse > config_.adverse_selection_threshold) {
+    // ── Правило 2: VPIN жёсткий стоп — информированный поток обнаружен ───
+    // Проверяется ДО взвешенного adverse, так как VPIN_toxic — бинарный флаг
+    // с высоким confidence (алгоритм специально откалиброван на этот порог)
+    if (features.microstructure.vpin_valid
+        && features.microstructure.vpin_toxic
+        && features.microstructure.vpin > config_.vpin_toxic_threshold) {
         return ExecutionStyle::NoExecution;
     }
 
-    // Правило 3: Высокая срочность → агрессивно
+    // ── Правило 3: Высокая взвешенная токсичность → отказ ────────────────
+    if (adverse_score > config_.adverse_selection_threshold) {
+        return ExecutionStyle::NoExecution;
+    }
+
+    // ── Правило 3: Высокая срочность → агрессивно ─────────────────────────
     if (urgency > config_.urgency_aggressive_threshold) {
         return ExecutionStyle::Aggressive;
     }
 
-    // Правило 4: Низкая срочность и узкий спред → пассивно
-    if (urgency < config_.urgency_passive_threshold &&
-        spread_bps < config_.max_spread_bps_passive) {
+    // ── Правило 4: PostOnly — идеальные условия для нулевых комиссий ──────
+    // Применяется при очень узком спреде, низкой срочности и чистом потоке
+    if (spread_bps < config_.postonly_spread_threshold_bps
+        && urgency < config_.postonly_urgency_max
+        && adverse_score < config_.postonly_adverse_max
+        && (!features.microstructure.vpin_valid || !features.microstructure.vpin_toxic)) {
+        return ExecutionStyle::PostOnly;
+    }
+
+    // ── Правило 5: Пассивный с учётом имбаланса стакана ──────────────────
+    if (urgency < config_.urgency_passive_threshold
+        && spread_bps < config_.max_spread_bps_passive) {
+
+        // Сильный имбаланс ПРОТИВ нас при пассивном ордере → переключиться на Hybrid.
+        // (Тонкая сторона нашего направления означает низкую вероятность fill.)
+        if (directional_imbalance < -config_.imbalance_unfavorable_threshold) {
+            return ExecutionStyle::Hybrid;
+        }
         return ExecutionStyle::Passive;
     }
 
-    // По умолчанию → гибридный
+    // ── Правило 6: Промежуточная срочность + имбаланс ─────────────────────
+    // Благоприятный имбаланс при умеренной срочности даёт шанс на Passive
+    if (urgency < config_.urgency_aggressive_threshold
+        && directional_imbalance > config_.imbalance_favorable_threshold
+        && spread_bps < config_.max_spread_bps_passive) {
+        return ExecutionStyle::Passive;
+    }
+
+    // ── По умолчанию → Hybrid ─────────────────────────────────────────────
     return ExecutionStyle::Hybrid;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_urgency — срочность с CUSUM + time-of-day + декомпозицией
+// ─────────────────────────────────────────────────────────────────────────────
+
 double RuleBasedExecutionAlpha::compute_urgency(
     const strategy::TradeIntent& intent,
-    const features::FeatureSnapshot& features) const
+    const features::FeatureSnapshot& features,
+    DecisionFactors& factors) const
 {
-    // Базовая срочность из интента
     double urgency = intent.urgency;
+    factors.urgency_base = urgency;
 
-    // Модификатор: высокая волатильность увеличивает срочность
+    // ── Волатильность: высокая вола → исполнять быстрее ──────────────────
     if (features.technical.volatility_valid && features.technical.volatility_5 > 0.0) {
-        // Нормализованная волатильность добавляет до 0.2 срочности
-        double vol_factor = std::min(features.technical.volatility_5 * 2.0, 0.2);
+        double vol_factor = std::min(features.technical.volatility_5 * 2.0, 0.20);
+        factors.urgency_vol_adj = vol_factor;
         urgency += vol_factor;
     }
 
-    // Модификатор: сильный моментум увеличивает срочность
+    // ── Моментум: сильное движение → не ждать лучшей цены ────────────────
     if (features.technical.momentum_valid) {
-        double momentum_abs = std::abs(features.technical.momentum_5);
-        double momentum_factor = std::min(momentum_abs * 0.5, 0.15);
+        double momentum_factor = std::min(std::abs(features.technical.momentum_5) * 0.5, 0.15);
+        factors.urgency_momentum_adj = momentum_factor;
         urgency += momentum_factor;
     }
 
-    // Ограничить диапазоном [0, 1]
+    // ── CUSUM: сигнал смены режима → срочность выше ───────────────────────
+    if (features.technical.cusum_valid && features.technical.cusum_regime_change) {
+        factors.urgency_cusum_adj = config_.urgency_cusum_boost;
+        urgency += config_.urgency_cusum_boost;
+    }
+
+    // ── Time-of-day: плохая торговая сессия → снизить срочность ──────────
+    // tod_alpha_score: [-1, +1]; отрицательный = плохой час, не стоит спешить
+    if (features.technical.tod_valid) {
+        double tod_adj = features.technical.tod_alpha_score * config_.urgency_tod_weight;
+        factors.urgency_tod_adj = tod_adj;
+        urgency += tod_adj;
+    }
+
     return std::clamp(urgency, 0.0, 1.0);
 }
 
-ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
-    ExecutionStyle style,
+// ─────────────────────────────────────────────────────────────────────────────
+// estimate_adverse_selection — взвешенная агрегация с VPIN
+// ─────────────────────────────────────────────────────────────────────────────
+
+double RuleBasedExecutionAlpha::estimate_adverse_selection(
+    const features::FeatureSnapshot& features,
+    DecisionFactors& factors) const
+{
+    double score = 0.0;
+    double weight_sum = 0.0;
+
+    // ── VPIN — первичный индикатор токсичности потока ─────────────────────
+    // VPIN нормализован: [0..1], значение > vpin_toxic_threshold = токсично.
+    // Вес выше, чем у других факторов, т.к. VPIN объединяет volume и direction.
+    if (features.microstructure.vpin_valid) {
+        double vpin_norm = std::clamp(
+            features.microstructure.vpin / config_.vpin_toxic_threshold, 0.0, 1.0);
+        factors.vpin_toxicity = vpin_norm;
+        factors.vpin_used = true;
+        score += vpin_norm * config_.vpin_weight;
+        weight_sum += config_.vpin_weight;
+    }
+
+    // ── Агрессивный поток ────────────────────────────────────────────────
+    if (features.microstructure.trade_flow_valid) {
+        double flow = std::clamp(features.microstructure.aggressive_flow, 0.0, 1.0);
+        factors.flow_toxicity = flow;
+        score += flow;
+        weight_sum += 1.0;
+    }
+
+    // ── Нестабильность стакана ───────────────────────────────────────────
+    if (features.microstructure.instability_valid) {
+        double instab = std::clamp(features.microstructure.book_instability, 0.0, 1.0);
+        factors.book_instability_score = instab;
+        score += instab;
+        weight_sum += 1.0;
+    }
+
+    // ── Спред как прокси токсичности ─────────────────────────────────────
+    if (features.microstructure.spread_valid) {
+        double spread_score = std::clamp(
+            features.microstructure.spread_bps / 100.0, 0.0, 1.0);
+        factors.spread_toxicity = spread_score;
+        score += spread_score;
+        weight_sum += 1.0;
+    }
+
+    double result = (weight_sum > 0.0) ? (score / weight_sum) : 0.0;
+    factors.adverse_selection_score = result;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_directional_imbalance — имбаланс стакана относительно направления сделки
+// ─────────────────────────────────────────────────────────────────────────────
+
+double RuleBasedExecutionAlpha::get_directional_imbalance(
+    Side side,
     const features::FeatureSnapshot& features) const
 {
+    if (!features.microstructure.book_imbalance_valid) return 0.0;
+    // book_imbalance_5 > 0 → bid > ask depth (давление покупателей)
+    // Для BUY пассивного: положительный имбаланс означает, что продавцы
+    // будут хитить наш bid → favorable. Для SELL: отрицательный = favorable.
+    double imb = features.microstructure.book_imbalance_5;
+    return (side == Side::Buy) ? imb : -imb;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// estimate_fill_probability — data-driven, не хардкод
+// ─────────────────────────────────────────────────────────────────────────────
+
+double RuleBasedExecutionAlpha::estimate_fill_probability(
+    ExecutionStyle style,
+    const strategy::TradeIntent& intent,
+    const features::FeatureSnapshot& features,
+    double directional_imbalance) const
+{
+    switch (style) {
+        case ExecutionStyle::Aggressive:
+            return 0.95;
+
+        case ExecutionStyle::NoExecution:
+            return 0.0;
+
+        case ExecutionStyle::Passive:
+        case ExecutionStyle::PostOnly: {
+            double fp = 0.60;
+
+            // ── Штраф за широкий спред ─────────────────────────────────
+            double spread_ratio = features.microstructure.spread_bps
+                                 / config_.max_spread_bps_passive;
+            fp -= std::clamp(spread_ratio * 0.15, 0.0, 0.20);
+
+            // ── Штраф за размер ордера относительно глубины ───────────
+            if (features.microstructure.liquidity_valid) {
+                double available = (intent.side == Side::Buy)
+                    ? features.microstructure.bid_depth_5_notional
+                    : features.microstructure.ask_depth_5_notional;
+                if (available > 0.0) {
+                    double order_notional = intent.suggested_quantity.get()
+                                          * features.mid_price.get();
+                    double size_ratio = std::clamp(order_notional / available, 0.0, 1.0);
+                    fp -= size_ratio * 0.15;
+                }
+            }
+
+            // ── Бонус за благоприятный имбаланс ──────────────────────
+            // Положительный directional_imbalance → больше давления
+            // в нашу сторону → выше вероятность fill
+            if (directional_imbalance > 0.0) {
+                fp += std::clamp(directional_imbalance * 0.10, 0.0, 0.10);
+            } else {
+                fp += std::clamp(directional_imbalance * 0.10, -0.10, 0.0);
+            }
+
+            return std::clamp(fp, config_.min_fill_probability_passive, 0.75);
+        }
+
+        case ExecutionStyle::Hybrid: {
+            // Hybrid: лимитный с переходом в рыночный — выше fill_prob, чем Passive
+            double base_fp = 0.80;
+            if (features.microstructure.spread_valid) {
+                double spread_penalty = std::clamp(
+                    features.microstructure.spread_bps / config_.max_spread_bps_any * 0.15,
+                    0.0, 0.15);
+                base_fp -= spread_penalty;
+            }
+            return std::clamp(base_fp, 0.60, 0.92);
+        }
+    }
+    return 0.5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// estimate_quality — использует data-driven fill_prob, точная модель стоимости
+// ─────────────────────────────────────────────────────────────────────────────
+
+ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
+    ExecutionStyle style,
+    const strategy::TradeIntent& intent,
+    const features::FeatureSnapshot& features,
+    double adverse_score,
+    double directional_imbalance) const
+{
     ExecutionQualityEstimate quality;
-
-    // Стоимость спреда
     quality.spread_cost_bps = features.microstructure.spread_bps;
+    quality.adverse_selection_risk = adverse_score;
 
-    // Ожидаемое проскальзывание зависит от стиля
+    // ── Проскальзывание и fill_probability по стилю ───────────────────────
     switch (style) {
         case ExecutionStyle::Passive:
         case ExecutionStyle::PostOnly:
-            // Пассивный — нет проскальзывания, но низкая вероятность заполнения
+            // Maker: получаем ребейт (нет slippage), но risk неисполнения
             quality.estimated_slippage_bps = 0.0;
-            quality.fill_probability = 0.4;
             break;
         case ExecutionStyle::Aggressive:
-            // Агрессивный — высокое проскальзывание, высокая вероятность
             quality.estimated_slippage_bps = features.execution_context.estimated_slippage_bps;
-            quality.fill_probability = 0.95;
             break;
         case ExecutionStyle::Hybrid:
-            // Гибридный — среднее проскальзывание
-            quality.estimated_slippage_bps = features.execution_context.estimated_slippage_bps * 0.5;
-            quality.fill_probability = 0.7;
+            // Частичное проскальзывание: начинаем как лимит, может стать рыночным
+            quality.estimated_slippage_bps = features.execution_context.estimated_slippage_bps * 0.4;
             break;
         case ExecutionStyle::NoExecution:
             quality.fill_probability = 0.0;
-            break;
+            return quality;
     }
 
-    // Риск неблагоприятного отбора
-    quality.adverse_selection_risk = estimate_adverse_selection(features);
+    // Data-driven вероятность заполнения
+    quality.fill_probability = estimate_fill_probability(
+        style, intent, features, directional_imbalance);
 
-    // Полная стоимость: для пассивного — только часть спреда, для агрессивного — спред + проскальзывание
+    // ── Полная стоимость исполнения ───────────────────────────────────────
     if (style == ExecutionStyle::Passive || style == ExecutionStyle::PostOnly) {
-        quality.total_cost_bps = quality.spread_cost_bps * 0.3; // Получаем ребейт
+        // Maker: платим ~30% half-spread (или получаем ребейт при PostOnly)
+        // adverse_selection_risk добавляет к стоимости — покупка при
+        // информированном потоке означает, что цена двинется против нас
+        quality.total_cost_bps = quality.spread_cost_bps * 0.30
+                                + adverse_score * quality.spread_cost_bps * 0.20;
     } else {
-        quality.total_cost_bps = quality.spread_cost_bps + quality.estimated_slippage_bps;
+        quality.total_cost_bps = quality.spread_cost_bps
+                                + quality.estimated_slippage_bps
+                                + adverse_score * quality.spread_cost_bps * 0.15;
     }
 
     return quality;
 }
 
-double RuleBasedExecutionAlpha::estimate_adverse_selection(
-    const features::FeatureSnapshot& features) const
-{
-    double score = 0.0;
-    int factors = 0;
-
-    // Агрессивный поток — токсичный рынок
-    if (features.microstructure.trade_flow_valid) {
-        score += std::clamp(features.microstructure.aggressive_flow, 0.0, 1.0);
-        factors++;
-    }
-
-    // Нестабильность стакана
-    if (features.microstructure.instability_valid) {
-        score += std::clamp(features.microstructure.book_instability, 0.0, 1.0);
-        factors++;
-    }
-
-    // Широкий спред как индикатор токсичности
-    if (features.microstructure.spread_valid) {
-        double spread_score = std::clamp(features.microstructure.spread_bps / 100.0, 0.0, 1.0);
-        score += spread_score;
-        factors++;
-    }
-
-    if (factors == 0) return 0.0;
-    return score / static_cast<double>(factors);
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_limit_price — weighted_mid + smart maker offset
+// ─────────────────────────────────────────────────────────────────────────────
 
 std::optional<Price> RuleBasedExecutionAlpha::compute_limit_price(
     ExecutionStyle style,
     const strategy::TradeIntent& intent,
-    const features::FeatureSnapshot& features) const
+    const features::FeatureSnapshot& features,
+    bool& weighted_mid_used_out) const
 {
-    // Для агрессивного стиля — нет лимитной цены (рыночный ордер)
+    // Рыночный или отказ → лимитная цена не нужна
     if (style == ExecutionStyle::Aggressive || style == ExecutionStyle::NoExecution) {
         return std::nullopt;
     }
 
-    const double mid = features.mid_price.get();
     const double spread = features.microstructure.spread;
+    if (spread <= 0.0) return std::nullopt;
 
-    if (mid <= 0.0 || spread <= 0.0) {
-        return std::nullopt;
+    // Выбор опорной цены: взвешенная средняя точнее отражает реальный mid
+    double mid;
+    if (config_.use_weighted_mid_price
+        && features.microstructure.weighted_mid_price > 0.0) {
+        mid = features.microstructure.weighted_mid_price;
+        weighted_mid_used_out = true;
+    } else {
+        mid = features.mid_price.get();
+        weighted_mid_used_out = false;
     }
 
-    // Для пассивного стиля — ставим на best bid/ask (не внутрь спреда)
-    // Buy: ставим чуть ниже best bid (вглубь стакана для maker)
-    // Sell: ставим чуть выше best ask (вглубь стакана для maker)
-    double offset = spread * 0.2; // 20% от спреда от best bid/ask наружу
-    double limit;
+    if (mid <= 0.0) return std::nullopt;
 
-    if (intent.side == Side::Buy) {
-        // Покупка — на best bid или чуть ниже (maker)
-        limit = mid - (spread / 2.0) - offset;
+    const double half_spread = spread / 2.0;
+    // Улучшение не более 30% от half_spread, иначе пересекаем mid
+    const double raw_improvement = mid * config_.limit_price_passive_bps / 10000.0;
+    const double capped_improvement = std::min(raw_improvement, half_spread * 0.30);
+
+    double limit;
+    if (style == ExecutionStyle::Passive || style == ExecutionStyle::PostOnly) {
+        if (intent.side == Side::Buy) {
+            // Вблизи best bid с небольшим улучшением к mid для приоритета в очереди
+            limit = mid - half_spread + capped_improvement;
+        } else {
+            limit = mid + half_spread - capped_improvement;
+        }
     } else {
-        // Продажа — на best ask или чуть выше (maker)
-        limit = mid + (spread / 2.0) + offset;
+        // Hybrid: внутри спреда для IOC-поведения
+        const double inside_offset = half_spread * 0.4;
+        if (intent.side == Side::Buy) {
+            limit = mid - inside_offset;
+        } else {
+            limit = mid + inside_offset;
+        }
     }
 
     return Price(limit);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_slice_plan — нарезка с учётом depth ratio
+// ─────────────────────────────────────────────────────────────────────────────
 
 std::optional<SlicePlan> RuleBasedExecutionAlpha::compute_slice_plan(
     const strategy::TradeIntent& intent,
@@ -241,32 +510,35 @@ std::optional<SlicePlan> RuleBasedExecutionAlpha::compute_slice_plan(
         return std::nullopt;
     }
 
-    // Доступная глубина (используем сторону покупки/продажи)
     double available_depth = (intent.side == Side::Buy)
         ? features.microstructure.bid_depth_5_notional
         : features.microstructure.ask_depth_5_notional;
 
-    if (available_depth <= 0.0) {
-        return std::nullopt;
-    }
+    if (available_depth <= 0.0) return std::nullopt;
 
-    const double order_notional = intent.suggested_quantity.get() *
-                                   features.mid_price.get();
+    const double order_notional = intent.suggested_quantity.get()
+                                 * features.mid_price.get();
     const double ratio = order_notional / available_depth;
 
-    // Если ордер мал относительно глубины — не нужна нарезка
     if (ratio < config_.large_order_slice_threshold) {
         return std::nullopt;
     }
 
     SlicePlan plan;
-    // Количество частей пропорционально превышению порога
     plan.num_slices = std::max(2, static_cast<int>(ratio / config_.large_order_slice_threshold));
-    plan.num_slices = std::min(plan.num_slices, 10); // Макс 10 частей
-    plan.slice_interval_ms = 200.0 * plan.num_slices; // Больше частей → больше интервал
+    plan.num_slices = std::min(plan.num_slices, 10);
+
+    // Адаптивный интервал: высокая нестабильность → быстрее, узкий спред → медленнее
+    double base_interval_ms = 200.0 * plan.num_slices;
+    if (features.microstructure.instability_valid
+        && features.microstructure.book_instability > 0.5) {
+        base_interval_ms *= 0.7; // Нестабильный стакан → ускорить нарезку
+    }
+    plan.slice_interval_ms = std::clamp(base_interval_ms, 200.0, 5000.0);
+
     plan.first_slice_pct = 1.0 / plan.num_slices;
-    plan.rationale = "Ордер = " + std::to_string(ratio * 100.0) +
-                     "% от глубины, разбиение на " + std::to_string(plan.num_slices) + " частей";
+    plan.rationale = "Ордер=" + std::to_string(ratio * 100.0)
+                   + "% от глубины, нарезка на " + std::to_string(plan.num_slices) + " частей";
 
     return plan;
 }

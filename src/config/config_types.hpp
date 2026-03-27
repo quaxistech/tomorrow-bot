@@ -185,20 +185,56 @@ struct TradingParamsConfig {
     int stop_loss_cooldown_seconds{300};        ///< Кулдаун после стоп-лосса (секунды)
 };
 
+/// Настройки модуля исполнительной альфы
+struct ExecutionAlphaConfig {
+    // ── Базовые пороги ──
+    double max_spread_bps_passive{15.0};      ///< Макс спред для пассивного исполнения [bps]
+    double max_spread_bps_any{50.0};           ///< Макс спред для любого исполнения [bps]
+    double adverse_selection_threshold{0.7};   ///< Порог токсичности для NoExecution [0..1]
+    double urgency_passive_threshold{0.5};     ///< Срочность ниже → Passive
+    double urgency_aggressive_threshold{0.8};  ///< Срочность выше → Aggressive
+    double large_order_slice_threshold{0.1};   ///< Доля от глубины стакана → нарезка [0..1]
+
+    // ── VPIN ──
+    double vpin_toxic_threshold{0.65};   ///< VPIN выше → высокая токсичность
+    double vpin_weight{0.40};            ///< Вес VPIN в расчёте adverse selection
+
+    // ── Дисбаланс стакана ──
+    double imbalance_favorable_threshold{0.30};   ///< Благоприятный → Passive предпочтителен
+    double imbalance_unfavorable_threshold{0.30};  ///< Неблагоприятный → предпочесть Hybrid
+
+    // ── Ценообразование ──
+    bool   use_weighted_mid_price{true};    ///< Использовать weighted_mid_price
+    double limit_price_passive_bps{3.0};    ///< Улучшение к best bid/ask для maker [bps]
+
+    // ── Срочность ──
+    double urgency_cusum_boost{0.15};   ///< Прирост при сигнале CUSUM
+    double urgency_tod_weight{0.10};    ///< Вес time-of-day alpha score
+
+    // ── Вероятность заполнения ──
+    double min_fill_probability_passive{0.25};  ///< Нижняя граница для Passive/PostOnly
+
+    // ── PostOnly условия ──
+    double postonly_spread_threshold_bps{4.5};  ///< Спред ниже → PostOnly кандидат [bps]
+    double postonly_urgency_max{0.35};           ///< Срочность ниже → PostOnly кандидат
+    double postonly_adverse_max{0.35};           ///< Токсичность ниже → PostOnly кандидат
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
-    ExchangeConfig       exchange;       ///< Настройки биржи
-    LoggingConfig        logging;        ///< Настройки логирования
-    MetricsConfig        metrics;        ///< Настройки метрик
-    HealthConfig         health;         ///< Настройки проверки здоровья
-    RiskConfig           risk;           ///< Настройки риск-менеджера
-    TradingModeConfig    trading;        ///< Настройки режима торговли
-    PairSelectionConfig  pair_selection; ///< Настройки выбора торговых пар
+    ExchangeConfig       exchange;         ///< Настройки биржи
+    LoggingConfig        logging;          ///< Настройки логирования
+    MetricsConfig        metrics;          ///< Настройки метрик
+    HealthConfig         health;           ///< Настройки проверки здоровья
+    RiskConfig           risk;             ///< Настройки риск-менеджера
+    TradingModeConfig    trading;          ///< Настройки режима торговли
+    PairSelectionConfig  pair_selection;   ///< Настройки выбора торговых пар
     AdversarialDefenseConfig adversarial_defense; ///< Защита от враждебных market conditions
-    AIAdvisoryConfig     ai_advisory;    ///< AI Advisory — правиловый/ML анализ
-    DecisionConfig       decision;       ///< Настройки движка принятия решений
-    TradingParamsConfig  trading_params;  ///< Настройки управления позицией
-    std::string          config_hash;    ///< SHA-256 хеш файла конфигурации (для аудита)
+    AIAdvisoryConfig     ai_advisory;      ///< AI Advisory — правиловый/ML анализ
+    DecisionConfig       decision;         ///< Настройки движка принятия решений
+    TradingParamsConfig  trading_params;   ///< Настройки управления позицией
+    ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
+    std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 
 } // namespace tb::config
