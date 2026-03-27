@@ -1830,6 +1830,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             snapshot.microstructure.bid_depth_5_notional + snapshot.microstructure.ask_depth_5_notional,
             snapshot.microstructure.spread_bps,
             snapshot.microstructure.aggressive_flow);
+        const auto ent = entropy_filter_->compute();
+        ml_snapshot_.computed_at_ns = clock_->now().get();
+        ml_snapshot_.composite_entropy = ent.composite_entropy;
+        ml_snapshot_.signal_quality = ent.signal_quality;
+        ml_snapshot_.is_noisy = ent.is_noisy;
+        ml_snapshot_.entropy_status = ent.component_status;
     }
 
     // 0.ml2. Детектор ликвидационных каскадов: обновляем по каждому тику
@@ -1841,11 +1847,21 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             tick_volume,
             snapshot.microstructure.bid_depth_5_notional,
             snapshot.microstructure.ask_depth_5_notional);
+        const auto c = cascade_detector_->evaluate();
+        ml_snapshot_.cascade_probability = c.probability;
+        ml_snapshot_.cascade_imminent = c.cascade_imminent;
+        ml_snapshot_.cascade_direction = c.direction;
+        ml_snapshot_.cascade_status = c.component_status;
     }
 
     // 0.ml3. Монитор корреляций: обновляем цену основного актива
     if (correlation_monitor_ && snapshot.mid_price.get() > 0.0) {
         correlation_monitor_->on_primary_tick(snapshot.mid_price.get());
+        const auto corr = correlation_monitor_->evaluate();
+        ml_snapshot_.avg_correlation = corr.avg_correlation;
+        ml_snapshot_.correlation_break = corr.any_break;
+        ml_snapshot_.correlation_risk_multiplier = corr.risk_multiplier;
+        ml_snapshot_.correlation_status = corr.component_status;
     }
 
     // 0a. СТОП-ЛОСС: проверяем КАЖДЫЙ тик, независимо от стратегий.
@@ -2177,6 +2193,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     if (fingerprinter_) {
         auto fp = fingerprinter_->create_fingerprint(snapshot);
         double fp_edge = fingerprinter_->predict_edge(fp);
+        ml_snapshot_.fingerprint_edge = fp_edge;
+        ml_snapshot_.fingerprint_status = fingerprinter_->status();
+        if (auto stats = fingerprinter_->get_stats(fp); stats.has_value()) {
+            ml_snapshot_.fingerprint_win_rate = stats->win_rate;
+            ml_snapshot_.fingerprint_sample_count = static_cast<int>(stats->count);
+        }
         if (fp_edge < -0.1) {
             if (tick_count_ % 200 == 0) {
                 logger_->debug("pipeline",
@@ -2195,6 +2217,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             "global", "conviction_threshold", regime.detailed);
         // Разница между адаптированным и дефолтным порогом
         bayesian_conviction_adj = adapted_threshold - config_.decision.min_conviction_threshold;
+        ml_snapshot_.adapted_conviction_threshold = adapted_threshold;
+        ml_snapshot_.adapted_atr_stop_mult = bayesian_adapter_->get_adapted_value(
+            "global", "atr_stop_multiplier", regime.detailed);
+    }
+    if (bayesian_adapter_) {
+        ml_snapshot_.bayesian_status = bayesian_adapter_->status();
     }
 
     // 8b. Alpha Decay: проверка порога conviction с учётом деградации per-strategy
@@ -2370,6 +2398,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     if (correlation_monitor_) {
         auto corr_result = correlation_monitor_->evaluate();
         correlation_risk_mult = corr_result.risk_multiplier;
+        ml_snapshot_.avg_correlation = corr_result.avg_correlation;
+        ml_snapshot_.correlation_break = corr_result.any_break;
+        ml_snapshot_.correlation_risk_multiplier = corr_result.risk_multiplier;
+        ml_snapshot_.correlation_status = corr_result.component_status;
         if (corr_result.any_break && tick_count_ % 200 == 0) {
             logger_->warn("pipeline",
                 "Разрыв корреляции обнаружен — размер позиции снижен",
@@ -2384,6 +2416,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     ml::EntryAction thompson_action = ml::EntryAction::EnterNow;
     if (thompson_sampler_ && !thompson_bypass) {
         thompson_action = thompson_sampler_->select_action();
+        ml_snapshot_.recommended_wait_periods = ml::wait_periods(thompson_action);
+        ml_snapshot_.thompson_status = thompson_sampler_->status();
+        for (const auto& arm : thompson_sampler_->get_arms()) {
+            if (arm.action == thompson_action) {
+                ml_snapshot_.entry_confidence = (arm.alpha + arm.beta > 0.0)
+                    ? arm.alpha / (arm.alpha + arm.beta)
+                    : 0.5;
+                break;
+            }
+        }
         int wait = ml::wait_periods(thompson_action);
 
         if (thompson_action == ml::EntryAction::Skip) {
@@ -2412,6 +2454,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
         // EnterNow — продолжаем немедленно
     }
+    ml_snapshot_.compute_aggregates();
 
     // 9_htf. HTF Trend Filter — ФИНАЛЬНЫЙ барьер перед отправкой ордера.
     // Даже если стратегия одобрила сигнал, мы блокируем его если он

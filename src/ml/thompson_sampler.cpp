@@ -3,10 +3,18 @@
 
 #include "ml/thompson_sampler.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace tb::ml {
+
+namespace {
+int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
 
 // ==================== Конструктор ====================
 
@@ -79,10 +87,17 @@ EntryAction ThompsonSampler::select_action() {
 // ==================== Запись результата ====================
 
 void ThompsonSampler::record_reward(EntryAction action, double reward) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!numeric::is_finite(reward)) {
+        if (logger_) {
+            logger_->warn("thompson", "Invalid reward, ignoring observation");
+        }
+        return;
+    }
 
-    // Применяем забывание ПЕРЕД обновлением — чтобы не дисконтировать новое наблюдение
-    apply_decay();
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_reward_ns_ = now_ns();
+    ++total_rewards_;
+    ++records_since_decay_;
 
     // Находим руку по действию
     for (auto& arm : arms_) {
@@ -90,18 +105,18 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
             // Инкрементируем счётчик выборов ПЕРЕД обновлением
             arm.pulls++;
 
-            // Обновляем posterior: reward > порог → успех, иначе — неудача
+            const double mag = std::min(std::abs(reward), 1.0);
             if (reward > config_.reward_threshold) {
-                arm.alpha += 1.0;
+                arm.alpha += 1.0 + config_.magnitude_bonus * mag;
+                arm.consecutive_losses = 0;
             } else {
                 arm.beta += 1.0;
+                arm.consecutive_losses++;
             }
 
-            // Обновляем среднюю награду (экспоненциальное скользящее)
-            {
-                double w = 1.0 / static_cast<double>(arm.pulls);
-                arm.avg_reward = (1.0 - w) * arm.avg_reward + w * reward;
-            }
+            const double w = 1.0 / static_cast<double>(arm.pulls);
+            arm.avg_reward = (1.0 - w) * arm.avg_reward + w * reward;
+            arm.cumulative_reward += reward;
 
             if (logger_) {
                 logger_->debug("thompson", "Результат записан",
@@ -109,11 +124,18 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
                      {"reward", std::to_string(reward)},
                      {"alpha", std::to_string(arm.alpha)},
                      {"beta", std::to_string(arm.beta)},
-                     {"avg_reward", std::to_string(arm.avg_reward)}});
+                     {"avg_reward", std::to_string(arm.avg_reward)},
+                     {"cum_reward", std::to_string(arm.cumulative_reward)},
+                     {"loss_streak", std::to_string(arm.consecutive_losses)}});
             }
 
             break;
         }
+    }
+
+    if (records_since_decay_ >= std::max<size_t>(1, config_.decay_interval)) {
+        apply_decay();
+        records_since_decay_ = 0;
     }
 }
 
@@ -132,7 +154,7 @@ EntryAction ThompsonSampler::best_action() const {
     EntryAction best = EntryAction::EnterNow;
 
     for (const auto& arm : arms_) {
-        double mean = arm.alpha / (arm.alpha + arm.beta);
+        double mean = numeric::safe_div(arm.alpha, arm.alpha + arm.beta, 0.0);
         if (mean > best_mean) {
             best_mean = mean;
             best = arm.action;
@@ -140,6 +162,53 @@ EntryAction ThompsonSampler::best_action() const {
     }
 
     return best;
+}
+
+MlComponentStatus ThompsonSampler::status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MlComponentStatus s;
+    s.last_update_ns = last_reward_ns_;
+    s.samples_processed = static_cast<int>(total_rewards_);
+
+    size_t min_pulls_seen = std::numeric_limits<size_t>::max();
+    for (const auto& arm : arms_) min_pulls_seen = std::min(min_pulls_seen, arm.pulls);
+
+    if (min_pulls_seen < config_.min_pulls) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(config_.min_pulls - min_pulls_seen);
+        return s;
+    }
+    if (numeric::is_stale(last_reward_ns_, now_ns(), config_.stale_threshold_ns)) {
+        s.health = MlComponentHealth::Stale;
+        s.warmup_remaining = 0;
+        return s;
+    }
+
+    bool degraded = false;
+    for (const auto& arm : arms_) {
+        if (arm.consecutive_losses > 20) {
+            degraded = true;
+            break;
+        }
+    }
+    s.health = degraded ? MlComponentHealth::Degraded : MlComponentHealth::Healthy;
+    s.warmup_remaining = 0;
+    return s;
+}
+
+void ThompsonSampler::reset_arm(EntryAction action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& arm : arms_) {
+        if (arm.action == action) {
+            arm.alpha = 1.0;
+            arm.beta = 1.0;
+            arm.pulls = 0;
+            arm.avg_reward = 0.0;
+            arm.cumulative_reward = 0.0;
+            arm.consecutive_losses = 0;
+            return;
+        }
+    }
 }
 
 // ==================== Внутренние методы ====================
@@ -156,7 +225,10 @@ double ThompsonSampler::sample_beta(double alpha, double beta) const {
     double x = gamma_a(rng_);
     double y = gamma_b(rng_);
 
-    if (x + y <= 0.0) return 0.5;  // Защита от вырождения
+    if (x + y <= 0.0) {
+        if (logger_) logger_->warn("thompson", "Degenerate beta sample, using neutral fallback");
+        return 0.5;
+    }
     return x / (x + y);
 }
 

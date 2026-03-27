@@ -7,7 +7,9 @@
 /// прибыльным сделкам, а какие — убыточным.
 
 #include "features/feature_snapshot.hpp"
+#include "common/numeric_utils.hpp"
 #include "logging/logger.hpp"
+#include "ml/ml_signal_types.hpp"
 #include <vector>
 #include <deque>
 #include <unordered_map>
@@ -58,6 +60,10 @@ struct FingerprintConfig {
     double favorable_win_rate{0.55};   ///< Порог «хорошего» fingerprint
     double unfavorable_win_rate{0.45}; ///< Порог «плохого» fingerprint
     int num_buckets{5};                ///< Количество бакетов для дискретизации (0..N-1)
+    int64_t stale_threshold_ns{10'000'000'000LL}; ///< stale threshold
+    double spread_bps_cap{300.0};      ///< Верхний cap для spread bucketization
+    double atr_norm_cap{0.2};          ///< Верхний cap ATR normalized
+    double min_return_for_decision{0.001}; ///< 0.1% by default
 };
 
 /// Microstructure Fingerprinting — учит паттерны микроструктуры
@@ -84,6 +90,7 @@ public:
 
     /// Количество уникальных fingerprints в базе
     size_t unique_fingerprints() const;
+    MlComponentStatus status() const;
 
 private:
     /// Дискретизировать значение в бакет [0..num_buckets-1]
@@ -95,6 +102,8 @@ private:
     /// База знаний: fingerprint → статистика
     std::unordered_map<MicroFingerprint, FingerprintStats, FingerprintHasher>
         knowledge_base_;
+    int64_t last_update_ns_{0};
+    size_t total_updates_{0};
 
     mutable std::mutex mutex_;
 };

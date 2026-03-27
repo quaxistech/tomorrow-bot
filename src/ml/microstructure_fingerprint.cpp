@@ -3,10 +3,18 @@
 
 #include "ml/microstructure_fingerprint.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace tb::ml {
+
+namespace {
+int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
 
 MicrostructureFingerprinter::MicrostructureFingerprinter(
     FingerprintConfig config,
@@ -27,9 +35,9 @@ MicroFingerprint MicrostructureFingerprinter::create_fingerprint(
 {
     MicroFingerprint fp;
 
-    // Спред: типичный диапазон 0..50 bps (базисных пунктов)
+    // Спред: configurable cap for cross-asset robustness
     fp.spread_bucket = discretize(
-        snapshot.microstructure.spread_bps, 0.0, 50.0);
+        snapshot.microstructure.spread_bps, 0.0, config_.spread_bps_cap);
 
     // Дисбаланс стакана: -1.0 (все asks) .. +1.0 (все bids)
     fp.imbalance_bucket = discretize(
@@ -39,9 +47,9 @@ MicroFingerprint MicrostructureFingerprinter::create_fingerprint(
     fp.flow_bucket = discretize(
         snapshot.microstructure.aggressive_flow, 0.0, 1.0);
 
-    // Волатильность: нормализованный ATR, типично 0..0.05 (5%)
+    // Волатильность: cap configurable
     fp.volatility_bucket = discretize(
-        snapshot.technical.atr_14_normalized, 0.0, 0.05);
+        snapshot.technical.atr_14_normalized, 0.0, config_.atr_norm_cap);
 
     // Глубина: отношение bid/ask ликвидности, типично 0.2..5.0
     fp.depth_bucket = discretize(
@@ -69,11 +77,11 @@ double MicrostructureFingerprinter::predict_edge(
     //   edge = 0 → нейтральный / недостаточно данных
     if (stats.win_rate >= config_.favorable_win_rate) {
         // Благоприятный: масштабируем от 0 до +1
-        return (stats.win_rate - 0.5) * 2.0;
+        return numeric::safe_clamp((stats.win_rate - 0.5) * 2.0, -1.0, 1.0);
     }
     if (stats.win_rate <= config_.unfavorable_win_rate) {
         // Неблагоприятный: масштабируем от -1 до 0
-        return (stats.win_rate - 0.5) * 2.0;
+        return numeric::safe_clamp((stats.win_rate - 0.5) * 2.0, -1.0, 1.0);
     }
 
     // Нейтральная зона
@@ -83,7 +91,10 @@ double MicrostructureFingerprinter::predict_edge(
 void MicrostructureFingerprinter::record_outcome(
     const MicroFingerprint& fp, double return_pct)
 {
+    if (!numeric::is_finite(return_pct)) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    last_update_ns_ = now_ns();
+    ++total_updates_;
 
     auto& stats = knowledge_base_[fp];
     stats.count++;
@@ -92,10 +103,10 @@ void MicrostructureFingerprinter::record_outcome(
     const double n = static_cast<double>(stats.count);
     stats.avg_return += (return_pct - stats.avg_return) / n;
 
-    // Считаем wins / losses с порогом 0.1% для исключения breakeven
-    if (return_pct > 0.001) {
+    // Считаем wins / losses с порогом для исключения breakeven
+    if (return_pct > config_.min_return_for_decision) {
         stats.wins++;
-    } else if (return_pct < -0.001) {
+    } else if (return_pct < -config_.min_return_for_decision) {
         stats.losses++;
     }
     // Breakeven (|return| < 0.1%) — не учитываем в win/loss
@@ -152,16 +163,36 @@ size_t MicrostructureFingerprinter::unique_fingerprints() const
     return knowledge_base_.size();
 }
 
+MlComponentStatus MicrostructureFingerprinter::status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MlComponentStatus s;
+    s.last_update_ns = last_update_ns_;
+    s.samples_processed = static_cast<int>(total_updates_);
+    if (total_updates_ < config_.min_samples) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(config_.min_samples - total_updates_);
+        return s;
+    }
+    if (numeric::is_stale(last_update_ns_, now_ns(), config_.stale_threshold_ns)) {
+        s.health = MlComponentHealth::Stale;
+        s.warmup_remaining = 0;
+        return s;
+    }
+    s.health = MlComponentHealth::Healthy;
+    s.warmup_remaining = 0;
+    return s;
+}
+
 int MicrostructureFingerprinter::discretize(
     double value, double min_val, double max_val) const
 {
-    if (max_val <= min_val) return 0;
+    if (max_val <= min_val || config_.num_buckets <= 1) return 0;
 
     // Ограничиваем значение диапазоном
     const double clamped = std::clamp(value, min_val, max_val);
 
     // Нормализуем в [0, 1] и масштабируем в [0, num_buckets-1]
-    const double normalized = (clamped - min_val) / (max_val - min_val);
+    const double normalized = numeric::safe_div((clamped - min_val), (max_val - min_val));
     const int bucket = static_cast<int>(normalized * (config_.num_buckets - 1));
 
     return std::clamp(bucket, 0, config_.num_buckets - 1);

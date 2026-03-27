@@ -7,7 +7,9 @@
 /// Thompson Sampling выбирает руку с максимальным сэмплом из Beta.
 
 #include "common/types.hpp"
+#include "common/numeric_utils.hpp"
 #include "logging/logger.hpp"
+#include "ml/ml_signal_types.hpp"
 #include <vector>
 #include <random>
 #include <mutex>
@@ -54,6 +56,8 @@ struct BetaArm {
     double beta{1.0};     ///< Неудачи + 1 (prior)
     size_t pulls{0};      ///< Количество выборов
     double avg_reward{0.0}; ///< Средняя награда
+    double cumulative_reward{0.0}; ///< Накопленная награда
+    size_t consecutive_losses{0};  ///< Подряд идущие убыточные исходы
 };
 
 /// Конфигурация Thompson Sampling
@@ -61,6 +65,9 @@ struct ThompsonConfig {
     double reward_threshold{0.0};  ///< P&L > порога = успех
     double decay_factor{0.995};    ///< Экспоненциальное забывание (для адаптации)
     size_t min_pulls{5};           ///< Минимум выборов перед использованием
+    int64_t stale_threshold_ns{10'000'000'000LL}; ///< stale threshold (10s)
+    size_t decay_interval{10};     ///< Применять decay каждые N reward-событий
+    double magnitude_bonus{0.5};   ///< Бонус к alpha для крупных reward
 };
 
 /// Thompson Sampling для оптимизации момента входа.
@@ -83,6 +90,8 @@ public:
 
     /// Получить лучшее действие (по среднему α/(α+β))
     EntryAction best_action() const;
+    MlComponentStatus status() const;
+    void reset_arm(EntryAction action);
 
 private:
     /// Сэмплировать из Beta(α, β)
@@ -94,6 +103,9 @@ private:
     ThompsonConfig config_;
     std::shared_ptr<logging::ILogger> logger_;
     std::vector<BetaArm> arms_;
+    int64_t last_reward_ns_{0};
+    size_t total_rewards_{0};
+    size_t records_since_decay_{0};
     mutable std::mt19937 rng_{};
     mutable std::mutex mutex_;
 };

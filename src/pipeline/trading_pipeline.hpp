@@ -48,6 +48,7 @@
 #include "ml/liquidation_cascade.hpp"
 #include "ml/correlation_monitor.hpp"
 #include "ml/thompson_sampler.hpp"
+#include "ml/ml_signal_types.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -179,6 +180,7 @@ private:
     std::shared_ptr<ml::CorrelationMonitor> correlation_monitor_;
     /// Thompson Sampling для оптимизации момента входа
     std::shared_ptr<ml::ThompsonSampler> thompson_sampler_;
+    ml::MlSignalSnapshot ml_snapshot_;
 
     /// Ожидающий вход (Thompson Sampling решил ждать)
     struct PendingEntry {

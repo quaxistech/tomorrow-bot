@@ -6,7 +6,9 @@
 /// Обнаруживает декорреляцию — сигнал опасности или возможности.
 
 #include "common/types.hpp"
+#include "common/numeric_utils.hpp"
 #include "logging/logger.hpp"
+#include "ml/ml_signal_types.hpp"
 #include <deque>
 #include <unordered_map>
 #include <string>
@@ -21,6 +23,7 @@ struct CorrelationConfig {
     size_t window_long{100};             ///< Длинное окно
     double decorrelation_threshold{0.3}; ///< Порог декорреляции (|corr| < 0.3)
     double correlation_break_threshold{0.5}; ///< Разрыв = |short_corr - long_corr| > порога
+    int64_t stale_threshold_ns{5'000'000'000LL}; ///< stale для primary/reference feed
     std::vector<std::string> reference_assets{"BTCUSDT", "ETHUSDT"}; ///< Референсные активы
 };
 
@@ -33,6 +36,7 @@ struct CorrelationSnapshot {
     bool decorrelated{false};       ///< Актив декоррелирован от референса
     bool correlation_break{false};  ///< Резкий разрыв корреляции
     bool valid{false};              ///< Данные достоверны (достаточно наблюдений)
+    bool stale{false};              ///< stale референс feed
 };
 
 /// Итоговый результат мониторинга корреляций
@@ -41,6 +45,8 @@ struct CorrelationResult {
     double avg_correlation{0.0};    ///< Средняя корреляция со всеми референсами
     bool any_break{false};          ///< Хотя бы один разрыв
     double risk_multiplier{1.0};    ///< Множитель риска (0.5 при разрывах)
+    MlComponentStatus component_status;
+    bool has_undefined_pairs{false};///< пары с нулевой дисперсией/невалидным corr
 };
 
 /// Монитор корреляций между торгуемым активом и референсными.
@@ -63,6 +69,7 @@ public:
 
     /// Быстрая проверка: есть разрыв корреляции?
     bool has_correlation_break() const;
+    MlComponentStatus status() const;
 
 private:
     /// Вычислить Pearson корреляцию между двумя последовательностями
@@ -77,6 +84,9 @@ private:
     std::unordered_map<std::string, std::deque<double>> reference_returns_;
     double last_primary_price_{0.0};
     std::unordered_map<std::string, double> last_reference_prices_;
+    int64_t last_primary_tick_ns_{0};
+    std::unordered_map<std::string, int64_t> last_reference_tick_ns_;
+    size_t total_ticks_{0};
 
     /// Кэш результата evaluate() (инвалидируется при on_primary_tick / on_reference_tick)
     mutable CorrelationResult cached_result_;

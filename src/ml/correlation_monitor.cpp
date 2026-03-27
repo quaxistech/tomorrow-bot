@@ -3,10 +3,18 @@
 
 #include "ml/correlation_monitor.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 
 namespace tb::ml {
+
+namespace {
+int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
 
 // ==================== Конструктор ====================
 
@@ -30,10 +38,13 @@ CorrelationMonitor::CorrelationMonitor(
 
 void CorrelationMonitor::on_primary_tick(double price) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!numeric::is_valid_price(price)) return;
+    last_primary_tick_ns_ = now_ns();
+    ++total_ticks_;
 
     if (last_primary_price_ > 0.0 && price > 0.0) {
         // Логарифмическая доходность для корреляции
-        double ret = std::log(price / last_primary_price_);
+        double ret = numeric::safe_log(price / last_primary_price_);
         primary_returns_.push_back(ret);
 
         // Ограничиваем размер буфера длинным окном + запас
@@ -47,10 +58,13 @@ void CorrelationMonitor::on_primary_tick(double price) {
 
 void CorrelationMonitor::on_reference_tick(const std::string& asset, double price) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!numeric::is_valid_price(price) || asset.empty()) return;
+    last_reference_tick_ns_[asset] = now_ns();
+    ++total_ticks_;
 
     auto it = last_reference_prices_.find(asset);
     if (it != last_reference_prices_.end() && it->second > 0.0 && price > 0.0) {
-        double ret = std::log(price / it->second);
+        double ret = numeric::safe_log(price / it->second);
         auto& returns = reference_returns_[asset];
         returns.push_back(ret);
 
@@ -71,7 +85,7 @@ double CorrelationMonitor::compute_pearson(
 {
     // Берём последние N элементов из каждой последовательности
     size_t n = std::min({x.size(), y.size(), window});
-    if (n < 5) return 0.0;  // Недостаточно данных
+    if (n < 5) return std::numeric_limits<double>::quiet_NaN();
 
     // Смещения до конца: берём последние n значений
     size_t x_offset = x.size() - n;
@@ -97,12 +111,15 @@ double CorrelationMonitor::compute_pearson(
     double var_x = sum_xx / dn - mean_x * mean_x;
     double var_y = sum_yy / dn - mean_y * mean_y;
 
-    if (var_x <= 0.0 || var_y <= 0.0) return 0.0;
+    if (var_x <= numeric::kEpsilon || var_y <= numeric::kEpsilon) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
 
     double cov_xy = sum_xy / dn - mean_x * mean_y;
-    double corr = cov_xy / (std::sqrt(var_x) * std::sqrt(var_y));
+    double corr = numeric::safe_div(cov_xy, (std::sqrt(var_x) * std::sqrt(var_y)),
+                                    std::numeric_limits<double>::quiet_NaN());
 
-    // Ограничиваем [-1, 1] на случай числовых погрешностей
+    if (!numeric::is_finite(corr)) return std::numeric_limits<double>::quiet_NaN();
     return std::clamp(corr, -1.0, 1.0);
 }
 
@@ -117,15 +134,25 @@ CorrelationResult CorrelationMonitor::evaluate() const {
     }
 
     CorrelationResult result;
+    result.component_status = status();
     double total_corr = 0.0;
     size_t valid_count = 0;
+    const int64_t ts = now_ns();
 
     for (const auto& asset : config_.reference_assets) {
         CorrelationSnapshot snap;
         snap.reference_asset = asset;
 
         auto it = reference_returns_.find(asset);
-        if (it == reference_returns_.end() || it->second.size() < 5) {
+        const auto ts_it = last_reference_tick_ns_.find(asset);
+        if (ts_it == last_reference_tick_ns_.end() ||
+            numeric::is_stale(ts_it->second, ts, config_.stale_threshold_ns)) {
+            snap.stale = true;
+            result.snapshots.push_back(snap);
+            continue;
+        }
+        if (it == reference_returns_.end() || it->second.size() < 5 ||
+            primary_returns_.size() < 5) {
             // Недостаточно данных по этому референсу
             result.snapshots.push_back(snap);
             continue;
@@ -135,17 +162,20 @@ CorrelationResult CorrelationMonitor::evaluate() const {
 
         // Минимум данных для корректного Pearson
         size_t available = std::min(primary_returns_.size(), ref_returns.size());
-        if (available >= 5) {
-            snap.valid = true;
-        }
+        snap.valid = (available >= 5);
 
         // Корреляция на коротком окне
-        snap.short_correlation = compute_pearson(
-            primary_returns_, ref_returns, config_.window_short);
+        snap.short_correlation = compute_pearson(primary_returns_, ref_returns, config_.window_short);
 
         // Корреляция на длинном окне
-        snap.long_correlation = compute_pearson(
-            primary_returns_, ref_returns, config_.window_long);
+        snap.long_correlation = compute_pearson(primary_returns_, ref_returns, config_.window_long);
+
+        if (!numeric::is_finite(snap.short_correlation) || !numeric::is_finite(snap.long_correlation)) {
+            snap.valid = false;
+            result.has_undefined_pairs = true;
+            result.snapshots.push_back(snap);
+            continue;
+        }
 
         // Изменение корреляции
         snap.correlation_change = snap.short_correlation - snap.long_correlation;
@@ -163,7 +193,7 @@ CorrelationResult CorrelationMonitor::evaluate() const {
         }
 
         // Считаем среднюю только по валидным snapshot-ам
-        if (snap.valid) {
+        if (snap.valid && !snap.stale) {
             total_corr += std::abs(snap.short_correlation);
             ++valid_count;
         }
@@ -190,6 +220,9 @@ CorrelationResult CorrelationMonitor::evaluate() const {
         }
         result.risk_multiplier = any_decorr ? 0.7 : 1.0;
     }
+    if (result.has_undefined_pairs) {
+        result.risk_multiplier = std::min(result.risk_multiplier, 0.8);
+    }
 
     cached_result_ = result;
     cache_valid_ = true;
@@ -201,6 +234,25 @@ CorrelationResult CorrelationMonitor::evaluate() const {
 
 bool CorrelationMonitor::has_correlation_break() const {
     return evaluate().any_break;
+}
+
+MlComponentStatus CorrelationMonitor::status() const {
+    MlComponentStatus s;
+    s.samples_processed = static_cast<int>(total_ticks_);
+    s.last_update_ns = last_primary_tick_ns_;
+    if (total_ticks_ == 0 || primary_returns_.size() < 5) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(5 - std::min<size_t>(5, primary_returns_.size()));
+        return s;
+    }
+    if (numeric::is_stale(last_primary_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+        s.health = MlComponentHealth::Stale;
+        s.warmup_remaining = 0;
+        return s;
+    }
+    s.health = MlComponentHealth::Healthy;
+    s.warmup_remaining = 0;
+    return s;
 }
 
 } // namespace tb::ml
