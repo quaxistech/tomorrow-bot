@@ -3,11 +3,21 @@
 
 #include "ml/entropy_filter.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <vector>
 
 namespace tb::ml {
+
+namespace {
+
+int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+} // anonymous namespace
 
 EntropyFilter::EntropyFilter(
     EntropyConfig config,
@@ -19,7 +29,8 @@ EntropyFilter::EntropyFilter(
         logger_->info("entropy_filter", "Фильтр энтропии создан",
             {{"window", std::to_string(config_.window_size)},
              {"bins", std::to_string(config_.num_bins)},
-             {"threshold", std::to_string(config_.noise_threshold)}});
+             {"threshold", std::to_string(config_.noise_threshold)},
+             {"min_samples", std::to_string(config_.min_samples)}});
     }
 }
 
@@ -28,9 +39,25 @@ void EntropyFilter::on_tick(
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Validate all inputs
+    if (!numeric::is_finite(price) || !numeric::is_finite(volume) ||
+        !numeric::is_finite(spread) || !numeric::is_finite(flow_imbalance)) {
+        if (logger_) {
+            logger_->warn("entropy_filter", "Bad tick data, skipping",
+                {{"price", std::to_string(price)},
+                 {"volume", std::to_string(volume)},
+                 {"spread", std::to_string(spread)},
+                 {"flow", std::to_string(flow_imbalance)}});
+        }
+        return;
+    }
+
+    last_tick_ns_ = now_ns();
+    ++total_ticks_;
+
     // Вычисляем доходность (log-return)
     if (last_price_ > 0.0 && price > 0.0) {
-        const double ret = std::log(price / last_price_);
+        const double ret = numeric::safe_log(price / last_price_);
         returns_.push_back(ret);
         if (returns_.size() > config_.window_size) {
             returns_.pop_front();
@@ -69,9 +96,38 @@ EntropyResult EntropyFilter::compute() const
     }
 
     EntropyResult result;
+    result.component_status = [this]() {
+        MlComponentStatus s;
+        s.last_update_ns = last_tick_ns_;
+        s.samples_processed = static_cast<int>(total_ticks_);
+
+        if (total_ticks_ == 0) {
+            s.health = MlComponentHealth::WarmingUp;
+            s.warmup_remaining = static_cast<int>(config_.min_samples);
+            return s;
+        }
+
+        if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+            s.health = MlComponentHealth::Stale;
+            s.warmup_remaining = 0;
+            return s;
+        }
+
+        if (returns_.size() < config_.min_samples) {
+            s.health = MlComponentHealth::WarmingUp;
+            s.warmup_remaining = static_cast<int>(config_.min_samples - returns_.size());
+            return s;
+        }
+
+        s.health = MlComponentHealth::Healthy;
+        s.warmup_remaining = 0;
+        return s;
+    }();
+
+    result.samples_used = static_cast<int>(returns_.size());
 
     // Недостаточно данных — возвращаем «чистый» сигнал
-    if (returns_.size() < config_.window_size / 2) {
+    if (returns_.size() < config_.min_samples) {
         cached_result_ = result;
         cache_valid_ = true;
         return result;
@@ -91,8 +147,7 @@ EntropyResult EntropyFilter::compute() const
         + config_.quality_weight_flow * result.flow_entropy;
 
     // Качество сигнала — инверсия энтропии
-    result.signal_quality = 1.0 - result.composite_entropy;
-    result.signal_quality = std::clamp(result.signal_quality, 0.0, 1.0);
+    result.signal_quality = numeric::safe_clamp(1.0 - result.composite_entropy, 0.0, 1.0);
 
     // Определяем зашумлённость
     result.is_noisy = result.composite_entropy > config_.noise_threshold;
@@ -104,8 +159,38 @@ EntropyResult EntropyFilter::compute() const
 
 bool EntropyFilter::is_noisy() const
 {
-    // Делегируем в compute() для консистентности
     return compute().is_noisy;
+}
+
+MlComponentStatus EntropyFilter::status() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MlComponentStatus s;
+    s.last_update_ns = last_tick_ns_;
+    s.samples_processed = static_cast<int>(total_ticks_);
+
+    if (total_ticks_ == 0) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(config_.min_samples);
+        return s;
+    }
+
+    if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+        s.health = MlComponentHealth::Stale;
+        s.warmup_remaining = 0;
+        return s;
+    }
+
+    if (returns_.size() < config_.min_samples) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(config_.min_samples - returns_.size());
+        return s;
+    }
+
+    s.health = MlComponentHealth::Healthy;
+    s.warmup_remaining = 0;
+    return s;
 }
 
 // Энтропия Шеннона с нормализацией к [0, 1]:
@@ -127,14 +212,17 @@ double EntropyFilter::compute_shannon_entropy(const std::deque<double>& data) co
     const double range = max_val - min_val;
 
     // Все значения одинаковы — нулевая энтропия (полная предсказуемость)
-    if (range < 1e-15) return 0.0;
+    if (range < numeric::kEpsilon) return 0.0;
 
     // Подсчитываем частоты по бинам
-    std::vector<size_t> bins(config_.num_bins, 0);
+    // Multiply by (num_bins - 1) so that max value maps to the last bin
+    // instead of overflowing to an out-of-range index.
+    const auto num_bins = config_.num_bins;
+    std::vector<size_t> bins(num_bins, 0);
     for (const double val : data) {
-        int bin = static_cast<int>(
-            (val - min_val) / range * static_cast<double>(config_.num_bins));
-        bin = std::clamp(bin, 0, static_cast<int>(config_.num_bins) - 1);
+        const double normalized = numeric::safe_div(val - min_val, range);
+        int bin = static_cast<int>(normalized * static_cast<double>(num_bins - 1));
+        bin = std::clamp(bin, 0, static_cast<int>(num_bins) - 1);
         bins[static_cast<size_t>(bin)]++;
     }
 
@@ -143,15 +231,17 @@ double EntropyFilter::compute_shannon_entropy(const std::deque<double>& data) co
     double entropy = 0.0;
     for (const size_t count : bins) {
         if (count == 0) continue;
-        const double p = static_cast<double>(count) / total;
-        entropy -= p * std::log2(p);
+        const double p = numeric::safe_div(static_cast<double>(count), total);
+        if (p > 0.0) {
+            entropy -= p * std::log2(p);
+        }
     }
 
     // Нормализуем к [0, 1] делением на максимальную энтропию
-    const double max_entropy = std::log2(static_cast<double>(config_.num_bins));
-    if (max_entropy < 1e-15) return 0.0;
+    const double max_entropy = std::log2(static_cast<double>(num_bins));
+    if (max_entropy < numeric::kEpsilon) return 0.0;
 
-    return std::clamp(entropy / max_entropy, 0.0, 1.0);
+    return numeric::safe_clamp(entropy / max_entropy, 0.0, 1.0);
 }
 
 } // namespace tb::ml

@@ -6,7 +6,9 @@
 /// (доходности, объёмы, спреды, поток ордеров). Высокая энтропия
 /// означает шумный, непредсказуемый рынок — сигналы ненадёжны.
 
+#include "common/numeric_utils.hpp"
 #include "logging/logger.hpp"
+#include "ml/ml_signal_types.hpp"
 #include <deque>
 #include <mutex>
 
@@ -20,6 +22,8 @@ struct EntropyConfig {
     double quality_weight_volume{0.2};  ///< Вес энтропии объёмов
     double quality_weight_spread{0.2};  ///< Вес энтропии спредов
     double quality_weight_flow{0.3};    ///< Вес энтропии потока ордеров
+    int64_t stale_threshold_ns{5'000'000'000LL}; ///< Порог устаревания данных (5с)
+    size_t min_samples{10};            ///< Минимальное кол-во тиков для вычисления
 };
 
 /// Результат фильтрации по энтропии
@@ -31,6 +35,8 @@ struct EntropyResult {
     double composite_entropy{0.0};     ///< Взвешенная композитная энтропия [0..1]
     double signal_quality{1.0};        ///< Качество сигнала = 1 - entropy [0..1]
     bool is_noisy{false};              ///< Сигнал зашумлён (entropy > threshold)
+    MlComponentStatus component_status; ///< Статус компонента
+    int samples_used{0};               ///< Количество использованных сэмплов
 };
 
 /// Фильтр энтропии — оценивает качество рыночных сигналов.
@@ -50,6 +56,9 @@ public:
     /// Быстрая проверка: сигнал зашумлён?
     bool is_noisy() const;
 
+    /// Текущий статус компонента
+    MlComponentStatus status() const;
+
 private:
     /// Рассчитать нормализованную энтропию Шеннона для последовательности
     double compute_shannon_entropy(const std::deque<double>& data) const;
@@ -62,6 +71,9 @@ private:
     std::deque<double> spreads_;           ///< Буфер спредов
     std::deque<double> flows_;             ///< Буфер потока ордеров
     double last_price_{0.0};               ///< Последняя цена (для расчёта доходности)
+
+    int64_t last_tick_ns_{0};              ///< Время последнего тика (ns)
+    size_t total_ticks_{0};                ///< Общее кол-во обработанных тиков
 
     mutable EntropyResult cached_result_;  ///< Кешированный результат
     mutable bool cache_valid_{false};      ///< Флаг валидности кеша

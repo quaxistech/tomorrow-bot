@@ -3,10 +3,20 @@
 
 #include "ml/liquidation_cascade.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 
 namespace tb::ml {
+
+namespace {
+
+int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+} // anonymous namespace
 
 // ==================== Конструктор ====================
 
@@ -21,7 +31,8 @@ LiquidationCascadeDetector::LiquidationCascadeDetector(
             {{"lookback", std::to_string(config_.lookback)},
              {"velocity_thr", std::to_string(config_.velocity_threshold)},
              {"volume_mult", std::to_string(config_.volume_spike_mult)},
-             {"depth_thr", std::to_string(config_.depth_thin_threshold)}});
+             {"depth_thr", std::to_string(config_.depth_thin_threshold)},
+             {"cooldown_ns", std::to_string(config_.cooldown_ns)}});
     }
 }
 
@@ -31,6 +42,44 @@ void LiquidationCascadeDetector::on_tick(
     double price, double volume, double bid_depth, double ask_depth)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Validate inputs
+    if (!numeric::is_valid_price(price)) {
+        if (logger_) {
+            logger_->warn("cascade", "Invalid price, skipping tick",
+                {{"price", std::to_string(price)}});
+        }
+        return;
+    }
+    if (!numeric::is_valid_volume(volume)) {
+        if (logger_) {
+            logger_->warn("cascade", "Invalid volume, skipping tick",
+                {{"volume", std::to_string(volume)}});
+        }
+        return;
+    }
+    if (!numeric::is_finite(bid_depth) || bid_depth < 0.0 ||
+        !numeric::is_finite(ask_depth) || ask_depth < 0.0) {
+        if (logger_) {
+            logger_->warn("cascade", "Invalid depth, skipping tick",
+                {{"bid_depth", std::to_string(bid_depth)},
+                 {"ask_depth", std::to_string(ask_depth)}});
+        }
+        return;
+    }
+
+    last_tick_ns_ = now_ns();
+    ++total_ticks_;
+
+    // Compute rolling volatility (stddev of log-returns)
+    if (!prices_.empty() && prices_.back() > 0.0 && price > 0.0) {
+        const double log_ret = numeric::safe_log(price / prices_.back());
+        // Incremental volatility using exponential weighting over the window
+        const double alpha = numeric::safe_div(2.0, static_cast<double>(config_.lookback) + 1.0);
+        rolling_volatility_ = numeric::safe_sqrt(
+            (1.0 - alpha) * rolling_volatility_ * rolling_volatility_ +
+            alpha * log_ret * log_ret);
+    }
 
     // Добавляем новые данные в роллинг-окно
     prices_.push_back(price);
@@ -52,7 +101,7 @@ void LiquidationCascadeDetector::on_tick(
                      / static_cast<double>(depths_.size());
     }
 
-    cache_valid_ = false;  // Инвалидируем кэш при новых данных
+    cache_valid_ = false;
 }
 
 // ==================== Оценка каскада ====================
@@ -67,6 +116,26 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
 
     CascadeSignal signal;
 
+    // Fill component status
+    const int64_t ts = now_ns();
+    signal.component_status.last_update_ns = last_tick_ns_;
+    signal.component_status.samples_processed = static_cast<int>(total_ticks_);
+    signal.samples_used = static_cast<int>(prices_.size());
+
+    if (total_ticks_ == 0) {
+        signal.component_status.health = MlComponentHealth::WarmingUp;
+        signal.component_status.warmup_remaining = 6;
+    } else if (numeric::is_stale(last_tick_ns_, ts, config_.stale_threshold_ns)) {
+        signal.component_status.health = MlComponentHealth::Stale;
+        signal.component_status.warmup_remaining = 0;
+    } else if (prices_.size() < 6) {
+        signal.component_status.health = MlComponentHealth::WarmingUp;
+        signal.component_status.warmup_remaining = static_cast<int>(6 - prices_.size());
+    } else {
+        signal.component_status.health = MlComponentHealth::Healthy;
+        signal.component_status.warmup_remaining = 0;
+    }
+
     // Недостаточно данных для анализа
     if (prices_.size() < 6) {
         cached_signal_ = signal;
@@ -75,59 +144,71 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     }
 
     // 1. Скорость цены: (price[n] - price[n-5]) / price[n-5]
-    size_t n = prices_.size();
-    size_t lag = std::min<size_t>(5, n - 1);
-    double price_old = prices_[n - 1 - lag];
-    double price_new = prices_[n - 1];
+    const size_t n = prices_.size();
+    const size_t lag = std::min<size_t>(5, n - 1);
+    const double price_old = prices_[n - 1 - lag];
+    const double price_new = prices_[n - 1];
 
-    if (price_old > 0.0) {
-        signal.price_velocity = (price_new - price_old) / price_old;
-    }
+    signal.price_velocity = numeric::safe_div(price_new - price_old, price_old);
 
     // 2. Всплеск объёма: текущий / средний
-    if (avg_volume_ > 0.0) {
-        signal.volume_ratio = volumes_.back() / avg_volume_;
-    }
+    signal.volume_ratio = numeric::safe_div(volumes_.back(), avg_volume_);
 
     // 3. Истончение стакана: текущая глубина / средняя
-    if (avg_depth_ > 0.0) {
-        signal.depth_ratio = depths_.back() / avg_depth_;
+    signal.depth_ratio = numeric::safe_div(depths_.back(), avg_depth_, 1.0);
+
+    // 4. Adaptive velocity threshold based on rolling volatility
+    double adapted_velocity_threshold = config_.velocity_threshold;
+    if (rolling_volatility_ > numeric::kEpsilon && config_.velocity_adaptation_factor > 0.0) {
+        // Scale threshold: higher current vol → higher threshold (more tolerant)
+        const double vol_scale = std::max(0.5,
+            rolling_volatility_ / std::max(config_.velocity_threshold, numeric::kEpsilon)
+            * config_.velocity_adaptation_factor);
+        adapted_velocity_threshold = config_.velocity_threshold * vol_scale;
     }
 
-    // 4. Нормализованные скоры [0..1]
-    double velocity_score = std::min(1.0,
-        std::abs(signal.price_velocity) / config_.velocity_threshold);
+    // 5. Нормализованные скоры [0..1]
+    const double velocity_score = std::min(1.0,
+        numeric::safe_div(std::abs(signal.price_velocity), adapted_velocity_threshold));
 
-    double volume_score = std::min(1.0,
-        signal.volume_ratio / config_.volume_spike_mult);
+    const double volume_score = std::min(1.0,
+        numeric::safe_div(signal.volume_ratio, config_.volume_spike_mult));
 
     // Для глубины: чем меньше ratio, тем выше скор (линейная шкала)
-    // depth_ratio < threshold → скор высокий; depth_ratio ≈ threshold → скор = 0.0
     double depth_score = 0.0;
     if (config_.depth_thin_threshold >= 1.0) {
-        // Некорректный порог — используем упрощённую оценку
         depth_score = (signal.depth_ratio < 0.5) ? 1.0 : 0.0;
     } else if (signal.depth_ratio < config_.depth_thin_threshold) {
-        // Линейная шкала: 0 при depth_ratio=threshold, 1 при depth_ratio=0
-        double threshold = std::max(config_.depth_thin_threshold, 0.01);
-        depth_score = (threshold - signal.depth_ratio) / threshold;
+        const double threshold = std::max(config_.depth_thin_threshold, 0.01);
+        depth_score = numeric::safe_div(threshold - signal.depth_ratio, threshold);
     }
 
-    // 5. Взвешенная вероятность каскада
-    signal.probability = 0.4 * velocity_score
-                       + 0.3 * volume_score
-                       + 0.3 * depth_score;
+    // 6. Взвешенная вероятность каскада
+    signal.probability = numeric::safe_clamp(
+        0.4 * velocity_score + 0.3 * volume_score + 0.3 * depth_score,
+        0.0, 1.0);
 
-    // 6. Направление каскада: знак скорости цены
+    // 7. Направление каскада: знак скорости цены
     if (signal.price_velocity > 0.0) {
         signal.direction = 1;
     } else if (signal.price_velocity < 0.0) {
         signal.direction = -1;
     }
 
-    // 7. Каскад неминуем, если вероятность выше порога
-    signal.cascade_imminent =
-        (signal.probability >= config_.cascade_probability_threshold);
+    // 8. Каскад неминуем, если вероятность выше порога
+    const bool raw_cascade = signal.probability >= config_.cascade_probability_threshold;
+
+    // 9. Cooldown: suppress repeated signals within cooldown window
+    if (raw_cascade) {
+        if (last_cascade_signal_ns_ > 0 &&
+            (ts - last_cascade_signal_ns_) < config_.cooldown_ns) {
+            signal.in_cooldown = true;
+            signal.cascade_imminent = false;
+        } else {
+            signal.cascade_imminent = true;
+            last_cascade_signal_ns_ = ts;
+        }
+    }
 
     cached_signal_ = signal;
     cache_valid_ = true;
@@ -139,6 +220,38 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
 
 bool LiquidationCascadeDetector::is_cascade_likely() const {
     return evaluate().cascade_imminent;
+}
+
+// ==================== Статус компонента ====================
+
+MlComponentStatus LiquidationCascadeDetector::status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MlComponentStatus s;
+    s.last_update_ns = last_tick_ns_;
+    s.samples_processed = static_cast<int>(total_ticks_);
+
+    if (total_ticks_ == 0) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = 6;
+        return s;
+    }
+
+    if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+        s.health = MlComponentHealth::Stale;
+        s.warmup_remaining = 0;
+        return s;
+    }
+
+    if (prices_.size() < 6) {
+        s.health = MlComponentHealth::WarmingUp;
+        s.warmup_remaining = static_cast<int>(6 - prices_.size());
+        return s;
+    }
+
+    s.health = MlComponentHealth::Healthy;
+    s.warmup_remaining = 0;
+    return s;
 }
 
 } // namespace tb::ml
