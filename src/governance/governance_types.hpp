@@ -2,7 +2,8 @@
  * @file governance_types.hpp
  * @brief Типы для слоя управления и аудита
  *
- * Определяет аудиторские события, реестр стратегий и snapshot governance.
+ * Определяет аудиторские события, реестр стратегий, snapshot governance,
+ * режимы остановки, инцидентные состояния и результат governance gate.
  */
 #pragma once
 
@@ -29,7 +30,15 @@ enum class AuditEventType {
     SafeModeEntered,        ///< Вход в безопасный режим
     SafeModeExited,         ///< Выход из безопасного режима
     SystemStartup,          ///< Запуск системы
-    SystemShutdown          ///< Остановка системы
+    SystemShutdown,         ///< Остановка системы
+    GovernanceGateDenied,   ///< Пайплайн отклонён governance gate
+    HaltModeChanged,        ///< Переход режима остановки
+    IncidentStateChanged,   ///< Переход инцидентного FSM
+    StrategyDraining,       ///< Стратегия входит в режим дренажа
+    StrategyRetired,        ///< Стратегия выведена из эксплуатации
+    AutoActionRequested,    ///< Автодействие от alpha_decay / self_diagnosis
+    PolicyDenied,           ///< Политика отклонила действие
+    ConfigRollback          ///< Откат конфигурации выполнен
 };
 
 /// Преобразование типа события в строку
@@ -50,6 +59,81 @@ inline std::string to_string(AuditEventType t) {
         case AuditEventType::SafeModeExited:         return "SafeModeExited";
         case AuditEventType::SystemStartup:          return "SystemStartup";
         case AuditEventType::SystemShutdown:         return "SystemShutdown";
+        case AuditEventType::GovernanceGateDenied:   return "GovernanceGateDenied";
+        case AuditEventType::HaltModeChanged:        return "HaltModeChanged";
+        case AuditEventType::IncidentStateChanged:   return "IncidentStateChanged";
+        case AuditEventType::StrategyDraining:       return "StrategyDraining";
+        case AuditEventType::StrategyRetired:        return "StrategyRetired";
+        case AuditEventType::AutoActionRequested:    return "AutoActionRequested";
+        case AuditEventType::PolicyDenied:           return "PolicyDenied";
+        case AuditEventType::ConfigRollback:         return "ConfigRollback";
+    }
+    return "Unknown";
+}
+
+/// Режим остановки торговли
+enum class HaltMode {
+    None,           ///< Нет ограничений
+    NoNewEntries,   ///< Запрет новых позиций
+    ReduceOnly,     ///< Только уменьшение позиций
+    CloseOnly,      ///< Только закрытие позиций
+    HardHalt        ///< Полная остановка торговли
+};
+
+/// Преобразование режима остановки в строку
+inline std::string to_string(HaltMode m) {
+    switch (m) {
+        case HaltMode::None:         return "None";
+        case HaltMode::NoNewEntries: return "NoNewEntries";
+        case HaltMode::ReduceOnly:   return "ReduceOnly";
+        case HaltMode::CloseOnly:    return "CloseOnly";
+        case HaltMode::HardHalt:     return "HardHalt";
+    }
+    return "Unknown";
+}
+
+/// Состояние инцидентного FSM
+enum class IncidentState {
+    Normal,      ///< Нормальная работа
+    Degraded,    ///< Деградация (частичные сбои)
+    Restricted,  ///< Ограниченный режим
+    Halted,      ///< Полная остановка
+    Recovering   ///< Восстановление после инцидента
+};
+
+/// Преобразование инцидентного состояния в строку
+inline std::string to_string(IncidentState s) {
+    switch (s) {
+        case IncidentState::Normal:     return "Normal";
+        case IncidentState::Degraded:   return "Degraded";
+        case IncidentState::Restricted: return "Restricted";
+        case IncidentState::Halted:     return "Halted";
+        case IncidentState::Recovering: return "Recovering";
+    }
+    return "Unknown";
+}
+
+/// Состояние жизненного цикла стратегии
+enum class StrategyLifecycleState {
+    Registered, ///< Зарегистрирована, ещё не запущена
+    Shadow,     ///< Теневой режим (наблюдение)
+    Candidate,  ///< Кандидат на продвижение
+    Live,       ///< Боевой режим
+    Draining,   ///< Дренаж (закрытие позиций)
+    Disabled,   ///< Выключена
+    Retired     ///< Выведена из эксплуатации
+};
+
+/// Преобразование состояния жизненного цикла в строку
+inline std::string to_string(StrategyLifecycleState s) {
+    switch (s) {
+        case StrategyLifecycleState::Registered: return "Registered";
+        case StrategyLifecycleState::Shadow:     return "Shadow";
+        case StrategyLifecycleState::Candidate:  return "Candidate";
+        case StrategyLifecycleState::Live:       return "Live";
+        case StrategyLifecycleState::Draining:   return "Draining";
+        case StrategyLifecycleState::Disabled:   return "Disabled";
+        case StrategyLifecycleState::Retired:    return "Retired";
     }
     return "Unknown";
 }
@@ -64,6 +148,10 @@ struct AuditRecord {
     std::string details;         ///< Подробности
     ConfigHash config_hash{""}; ///< Хэш конфигурации на момент события
     std::string metadata_json;   ///< Дополнительные метаданные (JSON)
+    std::string subsystem;       ///< Подсистема-источник события
+    std::string severity;        ///< Уровень серьёзности ("info", "warn", "critical")
+    std::string previous_state;  ///< Состояние до изменения
+    std::string new_state;       ///< Состояние после изменения
 };
 
 /// Запись реестра стратегий
@@ -77,6 +165,7 @@ struct StrategyRegistryEntry {
     Timestamp registered_at{0};
     Timestamp last_updated{0};
     ConfigHash config_hash{""};
+    StrategyLifecycleState lifecycle_state{StrategyLifecycleState::Registered};
 };
 
 /// Снимок governance состояния
@@ -89,6 +178,19 @@ struct GovernanceSnapshot {
     bool kill_switch_active{false};
     bool safe_mode_active{false};
     Timestamp snapshot_at{0};
+    HaltMode halt_mode{HaltMode::None};
+    IncidentState incident_state{IncidentState::Normal};
+    std::string incident_reason;              ///< Причина текущего инцидента
+};
+
+/// Результат проверки governance gate
+struct GovernanceGateResult {
+    bool trading_allowed{false};              ///< Торговля разрешена
+    bool new_entries_allowed{false};          ///< Новые позиции разрешены
+    bool close_only{false};                   ///< Только закрытие позиций
+    std::string denial_reason;                ///< Причина отказа
+    HaltMode current_halt{HaltMode::None};
+    IncidentState current_incident{IncidentState::Normal};
 };
 
 } // namespace tb::governance
