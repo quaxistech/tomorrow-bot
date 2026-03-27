@@ -71,7 +71,8 @@ TradingPipeline::TradingPipeline(
     // 3. Аналитический слой
     world_model_ = std::make_shared<world_model::RuleBasedWorldModelEngine>(logger_, clock_);
     regime_engine_ = std::make_shared<regime::RuleBasedRegimeEngine>(logger_, clock_, metrics_, config_.regime);
-    uncertainty_engine_ = std::make_shared<uncertainty::RuleBasedUncertaintyEngine>(logger_, clock_);
+    uncertainty_engine_ = std::make_shared<uncertainty::RuleBasedUncertaintyEngine>(
+        uncertainty::UncertaintyConfig{}, logger_, clock_);
 
     // 4. Стратегии
     strategy_registry_ = std::make_shared<strategy::StrategyRegistry>();
