@@ -238,7 +238,7 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
 | **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
 | **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow, champion_challenger |
-| **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis, governance (runtime control plane), operator_control |
+| **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis (v2: event-sourced, scorecards, corrective actions, pipeline-integrated), governance (runtime control plane), operator_control |
 
 ### Продвинутые технологии v0.3
 
@@ -511,6 +511,66 @@ Risk Engine делегирует kill switch в governance (единый source 
 | `governance_strategies_total` | Gauge | Количество зарегистрированных стратегий |
 | `governance_audit_events_total` | Counter | Общее число аудиторских событий |
 
+### Self-Diagnosis Engine v2
+
+Модуль самодиагностики превращён из локального explain-модуля в production subsystem, интегрированную в торговый pipeline.
+
+#### Архитектура
+
+```
+TradingPipeline
+  ├─ decision denied    → explain_denial()
+  ├─ risk denied        → explain_denial()
+  ├─ order executed     → explain_trade()
+  ├─ order failed       → diagnose_execution_failure()
+  └─ periodic (500 tick)→ diagnose_system_state()
+
+SelfDiagnosisEngine
+  ├─ 12 типов DiagnosticType
+  ├─ 4 уровня DiagnosticSeverity (Info → Fatal)
+  ├─ 7 CorrectiveAction (Observe → HaltSystem)
+  ├─ Event-sourced: каждая запись → EventJournal
+  ├─ Scorecards: агрегация по стратегиям
+  └─ Метрики Prometheus: tb_diag_records_total, tb_diag_max_severity
+```
+
+#### Типы диагностических событий
+
+| Тип | Описание |
+|-----|----------|
+| `TradeTaken` | Объяснение совершённой сделки |
+| `TradeDenied` | Объяснение отказа от сделки |
+| `SystemState` | Диагностика состояния системы |
+| `DegradedState` | Деградированное состояние |
+| `ExecutionFailure` | Ошибка исполнения ордера |
+| `MarketDataDegradation` | Деградация рыночных данных |
+| `ExchangeConnectivityIncident` | Инцидент подключения к бирже |
+| `StrategySuppression` | Подавление стратегии (alpha decay) |
+| `PortfolioConstraint` | Ограничение портфеля |
+| `ReconciliationMismatch` | Расхождение при сверке с биржей |
+| `RecoveryAction` | Действие восстановления |
+| `StrategyHealth` | Здоровье стратегии |
+
+#### Корректирующие действия
+
+| Действие | Описание | Автоматический триггер |
+|----------|----------|------------------------|
+| `Observe` | Только наблюдать | TradeTaken, StrategyHealth |
+| `SlowDown` | Увеличить интервалы | Единичные execution failures |
+| `ReduceSize` | Уменьшить размер позиций | DegradedState, PortfolioConstraint |
+| `StopEntries` | Запретить новые входы | Множественные execution failures |
+| `ForceReconcile` | Принудительная сверка | ReconciliationMismatch |
+| `HaltSymbol` | Остановить торговлю символом | MarketDataDegradation (critical) |
+| `HaltSystem` | Остановить всю торговлю | ExchangeConnectivity (critical) |
+
+#### Strategy Scorecards
+
+Агрегированная статистика по каждой стратегии:
+- `trades_taken` / `trades_denied` / `execution_failures` / `suppressions`
+- `denial_rate` — доля отклонённых сигналов
+- `avg_conviction` — средняя убеждённость сигналов
+- Сброс при дневной ротации (`reset_scorecards()`)
+
 ---
 
 ## Структура проекта
@@ -585,12 +645,12 @@ tomorrow-bot/
 │   ├── alpha_decay/            # Мониторинг деградации (7 измерений: expectancy, hit-rate, slippage, MAE, Brier, regime, execution quality). PostgreSQL persistence
 │   ├── shadow/                 # Теневые решения, гипотетический PnL
 │   ├── champion_challenger/    # A/B тестирование стратегий, promotion
-│   ├── self_diagnosis/         # Объяснение решений (human + machine readable)
+│   ├── self_diagnosis/         # Самодиагностика v2: 12 типов событий, severity/corrective actions, scorecards, event-sourced persistence, pipeline-integrated
 │   ├── adversarial_defense/    # 14 детекторов, v4: percentile, correlation, MTF, hysteresis
 │   ├── governance/             # Runtime control plane: governance gate, halt modes, incident FSM, strategy lifecycle, durable audit (23 event types)
 │   ├── operator_control/       # 11 команд оператора (kill-switch, shadow, inspect)
 │   └── synthetic_scenarios/    # 9 стресс-сценариев с валидацией
-├── tests/                      # 407 тестов (unit + integration + scenario)
+├── tests/                      # 433 теста (unit + integration + scenario)
 │   ├── unit/                   # Модульные тесты
 │   ├── integration/            # Интеграционные тесты
 │   ├── mocks/                  # Моки (exchange, persistence)

@@ -54,6 +54,7 @@
 #include "ml/correlation_monitor.hpp"
 #include "ml/thompson_sampler.hpp"
 #include "ml/ml_signal_types.hpp"
+#include "self_diagnosis/self_diagnosis_engine.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -195,6 +196,9 @@ private:
         ml::EntryAction action{ml::EntryAction::EnterNow}; ///< Выбранное действие
     };
     std::optional<PendingEntry> pending_entry_;
+
+    /// Движок самодиагностики — мониторинг здоровья, scorecards, corrective actions
+    std::shared_ptr<self_diagnosis::SelfDiagnosisEngine> self_diagnosis_;
 
     std::atomic<bool> running_{false};
     std::mutex pipeline_mutex_;

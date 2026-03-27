@@ -38,4 +38,5 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_persistence
     tb_ml
     tb_governance
+    tb_self_diagnosis
 )

@@ -223,6 +223,11 @@ TradingPipeline::TradingPipeline(
         bayesian_adapter_->register_parameter("global", atr_stop_param);
     }
 
+    // 5.9. Self-Diagnosis Engine — мониторинг здоровья и диагностика системы
+    self_diagnosis_ = std::make_shared<self_diagnosis::SelfDiagnosisEngine>(
+        logger_, clock_, metrics_);
+    logger_->info("pipeline", "Self-Diagnosis Engine инициализирован");
+
     // 6. Портфель (капитал из конфигурации)
     portfolio_ = std::make_shared<portfolio::InMemoryPortfolioEngine>(
         config_.trading.initial_capital, logger_, clock_, metrics_);
@@ -1958,6 +1963,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     check_alpha_decay_feedback();
     check_champion_challenger_status();
 
+    // 0d.diag. Self-Diagnosis: moved after world/regime/uncertainty computation (see below)
+
     // 0e. Периодическое обновление HTF индикаторов (каждый час или экстренно)
     maybe_update_htf(snapshot);
 
@@ -2056,6 +2063,27 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // 4. Статус рынка каждые 100 тиков (~30 секунд)
     if (tick_count_ % 100 == 0) {
         print_status(snapshot, world, regime);
+    }
+
+    // 4a. Self-Diagnosis: периодическая диагностика состояния системы
+    if (self_diagnosis_ && tick_count_ % 500 == 0) {
+        auto port_snap = portfolio_->snapshot();
+        double exposure_pct = port_snap.exposure.exposure_pct;
+        double drawdown_pct = port_snap.pnl.current_drawdown_pct;
+        bool kill_active = risk_engine_ && risk_engine_->is_kill_switch_active();
+
+        std::string w_str = std::string(to_string(world.label));
+        std::string r_str = std::string(to_string(regime.label));
+        std::string u_str = std::string(to_string(uncertainty.level));
+
+        auto diag = self_diagnosis_->diagnose_system_state(
+            w_str, r_str, u_str, exposure_pct, drawdown_pct, kill_active);
+
+        if (diag.severity >= self_diagnosis::DiagnosticSeverity::Warning) {
+            logger_->warn("pipeline", "Диагностика: " + diag.human_summary,
+                {{"severity", self_diagnosis::to_string(diag.severity)},
+                 {"action", self_diagnosis::to_string(diag.recommended_action)}});
+        }
     }
 
     // 5. Высокая неопределённость — торговля приостановлена
@@ -2231,6 +2259,18 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                  {"trade_approved", decision.trade_approved ? "true" : "false"},
                  {"has_intent", decision.final_intent.has_value() ? "true" : "false"},
                  {"rationale", decision.rationale}});
+        }
+
+        // Self-Diagnosis: объясняем отказ (каждые 200 тиков, чтобы не спамить)
+        if (self_diagnosis_ && tick_count_ % 200 == 0) {
+            std::string w_str = std::string(to_string(world.label));
+            std::string r_str = std::string(to_string(regime.label));
+            std::string u_str = std::string(to_string(uncertainty.level));
+            risk::RiskDecision empty_risk;
+            empty_risk.verdict = risk::RiskVerdict::Denied;
+            empty_risk.summary = "Комитет не одобрил сигнал: " + decision.rationale;
+            self_diagnosis_->explain_denial(
+                decision, empty_risk, w_str, r_str, u_str);
         }
         return;
     }
@@ -2872,6 +2912,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             logger_->warn("pipeline", "Сделка отклонена риск-движком",
                 {{"verdict", risk::to_string(risk_decision.verdict)},
                  {"reasons", std::to_string(risk_decision.reasons.size())}});
+
+            // Self-Diagnosis: объясняем отклонение риском
+            if (self_diagnosis_) {
+                std::string w_str = std::string(to_string(world.label));
+                std::string r_str = std::string(to_string(regime.label));
+                std::string u_str = std::string(to_string(uncertainty.level));
+                self_diagnosis_->explain_denial(
+                    decision, risk_decision, w_str, r_str, u_str);
+            }
             return;
         }
     }
@@ -2912,6 +2961,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
              {"qty", std::to_string(risk_decision.approved_quantity.get())},
              {"symbol", symbol_.get()},
              {"conviction", std::to_string(intent.conviction)}});
+
+        // Self-Diagnosis: регистрируем успешное исполнение
+        if (self_diagnosis_) {
+            std::string w_str = std::string(to_string(world.label));
+            std::string r_str = std::string(to_string(regime.label));
+            std::string u_str = std::string(to_string(uncertainty.level));
+            self_diagnosis_->explain_trade(
+                decision, risk_decision, w_str, r_str, u_str);
+        }
 
         // Инициализация trailing stop при открытии новой позиции
         if (intent.side == Side::Buy) {
@@ -2984,6 +3042,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
              {"symbol", symbol_.get()},
              {"consecutive_rejections", std::to_string(consecutive_rejections_)},
              {"backoff_sec", std::to_string(backoff / 1'000'000'000LL)}});
+
+        // Self-Diagnosis: диагностика ошибки исполнения
+        if (self_diagnosis_) {
+            self_diagnosis_->diagnose_execution_failure(
+                symbol_, intent.strategy_id, decision.correlation_id,
+                "Ордер отклонён биржей", consecutive_rejections_);
+        }
     }
 }
 
