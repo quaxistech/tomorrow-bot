@@ -84,6 +84,14 @@ TradingPipeline::TradingPipeline(
         std::make_shared<strategy::VolExpansionStrategy>(logger_, clock_));
     strategy_registry_->register_strategy(
         std::make_shared<strategy::MicrostructureScalpStrategy>(logger_, clock_));
+    strategy_registry_->register_strategy(
+        std::make_shared<strategy::EmaPullbackStrategy>(logger_, clock_));
+    strategy_registry_->register_strategy(
+        std::make_shared<strategy::RsiDivergenceStrategy>(logger_, clock_));
+    strategy_registry_->register_strategy(
+        std::make_shared<strategy::VwapReversionStrategy>(logger_, clock_));
+    strategy_registry_->register_strategy(
+        std::make_shared<strategy::VolumeProfileStrategy>(logger_, clock_));
 
     // 5. Аллокация стратегий и решения
     strategy_allocator_ = std::make_shared<strategy_allocator::RegimeAwareAllocator>(logger_, clock_);

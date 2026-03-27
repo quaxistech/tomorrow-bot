@@ -7,8 +7,10 @@ namespace tb::strategy {
 
 VolExpansionStrategy::VolExpansionStrategy(
     std::shared_ptr<logging::ILogger> logger,
-    std::shared_ptr<clock::IClock> clock)
-    : logger_(std::move(logger))
+    std::shared_ptr<clock::IClock> clock,
+    VolExpansionConfig cfg)
+    : cfg_(std::move(cfg))
+    , logger_(std::move(logger))
     , clock_(std::move(clock))
 {}
 
@@ -35,15 +37,12 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     }
 
     // Обновляем буфер ATR
-    {
-        std::lock_guard lock(history_mutex_);
-        atr_history_.push_back(tech.atr_14);
-        if (atr_history_.size() > kAtrHistorySize) {
-            atr_history_.pop_front();
-        }
+    std::lock_guard lock(history_mutex_);
+    atr_history_.push_back(tech.atr_14);
+    if (atr_history_.size() > cfg_.atr_history_size) {
+        atr_history_.pop_front();
     }
 
-    std::lock_guard lock(history_mutex_);
     if (atr_history_.size() < 5) {
         return std::nullopt;
     }
@@ -55,19 +54,19 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     // Step 1: Check that recent history had COMPRESSION (low ATR)
     // Step 2: Current ATR must be expanding from that compressed base
 
-    // Find the minimum ATR in history (excluding last 2 points)
+    // Find the minimum ATR in older window (excluding last 2 points)
+    std::size_t older_end = atr_history_.size() - 2;
     double min_atr = atr_history_[0];
-    for (std::size_t i = 1; i < atr_history_.size() - 2; ++i) {
+    for (std::size_t i = 1; i < older_end; ++i) {
         min_atr = std::min(min_atr, atr_history_[i]);
     }
 
-    // Average ATR of the older half (compression baseline)
-    std::size_t half = atr_history_.size() / 2;
+    // Average ATR of older window (compression baseline)
     double older_avg = 0.0;
-    for (std::size_t i = 0; i < half; ++i) {
+    for (std::size_t i = 0; i < older_end; ++i) {
         older_avg += atr_history_[i];
     }
-    older_avg /= static_cast<double>(half);
+    older_avg /= static_cast<double>(older_end);
 
     // Recent average (last 2 points)
     double recent_avg = (atr_history_[atr_history_.size() - 1] +
@@ -78,11 +77,11 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     }
 
     // Was compressed: older ATR was below 70% of recent ATR (volatility was LOW)
-    bool was_compressed = (older_avg < recent_avg * 0.70);
+    bool was_compressed = (older_avg < recent_avg * cfg_.compression_ratio);
 
     // Current expansion: ATR rising from compressed base by ≥ 40%
     double expansion_rate = (recent_avg - older_avg) / older_avg;
-    bool is_expanding = expansion_rate > 0.30;
+    bool is_expanding = expansion_rate > cfg_.expansion_rate_min;
 
     if (!was_compressed || !is_expanding) {
         return std::nullopt;
@@ -93,7 +92,7 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     // Instead, use RSI to determine DIRECTION.
 
     // ADX should be rising (trend forming from compression)
-    if (tech.adx < 20.0) {
+    if (tech.adx < cfg_.adx_min) {
         return std::nullopt;
     }
 
@@ -112,7 +111,7 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     }
 
     // Direction: determined by momentum + RSI + EMA
-    if (tech.momentum_5 > 0.003 && tech.rsi_14 > 50.0) {
+    if (tech.momentum_5 > cfg_.momentum_threshold && tech.rsi_14 >= 50.0) {
         if (trend_bearish) {
             logger_->debug("VolExpansion", "BUY отклонён — медвежий тренд EMA",
                 {{"ema20", std::to_string(tech.ema_20)},
@@ -120,10 +119,13 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
             return std::nullopt;
         }
         intent.side = Side::Buy;
+        intent.signal_intent = SignalIntent::LongEntry;
         intent.signal_name = "vol_compress_breakout_buy";
         intent.reason_codes = {"compression_to_expansion", "bullish_direction", "adx_rising"};
-    } else if (tech.momentum_5 < -0.003 && tech.rsi_14 < 50.0) {
+    } else if (tech.momentum_5 < -cfg_.momentum_threshold && tech.rsi_14 <= 50.0) {
         intent.side = Side::Sell;
+        intent.signal_intent = SignalIntent::LongExit;
+        intent.exit_reason = ExitReason::VolatilitySpikeExit;
         intent.signal_name = "vol_compress_breakout_sell";
         intent.reason_codes = {"compression_to_expansion", "bearish_direction", "adx_rising"};
     } else {
@@ -135,8 +137,8 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
     double expansion_factor = std::min(1.0, expansion_rate / 1.5);
     double momentum_factor = std::min(1.0, std::abs(tech.momentum_5) / 0.02);
     intent.conviction = std::clamp(
-        0.30 + expansion_factor * 0.25 + adx_factor * 0.25 + momentum_factor * 0.15,
-        0.0, 1.0);
+        cfg_.base_conviction + expansion_factor * cfg_.expansion_weight + adx_factor * cfg_.adx_weight + momentum_factor * cfg_.momentum_weight,
+        0.0, cfg_.max_conviction);
     intent.entry_score = intent.conviction * 0.80;
     intent.urgency = 0.75;
 

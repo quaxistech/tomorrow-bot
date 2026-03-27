@@ -8,12 +8,15 @@
 
 namespace tb::strategy {
 
-/// Стратегия Mean Reversion: Bollinger Bands + RSI экстремумы
-class MeanReversionStrategy : public IStrategy {
+/// Стратегия Volume Profile Reversion: вход вблизи ключевых уровней VP
+/// Логика: цена находится вблизи POC (Point of Control) или границ Value Area +
+/// RSI подтверждает + ADX не слишком высокий (нет сильного тренда)
+/// POC — магнит цены, Value Area — зона наибольшей торговой активности
+class VolumeProfileStrategy : public IStrategy {
 public:
-    MeanReversionStrategy(std::shared_ptr<logging::ILogger> logger,
+    VolumeProfileStrategy(std::shared_ptr<logging::ILogger> logger,
                           std::shared_ptr<clock::IClock> clock,
-                          MeanReversionConfig cfg = {});
+                          VolumeProfileConfig cfg = {});
 
     StrategyMeta meta() const override;
     std::optional<TradeIntent> evaluate(const StrategyContext& context) override;
@@ -22,7 +25,7 @@ public:
     void reset() override;
 
 private:
-    MeanReversionConfig cfg_;
+    VolumeProfileConfig cfg_;
 
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

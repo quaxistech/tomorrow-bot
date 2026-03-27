@@ -4,7 +4,7 @@
 
 Tomorrow Bot — полностью рабочая production-grade торговая система:
 - **42+ модулей** реализованы без заглушек
-- **203 unit-теста** проходят
+- **314 unit-тестов** проходят
 - **Реальная торговля** на Bitget через REST API
 - **WebSocket**: ~1000+ сообщений в минуту
 - **Graceful shutdown** по SIGTERM/SIGINT
@@ -31,7 +31,9 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Conviction threshold 0.35**: повышенный порог уверенности для входа (динамический)
 - **Bitget WebSocket**: Подключение, подписки (ticker, trade, books, candle1m, candle5m), reconnect
 - **Bitget REST API**: Отправка market/limit/post-only ордеров, отмена, HMAC-SHA256 подпись
-- **5 торговых стратегий**: Momentum, MeanReversion, Breakout, VolatilityExpansion, MicrostructureScalp
+- **9 торговых стратегий**: Momentum, MeanReversion, Breakout, VolatilityExpansion, MicrostructureScalp, EmaPullback, RsiDivergence, VwapReversion, VolumeProfile
+- **Typed Strategy Configs**: Все пороги стратегий конфигурируемы через типизированные структуры
+- **Spot Signal Semantics**: SignalIntent (LongEntry/LongExit/Reduce/Hold), ExitReason attribution
 - **14-проверочный Risk Engine**: Kill switch, daily loss, drawdown, exposure, stale feed, spread и др.
 - **Order FSM**: 10 состояний (New → PendingAck → Open → PartiallyFilled → Filled/Cancelled/Rejected/Expired)
 - **Портфель**: Позиции, realized/unrealized PnL, exposure, concentration

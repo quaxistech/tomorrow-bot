@@ -2,6 +2,7 @@
 #include "strategy/strategy_interface.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
+#include "strategy/strategy_config.hpp"
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -13,7 +14,8 @@ namespace tb::strategy {
 class BreakoutStrategy : public IStrategy {
 public:
     BreakoutStrategy(std::shared_ptr<logging::ILogger> logger,
-                     std::shared_ptr<clock::IClock> clock);
+                     std::shared_ptr<clock::IClock> clock,
+                     BreakoutConfig cfg = {});
 
     StrategyMeta meta() const override;
     std::optional<TradeIntent> evaluate(const StrategyContext& context) override;
@@ -22,9 +24,7 @@ public:
     void reset() override;
 
 private:
-    static constexpr std::size_t kBandwidthHistorySize = 10;
-    static constexpr double kCompressionThreshold = 0.03;
-    static constexpr double kExpansionRatio = 1.5;
+    BreakoutConfig cfg_;
 
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

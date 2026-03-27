@@ -2,6 +2,7 @@
 #include "strategy/strategy_interface.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
+#include "strategy/strategy_config.hpp"
 #include <atomic>
 #include <memory>
 
@@ -11,7 +12,8 @@ namespace tb::strategy {
 class MomentumStrategy : public IStrategy {
 public:
     MomentumStrategy(std::shared_ptr<logging::ILogger> logger,
-                     std::shared_ptr<clock::IClock> clock);
+                     std::shared_ptr<clock::IClock> clock,
+                     MomentumConfig cfg = {});
 
     StrategyMeta meta() const override;
     std::optional<TradeIntent> evaluate(const StrategyContext& context) override;
@@ -20,6 +22,8 @@ public:
     void reset() override;
 
 private:
+    MomentumConfig cfg_;
+
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
     std::atomic<bool> active_{true};

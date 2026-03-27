@@ -5,8 +5,10 @@ namespace tb::strategy {
 
 MomentumStrategy::MomentumStrategy(
     std::shared_ptr<logging::ILogger> logger,
-    std::shared_ptr<clock::IClock> clock)
-    : logger_(std::move(logger))
+    std::shared_ptr<clock::IClock> clock,
+    MomentumConfig cfg)
+    : cfg_(std::move(cfg))
+    , logger_(std::move(logger))
     , clock_(std::move(clock))
 {}
 
@@ -34,13 +36,13 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
 
     // ADX ≥ 20: relaxed from Wilder's 25; many systems use 20 as trend boundary
     // (Kaufman "Trading Systems & Methods" 6th ed. recommends 20 for faster markets)
-    if (tech.adx < 20.0) {
+    if (tech.adx < cfg_.adx_min) {
         return std::nullopt;
     }
 
     // Momentum must be MEANINGFUL, not just > 0
     // Filter noise: require |momentum_5| > 0.005 (0.5% over 5 periods)
-    if (std::abs(tech.momentum_5) < 0.005) {
+    if (std::abs(tech.momentum_5) < cfg_.momentum_threshold) {
         return std::nullopt;
     }
 
@@ -59,35 +61,36 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
     intent.generated_at = clock_->now();
 
     // BUY: EMA20 > EMA50 + RSI < 75 + momentum_5 positive + accelerating
-    if (tech.ema_20 > tech.ema_50 && tech.rsi_14 < 75.0 && tech.momentum_5 > 0.005) {
+    if (tech.ema_20 > tech.ema_50 && tech.rsi_14 < cfg_.rsi_overbought && tech.momentum_5 > cfg_.momentum_threshold) {
         intent.side = Side::Buy;
+        intent.signal_intent = SignalIntent::LongEntry;
         intent.signal_name = "momentum_buy_v2";
         intent.reason_codes = {"trend_aligned", "adx_confirmed"};
 
         // ADX factor: 20→0.0, 50→1.0 (normalized strength above minimum)
-        double adx_factor = std::min(1.0, (tech.adx - 20.0) / 30.0);
+        double adx_factor = std::min(1.0, (tech.adx - cfg_.adx_min) / 30.0);
 
         // Momentum magnitude factor (0.5% → 0.0, 3%+ → 1.0)
-        double momentum_factor = std::min(1.0, (std::abs(tech.momentum_5) - 0.005) / 0.025);
+        double momentum_factor = std::min(1.0, (std::abs(tech.momentum_5) - cfg_.momentum_threshold) / 0.025);
 
         // Acceleration bonus: if accelerating, +0.1 conviction
         double accel_bonus = 0.0;
-        if (momentum_accel > 0.001) {
-            accel_bonus = std::min(0.15, momentum_accel * 5.0);
+        if (momentum_accel > cfg_.accel_threshold) {
+            accel_bonus = std::min(cfg_.accel_max_bonus, momentum_accel * 5.0);
             intent.reason_codes.push_back("momentum_accelerating");
         }
 
         // OBV confirmation: volume supports price move
         double obv_bonus = 0.0;
-        if (tech.obv_valid && tech.obv_normalized > 0.3) {
-            obv_bonus = 0.05;
+        if (tech.obv_valid && tech.obv_normalized > cfg_.obv_confirm_threshold) {
+            obv_bonus = cfg_.obv_bonus;
             intent.reason_codes.push_back("volume_confirmed");
         }
 
         // Base conviction = 0.35 (higher floor since we require ADX≥25)
         intent.conviction = std::clamp(
-            0.35 + adx_factor * 0.25 + momentum_factor * 0.20 + accel_bonus + obv_bonus,
-            0.0, 1.0);
+            cfg_.base_conviction + adx_factor * cfg_.adx_weight + momentum_factor * cfg_.momentum_weight + accel_bonus + obv_bonus,
+            0.0, cfg_.max_conviction);
         intent.entry_score = intent.conviction * 0.85;
         intent.urgency = std::min(1.0, std::abs(tech.momentum_5) / 0.02);
 
@@ -100,28 +103,30 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
     }
 
     // SELL: EMA20 < EMA50 + RSI > 25 + momentum_5 negative + accelerating down
-    if (tech.ema_20 < tech.ema_50 && tech.rsi_14 > 25.0 && tech.momentum_5 < -0.005) {
+    if (tech.ema_20 < tech.ema_50 && tech.rsi_14 > cfg_.rsi_oversold && tech.momentum_5 < -cfg_.momentum_threshold) {
         intent.side = Side::Sell;
+        intent.signal_intent = SignalIntent::LongExit;
         intent.signal_name = "momentum_sell_v2";
         intent.reason_codes = {"trend_aligned", "adx_confirmed"};
 
-        double adx_factor = std::min(1.0, (tech.adx - 20.0) / 30.0);        double momentum_factor = std::min(1.0, (std::abs(tech.momentum_5) - 0.005) / 0.025);
+        double adx_factor = std::min(1.0, (tech.adx - cfg_.adx_min) / 30.0);
+        double momentum_factor = std::min(1.0, (std::abs(tech.momentum_5) - cfg_.momentum_threshold) / 0.025);
 
         double accel_bonus = 0.0;
-        if (momentum_accel < -0.001) {
-            accel_bonus = std::min(0.15, std::abs(momentum_accel) * 5.0);
+        if (momentum_accel < -cfg_.accel_threshold) {
+            accel_bonus = std::min(cfg_.accel_max_bonus, std::abs(momentum_accel) * 5.0);
             intent.reason_codes.push_back("momentum_accelerating");
         }
 
         double obv_bonus = 0.0;
-        if (tech.obv_valid && tech.obv_normalized < -0.3) {
-            obv_bonus = 0.05;
+        if (tech.obv_valid && tech.obv_normalized < -cfg_.obv_confirm_threshold) {
+            obv_bonus = cfg_.obv_bonus;
             intent.reason_codes.push_back("volume_confirmed");
         }
 
         intent.conviction = std::clamp(
-            0.35 + adx_factor * 0.25 + momentum_factor * 0.20 + accel_bonus + obv_bonus,
-            0.0, 1.0);
+            cfg_.base_conviction + adx_factor * cfg_.adx_weight + momentum_factor * cfg_.momentum_weight + accel_bonus + obv_bonus,
+            0.0, cfg_.max_conviction);
         intent.entry_score = intent.conviction * 0.85;
         intent.urgency = std::min(1.0, std::abs(tech.momentum_5) / 0.02);
 

@@ -2,6 +2,7 @@
 #include "strategy/strategy_interface.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
+#include "strategy/strategy_config.hpp"
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -13,7 +14,8 @@ namespace tb::strategy {
 class VolExpansionStrategy : public IStrategy {
 public:
     VolExpansionStrategy(std::shared_ptr<logging::ILogger> logger,
-                         std::shared_ptr<clock::IClock> clock);
+                         std::shared_ptr<clock::IClock> clock,
+                         VolExpansionConfig cfg = {});
 
     StrategyMeta meta() const override;
     std::optional<TradeIntent> evaluate(const StrategyContext& context) override;
@@ -22,7 +24,7 @@ public:
     void reset() override;
 
 private:
-    static constexpr std::size_t kAtrHistorySize = 10;
+    VolExpansionConfig cfg_;
 
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

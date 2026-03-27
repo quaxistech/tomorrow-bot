@@ -8,12 +8,15 @@
 
 namespace tb::strategy {
 
-/// Стратегия Mean Reversion: Bollinger Bands + RSI экстремумы
-class MeanReversionStrategy : public IStrategy {
+/// Стратегия VWAP Reversion: вход при отклонении от VWAP с ожиданием возврата
+/// Логика: цена отклонилась от trade VWAP (из microstructure features) +
+/// RSI подтверждает перепроданность/перекупленность + ADX низкий (нет тренда) +
+/// Volume confirmation
+class VwapReversionStrategy : public IStrategy {
 public:
-    MeanReversionStrategy(std::shared_ptr<logging::ILogger> logger,
+    VwapReversionStrategy(std::shared_ptr<logging::ILogger> logger,
                           std::shared_ptr<clock::IClock> clock,
-                          MeanReversionConfig cfg = {});
+                          VwapReversionConfig cfg = {});
 
     StrategyMeta meta() const override;
     std::optional<TradeIntent> evaluate(const StrategyContext& context) override;
@@ -22,7 +25,7 @@ public:
     void reset() override;
 
 private:
-    MeanReversionConfig cfg_;
+    VwapReversionConfig cfg_;
 
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

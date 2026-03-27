@@ -7,8 +7,10 @@ namespace tb::strategy {
 
 BreakoutStrategy::BreakoutStrategy(
     std::shared_ptr<logging::ILogger> logger,
-    std::shared_ptr<clock::IClock> clock)
-    : logger_(std::move(logger))
+    std::shared_ptr<clock::IClock> clock,
+    BreakoutConfig cfg)
+    : cfg_(std::move(cfg))
+    , logger_(std::move(logger))
     , clock_(std::move(clock))
 {}
 
@@ -36,16 +38,13 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
     }
 
     // Обновляем буфер bandwidth
-    {
-        std::lock_guard lock(history_mutex_);
-        bandwidth_history_.push_back(tech.bb_bandwidth);
-        if (bandwidth_history_.size() > kBandwidthHistorySize) {
-            bandwidth_history_.pop_front();
-        }
+    std::lock_guard lock(history_mutex_);
+    bandwidth_history_.push_back(tech.bb_bandwidth);
+    if (bandwidth_history_.size() > cfg_.bandwidth_history_size) {
+        bandwidth_history_.pop_front();
     }
 
     // Нужно хотя бы 5 наблюдений для обнаружения паттерна
-    std::lock_guard lock(history_mutex_);
     if (bandwidth_history_.size() < 5) {
         return std::nullopt;
     }
@@ -55,8 +54,8 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
     double min_bw = *std::min_element(bandwidth_history_.begin(), bandwidth_history_.end() - 1);
     double current_bw = bandwidth_history_.back();
 
-    bool was_compressed = min_bw < kCompressionThreshold;
-    bool is_expanding = current_bw > min_bw * kExpansionRatio;
+    bool was_compressed = min_bw < cfg_.compression_threshold;
+    bool is_expanding = current_bw > min_bw * cfg_.expansion_ratio;
 
     if (!was_compressed || !is_expanding) {
         return std::nullopt;
@@ -79,7 +78,7 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
     // Пробой вверх: цена выше верхней BB
     if (last_price > tech.bb_upper) {
         // Block BUY breakout against BEAR trend — likely false breakout
-        if (trend_bearish) {
+        if (trend_bearish && !cfg_.allow_counter_trend) {
             logger_->debug("Breakout", "BUY пробой отклонён — медвежий тренд EMA",
                 {{"ema20", std::to_string(tech.ema_20)},
                  {"ema50", std::to_string(tech.ema_50)}});
@@ -89,7 +88,7 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
         // Volume confirmation: OBV must confirm breakout direction
         // Reference: Katz & McCormick — breakout without volume = false breakout
         bool volume_ok = true;
-        if (tech.obv_valid && tech.obv_normalized < 0.0) {
+        if (tech.obv_valid && tech.obv_normalized < cfg_.obv_block_threshold) {
             volume_ok = false;  // OBV diverging from price → likely false breakout
         }
         if (!volume_ok) {
@@ -100,36 +99,42 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
 
         // ADX confirmation: ADX should be rising (trend forming)
         // ADX < 20 during breakout = weak, likely to fail
-        if (tech.adx_valid && tech.adx < 20.0) {
+        if (tech.adx_valid && tech.adx < cfg_.adx_min) {
             logger_->debug("Breakout", "Пробой вверх отклонён — ADX слишком низкий",
                 {{"adx", std::to_string(tech.adx)}});
             return std::nullopt;
         }
 
         intent.side = Side::Buy;
+        intent.signal_intent = SignalIntent::LongEntry;
         intent.signal_name = "bb_breakout_up_v2";
         intent.reason_codes = {"compression_detected", "expansion_confirmed", "price_above_upper_bb"};
 
         // Conviction: сила расширения
         double expansion_strength = std::min(1.0, (current_bw / min_bw - 1.0) / 3.0);
-        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 0.85);
+        intent.conviction = std::clamp(cfg_.base_conviction + expansion_strength * 0.5, 0.0, cfg_.max_conviction);
 
         // Подтверждение momentum
         if (tech.momentum_valid && tech.momentum_5 > 0.0) {
-            intent.conviction = std::min(0.85, intent.conviction + 0.15);
+            intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.momentum_bonus);
             intent.reason_codes.push_back("momentum_confirmed");
         }
 
         // ADX strength bonus
-        if (tech.adx_valid && tech.adx > 30.0) {
-            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+        if (tech.adx_valid && tech.adx > cfg_.adx_strong) {
+            intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.adx_bonus);
             intent.reason_codes.push_back("strong_trend");
         }
 
         // Volume confirmation bonus
-        if (tech.obv_valid && tech.obv_normalized > 0.5) {
-            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+        if (tech.obv_valid && tech.obv_normalized > cfg_.obv_surge_threshold) {
+            intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.volume_bonus);
             intent.reason_codes.push_back("volume_surge");
+        }
+
+        // Контр-тренд множитель conviction
+        if (trend_bearish && cfg_.allow_counter_trend) {
+            intent.conviction *= cfg_.counter_trend_conviction_mult;
         }
 
         intent.entry_score = intent.conviction * 0.80;
@@ -146,31 +151,33 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
     if (last_price < tech.bb_lower) {
         // Volume confirmation for downside breakout
         bool volume_ok = true;
-        if (tech.obv_valid && tech.obv_normalized > 0.0) {
+        if (tech.obv_valid && tech.obv_normalized > -cfg_.obv_block_threshold) {
             volume_ok = false;  // OBV diverging
         }
         if (!volume_ok) {
             return std::nullopt;
         }
 
-        if (tech.adx_valid && tech.adx < 20.0) {
+        if (tech.adx_valid && tech.adx < cfg_.adx_min) {
             return std::nullopt;
         }
 
         intent.side = Side::Sell;
+        intent.signal_intent = SignalIntent::LongExit;
+        intent.exit_reason = ExitReason::TrendFailure;
         intent.signal_name = "bb_breakout_down_v2";
         intent.reason_codes = {"compression_detected", "expansion_confirmed", "price_below_lower_bb"};
 
         double expansion_strength = std::min(1.0, (current_bw / min_bw - 1.0) / 3.0);
-        intent.conviction = std::clamp(0.3 + expansion_strength * 0.5, 0.0, 0.85);
+        intent.conviction = std::clamp(cfg_.base_conviction + expansion_strength * 0.5, 0.0, cfg_.max_conviction);
 
         if (tech.momentum_valid && tech.momentum_5 < 0.0) {
-            intent.conviction = std::min(0.85, intent.conviction + 0.15);
+            intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.momentum_bonus);
             intent.reason_codes.push_back("momentum_confirmed");
         }
 
-        if (tech.adx_valid && tech.adx > 30.0) {
-            intent.conviction = std::min(0.85, intent.conviction + 0.10);
+        if (tech.adx_valid && tech.adx > cfg_.adx_strong) {
+            intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.adx_bonus);
         }
 
         intent.entry_score = intent.conviction * 0.80;
