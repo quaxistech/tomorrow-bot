@@ -97,7 +97,10 @@ TradingPipeline
   ├──► Persistence (EventJournal + SnapshotStore)
   ├──► Telemetry (decision envelope)
   ├──► SelfDiagnosis (объяснение решений)
-  ├──► Shadow (теневые решения, гипотетический PnL)
+  ├──► ShadowModeEngine (виртуальное исполнение, fill simulation, position tracking)
+  │      ├── Получает: committee decisions, market prices, risk verdicts
+  │      ├── Производит: ShadowTradeRecord, ShadowComparison, ShadowAlert, Prometheus metrics
+  │      └── Использует: ILogger, IClock, IMetricsRegistry, GovernanceAuditLayer, IStorageAdapter
   ├──► ChampionChallenger (A/B тестирование)
   ├──► AlphaDecay (мониторинг деградации)
   ├──► AdversarialDefense (6 видов угроз)

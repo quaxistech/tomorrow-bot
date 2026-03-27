@@ -337,6 +337,40 @@ confidence переключения должен быть ≥ `min_confidence`. 
 **Explainability** — каждая классификация содержит `ClassificationExplanation`:
 список проверенных и сработавших условий, data quality score, и human-readable summary.
 
+### shadow (виртуальное исполнение v2.0)
+```yaml
+shadow:
+  enabled: true                         # Включение подсистемы
+  mode: observation                     # observation | validation | discovery
+  risk_policy: mirror_live              # mirror_live | relaxed | unconstrained
+  max_records_per_strategy: 10000       # Макс. записей на стратегию (FIFO eviction)
+  eval_window_short_ms: 1000            # Окно короткой оценки (1 с)
+  eval_window_mid_ms: 5000              # Окно средней оценки (5 с)
+  eval_window_long_ms: 30000            # Окно длинной оценки (30 с)
+  stale_timeout_ms: 120000              # Таймаут просроченных записей (2 мин)
+  taker_fee_pct: 0.001                  # Комиссия taker (0.1%)
+  maker_fee_pct: 0.0006                 # Комиссия maker (0.06%)
+  persist_to_db: false                  # PostgreSQL persistence (POSTGRES_URL env)
+  respect_kill_switch: true             # Остановка при kill switch
+  alert_pnl_divergence_bps: 50.0        # Порог алерта P&L дивергенции (bps)
+  alert_hit_rate_divergence: 0.15       # Порог алерта hit rate дивергенции
+```
+
+**Режимы:**
+- `observation` — чистая запись всех сигналов без вмешательства
+- `validation` — параллельное сравнение shadow vs live
+- `discovery` — scenario exploration с альтернативными risk/execution параметрами
+
+**Risk policies:**
+- `mirror_live` — shadow повторяет live risk limits
+- `relaxed` — ослабленные лимиты для исследования краёв
+- `unconstrained` — без risk limits для «что если» анализа
+
+При `persist_to_db: true` записи сохраняются в PostgreSQL через `POSTGRES_URL`.
+При достижении `max_records_per_strategy` старейшие записи вытесняются (FIFO).
+
+Подробнее: [Shadow Mode Guide](shadow_mode_guide.md)
+
 ## Настройка API-ключей
 
 Создайте файл `.env` в корне проекта:

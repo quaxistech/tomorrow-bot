@@ -206,3 +206,22 @@ regime:
   confidence_anomaly: 0.9
   stability_same_regime: 0.9
   stability_first_classification: 0.5
+
+# ── Shadow Trading Subsystem ──────────────────────────────────────────────────
+# Виртуальное исполнение решений без реальных ордеров
+# Все решения записываются для сравнения с live-результатами
+shadow:
+  enabled: true
+  mode: observation           # observation | validation | discovery
+  risk_policy: mirror_live    # mirror_live | relaxed | unconstrained
+  max_records_per_strategy: 10000
+  eval_window_short_ms: 1000  # Окно короткой оценки (1с)
+  eval_window_mid_ms: 5000    # Окно средней оценки (5с)
+  eval_window_long_ms: 30000  # Окно длинной оценки (30с)
+  stale_timeout_ms: 120000    # Таймаут для просроченных записей (2мин)
+  taker_fee_pct: 0.001        # Комиссия taker (0.1%)
+  maker_fee_pct: 0.0006       # Комиссия maker (0.06%)
+  persist_to_db: false        # PostgreSQL persistence (POSTGRES_URL env)
+  respect_kill_switch: true   # Остановка при kill switch
+  alert_pnl_divergence_bps: 50.0     # Порог алерта расхождения P&L (bps)
+  alert_hit_rate_divergence: 0.15     # Порог алерта расхождения hit rate

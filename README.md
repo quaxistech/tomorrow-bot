@@ -237,7 +237,7 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **Интеллект** | world_model, regime, uncertainty, strategy (×5), strategy_allocator, decision, ai |
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
 | **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
-| **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow, champion_challenger |
+| **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow (v2.0: виртуальное исполнение, fill simulation, multi-leg positions, configurable eval windows, Prometheus metrics, PostgreSQL persistence), champion_challenger |
 | **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis (v2: event-sourced, scorecards, corrective actions, pipeline-integrated), governance (runtime control plane), operator_control |
 
 ### Продвинутые технологии v0.3
@@ -643,7 +643,7 @@ tomorrow-bot/
 │   ├── replay/                 # ReplayEngine (pause/resume/seek, 4 режима, hooks) + BacktestEngine (fill simulation, equity curve, Sharpe/Sortino/Calmar)
 │   ├── telemetry/              # Исследовательская телеметрия (envelope)
 │   ├── alpha_decay/            # Мониторинг деградации (7 измерений: expectancy, hit-rate, slippage, MAE, Brier, regime, execution quality). PostgreSQL persistence
-│   ├── shadow/                 # Теневые решения, гипотетический PnL
+│   ├── shadow/                 # Shadow v2.0: виртуальное исполнение, fill simulation, multi-leg positions, P&L tracking, divergence alerts, Prometheus metrics, PostgreSQL persistence
 │   ├── champion_challenger/    # A/B тестирование стратегий, promotion
 │   ├── self_diagnosis/         # Самодиагностика v2: 12 типов событий, severity/corrective actions, scorecards, event-sourced persistence, pipeline-integrated
 │   ├── adversarial_defense/    # 14 детекторов, v4: percentile, correlation, MTF, hysteresis
@@ -699,7 +699,7 @@ tomorrow-bot/
 | [FSM ордеров](docs/architecture/order_fsm.md) | 10 состояний, переходы |
 | [Руководство по конфигурации](docs/guides/config_guide.md) | Параметры YAML, pair_selection |
 | [Расширение стратегий](docs/guides/strategy_extension_guide.md) | Как добавить стратегию |
-| [Shadow Mode](docs/guides/shadow_mode_guide.md) | Теневая торговля |
+| [Shadow Mode v2.0](docs/guides/shadow_mode_guide.md) | Виртуальное исполнение: fill simulation, position tracking, P&L, алерты |
 | [Champion-Challenger](docs/guides/champion_challenger_guide.md) | A/B тестирование |
 | [Развёртывание](docs/operations/production_deployment_guide.md) | Production setup |
 | [Operations runbook](docs/operations/operations_runbook.md) | Эксплуатация |
