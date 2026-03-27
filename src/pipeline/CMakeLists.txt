@@ -36,4 +36,5 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_champion_challenger
     tb_persistence
     tb_ml
+    tb_governance
 )

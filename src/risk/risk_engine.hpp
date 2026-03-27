@@ -13,6 +13,8 @@
 #include <deque>
 #include <atomic>
 
+namespace tb::governance { class GovernanceAuditLayer; }
+
 namespace tb::risk {
 
 /// Интерфейс риск-движка
@@ -51,7 +53,8 @@ public:
     ProductionRiskEngine(ExtendedRiskConfig config,
                          std::shared_ptr<logging::ILogger> logger,
                          std::shared_ptr<clock::IClock> clock,
-                         std::shared_ptr<metrics::IMetricsRegistry> metrics);
+                         std::shared_ptr<metrics::IMetricsRegistry> metrics,
+                         std::shared_ptr<governance::GovernanceAuditLayer> governance = nullptr);
 
     RiskDecision evaluate(
         const strategy::TradeIntent& intent,
@@ -130,6 +133,7 @@ private:
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
+    std::shared_ptr<governance::GovernanceAuditLayer> governance_;
 
     std::atomic<bool> kill_switch_active_{false};
     std::string kill_switch_reason_;

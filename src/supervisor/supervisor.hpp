@@ -11,6 +11,7 @@
 #include "logging/logger.hpp"
 #include "metrics/metrics_registry.hpp"
 #include "clock/clock.hpp"
+#include "governance/governance_audit_layer.hpp"
 #include <atomic>
 #include <memory>
 #include <functional>
@@ -58,7 +59,8 @@ public:
         std::shared_ptr<health::IHealthService>   health,
         std::shared_ptr<logging::ILogger>         logger,
         std::shared_ptr<metrics::IMetricsRegistry> metrics,
-        std::shared_ptr<clock::IClock>             clock
+        std::shared_ptr<clock::IClock>             clock,
+        std::shared_ptr<governance::GovernanceAuditLayer> governance = nullptr
     );
 
     ~Supervisor();
@@ -112,6 +114,7 @@ private:
     std::shared_ptr<logging::ILogger>          logger_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
     std::shared_ptr<clock::IClock>             clock_;
+    std::shared_ptr<governance::GovernanceAuditLayer> governance_;
 
     std::atomic<int>    state_;     ///< Атомарное состояние (int для atomic)
     std::string         degraded_reason_;   ///< Причина деградации

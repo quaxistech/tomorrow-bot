@@ -5,6 +5,7 @@
 #include "app_bootstrap.hpp"
 #include "clock/wall_clock.hpp"
 #include "common/enums.hpp"
+#include "governance/governance_audit_layer.hpp"
 #include <filesystem>
 
 namespace tb::app {
@@ -62,6 +63,21 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
 
     // ---- 6. Часы ----
     components.clock = clock::create_wall_clock();
+
+    // ---- 7. Governance control plane ----
+    components.governance = std::make_shared<governance::GovernanceAuditLayer>(
+        components.logger,
+        components.clock,
+        components.metrics,
+        components.health
+    );
+    components.governance->register_with_health();
+    components.governance->set_config_hash(ConfigHash(components.config.config_hash));
+    components.governance->set_trading_mode(components.config.trading.mode, "bootstrap");
+    components.governance->record_audit(
+        governance::AuditEventType::SystemStartup,
+        "bootstrap", "system",
+        "Инициализация завершена, режим: " + std::string(tb::to_string(components.config.trading.mode)));
 
     return Ok(std::move(components));
 }

@@ -15,6 +15,7 @@ target_link_libraries(tb_supervisor
         tb_logging
         tb_metrics
         tb_clock
+        tb_governance
 )
 
 target_compile_features(tb_supervisor PUBLIC cxx_std_20)

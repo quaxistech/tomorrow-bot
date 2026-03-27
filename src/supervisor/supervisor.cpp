@@ -30,11 +30,13 @@ Supervisor::Supervisor(
     std::shared_ptr<health::IHealthService>    health,
     std::shared_ptr<logging::ILogger>          logger,
     std::shared_ptr<metrics::IMetricsRegistry> metrics,
-    std::shared_ptr<clock::IClock>             clock)
+    std::shared_ptr<clock::IClock>             clock,
+    std::shared_ptr<governance::GovernanceAuditLayer> governance)
     : health_(std::move(health))
     , logger_(std::move(logger))
     , metrics_(std::move(metrics))
     , clock_(std::move(clock))
+    , governance_(std::move(governance))
     , state_(static_cast<int>(SystemState::Initializing))
 {
     instance_.store(this, std::memory_order_release);
@@ -79,6 +81,15 @@ void Supervisor::start() {
     health_->update_subsystem("logging",    health::SubsystemState::Healthy, "Логирование активно");
     health_->update_subsystem("metrics",    health::SubsystemState::Healthy, "Метрики готовы");
     health_->update_subsystem("clock",      health::SubsystemState::Healthy, "Часы синхронизированы");
+
+    // Governance: регистрируем подсистему и записываем SystemStartup
+    if (governance_) {
+        governance_->register_with_health();
+        governance_->record_audit(
+            governance::AuditEventType::SystemStartup,
+            "supervisor", "system",
+            "Супервизор запущен, подсистем: " + std::to_string(subsystems_.size()));
+    }
 
     // Запуск зарегистрированных подсистем в порядке регистрации
     for (auto& sub : subsystems_) {
@@ -128,6 +139,14 @@ void Supervisor::wait_for_shutdown() {
 
 void Supervisor::stop() {
     logger_->info("supervisor", "Завершение работы системы...");
+
+    // Governance: записываем SystemShutdown
+    if (governance_) {
+        governance_->record_audit(
+            governance::AuditEventType::SystemShutdown,
+            "supervisor", "system",
+            "Корректное завершение работы системы");
+    }
 
     // Остановка подсистем в обратном порядке регистрации
     for (auto it = subsystems_.rbegin(); it != subsystems_.rend(); ++it) {
@@ -195,6 +214,12 @@ void Supervisor::enter_degraded_mode(const std::string& reason) {
     degraded_reason_ = reason;
     health_->update_subsystem("supervisor", health::SubsystemState::Degraded, reason);
     logger_->warn("supervisor", "Вход в деградированный режим: " + reason);
+
+    // Governance: переводим инцидентное состояние в Degraded
+    if (governance_) {
+        governance_->transition_incident_state(
+            governance::IncidentState::Degraded, "supervisor", reason);
+    }
 }
 
 void Supervisor::exit_degraded_mode() {
@@ -206,6 +231,12 @@ void Supervisor::exit_degraded_mode() {
         degraded_reason_.clear();
         health_->update_subsystem("supervisor", health::SubsystemState::Healthy, "Работает");
         logger_->info("supervisor", "Выход из деградированного режима");
+
+        // Governance: возвращаем инцидентное состояние в Normal
+        if (governance_) {
+            governance_->transition_incident_state(
+                governance::IncidentState::Normal, "supervisor", "Выход из деградации");
+        }
     }
 }
 

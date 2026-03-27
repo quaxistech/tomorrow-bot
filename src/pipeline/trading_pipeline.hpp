@@ -36,6 +36,7 @@
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
 #include "health/health_service.hpp"
+#include "governance/governance_audit_layer.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
 #include "alpha_decay/alpha_decay_monitor.hpp"
@@ -67,6 +68,7 @@ public:
         std::shared_ptr<clock::IClock> clock,
         std::shared_ptr<metrics::IMetricsRegistry> metrics,
         std::shared_ptr<health::IHealthService> health,
+        std::shared_ptr<governance::GovernanceAuditLayer> governance = nullptr,
         const std::string& symbol = ""
     );
 
@@ -119,6 +121,9 @@ private:
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
     std::shared_ptr<health::IHealthService> health_;
+
+    /// Governance control plane — runtime gate для торговли
+    std::shared_ptr<governance::GovernanceAuditLayer> governance_;
 
     // Рыночные данные
     std::shared_ptr<indicators::IndicatorEngine> indicator_engine_;

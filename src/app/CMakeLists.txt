@@ -23,6 +23,7 @@ target_link_libraries(tomorrow-bot
         tb_health
         tb_clock
         tb_supervisor
+        tb_governance
         tb_platform
         Threads::Threads
 )

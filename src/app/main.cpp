@@ -253,7 +253,8 @@ int main(int argc, const char* argv[]) {
         comp.health,
         comp.logger,
         comp.metrics,
-        comp.clock
+        comp.clock,
+        comp.governance
     };
 
     supervisor.install_signal_handlers();
@@ -267,7 +268,7 @@ int main(int argc, const char* argv[]) {
 
         auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
             config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, comp.health,
-            sym);
+            comp.governance, sym);
 
         // Устанавливаем точность ордеров из данных сканирования
         auto prec_it = symbol_precisions.find(sym);
@@ -413,7 +414,7 @@ int main(int argc, const char* argv[]) {
                     const auto& sym = active_symbols[i];
                     auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
                         config, comp.secret_provider, comp.logger, comp.clock,
-                        comp.metrics, comp.health, sym);
+                        comp.metrics, comp.health, comp.governance, sym);
 
                     auto prec_it = symbol_precisions.find(sym);
                     if (prec_it != symbol_precisions.end()) {

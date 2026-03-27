@@ -14,6 +14,7 @@
 #include "metrics/metrics_registry.hpp"
 #include "health/health_service.hpp"
 #include "clock/clock.hpp"
+#include "governance/governance_audit_layer.hpp"
 #include "common/result.hpp"
 #include <memory>
 #include <string_view>
@@ -30,6 +31,7 @@ struct AppComponents {
     std::shared_ptr<metrics::IMetricsRegistry>  metrics;
     std::shared_ptr<health::IHealthService>     health;
     std::shared_ptr<clock::IClock>              clock;
+    std::shared_ptr<governance::GovernanceAuditLayer> governance;
     config::AppConfig                           config;
 };
 
@@ -43,6 +45,7 @@ struct AppComponents {
  * 4. Инициализация метрик
  * 5. Инициализация сервиса здоровья
  * 6. Инициализация часов
+ * 7. Инициализация governance control plane
  */
 class AppBootstrap {
 public:

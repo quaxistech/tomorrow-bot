@@ -1,4 +1,5 @@
 #include "risk/risk_engine.hpp"
+#include "governance/governance_audit_layer.hpp"
 #include "order_book/order_book_types.hpp"
 #include "common/constants.hpp"
 #include <algorithm>
@@ -11,11 +12,13 @@ ProductionRiskEngine::ProductionRiskEngine(
     ExtendedRiskConfig config,
     std::shared_ptr<logging::ILogger> logger,
     std::shared_ptr<clock::IClock> clock,
-    std::shared_ptr<metrics::IMetricsRegistry> metrics)
+    std::shared_ptr<metrics::IMetricsRegistry> metrics,
+    std::shared_ptr<governance::GovernanceAuditLayer> governance)
     : config_(std::move(config))
     , logger_(std::move(logger))
     , clock_(std::move(clock))
     , metrics_(std::move(metrics))
+    , governance_(std::move(governance))
 {
 }
 
@@ -119,6 +122,11 @@ void ProductionRiskEngine::activate_kill_switch(const std::string& reason) {
     kill_switch_reason_ = reason;
     logger_->critical("RiskEngine", "АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ АКТИВИРОВАН",
                       {{"reason", reason}});
+
+    // Делегируем в governance как единый source of truth
+    if (governance_) {
+        governance_->set_kill_switch(true, "risk_engine");
+    }
 }
 
 void ProductionRiskEngine::deactivate_kill_switch() {
@@ -126,9 +134,18 @@ void ProductionRiskEngine::deactivate_kill_switch() {
     kill_switch_active_.store(false);
     kill_switch_reason_.clear();
     logger_->info("RiskEngine", "Аварийный выключатель деактивирован", {});
+
+    // Делегируем в governance
+    if (governance_) {
+        governance_->set_kill_switch(false, "risk_engine");
+    }
 }
 
 bool ProductionRiskEngine::is_kill_switch_active() const {
+    // Единый source of truth: governance (если доступен), иначе локальный флаг
+    if (governance_) {
+        return governance_->is_kill_switch_active();
+    }
     return kill_switch_active_.load();
 }
 

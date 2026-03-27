@@ -48,6 +48,7 @@ TradingPipeline::TradingPipeline(
     std::shared_ptr<clock::IClock> clock,
     std::shared_ptr<metrics::IMetricsRegistry> metrics,
     std::shared_ptr<health::IHealthService> health,
+    std::shared_ptr<governance::GovernanceAuditLayer> governance,
     const std::string& symbol)
     : config_(config)
     , symbol_(Symbol(symbol.empty() ? "BTCUSDT" : symbol))
@@ -56,6 +57,7 @@ TradingPipeline::TradingPipeline(
     , clock_(std::move(clock))
     , metrics_(std::move(metrics))
     , health_(std::move(health))
+    , governance_(std::move(governance))
 {
     // 1. Индикаторы и признаки
     indicator_engine_ = std::make_shared<indicators::IndicatorEngine>(logger_);
@@ -269,7 +271,7 @@ TradingPipeline::TradingPipeline(
         risk_cfg.min_liquidity_depth = 1.0;
     }
     risk_engine_ = std::make_shared<risk::ProductionRiskEngine>(
-        risk_cfg, logger_, clock_, metrics_);
+        risk_cfg, logger_, clock_, metrics_, governance_);
 
     // 10. Исполнение — выбор submitter в зависимости от режима
     std::shared_ptr<execution::IOrderSubmitter> submitter;
@@ -1867,6 +1869,26 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // и рынок не в безопасных условиях для входа.
     if (!check_market_readiness(snapshot)) {
         return;
+    }
+
+    // 0c.gov. Governance Gate — проверяем разрешение control plane на торговлю.
+    // Стоп-лоссы проверяются раньше (0a) и обходят governance — экстренное закрытие
+    // имеет приоритет. Governance блокирует только новые входы и обычные сигналы.
+    if (governance_) {
+        // Определяем ID стратегии для governance gate
+        // (используем первую зарегистрированную стратегию или пустой ID для глобальной проверки)
+        auto gate_result = governance_->evaluate_trading_gate(StrategyId(""));
+        if (!gate_result.trading_allowed) {
+            if (tick_count_ % 200 == 0) {
+                logger_->debug("pipeline",
+                    "Governance gate заблокировал торговлю",
+                    {{"reason", gate_result.denial_reason},
+                     {"halt_mode", governance::to_string(gate_result.current_halt)},
+                     {"incident", governance::to_string(gate_result.current_incident)},
+                     {"symbol", symbol_.get()}});
+            }
+            return;
+        }
     }
 
     // 0d. Alpha Decay: периодическая проверка деградации стратегий

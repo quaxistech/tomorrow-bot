@@ -181,6 +181,8 @@ OperatorResponse OperatorControlPlane::handle_inspect_health(const OperatorReque
     std::string json = "{";
     json += "\"kill_switch_active\":" + std::string(snapshot.kill_switch_active ? "true" : "false") + ",";
     json += "\"safe_mode_active\":" + std::string(snapshot.safe_mode_active ? "true" : "false") + ",";
+    json += "\"halt_mode\":\"" + governance::to_string(snapshot.halt_mode) + "\",";
+    json += "\"incident_state\":\"" + governance::to_string(snapshot.incident_state) + "\",";
     json += "\"strategies_count\":" + std::to_string(snapshot.strategy_registry.size()) + ",";
     json += "\"runtime_version\":\"" + snapshot.runtime_version + "\"";
     json += "}";
@@ -203,6 +205,9 @@ OperatorResponse OperatorControlPlane::handle_inspect_governance(const OperatorR
     std::string json = "{";
     json += "\"kill_switch_active\":" + std::string(snapshot.kill_switch_active ? "true" : "false") + ",";
     json += "\"safe_mode_active\":" + std::string(snapshot.safe_mode_active ? "true" : "false") + ",";
+    json += "\"halt_mode\":\"" + governance::to_string(snapshot.halt_mode) + "\",";
+    json += "\"incident_state\":\"" + governance::to_string(snapshot.incident_state) + "\",";
+    json += "\"incident_reason\":\"" + snapshot.incident_reason + "\",";
     json += "\"current_mode\":" + std::to_string(static_cast<int>(snapshot.current_mode)) + ",";
     json += "\"config_hash\":\"" + snapshot.current_config_hash.get() + "\",";
     json += "\"runtime_version\":\"" + snapshot.runtime_version + "\",";
@@ -212,7 +217,8 @@ OperatorResponse OperatorControlPlane::handle_inspect_governance(const OperatorR
         if (i > 0) json += ",";
         json += "{\"id\":\"" + s.strategy_id.get() + "\",";
         json += "\"version\":" + std::to_string(s.version.get()) + ",";
-        json += "\"enabled\":" + std::string(s.enabled ? "true" : "false") + "}";
+        json += "\"enabled\":" + std::string(s.enabled ? "true" : "false") + ",";
+        json += "\"lifecycle\":\"" + governance::to_string(s.lifecycle_state) + "\"}";
     }
     json += "],";
     json += "\"recent_audit_count\":" + std::to_string(snapshot.recent_audit.size());
