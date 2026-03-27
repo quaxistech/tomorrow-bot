@@ -10,6 +10,7 @@
 
 #include "common/types.hpp"
 #include "ai/ai_advisory_types.hpp"
+#include "regime/regime_config.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -17,6 +18,7 @@
 namespace tb::config {
 
 using ai::AIAdvisoryConfig;
+using regime::RegimeConfig;
 
 /// Настройки подключения к бирже
 struct ExchangeConfig {
@@ -268,6 +270,7 @@ struct AppConfig {
     TradingParamsConfig  trading_params;   ///< Настройки управления позицией
     ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
     OpportunityCostConfig opportunity_cost; ///< Настройки модуля opportunity cost
+    RegimeConfig         regime;           ///< Настройки классификатора рыночных режимов
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

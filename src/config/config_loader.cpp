@@ -524,6 +524,81 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.opportunity_cost.drawdown_penalty_scale = parse_double(
         get_value(kv, "opportunity_cost.drawdown_penalty_scale", "0.5"), 0.5);
 
+    // ── Секция regime ──
+    // Trend thresholds
+    cfg.regime.trend.adx_strong = parse_double(
+        get_value(kv, "regime.trend_adx_strong", "30.0"), 30.0);
+    cfg.regime.trend.adx_weak_min = parse_double(
+        get_value(kv, "regime.trend_adx_weak_min", "18.0"), 18.0);
+    cfg.regime.trend.adx_weak_max = parse_double(
+        get_value(kv, "regime.trend_adx_weak_max", "30.0"), 30.0);
+    cfg.regime.trend.rsi_trend_bias = parse_double(
+        get_value(kv, "regime.trend_rsi_bias", "50.0"), 50.0);
+
+    // Mean-reversion thresholds
+    cfg.regime.mean_reversion.rsi_overbought = parse_double(
+        get_value(kv, "regime.mr_rsi_overbought", "70.0"), 70.0);
+    cfg.regime.mean_reversion.rsi_oversold = parse_double(
+        get_value(kv, "regime.mr_rsi_oversold", "30.0"), 30.0);
+    cfg.regime.mean_reversion.adx_max = parse_double(
+        get_value(kv, "regime.mr_adx_max", "25.0"), 25.0);
+
+    // Volatility thresholds
+    cfg.regime.volatility.bb_bandwidth_expansion = parse_double(
+        get_value(kv, "regime.vol_bb_expansion", "0.06"), 0.06);
+    cfg.regime.volatility.bb_bandwidth_compression = parse_double(
+        get_value(kv, "regime.vol_bb_compression", "0.02"), 0.02);
+    cfg.regime.volatility.atr_norm_expansion = parse_double(
+        get_value(kv, "regime.vol_atr_expansion", "0.02"), 0.02);
+    cfg.regime.volatility.adx_compression_max = parse_double(
+        get_value(kv, "regime.vol_adx_compression_max", "20.0"), 20.0);
+
+    // Stress thresholds
+    cfg.regime.stress.rsi_extreme_high = parse_double(
+        get_value(kv, "regime.stress_rsi_extreme_high", "85.0"), 85.0);
+    cfg.regime.stress.rsi_extreme_low = parse_double(
+        get_value(kv, "regime.stress_rsi_extreme_low", "15.0"), 15.0);
+    cfg.regime.stress.obv_norm_extreme = parse_double(
+        get_value(kv, "regime.stress_obv_extreme", "2.0"), 2.0);
+    cfg.regime.stress.aggressive_flow_toxic = parse_double(
+        get_value(kv, "regime.stress_aggressive_flow", "0.75"), 0.75);
+    cfg.regime.stress.spread_toxic_bps = parse_double(
+        get_value(kv, "regime.stress_spread_toxic_bps", "15.0"), 15.0);
+    cfg.regime.stress.book_instability_threshold = parse_double(
+        get_value(kv, "regime.stress_book_instability", "0.6"), 0.6);
+    cfg.regime.stress.spread_stress_bps = parse_double(
+        get_value(kv, "regime.stress_spread_bps", "30.0"), 30.0);
+    cfg.regime.stress.liquidity_ratio_stress = parse_double(
+        get_value(kv, "regime.stress_liquidity_ratio", "3.0"), 3.0);
+
+    // Chop thresholds
+    cfg.regime.chop.adx_max = parse_double(
+        get_value(kv, "regime.chop_adx_max", "18.0"), 18.0);
+
+    // Transition / hysteresis policy
+    cfg.regime.transition.confirmation_ticks = static_cast<int>(parse_double(
+        get_value(kv, "regime.transition_confirmation_ticks", "3"), 3.0));
+    cfg.regime.transition.min_confidence_to_switch = parse_double(
+        get_value(kv, "regime.transition_min_confidence", "0.55"), 0.55);
+    cfg.regime.transition.inertia_alpha = parse_double(
+        get_value(kv, "regime.transition_inertia_alpha", "0.15"), 0.15);
+    cfg.regime.transition.dwell_time_ticks = static_cast<int>(parse_double(
+        get_value(kv, "regime.transition_dwell_ticks", "5"), 5.0));
+
+    // Confidence policy
+    cfg.regime.confidence.base_confidence = parse_double(
+        get_value(kv, "regime.confidence_base", "0.5"), 0.5);
+    cfg.regime.confidence.data_quality_weight = parse_double(
+        get_value(kv, "regime.confidence_data_quality_weight", "0.2"), 0.2);
+    cfg.regime.confidence.max_indicator_count = static_cast<int>(parse_double(
+        get_value(kv, "regime.confidence_max_indicators", "6"), 6.0));
+    cfg.regime.confidence.anomaly_confidence = parse_double(
+        get_value(kv, "regime.confidence_anomaly", "0.9"), 0.9);
+    cfg.regime.confidence.same_regime_stability = parse_double(
+        get_value(kv, "regime.stability_same_regime", "0.9"), 0.9);
+    cfg.regime.confidence.first_classification_stability = parse_double(
+        get_value(kv, "regime.stability_first_classification", "0.5"), 0.5);
+
     // Валидация
     ConfigValidator validator;
     auto validation = validator.validate(cfg);

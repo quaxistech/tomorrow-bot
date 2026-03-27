@@ -39,6 +39,34 @@ struct RegimeTransition {
     Timestamp occurred_at{Timestamp(0)};
 };
 
+/// Одно условие, приведшее к классификации (для аудита и дебага)
+struct ClassificationCondition {
+    std::string indicator;    ///< Имя индикатора ("ADX", "RSI", "spread_bps", …)
+    double value{0.0};        ///< Фактическое значение
+    double threshold{0.0};    ///< Порог, с которым сравнивалось
+    std::string op;           ///< Оператор (">", "<", ">=", "in_range", …)
+    bool triggered{false};    ///< Сработало ли условие
+};
+
+/// Полное объяснение классификации: какие правила сработали, качество данных
+struct ClassificationExplanation {
+    DetailedRegime immediate_regime{DetailedRegime::Undefined};  ///< Мгновенный режим по правилам
+    DetailedRegime persistent_regime{DetailedRegime::Undefined}; ///< Режим после hysteresis
+    bool hysteresis_overrode{false};  ///< Hysteresis изменил итоговый режим
+
+    std::vector<ClassificationCondition> triggered_conditions;   ///< Условия, которые сработали
+    std::vector<ClassificationCondition> checked_conditions;     ///< Все проверенные условия
+
+    int valid_indicator_count{0};
+    int total_indicator_count{0};
+    double data_quality_score{0.0};   ///< [0,1]
+
+    int dwell_ticks{0};               ///< Сколько тиков в текущем режиме
+    int confirmation_ticks_remaining{0}; ///< 0 = подтверждён
+
+    std::string summary;              ///< Человекочитаемое резюме
+};
+
 /// Полный снимок результатов классификации режима
 struct RegimeSnapshot {
     RegimeLabel label{RegimeLabel::Unclear};             ///< Упрощённая метка
@@ -49,6 +77,8 @@ struct RegimeSnapshot {
     std::optional<RegimeTransition> last_transition;      ///< Последняя смена режима
     Timestamp computed_at{Timestamp(0)};
     Symbol symbol{Symbol("")};
+
+    ClassificationExplanation explanation;                 ///< Объяснение классификации
 };
 
 std::string to_string(DetailedRegime regime);

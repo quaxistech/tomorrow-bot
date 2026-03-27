@@ -1,5 +1,6 @@
 #pragma once
 #include "regime/regime_types.hpp"
+#include "regime/regime_config.hpp"
 #include "features/feature_snapshot.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
@@ -23,33 +24,53 @@ public:
     virtual std::optional<RegimeSnapshot> current_regime(const Symbol& symbol) const = 0;
 };
 
-/// Классификатор режима на основе правил
+/// Классификатор режима на основе правил с конфигурируемыми порогами и hysteresis
 class RuleBasedRegimeEngine : public IRegimeEngine {
 public:
     RuleBasedRegimeEngine(std::shared_ptr<logging::ILogger> logger,
                           std::shared_ptr<clock::IClock> clock,
-                          std::shared_ptr<metrics::IMetricsRegistry> metrics);
+                          std::shared_ptr<metrics::IMetricsRegistry> metrics,
+                          RegimeConfig config = make_default_regime_config());
 
     RegimeSnapshot classify(const features::FeatureSnapshot& snapshot) override;
     std::optional<RegimeSnapshot> current_regime(const Symbol& symbol) const override;
 
 private:
-    /// Детализированная классификация режима
-    DetailedRegime classify_detailed(const features::FeatureSnapshot& snap) const;
+    /// Per-symbol hysteresis state
+    struct HysteresisState {
+        DetailedRegime confirmed_regime{DetailedRegime::Undefined};
+        DetailedRegime candidate_regime{DetailedRegime::Undefined};
+        int candidate_ticks{0};  ///< How many ticks candidate has persisted
+        int dwell_ticks{0};      ///< How many ticks since last confirmed switch
+    };
 
-    /// Вычисление уверенности в классификации
-    double compute_confidence(const features::FeatureSnapshot& snap, DetailedRegime regime) const;
+    /// Мгновенная rule-based классификация (без hysteresis)
+    DetailedRegime classify_immediate(const features::FeatureSnapshot& snap,
+                                      ClassificationExplanation& explanation) const;
 
-    /// Вычисление стабильности (сравнение с предыдущим)
+    /// Применить hysteresis к мгновенному результату
+    DetailedRegime apply_hysteresis(DetailedRegime immediate, double confidence,
+                                    HysteresisState& state,
+                                    ClassificationExplanation& explanation) const;
+
+    double compute_confidence(const features::FeatureSnapshot& snap,
+                              DetailedRegime regime,
+                              const ClassificationExplanation& explanation) const;
+
     double compute_stability(DetailedRegime current, DetailedRegime previous) const;
 
-    /// Генерация рекомендаций по стратегиям
     std::vector<RegimeStrategyHint> generate_hints(DetailedRegime regime) const;
 
+    /// Формирование человекочитаемого резюме
+    static std::string build_summary(DetailedRegime regime, double confidence,
+                                     double stability, bool hysteresis_overrode);
+
+    RegimeConfig config_;
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
     std::unordered_map<std::string, RegimeSnapshot> snapshots_;
+    std::unordered_map<std::string, HysteresisState> hysteresis_;
     mutable std::mutex mutex_;
 };
 

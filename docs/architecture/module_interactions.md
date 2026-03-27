@@ -39,7 +39,11 @@ Normalizer (JSON → типизированные события)
   │  └── spread, depth_imbalance, book_instability
   │
   ├──► WorldModel (9 состояний: StableTrend, FragileBreakout, ChopNoise...)
-  ├──► RegimeEngine (13 режимов: StrongUptrend, MeanReversion, ToxicFlow...)
+  ├──► RegimeEngine (13 режимов, config-driven пороги, hysteresis FSM, explainability)
+  │     ├── RegimeConfig — внешние пороги (trend, MR, vol, stress, chop)
+  │     ├── TransitionPolicy — hysteresis (confirmation ticks, dwell time, min confidence)
+  │     ├── RegimePolicy — downstream stress policy (Allow/ReduceSize/BlockEntry/HaltAll)
+  │     └── ClassificationExplanation — аудит: triggered conditions, data quality, summary
   └──► UncertaintyEngine (4 измерения: regime, signal, data, execution)
         │
         ▼

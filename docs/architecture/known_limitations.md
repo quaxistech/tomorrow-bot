@@ -38,7 +38,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Order FSM**: 10 состояний (New → PendingAck → Open → PartiallyFilled → Filled/Cancelled/Rejected/Expired)
 - **Портфель**: Позиции, realized/unrealized PnL, exposure, concentration
 - **WorldModel**: 9 состояний мира (StableTrend, FragileBreakout, ChopNoise и др.)
-- **RegimeEngine**: 13 режимов рынка с confidence и stability scoring
+- **RegimeEngine**: 13 режимов рынка с config-driven порогами, hysteresis FSM, explainability, stress policies
 - **UncertaintyEngine**: 4 измерения (regime, signal, data quality, execution)
 - **StrategyAllocator**: Аллокация по режиму и world suitability
 - **DecisionAggregationEngine**: Комитетное голосование с вето

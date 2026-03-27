@@ -273,6 +273,70 @@ decision:
   # max_state_skew_ns: 200000000    # 200мс максимальная рассинхронизация
 ```
 
+### regime (новое — классификатор рыночных режимов)
+
+```yaml
+regime:
+  # Тренд
+  trend_adx_strong: 30.0            # ADX выше этого = сильный тренд
+  trend_adx_weak_min: 18.0          # Нижняя граница слабого тренда
+  trend_adx_weak_max: 30.0          # Верхняя граница слабого тренда
+  trend_rsi_bias: 50.0              # RSI pivot: выше = бычий, ниже = медвежий
+
+  # Возврат к среднему
+  mr_rsi_overbought: 70.0           # RSI порог перекупленности
+  mr_rsi_oversold: 30.0             # RSI порог перепроданности
+  mr_adx_max: 25.0                  # Макс ADX для mean-reversion
+
+  # Волатильность
+  vol_bb_expansion: 0.06            # BB bandwidth для расширения волатильности
+  vol_bb_compression: 0.02          # BB bandwidth для сжатия
+  vol_atr_expansion: 0.02           # Нормализованный ATR для расширения
+  vol_adx_compression_max: 20.0     # Макс ADX для компрессии
+
+  # Стресс / аномалии
+  stress_rsi_extreme_high: 85.0     # RSI аномально высокий
+  stress_rsi_extreme_low: 15.0      # RSI аномально низкий
+  stress_obv_extreme: 2.0           # OBV нормализованный — аномалия
+  stress_aggressive_flow: 0.75      # Порог токсичного потока
+  stress_spread_toxic_bps: 15.0     # Spread токсичности (bps)
+  stress_book_instability: 0.6      # Нестабильность книги ордеров
+  stress_spread_bps: 30.0           # Spread стресса (bps)
+  stress_liquidity_ratio: 3.0       # Коэффициент стресса ликвидности
+
+  # Chop / боковик
+  chop_adx_max: 18.0                # ADX ниже этого = Chop
+
+  # Гистерезис / переходная политика
+  transition_confirmation_ticks: 3  # Тиков для подтверждения смены режима
+  transition_min_confidence: 0.55   # Мин confidence для смены
+  transition_inertia_alpha: 0.15    # EMA-сглаживание перехода
+  transition_dwell_ticks: 5         # Мин тиков в режиме перед сменой
+
+  # Уверенность / стабильность
+  confidence_base: 0.5              # Базовая уверенность
+  confidence_data_quality_weight: 0.2
+  confidence_max_indicators: 6
+  confidence_anomaly: 0.9
+  stability_same_regime: 0.9
+  stability_first_classification: 0.5
+```
+
+**Hysteresis** — новый режим не принимается мгновенно. Новый кандидат должен продержаться
+`confirmation_ticks` тиков подряд, текущий режим должен прожить минимум `dwell_ticks`, и
+confidence переключения должен быть ≥ `min_confidence`. Это предотвращает осцилляцию режимов
+на шуме и даёт downstream-системам стабильный контекст.
+
+**Stress policies** — каждому из 13 режимов назначена downstream-политика (`RegimePolicy`):
+- `StressAction::Allow` — нормальная торговля
+- `StressAction::ReduceSize` — уменьшение размера позиции
+- `StressAction::RaiseThreshold` — повышение порогов conviction
+- `StressAction::BlockEntry` — блокировка новых входов (выходы разрешены)
+- `StressAction::HaltAll` — полная остановка торговли (AnomalyEvent)
+
+**Explainability** — каждая классификация содержит `ClassificationExplanation`:
+список проверенных и сработавших условий, data quality score, и human-readable summary.
+
 ## Настройка API-ключей
 
 Создайте файл `.env` в корне проекта:
