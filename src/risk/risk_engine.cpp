@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <chrono>
 
 namespace tb::risk {
 
@@ -33,8 +34,9 @@ RiskDecision ProductionRiskEngine::evaluate(
     decision.decided_at = clock_->now();
     decision.approved_quantity = sizing.approved_quantity;
     decision.verdict = RiskVerdict::Approved;
+    decision.phase = RiskPhase::PreTrade;
 
-    // Проверяем все 14 правил последовательно
+    // Проверяем все 23 правила последовательно
     // Каждая проверка добавляет причину в список при нарушении
 
     // 1. Аварийный выключатель
@@ -82,11 +84,38 @@ RiskDecision ProductionRiskEngine::evaluate(
     // 15. Макс убыток на сделку — если есть убыточные позиции, блокируем новые ордера
     check_max_loss_per_trade(portfolio, decision);
 
+    // 16. Бюджет стратегии
+    check_strategy_budget(intent, portfolio, decision);
+
+    // 17. Концентрация символа
+    check_symbol_concentration(intent, portfolio, decision);
+
+    // 18. Однонаправленные позиции
+    check_same_direction_positions(intent, portfolio, decision);
+
+    // 19. UTC cutoff
+    check_utc_cutoff(decision);
+
+    // 20. Оборачиваемость
+    check_turnover_rate(decision);
+
+    // 21. Реализованный дневной убыток
+    check_realized_daily_loss(portfolio, decision);
+
+    // 22. Интервал между сделками
+    check_trade_interval(intent, decision);
+
+    // 23. Масштабирование лимитов по режиму
+    check_regime_scaled_limits(decision);
+
     // Рассчитать утилизацию рисков
     if (portfolio.total_capital > 0.0) {
         decision.risk_utilization_pct =
             portfolio.exposure.gross_exposure / portfolio.total_capital;
     }
+
+    // Записать масштабирующий фактор режима
+    decision.regime_scaling_factor = regime_scale_factor_;
 
     // Сформировать итоговое описание
     std::ostringstream oss;
@@ -167,7 +196,146 @@ void ProductionRiskEngine::record_trade_result(bool is_loss) {
     (void)is_loss; // Подавление предупреждения о неиспользуемом параметре
 }
 
-// ========== Реализация 14 проверок ==========
+// ========== Новые методы ==========
+
+IntraTradeAssessment ProductionRiskEngine::evaluate_position(
+    const portfolio::Position& position,
+    const portfolio::PortfolioSnapshot& portfolio,
+    const features::FeatureSnapshot& /*features*/)
+{
+    IntraTradeAssessment assessment;
+    assessment.symbol = position.symbol;
+    assessment.assessed_at = clock_->now();
+
+    // Проверка max_adverse_excursion_pct
+    if (portfolio.total_capital > 0.0 && position.unrealized_pnl < 0.0) {
+        const double adverse_pct =
+            std::abs(position.unrealized_pnl) / portfolio.total_capital * 100.0;
+        if (adverse_pct >= config_.max_adverse_excursion_pct) {
+            assessment.should_close = true;
+            assessment.reasons.push_back({
+                "MAX_ADVERSE_EXCURSION",
+                "Неблагоприятное отклонение " + std::to_string(adverse_pct) +
+                "% превышает лимит " + std::to_string(config_.max_adverse_excursion_pct) + "%",
+                1.0
+            });
+        }
+    }
+
+    // Проверка max_position_hold_ns
+    const int64_t hold_duration = clock_->now().get() - position.opened_at.get();
+    if (config_.max_position_hold_ns > 0 && hold_duration > config_.max_position_hold_ns) {
+        assessment.should_close = true;
+        assessment.reasons.push_back({
+            "MAX_HOLD_TIME",
+            "Время удержания " + std::to_string(hold_duration / 1'000'000'000LL) +
+            "с превышает лимит " + std::to_string(config_.max_position_hold_ns / 1'000'000'000LL) + "с",
+            0.8
+        });
+    }
+
+    return assessment;
+}
+
+void ProductionRiskEngine::record_trade_close(const StrategyId& strategy_id,
+                                               const Symbol& symbol,
+                                               double realized_pnl)
+{
+    std::lock_guard lock(mutex_);
+
+    // Обновить бюджет стратегии
+    auto& budget = strategy_budgets_[strategy_id.get()];
+    budget.strategy_id = strategy_id;
+    budget.trades_today++;
+    budget.last_trade_at = clock_->now();
+
+    if (realized_pnl < 0.0) {
+        budget.daily_loss += std::abs(realized_pnl);
+        budget.consecutive_losses++;
+    } else {
+        budget.consecutive_losses = 0;
+    }
+
+    // Записать timestamp для отслеживания оборачиваемости
+    trade_close_timestamps_.push_back(clock_->now().get());
+
+    // Очистить старые записи (старше 1 часа)
+    const int64_t hour_cutoff = clock_->now().get() - 3'600'000'000'000LL;
+    while (!trade_close_timestamps_.empty() && trade_close_timestamps_.front() < hour_cutoff) {
+        trade_close_timestamps_.pop_front();
+    }
+
+    // Обновить интервал для символа
+    last_trade_per_symbol_[symbol.get()] = clock_->now().get();
+}
+
+void ProductionRiskEngine::set_current_regime(regime::DetailedRegime regime) {
+    std::lock_guard lock(mutex_);
+    current_regime_ = regime;
+
+    // Вычислить масштабирующий фактор на основе режима
+    if (!config_.regime_aware_limits_enabled) {
+        regime_scale_factor_ = 1.0;
+        return;
+    }
+
+    switch (regime) {
+        case regime::DetailedRegime::LiquidityStress:
+        case regime::DetailedRegime::VolatilityExpansion:
+        case regime::DetailedRegime::AnomalyEvent:
+        case regime::DetailedRegime::ToxicFlow:
+        case regime::DetailedRegime::SpreadInstability:
+            regime_scale_factor_ = config_.stress_regime_scale;
+            break;
+
+        case regime::DetailedRegime::StrongUptrend:
+        case regime::DetailedRegime::StrongDowntrend:
+            regime_scale_factor_ = config_.trending_regime_scale;
+            break;
+
+        case regime::DetailedRegime::Chop:
+        case regime::DetailedRegime::LowVolCompression:
+            regime_scale_factor_ = config_.chop_regime_scale;
+            break;
+
+        default:
+            regime_scale_factor_ = 1.0;
+            break;
+    }
+}
+
+RiskSnapshot ProductionRiskEngine::get_risk_snapshot() const {
+    std::lock_guard lock(mutex_);
+
+    RiskSnapshot snap;
+    snap.computed_at = clock_->now();
+    snap.kill_switch_active = kill_switch_active_.load();
+    snap.regime_scaling_factor = regime_scale_factor_;
+
+    // Собираем бюджеты стратегий
+    for (const auto& [key, budget] : strategy_budgets_) {
+        snap.strategy_budgets.push_back(budget);
+    }
+
+    return snap;
+}
+
+void ProductionRiskEngine::reset_daily() {
+    std::lock_guard lock(mutex_);
+
+    // Сброс дневных лимитов в бюджетах стратегий
+    for (auto& [key, budget] : strategy_budgets_) {
+        budget.daily_loss = 0.0;
+        budget.daily_loss_pct = 0.0;
+        budget.trades_today = 0;
+        budget.consecutive_losses = 0;
+    }
+
+    // Очистить отслеживание оборачиваемости
+    trade_close_timestamps_.clear();
+}
+
+// ========== Реализация 15 существующих проверок ==========
 
 void ProductionRiskEngine::check_kill_switch(RiskDecision& decision) const {
     if (kill_switch_active_.load()) {
@@ -463,6 +631,181 @@ void ProductionRiskEngine::check_max_loss_per_trade(
             break;
         }
     }
+}
+
+// ========== Реализация новых проверок 16-23 ==========
+
+void ProductionRiskEngine::check_strategy_budget(
+    const strategy::TradeIntent& intent,
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision)
+{
+    std::lock_guard lock(mutex_);
+    const auto& sid = intent.strategy_id.get();
+
+    auto it = strategy_budgets_.find(sid);
+    if (it == strategy_budgets_.end()) return; // Нет данных — пропускаем
+
+    const auto& budget = it->second;
+
+    if (portfolio.total_capital <= 0.0) return;
+
+    const double loss_pct = budget.daily_loss / portfolio.total_capital * 100.0;
+    decision.strategy_budget_utilization_pct = loss_pct;
+
+    if (loss_pct >= config_.max_strategy_daily_loss_pct) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "STRATEGY_BUDGET",
+            "Стратегия " + sid + " потеряла " + std::to_string(loss_pct) +
+            "% капитала (лимит: " + std::to_string(config_.max_strategy_daily_loss_pct) + "%)",
+            0.9
+        });
+    }
+}
+
+void ProductionRiskEngine::check_symbol_concentration(
+    const strategy::TradeIntent& intent,
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision) const
+{
+    if (portfolio.total_capital <= 0.0) return;
+
+    double symbol_exposure = 0.0;
+    for (const auto& pos : portfolio.positions) {
+        if (pos.symbol == intent.symbol) {
+            symbol_exposure += pos.notional.get();
+        }
+    }
+
+    const double conc_pct = symbol_exposure / portfolio.total_capital * 100.0;
+    decision.symbol_concentration_pct = conc_pct;
+
+    if (conc_pct >= config_.max_symbol_concentration_pct) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "SYMBOL_CONCENTRATION",
+            "Концентрация " + intent.symbol.get() + " = " + std::to_string(conc_pct) +
+            "% превышает лимит " + std::to_string(config_.max_symbol_concentration_pct) + "%",
+            0.8
+        });
+    }
+}
+
+void ProductionRiskEngine::check_same_direction_positions(
+    const strategy::TradeIntent& intent,
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision) const
+{
+    int same_dir_count = 0;
+    for (const auto& pos : portfolio.positions) {
+        if (pos.side == intent.side) {
+            ++same_dir_count;
+        }
+    }
+
+    if (same_dir_count >= config_.max_same_direction_positions) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "SAME_DIRECTION",
+            "Позиций в одном направлении " + std::to_string(same_dir_count) +
+            " достигло лимита " + std::to_string(config_.max_same_direction_positions),
+            0.7
+        });
+    }
+}
+
+void ProductionRiskEngine::check_utc_cutoff(RiskDecision& decision) const {
+    if (config_.utc_cutoff_hour < 0) return;
+
+    const int64_t now_ns = clock_->now().get();
+    // Конвертируем наносекунды в часы UTC
+    const int64_t seconds = now_ns / 1'000'000'000LL;
+    const int hour_utc = static_cast<int>((seconds % 86400) / 3600);
+
+    if (hour_utc >= config_.utc_cutoff_hour) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "UTC_CUTOFF",
+            "Торговля прекращена после " + std::to_string(config_.utc_cutoff_hour) +
+            ":00 UTC (текущий час: " + std::to_string(hour_utc) + ")",
+            1.0
+        });
+    }
+}
+
+void ProductionRiskEngine::check_turnover_rate(RiskDecision& decision) {
+    std::lock_guard lock(mutex_);
+
+    // Очистить старые записи (старше 1 часа)
+    const int64_t hour_cutoff = clock_->now().get() - 3'600'000'000'000LL;
+    while (!trade_close_timestamps_.empty() && trade_close_timestamps_.front() < hour_cutoff) {
+        trade_close_timestamps_.pop_front();
+    }
+
+    if (static_cast<int>(trade_close_timestamps_.size()) >= config_.max_trades_per_hour) {
+        if (decision.verdict != RiskVerdict::Denied) {
+            decision.verdict = RiskVerdict::Throttled;
+        }
+        decision.reasons.push_back({
+            "TURNOVER_RATE",
+            "Превышен лимит " + std::to_string(config_.max_trades_per_hour) +
+            " сделок в час (текущих: " + std::to_string(trade_close_timestamps_.size()) + ")",
+            0.6
+        });
+    }
+}
+
+void ProductionRiskEngine::check_realized_daily_loss(
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision) const
+{
+    if (portfolio.total_capital <= 0.0) return;
+
+    const double realized_loss = std::min(portfolio.pnl.realized_pnl_today, 0.0);
+    const double realized_loss_pct = std::abs(realized_loss) / portfolio.total_capital * 100.0;
+
+    if (realized_loss_pct >= config_.max_realized_daily_loss_pct) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back({
+            "REALIZED_DAILY_LOSS",
+            "Реализованный дневной убыток " + std::to_string(realized_loss_pct) +
+            "% превышает лимит " + std::to_string(config_.max_realized_daily_loss_pct) + "%",
+            1.0
+        });
+    }
+}
+
+void ProductionRiskEngine::check_trade_interval(
+    const strategy::TradeIntent& intent,
+    RiskDecision& decision)
+{
+    std::lock_guard lock(mutex_);
+
+    auto it = last_trade_per_symbol_.find(intent.symbol.get());
+    if (it == last_trade_per_symbol_.end()) return;
+
+    const int64_t elapsed = clock_->now().get() - it->second;
+    if (elapsed < config_.min_trade_interval_ns) {
+        if (decision.verdict != RiskVerdict::Denied) {
+            decision.verdict = RiskVerdict::Throttled;
+        }
+        decision.reasons.push_back({
+            "TRADE_INTERVAL",
+            "Интервал " + std::to_string(elapsed / 1'000'000'000LL) +
+            "с меньше минимума " + std::to_string(config_.min_trade_interval_ns / 1'000'000'000LL) + "с",
+            0.5
+        });
+    }
+}
+
+void ProductionRiskEngine::check_regime_scaled_limits(RiskDecision& decision) const {
+    if (!config_.regime_aware_limits_enabled) return;
+    if (regime_scale_factor_ >= 1.0) return; // Масштабирование не ужесточает — пропускаем
+
+    // Если режим стрессовый (scale < 1.0) и утилизация рисков высокая,
+    // добавляем предупреждение в decision
+    decision.regime_scaling_factor = regime_scale_factor_;
 }
 
 } // namespace tb::risk

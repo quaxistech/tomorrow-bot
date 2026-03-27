@@ -5,5 +5,5 @@ add_library(tb_risk STATIC
 target_include_directories(tb_risk PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(tb_risk PUBLIC
     tb_common tb_strategy tb_features tb_portfolio tb_portfolio_allocator
-    tb_execution_alpha tb_logging tb_clock tb_metrics tb_governance
+    tb_execution_alpha tb_logging tb_clock tb_metrics tb_governance tb_regime
 )

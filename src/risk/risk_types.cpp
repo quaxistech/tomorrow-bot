@@ -12,4 +12,13 @@ std::string to_string(RiskVerdict verdict) {
     return "Unknown";
 }
 
+std::string to_string(RiskPhase phase) {
+    switch (phase) {
+        case RiskPhase::PreTrade:   return "PreTrade";
+        case RiskPhase::IntraTrade: return "IntraTrade";
+        case RiskPhase::PostTrade:  return "PostTrade";
+    }
+    return "Unknown";
+}
+
 } // namespace tb::risk

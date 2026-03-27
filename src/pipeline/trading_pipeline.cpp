@@ -296,6 +296,9 @@ TradingPipeline::TradingPipeline(
     risk_cfg.max_daily_loss_pct = config_.risk.max_daily_loss_pct;
     risk_cfg.max_drawdown_pct = config_.risk.max_drawdown_pct;
     risk_cfg.kill_switch_enabled = config_.risk.kill_switch_enabled;
+    risk_cfg.max_loss_per_trade_pct = config_.trading_params.max_loss_per_trade_pct;
+    risk_cfg.max_position_hold_ns = static_cast<int64_t>(config_.trading_params.max_hold_absolute_minutes) * 60'000'000'000LL;
+    risk_cfg.post_loss_cooldown_ns = static_cast<int64_t>(config_.trading_params.stop_loss_cooldown_seconds) * 1'000'000'000LL;
     // Для маленьких аккаунтов — снижаем порог минимальной ликвидности
     if (config_.trading.initial_capital < 100.0) {
         risk_cfg.min_liquidity_depth = 1.0;
@@ -2031,6 +2034,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     // 2. Режим рынка
     auto regime = regime_engine_->classify(snapshot);
+    risk_engine_->set_current_regime(regime.detailed);
 
     // 3. Неопределённость
     auto uncertainty = uncertainty_engine_->assess(snapshot, regime, world);
@@ -2949,6 +2953,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
             // Записываем результат в risk engine
             risk_engine_->record_trade_result(closing_pnl < 0.0);
+            risk_engine_->record_trade_close(current_position_strategy_, symbol_, closing_pnl);
 
             reset_trailing_state();
         }
