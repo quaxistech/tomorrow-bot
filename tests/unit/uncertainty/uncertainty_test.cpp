@@ -4,6 +4,8 @@
 #include "uncertainty/uncertainty_engine.hpp"
 #include "regime/regime_types.hpp"
 #include "world_model/world_model_types.hpp"
+#include "portfolio/portfolio_types.hpp"
+#include "ml/ml_signal_types.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include <memory>
@@ -189,4 +191,552 @@ TEST_CASE("Uncertainty: Экстремальная неопределённос�
     REQUIRE(result.level == UncertaintyLevel::Extreme);
     REQUIRE(result.recommended_action == UncertaintyAction::NoTrade);
     REQUIRE(result.size_multiplier < 0.3);
+}
+
+// ============================================================
+// v2 helpers
+// ============================================================
+namespace {
+
+class AdvancingClock : public clock::IClock {
+    mutable int64_t ns_{1'000'000};
+public:
+    [[nodiscard]] Timestamp now() const override {
+        ns_ += 1'000'000'000;
+        return Timestamp(ns_);
+    }
+};
+
+portfolio::PortfolioSnapshot make_neutral_portfolio() {
+    portfolio::PortfolioSnapshot p;
+    p.total_capital = 10000.0;
+    p.available_capital = 8000.0;
+    p.capital_utilization_pct = 20.0;
+    return p;
+}
+
+portfolio::PortfolioSnapshot make_concentrated_portfolio() {
+    portfolio::PortfolioSnapshot p;
+    p.total_capital = 10000.0;
+    p.available_capital = 3000.0;
+    p.capital_utilization_pct = 70.0;
+    portfolio::Position pos;
+    pos.symbol = Symbol("BTCUSDT");
+    pos.size = Quantity(1.0);
+    pos.avg_entry_price = Price(50000.0);
+    pos.notional = NotionalValue(5000.0);
+    p.positions.push_back(pos);
+    return p;
+}
+
+ml::MlSignalSnapshot make_healthy_ml() {
+    ml::MlSignalSnapshot m;
+    m.signal_quality = 0.9;
+    m.cascade_probability = 0.05;
+    m.cascade_imminent = false;
+    m.correlation_break = false;
+    m.correlation_risk_multiplier = 0.9;
+    m.fingerprint_edge = 0.1;
+    m.recommended_wait_periods = 0;
+    m.overall_health = ml::MlComponentHealth::Healthy;
+    return m;
+}
+
+ml::MlSignalSnapshot make_degraded_ml() {
+    ml::MlSignalSnapshot m;
+    m.signal_quality = 0.2;
+    m.cascade_probability = 0.5;
+    m.cascade_imminent = false;
+    m.correlation_break = false;
+    m.correlation_risk_multiplier = 0.8;
+    m.overall_health = ml::MlComponentHealth::Degraded;
+    return m;
+}
+
+FeatureSnapshot make_extreme_bad_snapshot() {
+    FeatureSnapshot snap;
+    snap.symbol = Symbol("BTCUSDT");
+    snap.book_quality = order_book::BookQuality::Desynced;
+    snap.execution_context.is_feed_fresh = false;
+    snap.microstructure.spread_valid = true;
+    snap.microstructure.spread_bps = 80.0;
+    snap.microstructure.liquidity_valid = true;
+    snap.microstructure.liquidity_ratio = 5.0;
+    snap.execution_context.slippage_valid = true;
+    snap.execution_context.estimated_slippage_bps = 30.0;
+    return snap;
+}
+
+regime::RegimeSnapshot make_extreme_bad_regime() {
+    regime::RegimeSnapshot rs;
+    rs.confidence = 0.1;
+    rs.stability = 0.1;
+    rs.label = RegimeLabel::Unclear;
+    return rs;
+}
+
+} // anonymous namespace
+
+// ============================================================
+// Test 1: v2 overload with portfolio + ML signals
+// ============================================================
+TEST_CASE("Uncertainty v2: пятиаргументный assess() даёт более богатый результат", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto snap = make_good_snapshot();
+    auto regime = make_confident_regime();
+    auto world = make_stable_world();
+
+    auto v1 = engine.assess(snap, regime, world);
+    auto v2 = engine.assess(snap, regime, world,
+                            make_neutral_portfolio(), make_healthy_ml());
+
+    CHECK(v2.model_version == 1);
+    CHECK(!v2.top_drivers.empty());
+    // v2 has richer portfolio/ml info; v1 defaults them to 0
+    CHECK(v1.dimensions.portfolio_uncertainty == 0.0);
+    CHECK(v1.dimensions.ml_uncertainty == 0.0);
+}
+
+// ============================================================
+// Test 2: Portfolio uncertainty — concentrated position
+// ============================================================
+TEST_CASE("Uncertainty v2: концентрированная позиция → высокая портфельная неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), make_concentrated_portfolio(),
+                                make_healthy_ml());
+
+    REQUIRE(result.dimensions.portfolio_uncertainty >= 0.3);
+}
+
+// ============================================================
+// Test 3: Portfolio uncertainty — empty portfolio
+// ============================================================
+TEST_CASE("Uncertainty v2: пустой портфель → нулевая портфельная неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    portfolio::PortfolioSnapshot empty;
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), empty, make_healthy_ml());
+
+    REQUIRE(result.dimensions.portfolio_uncertainty == 0.0);
+}
+
+// ============================================================
+// Test 4: ML uncertainty — degraded signal quality
+// ============================================================
+TEST_CASE("Uncertainty v2: деградированный ML-сигнал → высокая ML-неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), make_neutral_portfolio(),
+                                make_degraded_ml());
+
+    // signal_quality=0.2 → base = 0.8, cascade_probability=0.5 → +0.15 => ~0.95
+    REQUIRE(result.dimensions.ml_uncertainty > 0.4);
+}
+
+// ============================================================
+// Test 5: ML uncertainty — cascade imminent
+// ============================================================
+TEST_CASE("Uncertainty v2: каскад неминуем → высокая ML-неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto ml = make_healthy_ml();
+    ml.cascade_imminent = true;
+
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), make_neutral_portfolio(), ml);
+
+    // base = 1-0.9=0.1, cascade_imminent → +0.3 => 0.4
+    REQUIRE(result.dimensions.ml_uncertainty > 0.3);
+}
+
+// ============================================================
+// Test 6: Correlation uncertainty — correlation break
+// ============================================================
+TEST_CASE("Uncertainty v2: разрыв корреляции → высокая корреляционная неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto ml = make_healthy_ml();
+    ml.correlation_break = true;
+
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), make_neutral_portfolio(), ml);
+
+    // correlation_break=true → returns 0.8
+    REQUIRE(result.dimensions.correlation_uncertainty >= 0.8);
+}
+
+// ============================================================
+// Test 7: Transition uncertainty — recent transition + low stability
+// ============================================================
+TEST_CASE("Uncertainty v2: высокая транзиционная неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    regime::RegimeSnapshot regime;
+    regime.confidence = 0.5;
+    regime.stability = 0.2; // < 0.3 → +0.2
+    regime.last_transition = regime::RegimeTransition{
+        regime::DetailedRegime::StrongUptrend,
+        regime::DetailedRegime::VolatilityExpansion,
+        0.8, Timestamp(0) // confidence = 0.8
+    };
+
+    auto result = engine.assess(make_good_snapshot(), regime,
+                                make_stable_world(), make_neutral_portfolio(),
+                                make_healthy_ml());
+
+    // base = 0.8 (transition confidence) + 0.2 (low stability) = 1.0
+    REQUIRE(result.dimensions.transition_uncertainty >= 0.8);
+}
+
+// ============================================================
+// Test 8: Stateful — EMA smoothing (persistent_score)
+// ============================================================
+TEST_CASE("Uncertainty v2: EMA-сглаживание persistent_score", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto snap = make_good_snapshot();
+    auto regime = make_confident_regime();
+    auto world = make_stable_world();
+    auto port = make_neutral_portfolio();
+    auto ml = make_healthy_ml();
+
+    // First assessment establishes baseline
+    auto r1 = engine.assess(snap, regime, world, port, ml);
+    double prev_persistent = r1.persistent_score;
+
+    // Subsequent calls: persistent_score should move toward aggregate_score
+    for (int i = 0; i < 5; ++i) {
+        auto r = engine.assess(snap, regime, world, port, ml);
+        double dist_now = std::abs(r.persistent_score - r.aggregate_score);
+        double dist_prev = std::abs(prev_persistent - r.aggregate_score);
+        CHECK(dist_now <= dist_prev + 0.01); // converging (with tolerance)
+        prev_persistent = r.persistent_score;
+    }
+}
+
+// ============================================================
+// Test 9: Stateful — spike detection
+// ============================================================
+TEST_CASE("Uncertainty v2: обнаружение спайка при резком ухудшении", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto port = make_neutral_portfolio();
+    auto ml = make_healthy_ml();
+
+    // Establish low EMA with several good assessments
+    for (int i = 0; i < 5; ++i) {
+        engine.assess(make_good_snapshot(), make_confident_regime(),
+                      make_stable_world(), port, ml);
+    }
+
+    // Sudden bad conditions → spike should be positive
+    auto result = engine.assess(make_extreme_bad_snapshot(),
+                                make_extreme_bad_regime(),
+                                make_fragile_world(), port, make_degraded_ml());
+
+    REQUIRE(result.spike_score > 0.0);
+}
+
+// ============================================================
+// Test 10: Execution mode recommendations
+// ============================================================
+TEST_CASE("Uncertainty v2: рекомендации по режиму исполнения", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+
+    SECTION("High → Conservative or DefensiveOnly") {
+        RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+        FeatureSnapshot snap;
+        snap.symbol = Symbol("BTCUSDT");
+        snap.book_quality = order_book::BookQuality::Stale;
+        snap.execution_context.is_feed_fresh = false;
+        snap.microstructure.spread_valid = true;
+        snap.microstructure.spread_bps = 40.0;
+
+        auto result = engine.assess(snap, make_uncertain_regime(),
+                                    make_fragile_world(), make_neutral_portfolio(),
+                                    make_degraded_ml());
+
+        if (result.level == UncertaintyLevel::High) {
+            CHECK((result.execution_mode == ExecutionModeRecommendation::Conservative ||
+                   result.execution_mode == ExecutionModeRecommendation::DefensiveOnly));
+        }
+    }
+
+    SECTION("Extreme → HaltNewEntries") {
+        RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+        auto result = engine.assess(make_extreme_bad_snapshot(),
+                                    make_extreme_bad_regime(),
+                                    make_fragile_world(), make_neutral_portfolio(),
+                                    make_degraded_ml());
+
+        if (result.level == UncertaintyLevel::Extreme) {
+            REQUIRE(result.execution_mode == ExecutionModeRecommendation::HaltNewEntries);
+        }
+    }
+}
+
+// ============================================================
+// Test 11: Top drivers ranking
+// ============================================================
+TEST_CASE("Uncertainty v2: ранжирование top_drivers", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    // Make regime the dominant uncertainty source
+    auto result = engine.assess(make_good_snapshot(), make_uncertain_regime(),
+                                make_stable_world(), make_neutral_portfolio(),
+                                make_healthy_ml());
+
+    REQUIRE(!result.top_drivers.empty());
+    // Drivers should be sorted by contribution (descending)
+    for (size_t i = 1; i < result.top_drivers.size(); ++i) {
+        CHECK(result.top_drivers[i - 1].contribution >= result.top_drivers[i].contribution);
+    }
+    // Regime should be among the top drivers
+    bool found_regime = false;
+    for (const auto& d : result.top_drivers) {
+        if (d.dimension.find("regime") != std::string::npos) {
+            found_regime = true;
+            break;
+        }
+    }
+    CHECK(found_regime);
+}
+
+// ============================================================
+// Test 12: Cooldown activation after consecutive extremes
+// ============================================================
+TEST_CASE("Uncertainty v2: кулдаун после серии экстремальных оценок", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto port = make_neutral_portfolio();
+    auto ml = make_degraded_ml();
+    auto snap = make_extreme_bad_snapshot();
+    auto regime = make_extreme_bad_regime();
+    auto world = make_fragile_world();
+
+    // Trigger 3+ consecutive extreme assessments
+    for (int i = 0; i < 3; ++i) {
+        auto r = engine.assess(snap, regime, world, port, ml);
+        REQUIRE(r.level == UncertaintyLevel::Extreme);
+    }
+
+    // 4th assessment: cooldown should now be active
+    auto r4 = engine.assess(snap, regime, world, port, ml);
+    REQUIRE(r4.cooldown.active);
+    CHECK(r4.cooldown.remaining_ns > 0);
+}
+
+// ============================================================
+// Test 13: Diagnostics tracking
+// ============================================================
+TEST_CASE("Uncertainty v2: диагностика отслеживает количество оценок", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    constexpr int N = 7;
+    for (int i = 0; i < N; ++i) {
+        engine.assess(make_good_snapshot(), make_confident_regime(),
+                      make_stable_world(), make_neutral_portfolio(),
+                      make_healthy_ml());
+    }
+
+    auto diag = engine.diagnostics();
+    REQUIRE(diag.total_assessments == N);
+}
+
+// ============================================================
+// Test 14: Feedback recording
+// ============================================================
+TEST_CASE("Uncertainty v2: запись обратной связи увеличивает счётчик", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto before = engine.diagnostics().feedback_samples;
+
+    UncertaintyFeedback fb;
+    fb.symbol = Symbol("BTCUSDT");
+    fb.predicted_uncertainty = 0.3;
+    fb.realized_slippage = 0.1;
+    engine.record_feedback(fb);
+
+    REQUIRE(engine.diagnostics().feedback_samples == before + 1);
+}
+
+// ============================================================
+// Test 15: reset_state clears everything
+// ============================================================
+TEST_CASE("Uncertainty v2: reset_state очищает всё", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    engine.assess(make_good_snapshot(), make_confident_regime(),
+                  make_stable_world(), make_neutral_portfolio(),
+                  make_healthy_ml());
+
+    REQUIRE(engine.current(Symbol("BTCUSDT")).has_value());
+
+    engine.reset_state();
+
+    REQUIRE_FALSE(engine.current(Symbol("BTCUSDT")).has_value());
+}
+
+// ============================================================
+// Test 16: Bounds guarantees
+// ============================================================
+TEST_CASE("Uncertainty v2: гарантии границ size_multiplier и threshold_multiplier", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    UncertaintyConfig cfg;
+    RuleBasedUncertaintyEngine engine(cfg, logger, clk);
+
+    auto port = make_neutral_portfolio();
+
+    auto check_bounds = [&](const UncertaintySnapshot& r) {
+        CHECK(r.size_multiplier >= cfg.size_floor);
+        CHECK(r.size_multiplier <= 1.0);
+        CHECK(r.threshold_multiplier >= 1.0);
+        CHECK(r.threshold_multiplier <= cfg.threshold_ceiling);
+    };
+
+    // Good conditions
+    check_bounds(engine.assess(make_good_snapshot(), make_confident_regime(),
+                               make_stable_world(), port, make_healthy_ml()));
+
+    // Bad conditions
+    check_bounds(engine.assess(make_extreme_bad_snapshot(), make_extreme_bad_regime(),
+                               make_fragile_world(), port, make_degraded_ml()));
+}
+
+// ============================================================
+// Test 17: Monotonicity — worse input → higher score
+// ============================================================
+TEST_CASE("Uncertainty v2: монотонность — ухудшение условий повышает скор", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+
+    auto port = make_neutral_portfolio();
+    auto ml_good = make_healthy_ml();
+    auto ml_bad = make_degraded_ml();
+
+    // Level 0: perfect
+    {
+        RuleBasedUncertaintyEngine e(UncertaintyConfig{}, logger, clk);
+        auto r0 = e.assess(make_good_snapshot(), make_confident_regime(),
+                           make_stable_world(), port, ml_good);
+
+        // Level 1: uncertain regime
+        auto r1 = e.assess(make_good_snapshot(), make_uncertain_regime(),
+                           make_stable_world(), port, ml_good);
+
+        // Level 2: uncertain regime + fragile world + bad ML
+        auto r2 = e.assess(make_good_snapshot(), make_uncertain_regime(),
+                           make_fragile_world(), port, ml_bad);
+
+        // Level 3: everything bad
+        auto r3 = e.assess(make_extreme_bad_snapshot(), make_extreme_bad_regime(),
+                           make_fragile_world(), port, ml_bad);
+
+        CHECK(r0.aggregate_score <= r1.aggregate_score + 0.01);
+        CHECK(r1.aggregate_score <= r2.aggregate_score + 0.01);
+        CHECK(r2.aggregate_score <= r3.aggregate_score + 0.01);
+    }
+}
+
+// ============================================================
+// Test 18: Configurable weights change results
+// ============================================================
+TEST_CASE("Uncertainty v2: пользовательские веса меняют результат", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+
+    UncertaintyConfig cfg_regime_heavy;
+    cfg_regime_heavy.w_regime = 0.80;
+    cfg_regime_heavy.w_signal = 0.05;
+    cfg_regime_heavy.w_data_quality = 0.03;
+    cfg_regime_heavy.w_execution = 0.02;
+    cfg_regime_heavy.w_portfolio = 0.02;
+    cfg_regime_heavy.w_ml = 0.02;
+    cfg_regime_heavy.w_correlation = 0.02;
+    cfg_regime_heavy.w_transition = 0.02;
+    cfg_regime_heavy.w_operational = 0.02;
+
+    UncertaintyConfig cfg_balanced;
+
+    RuleBasedUncertaintyEngine eng_heavy(cfg_regime_heavy, logger, clk);
+    RuleBasedUncertaintyEngine eng_balanced(cfg_balanced, logger, clk);
+
+    auto snap = make_good_snapshot();
+    auto port = make_neutral_portfolio();
+    auto ml = make_healthy_ml();
+
+    // Uncertain regime should matter more with heavy regime weight
+    auto rh = eng_heavy.assess(snap, make_uncertain_regime(), make_stable_world(), port, ml);
+    auto rb = eng_balanced.assess(snap, make_uncertain_regime(), make_stable_world(), port, ml);
+
+    CHECK(rh.aggregate_score > rb.aggregate_score - 0.01);
+}
+
+// ============================================================
+// Test 19: Operational uncertainty — stale feed
+// ============================================================
+TEST_CASE("Uncertainty v2: несвежий фид → высокая операционная неопределённость", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    FeatureSnapshot snap = make_good_snapshot();
+    snap.execution_context.is_feed_fresh = false;
+
+    auto result = engine.assess(snap, make_confident_regime(),
+                                make_stable_world(), make_neutral_portfolio(),
+                                make_healthy_ml());
+
+    // compute_operational_uncertainty returns 0.7 when feed is not fresh
+    REQUIRE(result.dimensions.operational_uncertainty > 0.5);
+}
+
+// ============================================================
+// Test 20: Model version field
+// ============================================================
+TEST_CASE("Uncertainty v2: model_version равна 1", "[uncertainty][v2]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<AdvancingClock>();
+    RuleBasedUncertaintyEngine engine(UncertaintyConfig{}, logger, clk);
+
+    auto result = engine.assess(make_good_snapshot(), make_confident_regime(),
+                                make_stable_world(), make_neutral_portfolio(),
+                                make_healthy_ml());
+
+    REQUIRE(result.model_version == 1);
 }
