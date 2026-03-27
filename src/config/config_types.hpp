@@ -57,6 +57,21 @@ struct RiskConfig {
     double max_daily_loss_pct{2.0};         ///< Максимальный дневной убыток (% от капитала)
     double max_drawdown_pct{5.0};           ///< Максимальная просадка (% от капитала)
     bool   kill_switch_enabled{true};       ///< Включён ли аварийный выключатель
+
+    // === Расширенные параметры риска (desk-grade) ===
+    double max_strategy_daily_loss_pct{1.5};     ///< Макс дневной убыток одной стратегии (% капитала)
+    double max_strategy_exposure_pct{30.0};      ///< Макс экспозиция одной стратегии (% капитала)
+    double max_symbol_concentration_pct{35.0};   ///< Макс доля капитала на один символ (%)
+    int    max_same_direction_positions{3};       ///< Макс позиций в одном направлении
+    bool   regime_aware_limits_enabled{true};     ///< Включить адаптацию лимитов по режиму
+    double stress_regime_scale{0.5};              ///< Множитель лимитов в стрессовых режимах
+    double trending_regime_scale{1.2};            ///< Множитель лимитов в трендовых режимах
+    double chop_regime_scale{0.7};                ///< Множитель лимитов в боковых режимах
+    int    max_trades_per_hour{8};                ///< Макс закрытых сделок в час
+    double min_trade_interval_sec{30.0};          ///< Мин интервал между сделками одного символа (секунды)
+    double max_adverse_excursion_pct{3.0};        ///< Макс неблагоприятное отклонение (% капитала)
+    double max_realized_daily_loss_pct{1.5};      ///< Макс реализованный дневной убыток (%)
+    int    utc_cutoff_hour{-1};                   ///< Час UTC прекращения торговли (-1 = отключено)
 };
 
 /// Настройки режима торговли

@@ -33,6 +33,20 @@ risk:
   max_daily_loss_pct: 2.0
   max_drawdown_pct: 5.0
   kill_switch_enabled: true
+  # Расширенные параметры (desk-grade risk)
+  max_strategy_daily_loss_pct: 1.5       # Макс дневной убыток одной стратегии (%)
+  max_strategy_exposure_pct: 30.0        # Макс экспозиция одной стратегии (%)
+  max_symbol_concentration_pct: 35.0     # Макс концентрация на один символ (%)
+  max_same_direction_positions: 3        # Макс позиций в одном направлении
+  regime_aware_limits_enabled: true      # Адаптация лимитов по режиму рынка
+  stress_regime_scale: 0.5               # Множитель лимитов при стрессе
+  trending_regime_scale: 1.2             # Множитель лимитов в тренде
+  chop_regime_scale: 0.7                 # Множитель лимитов в боковике
+  max_trades_per_hour: 8                 # Макс сделок в час
+  min_trade_interval_sec: 30.0           # Мин интервал между сделками (секунды)
+  max_adverse_excursion_pct: 3.0         # Макс неблагоприятное отклонение (%)
+  max_realized_daily_loss_pct: 1.5       # Макс реализованный дневной убыток (%)
+  utc_cutoff_hour: -1                    # Час UTC остановки торговли (-1 = отключено)
 
 adversarial_defense:
   enabled: true

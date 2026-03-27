@@ -91,6 +91,43 @@ void ConfigValidator::validate_risk(const RiskConfig& cfg, ValidationResult& res
     if (cfg.max_daily_loss_pct > cfg.max_drawdown_pct) {
         result.add_error("risk.max_daily_loss_pct не может превышать max_drawdown_pct");
     }
+    // Расширенные параметры
+    if (cfg.max_strategy_daily_loss_pct <= 0.0 || cfg.max_strategy_daily_loss_pct > 100.0) {
+        result.add_error("risk.max_strategy_daily_loss_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.max_strategy_exposure_pct <= 0.0 || cfg.max_strategy_exposure_pct > 100.0) {
+        result.add_error("risk.max_strategy_exposure_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.max_symbol_concentration_pct <= 0.0 || cfg.max_symbol_concentration_pct > 100.0) {
+        result.add_error("risk.max_symbol_concentration_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.max_same_direction_positions < 1) {
+        result.add_error("risk.max_same_direction_positions должен быть >= 1");
+    }
+    if (cfg.stress_regime_scale <= 0.0 || cfg.stress_regime_scale > 2.0) {
+        result.add_error("risk.stress_regime_scale должен быть в диапазоне (0, 2]");
+    }
+    if (cfg.trending_regime_scale <= 0.0 || cfg.trending_regime_scale > 3.0) {
+        result.add_error("risk.trending_regime_scale должен быть в диапазоне (0, 3]");
+    }
+    if (cfg.chop_regime_scale <= 0.0 || cfg.chop_regime_scale > 2.0) {
+        result.add_error("risk.chop_regime_scale должен быть в диапазоне (0, 2]");
+    }
+    if (cfg.max_trades_per_hour < 1) {
+        result.add_error("risk.max_trades_per_hour должен быть >= 1");
+    }
+    if (cfg.min_trade_interval_sec < 0.0) {
+        result.add_error("risk.min_trade_interval_sec не может быть отрицательным");
+    }
+    if (cfg.max_adverse_excursion_pct <= 0.0 || cfg.max_adverse_excursion_pct > 100.0) {
+        result.add_error("risk.max_adverse_excursion_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.max_realized_daily_loss_pct <= 0.0 || cfg.max_realized_daily_loss_pct > 100.0) {
+        result.add_error("risk.max_realized_daily_loss_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.utc_cutoff_hour < -1 || cfg.utc_cutoff_hour > 23) {
+        result.add_error("risk.utc_cutoff_hour должен быть -1 (отключено) или в диапазоне [0, 23]");
+    }
 }
 
 void ConfigValidator::validate_adversarial(

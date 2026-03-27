@@ -205,6 +205,28 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     auto ks_str = get_value(kv, "risk.kill_switch_enabled", "true");
     cfg.risk.kill_switch_enabled   = (ks_str != "false" && ks_str != "0");
 
+    // Расширенные параметры риска (desk-grade)
+    cfg.risk.max_strategy_daily_loss_pct   = parse_double(get_value(kv, "risk.max_strategy_daily_loss_pct",   "1.5"),  1.5);
+    cfg.risk.max_strategy_exposure_pct     = parse_double(get_value(kv, "risk.max_strategy_exposure_pct",     "30.0"), 30.0);
+    cfg.risk.max_symbol_concentration_pct  = parse_double(get_value(kv, "risk.max_symbol_concentration_pct",  "35.0"), 35.0);
+    auto sdp_str = get_value(kv, "risk.max_same_direction_positions", "3");
+    try { cfg.risk.max_same_direction_positions = std::stoi(sdp_str); }
+    catch (...) { cfg.risk.max_same_direction_positions = 3; }
+    auto ral_str = get_value(kv, "risk.regime_aware_limits_enabled", "true");
+    cfg.risk.regime_aware_limits_enabled   = (ral_str != "false" && ral_str != "0");
+    cfg.risk.stress_regime_scale           = parse_double(get_value(kv, "risk.stress_regime_scale",           "0.5"),  0.5);
+    cfg.risk.trending_regime_scale         = parse_double(get_value(kv, "risk.trending_regime_scale",         "1.2"),  1.2);
+    cfg.risk.chop_regime_scale             = parse_double(get_value(kv, "risk.chop_regime_scale",             "0.7"),  0.7);
+    auto tph_str = get_value(kv, "risk.max_trades_per_hour", "8");
+    try { cfg.risk.max_trades_per_hour = std::stoi(tph_str); }
+    catch (...) { cfg.risk.max_trades_per_hour = 8; }
+    cfg.risk.min_trade_interval_sec        = parse_double(get_value(kv, "risk.min_trade_interval_sec",        "30.0"), 30.0);
+    cfg.risk.max_adverse_excursion_pct     = parse_double(get_value(kv, "risk.max_adverse_excursion_pct",     "3.0"),  3.0);
+    cfg.risk.max_realized_daily_loss_pct   = parse_double(get_value(kv, "risk.max_realized_daily_loss_pct",   "1.5"),  1.5);
+    auto cutoff_str = get_value(kv, "risk.utc_cutoff_hour", "-1");
+    try { cfg.risk.utc_cutoff_hour = std::stoi(cutoff_str); }
+    catch (...) { cfg.risk.utc_cutoff_hour = -1; }
+
     // Секция pair_selection
     auto ps_mode_str = get_value(kv, "pair_selection.mode", "auto");
     cfg.pair_selection.mode = (ps_mode_str == "manual")

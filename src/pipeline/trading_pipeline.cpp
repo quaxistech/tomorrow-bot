@@ -299,6 +299,20 @@ TradingPipeline::TradingPipeline(
     risk_cfg.max_loss_per_trade_pct = config_.trading_params.max_loss_per_trade_pct;
     risk_cfg.max_position_hold_ns = static_cast<int64_t>(config_.trading_params.max_hold_absolute_minutes) * 60'000'000'000LL;
     risk_cfg.post_loss_cooldown_ns = static_cast<int64_t>(config_.trading_params.stop_loss_cooldown_seconds) * 1'000'000'000LL;
+    // Расширенные параметры из конфига
+    risk_cfg.max_strategy_daily_loss_pct = config_.risk.max_strategy_daily_loss_pct;
+    risk_cfg.max_strategy_exposure_pct = config_.risk.max_strategy_exposure_pct;
+    risk_cfg.max_symbol_concentration_pct = config_.risk.max_symbol_concentration_pct;
+    risk_cfg.max_same_direction_positions = config_.risk.max_same_direction_positions;
+    risk_cfg.regime_aware_limits_enabled = config_.risk.regime_aware_limits_enabled;
+    risk_cfg.stress_regime_scale = config_.risk.stress_regime_scale;
+    risk_cfg.trending_regime_scale = config_.risk.trending_regime_scale;
+    risk_cfg.chop_regime_scale = config_.risk.chop_regime_scale;
+    risk_cfg.max_trades_per_hour = config_.risk.max_trades_per_hour;
+    risk_cfg.min_trade_interval_ns = static_cast<int64_t>(config_.risk.min_trade_interval_sec * 1'000'000'000LL);
+    risk_cfg.max_adverse_excursion_pct = config_.risk.max_adverse_excursion_pct;
+    risk_cfg.max_realized_daily_loss_pct = config_.risk.max_realized_daily_loss_pct;
+    risk_cfg.utc_cutoff_hour = config_.risk.utc_cutoff_hour;
     // Для маленьких аккаунтов — снижаем порог минимальной ликвидности
     if (config_.trading.initial_capital < 100.0) {
         risk_cfg.min_liquidity_depth = 1.0;
