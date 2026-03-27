@@ -12,4 +12,21 @@ std::string to_string(OpportunityAction action) {
     return "Unknown";
 }
 
+std::string to_string(OpportunityReason reason) {
+    switch (reason) {
+        case OpportunityReason::None:                      return "None";
+        case OpportunityReason::NegativeNetEdge:           return "NegativeNetEdge";
+        case OpportunityReason::ConvictionBelowThreshold:  return "ConvictionBelowThreshold";
+        case OpportunityReason::HighExposureLowConviction: return "HighExposureLowConviction";
+        case OpportunityReason::InsufficientNetEdge:       return "InsufficientNetEdge";
+        case OpportunityReason::CapitalExhausted:          return "CapitalExhausted";
+        case OpportunityReason::HighConcentration:         return "HighConcentration";
+        case OpportunityReason::StrongEdgeAvailable:       return "StrongEdgeAvailable";
+        case OpportunityReason::HighConvictionOverride:    return "HighConvictionOverride";
+        case OpportunityReason::UpgradeBetterCandidate:    return "UpgradeBetterCandidate";
+        case OpportunityReason::DefaultDefer:              return "DefaultDefer";
+    }
+    return "Unknown";
+}
+
 } // namespace tb::opportunity_cost

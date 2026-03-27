@@ -494,6 +494,36 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.execution_alpha.postonly_adverse_max = parse_double(
         get_value(kv, "execution_alpha.postonly_adverse_max", "0.35"), 0.35);
 
+    // ── Opportunity Cost ──────────────────────────────────────────────────
+    cfg.opportunity_cost.min_net_expected_bps = parse_double(
+        get_value(kv, "opportunity_cost.min_net_expected_bps", "0.0"), 0.0);
+    cfg.opportunity_cost.execute_min_net_bps = parse_double(
+        get_value(kv, "opportunity_cost.execute_min_net_bps", "15.0"), 15.0);
+    cfg.opportunity_cost.high_exposure_threshold = parse_double(
+        get_value(kv, "opportunity_cost.high_exposure_threshold", "0.75"), 0.75);
+    cfg.opportunity_cost.high_exposure_min_conviction = parse_double(
+        get_value(kv, "opportunity_cost.high_exposure_min_conviction", "0.65"), 0.65);
+    cfg.opportunity_cost.max_symbol_concentration = parse_double(
+        get_value(kv, "opportunity_cost.max_symbol_concentration", "0.25"), 0.25);
+    cfg.opportunity_cost.max_strategy_concentration = parse_double(
+        get_value(kv, "opportunity_cost.max_strategy_concentration", "0.35"), 0.35);
+    cfg.opportunity_cost.capital_exhaustion_threshold = parse_double(
+        get_value(kv, "opportunity_cost.capital_exhaustion_threshold", "0.90"), 0.90);
+    cfg.opportunity_cost.weight_conviction = parse_double(
+        get_value(kv, "opportunity_cost.weight_conviction", "0.35"), 0.35);
+    cfg.opportunity_cost.weight_net_edge = parse_double(
+        get_value(kv, "opportunity_cost.weight_net_edge", "0.35"), 0.35);
+    cfg.opportunity_cost.weight_capital_efficiency = parse_double(
+        get_value(kv, "opportunity_cost.weight_capital_efficiency", "0.15"), 0.15);
+    cfg.opportunity_cost.weight_urgency = parse_double(
+        get_value(kv, "opportunity_cost.weight_urgency", "0.15"), 0.15);
+    cfg.opportunity_cost.conviction_to_bps_scale = parse_double(
+        get_value(kv, "opportunity_cost.conviction_to_bps_scale", "120.0"), 120.0);
+    cfg.opportunity_cost.upgrade_min_edge_advantage_bps = parse_double(
+        get_value(kv, "opportunity_cost.upgrade_min_edge_advantage_bps", "10.0"), 10.0);
+    cfg.opportunity_cost.drawdown_penalty_scale = parse_double(
+        get_value(kv, "opportunity_cost.drawdown_penalty_scale", "0.5"), 0.5);
+
     // Валидация
     ConfigValidator validator;
     auto validation = validator.validate(cfg);

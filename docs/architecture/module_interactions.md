@@ -55,7 +55,7 @@ Normalizer (JSON → типизированные события)
   DecisionAggregationEngine (комитетное голосование, вето)
   │
   ├──► ExecutionAlphaEngine (passive/aggressive/hybrid, urgency, slice plan)
-  ├──► OpportunityCostEngine (ранжирование, suppress/defer)
+  ├──► OpportunityCostEngine (10 правил scoring, портфельный контекст, Execute/Defer/Suppress/Upgrade)
   └──► PortfolioAllocator (global → regime → strategy → symbol бюджет)
         │
         ▼

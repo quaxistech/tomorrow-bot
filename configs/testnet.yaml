@@ -141,3 +141,20 @@ execution_alpha:
   postonly_spread_threshold_bps: 4.5
   postonly_urgency_max: 0.35
   postonly_adverse_max: 0.35
+
+# ── Opportunity Cost ──────────────────────────────────────────────────────────
+opportunity_cost:
+  min_net_expected_bps: 0.0
+  execute_min_net_bps: 15.0
+  high_exposure_threshold: 0.75
+  high_exposure_min_conviction: 0.65
+  max_symbol_concentration: 0.30
+  max_strategy_concentration: 0.40
+  capital_exhaustion_threshold: 0.90
+  weight_conviction: 0.35
+  weight_net_edge: 0.35
+  weight_capital_efficiency: 0.15
+  weight_urgency: 0.15
+  conviction_to_bps_scale: 120.0
+  upgrade_min_edge_advantage_bps: 10.0
+  drawdown_penalty_scale: 0.3

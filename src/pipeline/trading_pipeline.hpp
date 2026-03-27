@@ -27,6 +27,7 @@
 #include "portfolio_allocator/portfolio_allocator.hpp"
 #include "portfolio/portfolio_engine.hpp"
 #include "execution_alpha/execution_alpha_engine.hpp"
+#include "opportunity_cost/opportunity_cost_engine.hpp"
 #include "risk/risk_engine.hpp"
 #include "execution/execution_engine.hpp"
 #include "execution/twap_executor.hpp"
@@ -150,6 +151,7 @@ private:
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
     std::shared_ptr<portfolio_allocator::IPortfolioAllocator> portfolio_allocator_;
     std::shared_ptr<execution_alpha::IExecutionAlphaEngine> execution_alpha_;
+    std::shared_ptr<opportunity_cost::IOpportunityCostEngine> opportunity_cost_engine_;
     std::shared_ptr<risk::IRiskEngine> risk_engine_;
     std::shared_ptr<execution::ExecutionEngine> execution_engine_;
 

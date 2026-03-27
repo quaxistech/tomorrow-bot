@@ -260,6 +260,28 @@ TradingPipeline::TradingPipeline(
             std::move(ea_cfg), logger_, clock_, metrics_);
     }
 
+    // 8a. Opportunity cost — модуль ранжирования / gating возможностей
+    {
+        opportunity_cost::OpportunityCostConfig oc_cfg;
+        oc_cfg.min_net_expected_bps       = config_.opportunity_cost.min_net_expected_bps;
+        oc_cfg.execute_min_net_bps        = config_.opportunity_cost.execute_min_net_bps;
+        oc_cfg.high_exposure_threshold    = config_.opportunity_cost.high_exposure_threshold;
+        oc_cfg.high_exposure_min_conviction = config_.opportunity_cost.high_exposure_min_conviction;
+        oc_cfg.max_symbol_concentration   = config_.opportunity_cost.max_symbol_concentration;
+        oc_cfg.max_strategy_concentration = config_.opportunity_cost.max_strategy_concentration;
+        oc_cfg.capital_exhaustion_threshold = config_.opportunity_cost.capital_exhaustion_threshold;
+        oc_cfg.weight_conviction          = config_.opportunity_cost.weight_conviction;
+        oc_cfg.weight_net_edge            = config_.opportunity_cost.weight_net_edge;
+        oc_cfg.weight_capital_efficiency  = config_.opportunity_cost.weight_capital_efficiency;
+        oc_cfg.weight_urgency             = config_.opportunity_cost.weight_urgency;
+        oc_cfg.conviction_to_bps_scale    = config_.opportunity_cost.conviction_to_bps_scale;
+        oc_cfg.upgrade_min_edge_advantage_bps = config_.opportunity_cost.upgrade_min_edge_advantage_bps;
+        oc_cfg.drawdown_penalty_scale     = config_.opportunity_cost.drawdown_penalty_scale;
+
+        opportunity_cost_engine_ = std::make_shared<opportunity_cost::RuleBasedOpportunityCost>(
+            std::move(oc_cfg), logger_, clock_, metrics_);
+    }
+
     // 9. Риск-движок
     risk::ExtendedRiskConfig risk_cfg;
     risk_cfg.max_position_notional = config_.risk.max_position_notional;
@@ -2665,6 +2687,69 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             {{"symbol", symbol_.get()},
              {"qty", std::to_string(closing_qty.get())}});
     } else {
+        // 9d. Opportunity Cost — оценка целесообразности входа
+        //     Вызывается ПЕРЕД sizing/risk для новых позиций.
+        //     Закрытие позиции обходит этот шаг (безусловно исполняется).
+        {
+            auto port_snap = portfolio_->snapshot();
+
+            opportunity_cost::PortfolioContext oc_ctx;
+            oc_ctx.gross_exposure_pct = port_snap.exposure.exposure_pct;
+            oc_ctx.net_exposure_pct = (port_snap.total_capital > 0.0)
+                ? port_snap.exposure.net_exposure / port_snap.total_capital : 0.0;
+            oc_ctx.available_capital = port_snap.available_capital;
+            oc_ctx.total_capital = port_snap.total_capital;
+            oc_ctx.open_positions_count = port_snap.exposure.open_positions_count;
+            oc_ctx.current_drawdown_pct = port_snap.pnl.current_drawdown_pct;
+            oc_ctx.consecutive_losses = port_snap.pnl.consecutive_losses;
+
+            // Расчёт концентрации по символу и стратегии
+            double symbol_notional = 0.0;
+            double strategy_notional = 0.0;
+            for (const auto& pos : port_snap.positions) {
+                if (pos.symbol.get() == intent.symbol.get()) {
+                    symbol_notional += std::abs(pos.notional.get());
+                }
+                if (pos.strategy_id.get() == intent.strategy_id.get()) {
+                    strategy_notional += std::abs(pos.notional.get());
+                }
+            }
+            if (port_snap.total_capital > 0.0) {
+                oc_ctx.symbol_exposure_pct = symbol_notional / port_snap.total_capital;
+                oc_ctx.strategy_exposure_pct = strategy_notional / port_snap.total_capital;
+            }
+
+            auto oc_result = opportunity_cost_engine_->evaluate(
+                intent, exec_alpha, oc_ctx,
+                config_.decision.min_conviction_threshold);
+
+            if (oc_result.action == opportunity_cost::OpportunityAction::Suppress) {
+                logger_->info("pipeline", "Вход отклонён opportunity cost: Suppress",
+                    {{"symbol", symbol_.get()},
+                     {"reason", opportunity_cost::to_string(oc_result.reason)},
+                     {"net_bps", std::to_string(oc_result.score.net_expected_bps)},
+                     {"score", std::to_string(oc_result.score.score)}});
+                return;
+            }
+
+            if (oc_result.action == opportunity_cost::OpportunityAction::Defer) {
+                logger_->debug("pipeline", "Вход отложен opportunity cost: Defer",
+                    {{"symbol", symbol_.get()},
+                     {"reason", opportunity_cost::to_string(oc_result.reason)},
+                     {"net_bps", std::to_string(oc_result.score.net_expected_bps)}});
+                return;
+            }
+
+            // Execute или Upgrade — продолжаем к sizing
+            if (oc_result.action == opportunity_cost::OpportunityAction::Upgrade) {
+                logger_->info("pipeline", "Opportunity cost рекомендует Upgrade",
+                    {{"symbol", symbol_.get()},
+                     {"net_bps", std::to_string(oc_result.score.net_expected_bps)}});
+                // Upgrade будет обработан: пока продолжаем как Execute,
+                // закрытие худшей позиции реализуется в следующих фазах.
+            }
+        }
+
         // 10. Расчёт размера для нового ордера
 
         // Volatility Targeting: передаём рыночный контекст в аллокатор

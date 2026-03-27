@@ -29,6 +29,7 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_portfolio_allocator
     tb_portfolio
     tb_execution_alpha
+    tb_opportunity_cost
     tb_risk
     tb_execution
     tb_exchange_bitget

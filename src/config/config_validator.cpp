@@ -15,6 +15,7 @@ VoidResult ConfigValidator::validate(const AppConfig& cfg) const {
     validate_metrics(cfg.metrics, result);
     validate_risk(cfg.risk, result);
     validate_adversarial(cfg.adversarial_defense, result);
+    validate_opportunity_cost(cfg.opportunity_cost, result);
     validate_cross(cfg, result);
 
     if (!result.valid) {
@@ -228,6 +229,49 @@ void ConfigValidator::validate_adversarial(
     // --- v4: Event sourcing ---
     if (cfg.audit_log_max_size < 0) {
         result.add_error("adversarial_defense.audit_log_max_size должен быть >= 0");
+    }
+}
+
+void ConfigValidator::validate_opportunity_cost(
+    const OpportunityCostConfig& cfg, ValidationResult& result) const {
+    if (cfg.execute_min_net_bps < cfg.min_net_expected_bps) {
+        result.add_error("opportunity_cost.execute_min_net_bps должен быть >= min_net_expected_bps");
+    }
+    if (cfg.high_exposure_threshold <= 0.0 || cfg.high_exposure_threshold > 1.0) {
+        result.add_error("opportunity_cost.high_exposure_threshold должен быть в (0, 1]");
+    }
+    if (cfg.high_exposure_min_conviction <= 0.0 || cfg.high_exposure_min_conviction > 1.0) {
+        result.add_error("opportunity_cost.high_exposure_min_conviction должен быть в (0, 1]");
+    }
+    if (cfg.max_symbol_concentration <= 0.0 || cfg.max_symbol_concentration > 1.0) {
+        result.add_error("opportunity_cost.max_symbol_concentration должен быть в (0, 1]");
+    }
+    if (cfg.max_strategy_concentration <= 0.0 || cfg.max_strategy_concentration > 1.0) {
+        result.add_error("opportunity_cost.max_strategy_concentration должен быть в (0, 1]");
+    }
+    if (cfg.capital_exhaustion_threshold <= 0.0 || cfg.capital_exhaustion_threshold > 1.0) {
+        result.add_error("opportunity_cost.capital_exhaustion_threshold должен быть в (0, 1]");
+    }
+    // Веса должны быть положительными и давать в сумме 1.0 (±допуск)
+    double total_weight = cfg.weight_conviction + cfg.weight_net_edge +
+                          cfg.weight_capital_efficiency + cfg.weight_urgency;
+    if (std::abs(total_weight - 1.0) > 0.01) {
+        result.add_error(
+            std::format("opportunity_cost weights должны давать сумму 1.0, получено: {:.3f}",
+                total_weight));
+    }
+    if (cfg.weight_conviction < 0.0 || cfg.weight_net_edge < 0.0 ||
+        cfg.weight_capital_efficiency < 0.0 || cfg.weight_urgency < 0.0) {
+        result.add_error("opportunity_cost weights не могут быть отрицательными");
+    }
+    if (cfg.conviction_to_bps_scale <= 0.0) {
+        result.add_error("opportunity_cost.conviction_to_bps_scale должен быть > 0");
+    }
+    if (cfg.upgrade_min_edge_advantage_bps < 0.0) {
+        result.add_error("opportunity_cost.upgrade_min_edge_advantage_bps должен быть >= 0");
+    }
+    if (cfg.drawdown_penalty_scale < 0.0) {
+        result.add_error("opportunity_cost.drawdown_penalty_scale должен быть >= 0");
     }
 }
 

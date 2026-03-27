@@ -22,8 +22,13 @@ ExecutionAlphaEngine → ExecutionAlphaResult
     │
     ▼
 OpportunityCostEngine → OpportunityCostResult
-    │  Оценивает ожидаемый доход vs стоимость исполнения
-    │  Решает: Execute / Defer / Suppress
+    │  Оценивает opportunity cost на уровне сигнала, портфеля и исполнения
+    │  Нелинейный скоринг: conviction^1.5 × bps_scale − execution_cost
+    │  10 каскадных правил приоритезации с адаптивными порогами
+    │  Портфельный контекст: концентрация, экспозиция, просадка, серии убытков
+    │  Решает: Execute / Defer / Suppress / Upgrade
+    │  Полная аудит-трасса: OpportunityCostFactors + rule_id + counterfactual
+    │  Метрики: Prometheus counters/gauges/histogram
     │
     ▼
 PortfolioAllocator → SizingResult
@@ -193,11 +198,122 @@ execution_alpha:
   postonly_adverse_max: 0.35
 ```
 
-## Зависимости модулей
+## OpportunityCost — архитектура и логика
+
+### Модель скоринга
+
+```
+expected_return_bps = conviction^1.5 × conviction_to_bps_scale
+net_expected_bps    = expected_return_bps − execution_cost_bps
+capital_efficiency  = net_expected_bps / max(exposure, 0.05)
+
+composite_score = w_conviction × conviction_component
+                + w_net_edge   × net_edge_component
+                + w_capital    × capital_efficiency_component
+                + w_urgency    × urgency_component
+
+Все веса конфигурируемы, сумма = 1.0
+```
+
+### Адаптивный порог conviction
+
+```
+effective_threshold = base_threshold
+                    + drawdown_penalty_scale × (drawdown% / 5%)
+                    + 0.02 × consecutive_losses
+
+Клэмп: [0.0, 0.95]
+```
+
+При просадке и серии убытков порог автоматически повышается,
+система становится консервативнее.
+
+### 10 каскадных правил приоритезации
+
+| # | Правило | Действие |
+|---|---------|----------|
+| 1 | net_edge < min_net_expected_bps | Suppress (NegativeNetEdge) |
+| 2 | conviction < effective_threshold | Suppress (ConvictionBelowThreshold) |
+| 3 | exposure > capital_exhaustion_pct | Suppress (CapitalExhausted) |
+| 4 | symbol concentration > max_symbol_concentration | Suppress (SymbolConcentrationExceeded) |
+| 5 | strategy concentration > max_strategy_concentration | Defer (StrategyConcentrationExceeded) |
+| 6 | exposure > high_exposure_threshold И conviction < 0.7 | Defer (HighExposureLowConviction) |
+| 7 | net_edge лучше worst position + min_edge_advantage | Upgrade (UpgradeOpportunity) |
+| 8 | net_edge ≥ min_net_expected_bps И exposure < capital_exhaustion | Execute (StrongEdgeAvailable) |
+| 9 | conviction ≥ high_conviction_override | Execute (HighConvictionOverride) |
+| 10 | Остальное | Defer (InsufficientNetEdge) |
+
+Правила каскадные — первое сработавшее определяет действие.
+
+### Портфельный контекст (PortfolioContext)
+
+```cpp
+struct PortfolioContext {
+    double gross_exposure_pct;         // Текущая грубая экспозиция [0..1]
+    double net_exposure_pct;           // Чистая экспозиция [−1..+1]
+    double available_capital_pct;      // Доступный капитал [0..1]
+    double current_drawdown_pct;       // Текущая просадка [0..1]
+    int    active_positions;           // Число активных позиций
+    int    consecutive_losses;         // Подряд убыточные сделки
+    double symbol_concentration;       // Концентрация по символу [0..1]
+    double strategy_concentration;     // Концентрация по стратегии [0..1]
+    double worst_position_edge_bps;    // Edge худшей позиции
+    double portfolio_heat;             // Суммарный PnL-heat [0..1]
+    double recent_win_rate;            // Winrate за окно
+    double avg_holding_period_minutes; // Средний срок удержания
+};
+```
+
+Контекст конструируется из `PortfolioSnapshot` непосредственно перед вызовом.
+
+### Аудит-трасса (OpportunityCostFactors)
+
+```cpp
+struct OpportunityCostFactors {
+    int    rule_id;                    // Номер сработавшего правила
+    double raw_conviction;             // Входная conviction
+    double effective_conviction_threshold; // Адаптивный порог
+    double expected_return_bps;        // Ожидаемый доход
+    double execution_cost_bps;         // Стоимость исполнения
+    double net_expected_bps;           // Чистый edge
+    double capital_efficiency;         // Эффективность капитала
+    double composite_score;            // Composite score [0..1]
+    OpportunityAction counterfactual_action; // Что было бы при пороге −20%
+    std::string decision_rationale;    // Человекочитаемое объяснение
+};
+```
+
+### Специальные случаи
+
+| Сценарий | Поведение |
+|----------|-----------|
+| **Закрытие позиции** | Обходит OpportunityCostEngine (безусловное исполнение) |
+| **Upgrade** | Детектируется, но текущая версия пропускает как Execute (placeholder для phase 3) |
+
+### Конфигурация (`opportunity_cost` секция)
+
+```yaml
+opportunity_cost:
+  conviction_to_bps_scale: 150.0    # Масштаб conviction → bps
+  min_conviction_threshold: 0.25    # Базовый порог conviction [0..1]
+  min_net_expected_bps: 2.0         # Мин чистый edge для Execute [bps]
+  max_exposure_for_new_entry: 0.85  # Макс экспозиция для новых входов
+  high_conviction_override: 0.85    # Conviction для override → Execute
+  min_edge_advantage_bps: 5.0       # Мин преимущество для Upgrade [bps]
+  capital_exhaustion_pct: 0.90      # Порог исчерпания капитала
+  high_exposure_threshold: 0.70     # Порог высокой экспозиции
+  max_symbol_concentration: 0.25    # Макс концентрация по символу
+  max_strategy_concentration: 0.35  # Макс концентрация по стратегии
+  drawdown_penalty_scale: 0.10      # Масштаб штрафа за просадку
+  weight_conviction: 0.35           # Вес conviction в composite score
+  weight_net_edge: 0.30             # Вес net edge
+  weight_capital_efficiency: 0.20   # Вес capital efficiency
+  weight_urgency: 0.15              # Вес urgency (сумма весов = 1.0)
+```
 
 ```
 tb_execution_alpha → tb_common, tb_features, tb_strategy, tb_logging, tb_clock, tb_metrics
-tb_opportunity_cost → tb_common, tb_strategy, tb_execution_alpha, tb_logging, tb_clock
+tb_opportunity_cost → tb_common, tb_strategy, tb_execution_alpha, tb_logging, tb_clock, tb_metrics
 tb_portfolio → tb_common, tb_logging, tb_clock, tb_metrics
 tb_portfolio_allocator → tb_common, tb_strategy, tb_portfolio, tb_logging
 tb_risk → tb_common, tb_strategy, tb_features, tb_portfolio, tb_portfolio_allocator,
@@ -214,93 +330,4 @@ tb_execution → tb_common, tb_strategy, tb_risk, tb_execution_alpha, tb_portfol
 4. **Тестируемость**: Все зависимости — через интерфейсы (DI)
 5. **RAII**: Используется std::lock_guard для управления мьютексами
 6. **Result-based errors**: Используется std::expected вместо исключений
-7. **Конфигурируемость**: Все пороги вынесены в `execution_alpha` секцию YAML
-
-
-## Обзор
-
-Фаза 4 реализует полный путь от торгового решения до исполнения ордера.
-Каждый шаг обязателен, ни один торговый путь не может обойти Риск-движок.
-
-## Конвейер исполнения
-
-```
-DecisionRecord (из decision/)
-    │
-    ▼
-ExecutionAlphaEngine → ExecutionAlphaResult
-    │  Определяет стиль исполнения (Passive/Aggressive/Hybrid)
-    │  Оценивает качество исполнения (спред, проскальзывание)
-    │  Рассчитывает лимитную цену и план нарезки
-    │
-    ▼
-OpportunityCostEngine → OpportunityCostResult
-    │  Оценивает ожидаемый доход vs стоимость исполнения
-    │  Решает: Execute / Defer / Suppress
-    │
-    ▼
-PortfolioAllocator → SizingResult
-    │  Применяет иерархию бюджетов
-    │  Лимит концентрации (≤20% капитала на одну позицию)
-    │  Лимит стратегии (≤30% капитала)
-    │  Множитель неопределённости
-    │  Ограничение доступным капиталом
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│     RiskEngine → RiskDecision           │
-│     *** ОБЯЗАТЕЛЬНЫЙ, ОБХОД ЗАПРЕЩЁН ***│
-│                                         │
-│  14 правил последовательной проверки:   │
-│  1.  Kill switch                        │
-│  2.  Макс дневной убыток              │
-│  3.  Макс просадка                     │
-│  4.  Макс одновременных позиций        │
-│  5.  Макс валовая экспозиция           │
-│  6.  Макс номинал позиции              │
-│  7.  Макс плечо                        │
-│  8.  Макс проскальзывание              │
-│  9.  Частота ордеров                   │
-│  10. Подряд убыточные сделки           │
-│  11. Актуальность данных               │
-│  12. Качество стакана                  │
-│  13. Ширина спреда                     │
-│  14. Минимальная ликвидность           │
-│                                         │
-│  Verdict: Approved/Denied/ReduceSize/   │
-│           Throttled                     │
-└─────────────────────────────────────────┘
-    │
-    ▼
-ExecutionEngine → OrderRecord + FSM
-    │  Создаёт запись ордера
-    │  Управляет FSM (конечный автомат состояний)
-    │  Проверяет дублирование
-    │  Отправляет через IOrderSubmitter
-    │
-    ▼
-PortfolioEngine (обновление позиций)
-    │  При заполнении: открытие/обновление позиции
-    │  Отслеживание P&L, экспозиции, просадки
-```
-
-## Зависимости модулей
-
-```
-tb_execution_alpha → tb_common, tb_features, tb_strategy, tb_logging, tb_clock, tb_metrics
-tb_opportunity_cost → tb_common, tb_strategy, tb_execution_alpha, tb_logging, tb_clock
-tb_portfolio → tb_common, tb_logging, tb_clock, tb_metrics
-tb_portfolio_allocator → tb_common, tb_strategy, tb_portfolio, tb_logging
-tb_risk → tb_common, tb_strategy, tb_features, tb_portfolio, tb_portfolio_allocator,
-          tb_execution_alpha, tb_logging, tb_clock, tb_metrics
-tb_execution → tb_common, tb_strategy, tb_risk, tb_execution_alpha, tb_portfolio,
-               tb_logging, tb_clock, tb_metrics
-```
-
-## Принципы проектирования
-
-1. **Безопасность**: Никакой живой ордер не может обойти RiskEngine
-2. **Потокобезопасность**: Все движки используют мьютексы для защиты состояния
-3. **Тестируемость**: Все зависимости — через интерфейсы (DI)
-4. **RAII**: Используется std::lock_guard для управления мьютексами
-5. **Result-based errors**: Используется std::expected вместо исключений
+7. **Конфигурируемость**: Все пороги вынесены в YAML секции (`execution_alpha`, `opportunity_cost`)

@@ -167,3 +167,20 @@ execution_alpha:
   postonly_spread_threshold_bps: 4.0
   postonly_urgency_max: 0.30
   postonly_adverse_max: 0.30
+
+# ── Opportunity Cost ──────────────────────────────────────────────────────────
+opportunity_cost:
+  min_net_expected_bps: 5.0              # Production: строже — фильтруем слабые сигналы
+  execute_min_net_bps: 20.0              # Порог для немедленного исполнения (бп)
+  high_exposure_threshold: 0.70          # Production: осторожнее (70% вместо 75%)
+  high_exposure_min_conviction: 0.70     # Мин conviction при высокой экспозиции
+  max_symbol_concentration: 0.25         # Макс 25% капитала на символ
+  max_strategy_concentration: 0.35       # Макс 35% капитала на стратегию
+  capital_exhaustion_threshold: 0.85     # Production: оставляем 15% резерв
+  weight_conviction: 0.35               # Вес conviction в скоринге
+  weight_net_edge: 0.35                 # Вес чистого edge
+  weight_capital_efficiency: 0.15       # Вес эффективности капитала
+  weight_urgency: 0.15                  # Вес срочности
+  conviction_to_bps_scale: 120.0        # conviction 1.0 → 120 бп ожидаемого дохода
+  upgrade_min_edge_advantage_bps: 15.0  # Production: нужно 15 бп преимущество для замены
+  drawdown_penalty_scale: 0.5           # +0.5 к порогу за каждые 5% просадки

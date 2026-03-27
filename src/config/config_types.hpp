@@ -220,6 +220,39 @@ struct ExecutionAlphaConfig {
     double postonly_adverse_max{0.35};           ///< Токсичность ниже → PostOnly кандидат
 };
 
+/// Настройки модуля opportunity cost
+struct OpportunityCostConfig {
+    // ── Пороги net edge (базисные пункты) ──
+    double min_net_expected_bps{0.0};          ///< Мин чистый ожидаемый доход для входа
+    double execute_min_net_bps{15.0};          ///< Мин чистый доход для немедленного исполнения
+
+    // ── Пороги экспозиции ──
+    double high_exposure_threshold{0.75};      ///< Порог высокой экспозиции [0,1]
+    double high_exposure_min_conviction{0.65}; ///< Мин conviction при высокой экспозиции
+
+    // ── Пороги концентрации ──
+    double max_symbol_concentration{0.25};     ///< Макс доля капитала на один символ
+    double max_strategy_concentration{0.35};   ///< Макс доля капитала на одну стратегию
+
+    // ── Пороги капитала ──
+    double capital_exhaustion_threshold{0.90}; ///< Порог исчерпания капитала [0,1]
+
+    // ── Веса скоринга ──
+    double weight_conviction{0.35};            ///< Вес conviction в composite score
+    double weight_net_edge{0.35};              ///< Вес net edge
+    double weight_capital_efficiency{0.15};    ///< Вес capital efficiency
+    double weight_urgency{0.15};               ///< Вес urgency
+
+    // ── Масштабирование expected return ──
+    double conviction_to_bps_scale{120.0};     ///< Масштаб: conviction 1.0 → N bps
+
+    // ── Upgrade ──
+    double upgrade_min_edge_advantage_bps{10.0}; ///< Мин разница edge для Upgrade vs худшей позиции
+
+    // ── Drawdown penalty ──
+    double drawdown_penalty_scale{0.5};        ///< Множитель: +X к порогу за каждые 5% просадки
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
     ExchangeConfig       exchange;         ///< Настройки биржи
@@ -234,6 +267,7 @@ struct AppConfig {
     DecisionConfig       decision;         ///< Настройки движка принятия решений
     TradingParamsConfig  trading_params;   ///< Настройки управления позицией
     ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
+    OpportunityCostConfig opportunity_cost; ///< Настройки модуля opportunity cost
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 
