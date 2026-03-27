@@ -55,6 +55,7 @@
 #include "ml/thompson_sampler.hpp"
 #include "ml/ml_signal_types.hpp"
 #include "self_diagnosis/self_diagnosis_engine.hpp"
+#include "shadow/shadow_mode_engine.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -199,6 +200,9 @@ private:
 
     /// Движок самодиагностики — мониторинг здоровья, scorecards, corrective actions
     std::shared_ptr<self_diagnosis::SelfDiagnosisEngine> self_diagnosis_;
+
+    /// Shadow trading подсистема — виртуальное исполнение без реальных ордеров
+    std::shared_ptr<shadow::ShadowModeEngine> shadow_engine_;
 
     std::atomic<bool> running_{false};
     std::mutex pipeline_mutex_;
@@ -389,6 +393,11 @@ private:
 
     /// Минимальный порог conviction для открытия новой позиции
     static constexpr double kDefaultConvictionThreshold = 0.3;
+
+    /// Записать текущее решение в shadow-подсистему
+    void record_shadow_decision(const strategy::TradeIntent& intent,
+                                const std::string& risk_verdict,
+                                bool would_have_been_live);
 
     /// Проверить alpha decay для всех стратегий и обновить множители
     void check_alpha_decay_feedback();

@@ -11,6 +11,7 @@
 #include "common/types.hpp"
 #include "ai/ai_advisory_types.hpp"
 #include "regime/regime_config.hpp"
+#include "shadow/shadow_types.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -286,6 +287,7 @@ struct AppConfig {
     ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
     OpportunityCostConfig opportunity_cost; ///< Настройки модуля opportunity cost
     RegimeConfig         regime;           ///< Настройки классификатора рыночных режимов
+    shadow::ShadowConfig shadow;           ///< Настройки shadow trading подсистемы
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

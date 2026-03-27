@@ -9,6 +9,7 @@
 #include "config_hash.hpp"
 #include "config_validator.hpp"
 #include "common/enums.hpp"
+#include "shadow/shadow_types.hpp"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -620,6 +621,50 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "regime.stability_same_regime", "0.9"), 0.9);
     cfg.regime.confidence.first_classification_stability = parse_double(
         get_value(kv, "regime.stability_first_classification", "0.5"), 0.5);
+
+    // ── Секция shadow ────────────────────────────────────────────────────
+    {
+        auto& s = cfg.shadow;
+        auto enabled_str = get_value(kv, "shadow.enabled", "false");
+        s.enabled = (enabled_str == "true" || enabled_str == "1");
+
+        auto mode_str = get_value(kv, "shadow.mode", "observation");
+        if (mode_str == "validation") s.mode = shadow::ShadowMode::Validation;
+        else if (mode_str == "discovery") s.mode = shadow::ShadowMode::Discovery;
+        else s.mode = shadow::ShadowMode::Observation;
+
+        auto policy_str = get_value(kv, "shadow.risk_policy", "mirror_live");
+        if (policy_str == "relaxed") s.risk_policy = shadow::ShadowRiskPolicy::Relaxed;
+        else if (policy_str == "unconstrained") s.risk_policy = shadow::ShadowRiskPolicy::Unconstrained;
+        else s.risk_policy = shadow::ShadowRiskPolicy::MirrorLive;
+
+        s.max_records_per_strategy = static_cast<int>(parse_double(
+            get_value(kv, "shadow.max_records_per_strategy", "1000"), 1000.0));
+        s.eval_window_short_ns = static_cast<int64_t>(parse_double(
+            get_value(kv, "shadow.eval_window_short_ms", "1000"), 1000.0)) * 1000000LL;
+        s.eval_window_mid_ns = static_cast<int64_t>(parse_double(
+            get_value(kv, "shadow.eval_window_mid_ms", "5000"), 5000.0)) * 1000000LL;
+        s.eval_window_long_ns = static_cast<int64_t>(parse_double(
+            get_value(kv, "shadow.eval_window_long_ms", "30000"), 30000.0)) * 1000000LL;
+        s.stale_record_timeout_ns = static_cast<int64_t>(parse_double(
+            get_value(kv, "shadow.stale_timeout_ms", "120000"), 120000.0)) * 1000000LL;
+        s.taker_fee_pct = parse_double(
+            get_value(kv, "shadow.taker_fee_pct", std::to_string(s.taker_fee_pct)), s.taker_fee_pct);
+        s.maker_fee_pct = parse_double(
+            get_value(kv, "shadow.maker_fee_pct", std::to_string(s.maker_fee_pct)), s.maker_fee_pct);
+
+        auto persist_str = get_value(kv, "shadow.persist_to_db", "false");
+        s.persist_to_db = (persist_str == "true" || persist_str == "1");
+        auto respect_ks_str = get_value(kv, "shadow.respect_kill_switch", "true");
+        s.respect_kill_switch = (respect_ks_str != "false" && respect_ks_str != "0");
+
+        s.alert_pnl_divergence_bps = parse_double(
+            get_value(kv, "shadow.alert_pnl_divergence_bps", std::to_string(s.alert_pnl_divergence_bps)),
+            s.alert_pnl_divergence_bps);
+        s.alert_hit_rate_divergence = parse_double(
+            get_value(kv, "shadow.alert_hit_rate_divergence", std::to_string(s.alert_hit_rate_divergence)),
+            s.alert_hit_rate_divergence);
+    }
 
     // Валидация
     ConfigValidator validator;

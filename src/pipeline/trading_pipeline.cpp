@@ -9,6 +9,7 @@
 #include "normalizer/normalized_events.hpp"
 #include "common/enums.hpp"
 #include "persistence/postgres_storage_adapter.hpp"
+#include "shadow/shadow_mode_engine.hpp"
 #include <boost/json.hpp>
 #include <sstream>
 #include <iomanip>
@@ -176,6 +177,30 @@ TradingPipeline::TradingPipeline(
 
         logger_->info("pipeline", "Champion-Challenger инициализирован",
             {{"pairs", "momentum/mean_reversion, breakout/vol_expansion"}});
+    }
+
+    // 5.4b. Shadow trading подсистема
+    {
+        shadow_engine_ = std::make_shared<shadow::ShadowModeEngine>(
+            config_.shadow, logger_, clock_, metrics_, governance_);
+        if (config_.shadow.persist_to_db) {
+            // PostgreSQL storage для shadow — если задан POSTGRES_URL
+            if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
+                try {
+                    auto shadow_storage = persistence::make_postgres_adapter(pg_url);
+                    shadow_engine_ = std::make_shared<shadow::ShadowModeEngine>(
+                        config_.shadow, logger_, clock_, metrics_, governance_, shadow_storage);
+                    logger_->info("pipeline", "Shadow: PostgreSQL storage подключён");
+                } catch (const std::exception& ex) {
+                    logger_->warn("pipeline", "Shadow: PostgreSQL недоступен, работаем in-memory",
+                        {{"error", ex.what()}});
+                }
+            }
+        }
+        logger_->info("pipeline", "Shadow подсистема инициализирована",
+            {{"enabled", config_.shadow.enabled ? "true" : "false"},
+             {"mode", config_.shadow.mode == shadow::ShadowMode::Observation ? "observation"
+                    : config_.shadow.mode == shadow::ShadowMode::Validation ? "validation" : "discovery"}});
     }
 
     // 5.5a. AI Advisory Engine
@@ -1868,6 +1893,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (advanced_features_) {
             advanced_features_->on_tick(snapshot.mid_price.get());
         }
+
+        // Обновляем shadow price tracking на каждом тике
+        if (shadow_engine_ && shadow_engine_->is_enabled()) {
+            shadow_engine_->update_price_tracking(symbol_, Price(snapshot.mid_price), clock_->now());
+            // Периодическая очистка зависших записей
+            if (tick_count_ % 100 == 0) {
+                shadow_engine_->cleanup_stale_records(clock_->now());
+            }
+        }
     }
 
     // 0.adv. Заполняем продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
@@ -2925,6 +2959,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
     }
 
+    // Записываем в shadow подсистему
+    record_shadow_decision(intent,
+        risk_decision.verdict == risk::RiskVerdict::Approved ? "Approved" : "Denied",
+        risk_decision.verdict == risk::RiskVerdict::Approved);
+
     // 11a. Smart TWAP: разбиваем крупные ордера на слайсы.
     // Execution Alpha является основным арбитром: если он рекомендует нарезку
     // (slice_plan.has_value()), это учитывается в приоритете над оценкой TWAP.
@@ -3098,6 +3137,35 @@ void TradingPipeline::print_status(
          {"regime", std::string(to_string(regime.label))},
          {"world", std::string(world_model::to_string(world.state))},
          {"positions", std::to_string(portfolio_->snapshot().exposure.open_positions_count)}});
+}
+
+void TradingPipeline::record_shadow_decision(
+    const strategy::TradeIntent& intent,
+    const std::string& risk_verdict,
+    bool would_have_been_live)
+{
+    if (!shadow_engine_ || !shadow_engine_->is_enabled()) return;
+
+    shadow::ShadowDecision decision;
+    decision.correlation_id = intent.correlation_id;
+    decision.strategy_id = intent.strategy_id;
+    decision.symbol = intent.symbol;
+    decision.side = intent.side;
+    decision.signal_intent = (intent.side == Side::Buy)
+        ? shadow::SignalIntent::LongEntry
+        : shadow::SignalIntent::LongExit;
+    decision.quantity = intent.suggested_quantity;
+    decision.intended_price = intent.limit_price.value_or(Price(0.0));
+    decision.conviction = intent.conviction;
+    decision.decided_at = clock_->now();
+    decision.risk_verdict = risk_verdict;
+    decision.would_have_been_live = would_have_been_live;
+
+    auto result = shadow_engine_->record_decision(std::move(decision));
+    if (!result.has_value()) {
+        logger_->debug("pipeline", "Shadow decision not recorded",
+            {{"reason", "disabled or kill_switch"}});
+    }
 }
 
 } // namespace tb::pipeline
