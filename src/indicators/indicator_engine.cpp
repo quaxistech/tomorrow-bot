@@ -1,18 +1,38 @@
 #include "indicator_engine.hpp"
+#include "common/numeric_utils.hpp"
 #include <cmath>
 #include <numeric>
-#include <stdexcept>
 #include <algorithm>
 
 namespace tb::indicators {
 
+using numeric::safe_div;
+using numeric::safe_sqrt;
+using numeric::validate_price_series;
+using numeric::validate_series_alignment;
+using numeric::is_valid_price;
+using numeric::is_valid_volume;
+using numeric::kEpsilon;
+using numeric::kMinVariance;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction & utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorEngine::IndicatorEngine(std::shared_ptr<tb::logging::ILogger> logger)
     : logger_(std::move(logger))
-    , talib_available_(false) // TA-Lib не интегрирована, используется встроенная реализация
+    , talib_available_(false)
 {
     if (logger_) {
-        logger_->info("IndicatorEngine", "Используется встроенная реализация индикаторов");
+        logger_->info("IndicatorEngine", "Initialized with built-in indicator implementations");
     }
+}
+
+bool IndicatorEngine::run_talib_smoke_test() {
+    if (logger_) {
+        logger_->warn("IndicatorEngine", "TA-Lib not available, smoke test skipped");
+    }
+    return false;
 }
 
 bool IndicatorEngine::is_talib_available() const {
@@ -20,15 +40,15 @@ bool IndicatorEngine::is_talib_available() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Вспомогательный метод: полный ряд EMA
-// output[i] — EMA на позиции i; для i < period-1 значение равно 0.0 (невалидно)
+// Helper: full EMA series
+// output[i] valid for i >= period-1; earlier entries are 0.0
 // ─────────────────────────────────────────────────────────────────────────────
+
 std::vector<double> IndicatorEngine::ema_series(const std::vector<double>& prices, int period) const {
     const std::size_t n = prices.size();
     std::vector<double> out(n, 0.0);
     if (n < static_cast<std::size_t>(period) || period <= 0) return out;
 
-    // Первое значение EMA = SMA первых period элементов
     double seed = 0.0;
     for (int i = 0; i < period; ++i) seed += prices[i];
     seed /= static_cast<double>(period);
@@ -44,6 +64,7 @@ std::vector<double> IndicatorEngine::ema_series(const std::vector<double>& price
 // ─────────────────────────────────────────────────────────────────────────────
 // SMA
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::sma(const std::vector<double>& prices, int period) const {
 #ifdef TB_TALIB_AVAILABLE
     return sma_talib(prices, period);
@@ -53,20 +74,45 @@ IndicatorResult IndicatorEngine::sma(const std::vector<double>& prices, int peri
 }
 
 IndicatorResult IndicatorEngine::sma_builtin(const std::vector<double>& prices, int period) const {
-    if (period <= 0 || prices.size() < static_cast<std::size_t>(period)) {
-        return {false, 0.0, "SMA"};
+    IndicatorResult result;
+    result.name = "SMA";
+    const auto n = static_cast<int>(prices.size());
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "SMA: invalid period", {{"period", std::to_string(period)}});
+        return result;
     }
-    const std::size_t n = prices.size();
+    if (n < period) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = period - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "SMA: invalid price data detected");
+        return result;
+    }
+
     double sum = 0.0;
-    for (std::size_t i = n - static_cast<std::size_t>(period); i < n; ++i) {
+    const std::size_t start = prices.size() - static_cast<std::size_t>(period);
+    for (std::size_t i = start; i < prices.size(); ++i) {
         sum += prices[i];
     }
-    return {true, sum / static_cast<double>(period), "SMA"};
+
+    result.valid = true;
+    result.value = safe_div(sum, static_cast<double>(period));
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EMA
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::ema(const std::vector<double>& prices, int period) const {
 #ifdef TB_TALIB_AVAILABLE
     return ema_talib(prices, period);
@@ -76,27 +122,68 @@ IndicatorResult IndicatorEngine::ema(const std::vector<double>& prices, int peri
 }
 
 IndicatorResult IndicatorEngine::ema_builtin(const std::vector<double>& prices, int period) const {
-    if (period <= 0 || prices.size() < static_cast<std::size_t>(period)) {
-        return {false, 0.0, "EMA"};
+    IndicatorResult result;
+    result.name = "EMA";
+    const auto n = static_cast<int>(prices.size());
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "EMA: invalid period", {{"period", std::to_string(period)}});
+        return result;
     }
+    if (n < period) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = period - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "EMA: invalid price data detected");
+        return result;
+    }
+
     const auto series = ema_series(prices, period);
-    return {true, series.back(), "EMA"};
+
+    result.valid = true;
+    result.value = series.back();
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RSI (метод Уайлдера)
+// RSI (Wilder's method)
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::rsi(const std::vector<double>& prices, int period) const {
     return rsi_builtin(prices, period);
 }
 
 IndicatorResult IndicatorEngine::rsi_builtin(const std::vector<double>& prices, int period) const {
-    const std::size_t n = prices.size();
-    if (period <= 0 || n < static_cast<std::size_t>(period) + 1) {
-        return {false, 0.0, "RSI"};
+    IndicatorResult result;
+    result.name = "RSI";
+    const auto n = static_cast<int>(prices.size());
+    const int min_bars = period + 1;
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "RSI: invalid period", {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "RSI: invalid price data detected");
+        return result;
     }
 
-    // Вычисляем первые изменения цены
     double avg_gain = 0.0, avg_loss = 0.0;
     for (int i = 1; i <= period; ++i) {
         const double delta = prices[i] - prices[i - 1];
@@ -106,8 +193,7 @@ IndicatorResult IndicatorEngine::rsi_builtin(const std::vector<double>& prices, 
     avg_gain /= static_cast<double>(period);
     avg_loss /= static_cast<double>(period);
 
-    // Сглаживание по Уайлдеру для остальных баров
-    for (std::size_t i = static_cast<std::size_t>(period) + 1; i < n; ++i) {
+    for (std::size_t i = static_cast<std::size_t>(period) + 1; i < static_cast<std::size_t>(n); ++i) {
         const double delta = prices[i] - prices[i - 1];
         const double gain = delta > 0.0 ? delta : 0.0;
         const double loss = delta < 0.0 ? -delta : 0.0;
@@ -115,14 +201,24 @@ IndicatorResult IndicatorEngine::rsi_builtin(const std::vector<double>& prices, 
         avg_loss = (avg_loss * static_cast<double>(period - 1) + loss) / static_cast<double>(period);
     }
 
-    if (avg_loss < 1e-12) return {true, 100.0, "RSI"};
-    const double rs = avg_gain / avg_loss;
-    return {true, 100.0 - 100.0 / (1.0 + rs), "RSI"};
+    if (avg_loss < kEpsilon) {
+        result.value = 100.0;
+    } else {
+        const double rs = safe_div(avg_gain, avg_loss);
+        result.value = 100.0 - safe_div(100.0, 1.0 + rs);
+    }
+
+    result.valid = true;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MACD
 // ─────────────────────────────────────────────────────────────────────────────
+
 MacdResult IndicatorEngine::macd(const std::vector<double>& prices,
                                   int fast_period, int slow_period, int signal_period) const {
     return macd_builtin(prices, fast_period, slow_period, signal_period);
@@ -130,38 +226,61 @@ MacdResult IndicatorEngine::macd(const std::vector<double>& prices,
 
 MacdResult IndicatorEngine::macd_builtin(const std::vector<double>& prices,
                                           int fast, int slow, int signal) const {
-    const std::size_t n = prices.size();
-    // Нужно как минимум slow баров для первого EMA + signal баров для сигнальной линии
-    if (fast <= 0 || slow <= 0 || signal <= 0 || fast >= slow ||
-        n < static_cast<std::size_t>(slow + signal - 1)) {
-        return {};
+    MacdResult result;
+    const auto n = static_cast<int>(prices.size());
+    const int min_bars = slow + signal - 1;
+
+    if (fast <= 0 || slow <= 0 || signal <= 0 || fast >= slow) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "MACD: invalid parameters",
+            {{"fast", std::to_string(fast)}, {"slow", std::to_string(slow)}, {"signal", std::to_string(signal)}});
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "MACD: invalid price data detected");
+        return result;
     }
 
-    // Полные ряды EMA
     const auto fast_ema  = ema_series(prices, fast);
     const auto slow_ema  = ema_series(prices, slow);
 
-    // Ряд MACD: валиден с индекса slow-1
     const std::size_t macd_start = static_cast<std::size_t>(slow - 1);
-    const std::size_t macd_len   = n - macd_start;
+    const std::size_t macd_len   = static_cast<std::size_t>(n) - macd_start;
     std::vector<double> macd_line(macd_len);
     for (std::size_t i = 0; i < macd_len; ++i) {
         macd_line[i] = fast_ema[macd_start + i] - slow_ema[macd_start + i];
     }
 
-    if (macd_line.size() < static_cast<std::size_t>(signal)) return {};
+    if (macd_line.size() < static_cast<std::size_t>(signal)) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = signal - static_cast<int>(macd_line.size());
+        return result;
+    }
 
-    // Сигнальная линия = EMA(macd_line, signal)
     const auto signal_series = ema_series(macd_line, signal);
 
-    const double macd_val  = macd_line.back();
-    const double sig_val   = signal_series.back();
-    return {true, macd_val, sig_val, macd_val - sig_val};
+    result.valid = true;
+    result.macd = macd_line.back();
+    result.signal = signal_series.back();
+    result.histogram = result.macd - result.signal;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bollinger Bands
 // ─────────────────────────────────────────────────────────────────────────────
+
 BollingerResult IndicatorEngine::bollinger(const std::vector<double>& prices,
                                             int period, double stddev_mult) const {
     return bollinger_builtin(prices, period, stddev_mult);
@@ -169,39 +288,66 @@ BollingerResult IndicatorEngine::bollinger(const std::vector<double>& prices,
 
 BollingerResult IndicatorEngine::bollinger_builtin(const std::vector<double>& prices,
                                                     int period, double stddev_mult) const {
-    const std::size_t n = prices.size();
-    if (period <= 0 || n < static_cast<std::size_t>(period)) return {};
+    BollingerResult result;
+    const auto n = static_cast<int>(prices.size());
 
-    const std::size_t start = n - static_cast<std::size_t>(period);
+    if (period <= 0 || stddev_mult < 0.0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Bollinger: invalid parameters",
+            {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < period) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = period - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Bollinger: invalid price data detected");
+        return result;
+    }
 
-    // Среднее (SMA)
+    const std::size_t start = prices.size() - static_cast<std::size_t>(period);
+
     double sum = 0.0;
-    for (std::size_t i = start; i < n; ++i) sum += prices[i];
-    const double middle = sum / static_cast<double>(period);
+    for (std::size_t i = start; i < prices.size(); ++i) sum += prices[i];
+    const double middle = safe_div(sum, static_cast<double>(period));
 
-    // Стандартное отклонение (несмещённое, делитель = period)
     double var = 0.0;
-    for (std::size_t i = start; i < n; ++i) {
+    for (std::size_t i = start; i < prices.size(); ++i) {
         const double d = prices[i] - middle;
         var += d * d;
     }
-    const double sigma = std::sqrt(var / static_cast<double>(period));
+    const double sigma = safe_sqrt(safe_div(var, static_cast<double>(period)));
 
     const double upper = middle + stddev_mult * sigma;
     const double lower = middle - stddev_mult * sigma;
-    const double bandwidth = (upper - lower) / (middle != 0.0 ? middle : 1.0);
+    const double bandwidth = safe_div(upper - lower, middle);
 
     double percent_b = 0.5;
-    if (upper - lower > 1e-12) {
-        percent_b = (prices.back() - lower) / (upper - lower);
+    const double band_width_raw = upper - lower;
+    if (band_width_raw > kEpsilon) {
+        percent_b = safe_div(prices.back() - lower, band_width_raw, 0.5);
     }
 
-    return {true, upper, middle, lower, bandwidth, percent_b};
+    result.valid = true;
+    result.upper = upper;
+    result.middle = middle;
+    result.lower = lower;
+    result.bandwidth = bandwidth;
+    result.percent_b = percent_b;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ATR (Average True Range, метод Уайлдера)
+// ATR (Average True Range, Wilder's method)
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::atr(const std::vector<double>& high,
                                       const std::vector<double>& low,
                                       const std::vector<double>& close,
@@ -213,38 +359,63 @@ IndicatorResult IndicatorEngine::atr_builtin(const std::vector<double>& high,
                                               const std::vector<double>& low,
                                               const std::vector<double>& close,
                                               int period) const {
-    const std::size_t n = high.size();
-    if (period <= 0 || n != low.size() || n != close.size() ||
-        n < static_cast<std::size_t>(period) + 1) {
-        return {false, 0.0, "ATR"};
+    IndicatorResult result;
+    result.name = "ATR";
+    const auto n = static_cast<int>(high.size());
+    const int min_bars = period + 1;
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ATR: invalid period", {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (high.size() != low.size() || high.size() != close.size()) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ATR: series length mismatch");
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(high) || !validate_price_series(low) || !validate_price_series(close)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ATR: invalid price data detected");
+        return result;
     }
 
-    // True Range для каждого бара (начиная с индекса 1)
-    std::vector<double> tr(n - 1);
-    for (std::size_t i = 1; i < n; ++i) {
-        const double hl   = high[i] - low[i];
-        const double hpc  = std::abs(high[i]  - close[i - 1]);
-        const double lpc  = std::abs(low[i]   - close[i - 1]);
+    std::vector<double> tr(static_cast<std::size_t>(n) - 1);
+    for (std::size_t i = 1; i < static_cast<std::size_t>(n); ++i) {
+        const double hl  = high[i] - low[i];
+        const double hpc = std::abs(high[i]  - close[i - 1]);
+        const double lpc = std::abs(low[i]   - close[i - 1]);
         tr[i - 1] = std::max({hl, hpc, lpc});
     }
 
-    // Первый ATR = среднее первых period значений TR
     double atr_val = 0.0;
     for (int i = 0; i < period; ++i) atr_val += tr[i];
-    atr_val /= static_cast<double>(period);
+    atr_val = safe_div(atr_val, static_cast<double>(period));
 
-    // Сглаживание по Уайлдеру
     const std::size_t tr_n = tr.size();
     for (std::size_t i = static_cast<std::size_t>(period); i < tr_n; ++i) {
-        atr_val = (atr_val * static_cast<double>(period - 1) + tr[i]) / static_cast<double>(period);
+        atr_val = safe_div(atr_val * static_cast<double>(period - 1) + tr[i],
+                           static_cast<double>(period));
     }
 
-    return {true, atr_val, "ATR"};
+    result.valid = true;
+    result.value = atr_val;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADX (+DI, -DI, ADX)
 // ─────────────────────────────────────────────────────────────────────────────
+
 AdxResult IndicatorEngine::adx(const std::vector<double>& high,
                                  const std::vector<double>& low,
                                  const std::vector<double>& close,
@@ -256,16 +427,35 @@ AdxResult IndicatorEngine::adx_builtin(const std::vector<double>& high,
                                          const std::vector<double>& low,
                                          const std::vector<double>& close,
                                          int period) const {
-    const std::size_t n = high.size();
-    if (period <= 0 || n != low.size() || n != close.size() ||
-        n < static_cast<std::size_t>(2 * period + 1)) {
-        return {};
+    AdxResult result;
+    const auto n = static_cast<int>(high.size());
+    const int min_bars = 2 * period + 1;
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ADX: invalid period", {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (high.size() != low.size() || high.size() != close.size()) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ADX: series length mismatch");
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(high) || !validate_price_series(low) || !validate_price_series(close)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ADX: invalid price data detected");
+        return result;
     }
 
-    // Вычисляем +DM, -DM и TR для каждого бара
-    const std::size_t bars = n - 1;
+    const std::size_t bars = static_cast<std::size_t>(n) - 1;
     std::vector<double> plus_dm(bars), minus_dm(bars), tr_v(bars);
-    for (std::size_t i = 1; i < n; ++i) {
+    for (std::size_t i = 1; i < static_cast<std::size_t>(n); ++i) {
         const double up   = high[i]  - high[i - 1];
         const double down = low[i - 1] - low[i];
 
@@ -278,7 +468,6 @@ AdxResult IndicatorEngine::adx_builtin(const std::vector<double>& high,
         tr_v[i - 1] = std::max({hl, hpc, lpc});
     }
 
-    // Первое сглаженное значение (сумма первых period баров)
     double smooth_pdm = 0.0, smooth_mdm = 0.0, smooth_tr = 0.0;
     for (int i = 0; i < period; ++i) {
         smooth_pdm += plus_dm[i];
@@ -286,50 +475,58 @@ AdxResult IndicatorEngine::adx_builtin(const std::vector<double>& high,
         smooth_tr  += tr_v[i];
     }
 
-    // Ряд DX-значений для вычисления ADX
     std::vector<double> dx_series;
     dx_series.reserve(bars - static_cast<std::size_t>(period));
 
     auto calc_dx = [&]() -> double {
-        if (smooth_tr < 1e-12) return 0.0;
-        const double plus_di  = 100.0 * smooth_pdm / smooth_tr;
-        const double minus_di = 100.0 * smooth_mdm / smooth_tr;
-        const double di_sum   = plus_di + minus_di;
-        return di_sum > 1e-12 ? 100.0 * std::abs(plus_di - minus_di) / di_sum : 0.0;
+        const double plus_di_val  = safe_div(100.0 * smooth_pdm, smooth_tr);
+        const double minus_di_val = safe_div(100.0 * smooth_mdm, smooth_tr);
+        const double di_sum = plus_di_val + minus_di_val;
+        return safe_div(100.0 * std::abs(plus_di_val - minus_di_val), di_sum);
     };
 
     dx_series.push_back(calc_dx());
 
-    // Продолжаем сглаживание по Уайлдеру для оставшихся баров
     for (std::size_t i = static_cast<std::size_t>(period); i < bars; ++i) {
-        smooth_pdm = smooth_pdm - smooth_pdm / static_cast<double>(period) + plus_dm[i];
-        smooth_mdm = smooth_mdm - smooth_mdm / static_cast<double>(period) + minus_dm[i];
-        smooth_tr  = smooth_tr  - smooth_tr  / static_cast<double>(period) + tr_v[i];
+        smooth_pdm = smooth_pdm - safe_div(smooth_pdm, static_cast<double>(period)) + plus_dm[i];
+        smooth_mdm = smooth_mdm - safe_div(smooth_mdm, static_cast<double>(period)) + minus_dm[i];
+        smooth_tr  = smooth_tr  - safe_div(smooth_tr,  static_cast<double>(period)) + tr_v[i];
         dx_series.push_back(calc_dx());
     }
 
-    // Первый ADX = среднее первых period значений DX
-    if (dx_series.size() < static_cast<std::size_t>(period)) return {};
+    if (dx_series.size() < static_cast<std::size_t>(period)) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = period - static_cast<int>(dx_series.size());
+        return result;
+    }
 
     double adx_val = 0.0;
     for (int i = 0; i < period; ++i) adx_val += dx_series[i];
-    adx_val /= static_cast<double>(period);
+    adx_val = safe_div(adx_val, static_cast<double>(period));
 
-    // Сглаживание ADX
     for (std::size_t i = static_cast<std::size_t>(period); i < dx_series.size(); ++i) {
-        adx_val = (adx_val * static_cast<double>(period - 1) + dx_series[i]) / static_cast<double>(period);
+        adx_val = safe_div(adx_val * static_cast<double>(period - 1) + dx_series[i],
+                           static_cast<double>(period));
     }
 
-    // Финальные значения +DI и -DI
-    const double plus_di  = smooth_tr > 1e-12 ? 100.0 * smooth_pdm / smooth_tr : 0.0;
-    const double minus_di = smooth_tr > 1e-12 ? 100.0 * smooth_mdm / smooth_tr : 0.0;
+    const double final_plus_di  = safe_div(100.0 * smooth_pdm, smooth_tr);
+    const double final_minus_di = safe_div(100.0 * smooth_mdm, smooth_tr);
 
-    return {true, adx_val, plus_di, minus_di};
+    result.valid = true;
+    result.adx = adx_val;
+    result.plus_di = final_plus_di;
+    result.minus_di = final_minus_di;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OBV (On-Balance Volume)
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::obv(const std::vector<double>& prices,
                                       const std::vector<double>& volumes) const {
     return obv_builtin(prices, volumes);
@@ -337,39 +534,273 @@ IndicatorResult IndicatorEngine::obv(const std::vector<double>& prices,
 
 IndicatorResult IndicatorEngine::obv_builtin(const std::vector<double>& prices,
                                               const std::vector<double>& volumes) const {
-    const std::size_t n = prices.size();
-    if (n < 2 || n != volumes.size()) return {false, 0.0, "OBV"};
+    IndicatorResult result;
+    result.name = "OBV";
+    const auto n = static_cast<int>(prices.size());
+
+    if (prices.size() != volumes.size()) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "OBV: prices/volumes length mismatch");
+        return result;
+    }
+    if (n < 2) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = 2 - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "OBV: invalid price data detected");
+        return result;
+    }
+    for (const auto& v : volumes) {
+        if (!is_valid_volume(v)) {
+            result.status = IndicatorStatus::InvalidInput;
+            if (logger_) logger_->warn("IndicatorEngine", "OBV: non-finite or invalid volume detected");
+            return result;
+        }
+    }
 
     double obv_val = 0.0;
-    for (std::size_t i = 1; i < n; ++i) {
+    for (std::size_t i = 1; i < static_cast<std::size_t>(n); ++i) {
         if (prices[i] > prices[i - 1])      obv_val += volumes[i];
         else if (prices[i] < prices[i - 1]) obv_val -= volumes[i];
-        // При равенстве цен OBV не меняется
     }
-    return {true, obv_val, "OBV"};
+
+    result.valid = true;
+    result.value = obv_val;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VWAP (скользящий, не сессионный)
+// VWAP (rolling window, default last min(n, 50) bars)
 // ─────────────────────────────────────────────────────────────────────────────
+
 IndicatorResult IndicatorEngine::vwap(const std::vector<double>& high,
                                        const std::vector<double>& low,
                                        const std::vector<double>& close,
                                        const std::vector<double>& volume) const {
-    const std::size_t n = high.size();
-    if (n == 0 || n != low.size() || n != close.size() || n != volume.size()) {
-        return {false, 0.0, "VWAP"};
+    IndicatorResult result;
+    result.name = "VWAP";
+    const auto n = static_cast<int>(high.size());
+
+    if (n == 0) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.warmup_remaining = 1;
+        return result;
+    }
+    if (high.size() != low.size() || high.size() != close.size() || high.size() != volume.size()) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "VWAP: series length mismatch");
+        return result;
+    }
+    if (!validate_price_series(high) || !validate_price_series(low) || !validate_price_series(close)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "VWAP: invalid price data detected");
+        return result;
+    }
+    for (const auto& v : volume) {
+        if (!is_valid_volume(v)) {
+            result.status = IndicatorStatus::InvalidInput;
+            if (logger_) logger_->warn("IndicatorEngine", "VWAP: invalid volume data detected");
+            return result;
+        }
     }
 
+    const std::size_t window = std::min(static_cast<std::size_t>(n), std::size_t{50});
+    const std::size_t start  = static_cast<std::size_t>(n) - window;
+
     double sum_tpv = 0.0, sum_vol = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t i = start; i < static_cast<std::size_t>(n); ++i) {
         const double typical = (high[i] + low[i] + close[i]) / 3.0;
         sum_tpv += typical * volume[i];
         sum_vol += volume[i];
     }
 
-    if (sum_vol < 1e-12) return {false, 0.0, "VWAP"};
-    return {true, sum_tpv / sum_vol, "VWAP"};
+    if (sum_vol < kEpsilon) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "VWAP: zero total volume");
+        return result;
+    }
+
+    result.valid = true;
+    result.value = safe_div(sum_tpv, sum_vol);
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rolling VWAP with bands (± stddev)
+// ─────────────────────────────────────────────────────────────────────────────
+
+VwapResult IndicatorEngine::rolling_vwap(const std::vector<double>& high,
+                                          const std::vector<double>& low,
+                                          const std::vector<double>& close,
+                                          const std::vector<double>& volume,
+                                          int window, double band_stddev) const {
+    VwapResult result;
+    const auto n = static_cast<int>(high.size());
+
+    if (window <= 0 || band_stddev < 0.0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "rolling_vwap: invalid parameters",
+            {{"window", std::to_string(window)}});
+        return result;
+    }
+    if (n == 0) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.warmup_remaining = 1;
+        return result;
+    }
+    if (high.size() != low.size() || high.size() != close.size() || high.size() != volume.size()) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "rolling_vwap: series length mismatch");
+        return result;
+    }
+    if (!validate_price_series(high) || !validate_price_series(low) || !validate_price_series(close)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "rolling_vwap: invalid price data");
+        return result;
+    }
+    for (const auto& v : volume) {
+        if (!is_valid_volume(v)) {
+            result.status = IndicatorStatus::InvalidInput;
+            if (logger_) logger_->warn("IndicatorEngine", "rolling_vwap: invalid volume data");
+            return result;
+        }
+    }
+
+    const std::size_t eff_window = std::min(static_cast<std::size_t>(window),
+                                            static_cast<std::size_t>(n));
+    const std::size_t start = static_cast<std::size_t>(n) - eff_window;
+
+    double sum_tpv = 0.0, sum_vol = 0.0;
+    std::vector<double> typical_prices(eff_window);
+    for (std::size_t i = 0; i < eff_window; ++i) {
+        const std::size_t idx = start + i;
+        const double tp = (high[idx] + low[idx] + close[idx]) / 3.0;
+        typical_prices[i] = tp;
+        sum_tpv += tp * volume[idx];
+        sum_vol += volume[idx];
+    }
+
+    if (sum_vol < kEpsilon) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "rolling_vwap: zero total volume");
+        return result;
+    }
+
+    const double vwap_val = safe_div(sum_tpv, sum_vol);
+
+    // Volume-weighted variance for bands
+    double weighted_var = 0.0;
+    for (std::size_t i = 0; i < eff_window; ++i) {
+        const std::size_t idx = start + i;
+        const double dev = typical_prices[i] - vwap_val;
+        weighted_var += volume[idx] * dev * dev;
+    }
+    const double stddev = safe_sqrt(safe_div(weighted_var, sum_vol));
+
+    result.valid = true;
+    result.vwap = vwap_val;
+    result.upper_band = vwap_val + band_stddev * stddev;
+    result.lower_band = vwap_val - band_stddev * stddev;
+    result.cumulative_volume = sum_vol;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = std::max(0, window - n);
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate of Change: ((price / price_n_ago) - 1) * 100
+// ─────────────────────────────────────────────────────────────────────────────
+
+IndicatorResult IndicatorEngine::rate_of_change(const std::vector<double>& prices, int period) const {
+    IndicatorResult result;
+    result.name = "ROC";
+    const auto n = static_cast<int>(prices.size());
+    const int min_bars = period + 1;
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ROC: invalid period", {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "ROC: invalid price data detected");
+        return result;
+    }
+
+    const double current = prices.back();
+    const double past    = prices[prices.size() - 1 - static_cast<std::size_t>(period)];
+
+    result.valid = true;
+    result.value = safe_div(current - past, past) * 100.0;
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Z-Score of latest price relative to the last `period` bars
+// ─────────────────────────────────────────────────────────────────────────────
+
+IndicatorResult IndicatorEngine::z_score(const std::vector<double>& prices, int period) const {
+    IndicatorResult result;
+    result.name = "ZSCORE";
+    const auto n = static_cast<int>(prices.size());
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Z-Score: invalid period", {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < period) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = period - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Z-Score: invalid price data detected");
+        return result;
+    }
+
+    const std::size_t start = prices.size() - static_cast<std::size_t>(period);
+
+    double sum = 0.0;
+    for (std::size_t i = start; i < prices.size(); ++i) sum += prices[i];
+    const double mean = safe_div(sum, static_cast<double>(period));
+
+    double var = 0.0;
+    for (std::size_t i = start; i < prices.size(); ++i) {
+        const double d = prices[i] - mean;
+        var += d * d;
+    }
+    const double stddev = safe_sqrt(safe_div(var, static_cast<double>(period)));
+
+    result.valid = true;
+    result.value = safe_div(prices.back() - mean, stddev);
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
 }
 
 } // namespace tb::indicators
