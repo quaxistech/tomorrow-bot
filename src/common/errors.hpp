@@ -51,10 +51,6 @@ enum class TbError {
     // --- Shadow ---
     ShadowDisabled,             ///< Shadow-режим отключён или заблокирован kill switch
 
-    // --- TA-Lib ---
-    TaLibInitFailed,            ///< Не удалось инициализировать TA-Lib
-    TaLibSmokeFailed,           ///< Дымовой тест TA-Lib провалился
-
     // --- Reconciliation ---
     ReconciliationFailed,           ///< Ошибка reconciliation
     ReconciliationMismatch,         ///< Обнаружено расхождение
@@ -129,10 +125,6 @@ public:
                 return "Ошибка воспроизведения данных";
             case TbError::ShadowDisabled:
                 return "Shadow-режим отключён";
-            case TbError::TaLibInitFailed:
-                return "Ошибка инициализации TA-Lib";
-            case TbError::TaLibSmokeFailed:
-                return "Дымовой тест TA-Lib провалился";
             case TbError::ReconciliationFailed:
                 return "Ошибка reconciliation";
             case TbError::ReconciliationMismatch:

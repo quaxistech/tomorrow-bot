@@ -64,7 +64,7 @@
 
 ### 3.1 Индикаторы
 - [x] EMA, RSI, MACD, Bollinger Bands (встроенная реализация)
-- [~] TA-Lib интеграция — библиотека НЕ установлена, CMake детектирует gracefully
+- [x] ATR, ADX, OBV, VWAP, Rolling VWAP, ROC, Z-Score
 - [x] Инкрементальное вычисление
 
 ### 3.2 Feature Engineering
@@ -197,7 +197,7 @@
 - [x] Тесты для всех основных модулей
 
 ### 8.2 Интеграционные тесты
-- [x] TA-Lib smoke test
+- [x] Indicator smoke test
 - [x] Normalizer test
 - [x] Сценарии + Adversarial Defense
 

@@ -15,7 +15,7 @@ struct OhlcvCandle {
     bool is_closed{false};
 };
 
-// Специализированный буфер свечей с методами извлечения для TA-Lib
+// Специализированный буфер свечей с методами извлечения OHLCV-массивов
 template<std::size_t Capacity = 500>
 class CandleBuffer {
 public:
@@ -44,7 +44,7 @@ public:
         last.is_closed = candle.is_closed;
     }
 
-    // Извлечение массивов для TA-Lib (последние n свечей, от старых к новым)
+    // Извлечение OHLCV-массивов (последние n свечей, от старых к новым)
     std::vector<double> close_prices(std::size_t n = Capacity) const {
         std::vector<double> out;
         buffer_.extract_field(out, &OhlcvCandle::close, n);

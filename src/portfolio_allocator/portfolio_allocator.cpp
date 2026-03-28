@@ -1,4 +1,5 @@
 #include "portfolio_allocator/portfolio_allocator.hpp"
+#include "common/constants.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -635,7 +636,7 @@ SizingResult HierarchicalAllocator::compute_size_v2(
     final_notional = qty * price;
     double fee_pct = context.exchange_filters.has_value()
         ? context.exchange_filters->taker_fee_pct
-        : 0.001;
+        : tb::common::fees::kDefaultTakerFeePct;
     result.expected_fee = final_notional * fee_pct;
     result.fee_adjusted_notional = final_notional + result.expected_fee;
 

@@ -20,9 +20,8 @@ find_package(Boost 1.82 REQUIRED COMPONENTS system json thread)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
-# TA-Lib через кастомный Find-модуль
+# Путь к кастомным CMake-модулям
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(FindTALib)
 
 # simdjson
 find_package(simdjson QUIET)

@@ -35,7 +35,7 @@ Normalizer (JSON → типизированные события)
         │
         ▼
   FeatureEngine (технические + микроструктурные фичи)
-  │  ├── SMA, EMA, MACD, RSI, Bollinger, ATR, ADX (TA-Lib)
+  │  ├── SMA, EMA, MACD, RSI, Bollinger, ATR, ADX (встроенные)
   │  └── spread, depth_imbalance, book_instability
   │
   ├──► WorldModel (9 состояний: StableTrend, FragileBreakout, ChopNoise...)

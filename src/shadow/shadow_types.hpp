@@ -6,6 +6,7 @@
  */
 
 #include "common/types.hpp"
+#include "common/constants.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -84,8 +85,8 @@ struct ShadowConfig {
     int64_t stale_record_timeout_ns{120'000'000'000};    ///< 120 секунд
 
     // Комиссии (Bitget spot)
-    double taker_fee_pct{0.001};   ///< Taker fee 0.1%
-    double maker_fee_pct{0.0008};  ///< Maker fee 0.08%
+    double taker_fee_pct{tb::common::fees::kDefaultTakerFeePct};   ///< Taker fee 0.1%
+    double maker_fee_pct{tb::common::fees::kDefaultMakerFeePct};   ///< Maker fee 0.08%
 
     bool persist_to_db{false};
     bool respect_kill_switch{true};

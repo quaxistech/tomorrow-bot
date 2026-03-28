@@ -18,4 +18,10 @@ namespace finance {
     constexpr double kMinValidPrice = 1e-10;       ///< Минимальная валидная цена
 } // namespace finance
 
+/// Комиссии биржи Bitget (spot, базовые значения по умолчанию)
+namespace fees {
+    constexpr double kDefaultTakerFeePct = 0.001;  ///< Taker-комиссия 0.1%
+    constexpr double kDefaultMakerFeePct = 0.0008; ///< Maker-комиссия 0.08%
+} // namespace fees
+
 } // namespace tb::common

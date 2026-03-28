@@ -1,5 +1,6 @@
 #pragma once
 #include "common/types.hpp"
+#include "common/constants.hpp"
 #include "regime/regime_types.hpp"
 #include "strategy/strategy_types.hpp"
 #include <cmath>
@@ -28,8 +29,8 @@ struct ExchangeFilters {
     double tick_size{0.01};           ///< Шаг цены
     int quantity_precision{8};        ///< Количество знаков после запятой для qty
     int price_precision{2};           ///< Количество знаков после запятой для price
-    double taker_fee_pct{0.001};      ///< Комиссия тейкера (0.1%)
-    double maker_fee_pct{0.001};      ///< Комиссия мейкера (0.1%)
+    double taker_fee_pct{tb::common::fees::kDefaultTakerFeePct};      ///< Комиссия тейкера (0.1%)
+    double maker_fee_pct{tb::common::fees::kDefaultMakerFeePct};     ///< Комиссия мейкера (0.08%)
 };
 
 /// Полный контекст для принятия решения по размеру позиции

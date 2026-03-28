@@ -681,7 +681,7 @@ tomorrow-bot/
 ├── CMakeLists.txt              # Корневой CMake
 ├── README.md                   # Этот файл
 ├── .env                        # API-ключи (не в VCS)
-├── cmake/                      # CMake-модули (FindTALib, Sanitizers)
+├── cmake/                      # CMake-модули (Sanitizers, CompilerWarnings)
 ├── configs/                    # Конфигурации по режимам
 │   ├── paper.yaml
 │   ├── shadow.yaml
@@ -716,7 +716,7 @@ tomorrow-bot/
 │   ├── market_data/            # Шлюз рыночных данных, фильтрация heartbeat
 │   ├── order_book/             # Локальный L2-стакан с валидацией
 │   ├── buffers/                # Lock-free кольцевые буферы
-│   ├── indicators/             # TA-Lib обёртки (SMA, EMA, RSI, MACD, BB, ATR, ADX)
+│   ├── indicators/             # Встроенные индикаторы (SMA, EMA, RSI, MACD, BB, ATR, ADX, OBV, VWAP, ROC, Z-Score)
 │   ├── features/               # FeatureEngine + AdvancedFeatures (CUSUM, VPIN, VolumeProfile, ToD)
 │   ├── pair_scanner/           # PairScanner v5: scoring, parallel fetch, retry, diversification, audit
 │   ├── world_model/            # 9 состояний мира, fragility, tendency

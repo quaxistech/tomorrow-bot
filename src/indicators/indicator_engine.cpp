@@ -21,22 +21,10 @@ using numeric::kMinVariance;
 
 IndicatorEngine::IndicatorEngine(std::shared_ptr<tb::logging::ILogger> logger)
     : logger_(std::move(logger))
-    , talib_available_(false)
 {
     if (logger_) {
         logger_->info("IndicatorEngine", "Initialized with built-in indicator implementations");
     }
-}
-
-bool IndicatorEngine::run_talib_smoke_test() {
-    if (logger_) {
-        logger_->warn("IndicatorEngine", "TA-Lib not available, smoke test skipped");
-    }
-    return false;
-}
-
-bool IndicatorEngine::is_talib_available() const {
-    return talib_available_;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,11 +54,7 @@ std::vector<double> IndicatorEngine::ema_series(const std::vector<double>& price
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::sma(const std::vector<double>& prices, int period) const {
-#ifdef TB_TALIB_AVAILABLE
-    return sma_talib(prices, period);
-#else
     return sma_builtin(prices, period);
-#endif
 }
 
 IndicatorResult IndicatorEngine::sma_builtin(const std::vector<double>& prices, int period) const {
@@ -114,11 +98,7 @@ IndicatorResult IndicatorEngine::sma_builtin(const std::vector<double>& prices, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::ema(const std::vector<double>& prices, int period) const {
-#ifdef TB_TALIB_AVAILABLE
-    return ema_talib(prices, period);
-#else
     return ema_builtin(prices, period);
-#endif
 }
 
 IndicatorResult IndicatorEngine::ema_builtin(const std::vector<double>& prices, int period) const {

@@ -9,6 +9,7 @@
  * статистические метрики производительности.
  */
 #include "common/types.hpp"
+#include "common/constants.hpp"
 #include "replay/replay_types.hpp"
 #include <string>
 #include <vector>
@@ -25,8 +26,8 @@ namespace tb::replay {
 
 /// Модель комиссий (fee tiers)
 struct FeeModel {
-    double taker_fee_pct{0.001};        ///< Taker-комиссия (по умолчанию 0.1% Bitget)
-    double maker_fee_pct{0.001};        ///< Maker-комиссия
+    double taker_fee_pct{tb::common::fees::kDefaultTakerFeePct};        ///< Taker-комиссия (по умолчанию 0.1% Bitget)
+    double maker_fee_pct{tb::common::fees::kDefaultMakerFeePct};        ///< Maker-комиссия (по умолчанию 0.08% Bitget)
     bool use_maker_for_limit{true};     ///< Limit-ордера используют maker fee
 };
 

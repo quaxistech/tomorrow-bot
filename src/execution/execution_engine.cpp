@@ -1,12 +1,12 @@
 #include "execution/execution_engine.hpp"
 #include "uncertainty/uncertainty_types.hpp"
 #include "common/enums.hpp"
+#include "common/constants.hpp"
 #include <sstream>
 
 namespace tb::execution {
 
-// Bitget spot: 0.1% taker fee на каждую сторону сделки
-static constexpr double kTakerFeePct = 0.001;
+using tb::common::fees::kDefaultTakerFeePct;
 
 // ========== PaperOrderSubmitter ==========
 
@@ -123,7 +123,7 @@ Result<OrderId> ExecutionEngine::execute(
     if (order.side == Side::Buy && portfolio_) {
         double notional = order.original_quantity.get() *
             (order.price.get() > 0.0 ? order.price.get() : market_fill_price.get());
-        double estimated_fee = notional * kTakerFeePct;
+        double estimated_fee = notional * kDefaultTakerFeePct;
         if (!portfolio_->reserve_cash(order.order_id, order.symbol, notional, estimated_fee, order.strategy_id)) {
             logger_->warn("Execution", "Недостаточно cash для резервирования",
                 {{"order_id", order_id_str}, {"notional", std::to_string(notional)}});
@@ -416,13 +416,13 @@ void ExecutionEngine::apply_sell_fill_to_portfolio(const OrderRecord& order) {
     if (existing.has_value()) {
         double entry_cost    = existing->avg_entry_price.get() * order.filled_quantity.get();
         double exit_proceeds = order.avg_fill_price.get()      * order.filled_quantity.get();
-        double buy_fee       = entry_cost    * kTakerFeePct;
-        double sell_fee      = exit_proceeds * kTakerFeePct;
+        double buy_fee       = entry_cost    * kDefaultTakerFeePct;
+        double sell_fee      = exit_proceeds * kDefaultTakerFeePct;
         realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
     }
     portfolio_->reduce_position(order.symbol, order.filled_quantity,
                                 order.avg_fill_price, realized_pnl);
-    double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kTakerFeePct;
+    double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
     portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
     logger_->info("Execution", "Позиция уменьшена (SELL fill)",
         {{"symbol", order.symbol.get()},
@@ -444,7 +444,7 @@ void ExecutionEngine::apply_buy_fill_to_portfolio(const OrderRecord& order) {
     pos.updated_at      = clock_->now();
     portfolio_->open_position(pos);
     portfolio_->release_cash(order.order_id);
-    double buy_fee = order.filled_quantity.get() * order.avg_fill_price.get() * kTakerFeePct;
+    double buy_fee = order.filled_quantity.get() * order.avg_fill_price.get() * kDefaultTakerFeePct;
     portfolio_->record_fee(order.symbol, buy_fee, order.order_id);
 }
 

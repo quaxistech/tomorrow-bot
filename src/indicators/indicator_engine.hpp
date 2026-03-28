@@ -16,14 +16,10 @@ public:
     virtual int min_periods() const = 0;
 };
 
-// Indicator engine — computes technical indicators.
-// Uses TA-Lib when available, otherwise built-in implementations.
+// Indicator engine — computes technical indicators using built-in implementations.
 class IndicatorEngine {
 public:
     explicit IndicatorEngine(std::shared_ptr<tb::logging::ILogger> logger);
-
-    bool run_talib_smoke_test();
-    bool is_talib_available() const;
 
     // --- Core indicators (original API) ------------------------------------
 
@@ -78,11 +74,6 @@ public:
                             int period = 20) const;
 
 private:
-#ifdef TB_TALIB_AVAILABLE
-    IndicatorResult sma_talib(const std::vector<double>& prices, int period) const;
-    IndicatorResult ema_talib(const std::vector<double>& prices, int period) const;
-#endif
-
     // Computes full EMA series; output[i] valid for i >= period-1
     std::vector<double> ema_series(const std::vector<double>& prices, int period) const;
 
@@ -100,7 +91,6 @@ private:
     IndicatorResult obv_builtin(const std::vector<double>& prices,
                                 const std::vector<double>& volumes) const;
 
-    bool talib_available_{false};
     std::shared_ptr<tb::logging::ILogger> logger_;
 };
 
