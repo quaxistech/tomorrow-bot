@@ -1,7 +1,7 @@
 # Корневой CMake файл проекта Tomorrow Bot
 # Адаптивная торговая операционная система для биржи Bitget
 cmake_minimum_required(VERSION 3.25)
-project(tomorrow-bot VERSION 0.1.0 LANGUAGES CXX)
+project(tomorrow-bot VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
