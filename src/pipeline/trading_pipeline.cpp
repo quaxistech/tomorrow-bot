@@ -410,6 +410,36 @@ TradingPipeline::TradingPipeline(
     logger_->info("pipeline", "Торговый pipeline создан",
         {{"symbol", symbol_.get()},
          {"strategies", std::to_string(strategy_registry_->active().size())}});
+
+    // ==================== Phase 1: Latency Tracker ====================
+    latency_tracker_ = std::make_unique<PipelineLatencyTracker>(metrics_, logger_);
+    logger_->info("pipeline", "Latency tracker инициализирован");
+
+    // ==================== Phase 2: Order Watchdog ====================
+    {
+        OrderWatchdogConfig wdcfg;
+        order_watchdog_ = std::make_unique<OrderWatchdog>(
+            wdcfg, execution_engine_, logger_, clock_, metrics_);
+        order_watchdog_->set_cancel_callback([this](const OrderId& id, const std::string& reason) {
+            logger_->warn("watchdog", "Ордер принудительно отменён watchdog-ом",
+                {{"order_id", id.get()}, {"reason", reason}});
+        });
+        logger_->info("pipeline", "Order watchdog инициализирован",
+            {{"max_open_ms", "30000"}, {"max_partial_ms", "60000"}});
+    }
+
+    // ==================== Phase 4: Reconciliation ====================
+    // Инициализируем reconciliation только для production/testnet (нужен REST)
+    if (rest_client_) {
+        exchange_query_adapter_ = std::make_shared<exchange::bitget::BitgetExchangeQueryAdapter>(
+            rest_client_, logger_);
+        reconciliation::ReconciliationConfig rec_cfg;
+        rec_cfg.auto_resolve_state_mismatches = true;
+        rec_cfg.balance_tolerance_pct = 1.0;
+        reconciliation_engine_ = std::make_shared<reconciliation::ReconciliationEngine>(
+            rec_cfg, exchange_query_adapter_, logger_, clock_, metrics_);
+        logger_->info("pipeline", "Continuous reconciliation engine инициализирован");
+    }
 }
 
 TradingPipeline::~TradingPipeline() {
@@ -1875,6 +1905,51 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     ++tick_count_;
 
+    int64_t now_ns = clock_->now().get();
+
+    // ─── Phase 1: Freshness Gate ──────────────────────────────────────────
+    // Отклоняем устаревшие котировки ДО любой обработки.
+    // Порог: 5 секунд. Stale ticks могут вызвать ложные сигналы и bad fills.
+    if (snapshot.computed_at.get() > 0) {
+        int64_t age_ns = now_ns - snapshot.computed_at.get();
+        constexpr int64_t kMaxFreshnessNs = 5'000'000'000LL;
+        if (age_ns > kMaxFreshnessNs) {
+            if (tick_count_ % 50 == 0) {
+                logger_->warn("pipeline", "Stale tick отклонён",
+                    {{"age_ms", std::to_string(age_ns / 1'000'000)},
+                     {"max_ms", "5000"},
+                     {"tick", std::to_string(tick_count_)}});
+            }
+            if (metrics_) {
+                metrics_->counter("pipeline_stale_ticks_total", {{"symbol", symbol_.get()}})->increment();
+            }
+            return;
+        }
+    }
+
+    // ─── Phase 1: Backlog Detection ───────────────────────────────────────
+    // Если предыдущая обработка тика была слишком долгой (pipeline не успевает),
+    // логируем предупреждение. Детектируем по gap между тиками.
+    {
+        static thread_local int64_t last_tick_ingress_ns = 0;
+        if (last_tick_ingress_ns > 0) {
+            int64_t gap_ns = now_ns - last_tick_ingress_ns;
+            constexpr int64_t kMaxTickGapNs = 2'000'000'000LL;  // 2 секунды
+            if (gap_ns > kMaxTickGapNs && tick_count_ > kMinWarmupTicks) {
+                logger_->warn("pipeline", "Tick gap обнаружен — возможен backlog",
+                    {{"gap_ms", std::to_string(gap_ns / 1'000'000)},
+                     {"tick", std::to_string(tick_count_)}});
+                if (metrics_) {
+                    metrics_->counter("pipeline_tick_gaps_total", {{"symbol", symbol_.get()}})->increment();
+                }
+            }
+        }
+        last_tick_ingress_ns = now_ns;
+    }
+
+    // ─── Phase 2/4: Periodic Background Tasks ────────────────────────────
+    run_periodic_tasks(now_ns);
+
     // Логируем первый тик — означает завершение прогрева
     if (tick_count_ == 1) {
         logger_->info("pipeline", "Первый тик от WebSocket",
@@ -2630,7 +2705,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     // 9a. Cooldown — не торгуем чаще настроенного интервала
-    int64_t now_ns = clock_->now().get();
+    now_ns = clock_->now().get();  // обновляем значение (объявлено выше, в freshness gate)
     int64_t order_cooldown_ns = static_cast<int64_t>(config_.trading_params.order_cooldown_seconds)
                                * 1'000'000'000LL;
     if (last_order_time_ns_ > 0 && (now_ns - last_order_time_ns_) < order_cooldown_ns) {
@@ -3169,6 +3244,79 @@ void TradingPipeline::record_shadow_decision(
     if (!result.has_value()) {
         logger_->debug("pipeline", "Shadow decision not recorded",
             {{"reason", "disabled or kill_switch"}});
+    }
+}
+
+// ==================== Phase 1: Freshness Validation ====================
+
+FreshnessResult TradingPipeline::check_quote_freshness(
+    const features::FeatureSnapshot& snapshot) const
+{
+    FreshnessResult result;
+    if (snapshot.computed_at.get() <= 0) return result;  // unknown — считаем свежим
+    result.age_ns = clock_->now().get() - snapshot.computed_at.get();
+    result.is_fresh = (result.age_ns <= result.max_age_ns);
+    return result;
+}
+
+// ==================== Phase 1/2/4: Periodic Tasks ====================
+
+void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
+    run_order_watchdog(now_ns);
+    run_continuous_reconciliation(now_ns);
+}
+
+void TradingPipeline::run_order_watchdog(int64_t now_ns) {
+    if (!order_watchdog_) return;
+    if (last_watchdog_ns_ > 0 && (now_ns - last_watchdog_ns_) < kWatchdogIntervalNs) return;
+    last_watchdog_ns_ = now_ns;
+
+    auto reports = order_watchdog_->run_check();
+    for (const auto& rep : reports) {
+        if (rep.action != WatchdogOrderAction::Ok) {
+            const char* action_str = [&]() -> const char* {
+                switch (rep.action) {
+                    case WatchdogOrderAction::Cancel:       return "cancel";
+                    case WatchdogOrderAction::RecoverState: return "recover_state";
+                    case WatchdogOrderAction::ForceClose:   return "force_close";
+                    default:                                return "ok";
+                }
+            }();
+            logger_->warn("watchdog", "Обнаружена проблема с ордером",
+                {{"order_id", rep.order_id.get()},
+                 {"action", action_str},
+                 {"reason", rep.reason},
+                 {"age_ms", std::to_string(rep.age_ms)}});
+        }
+    }
+}
+
+void TradingPipeline::run_continuous_reconciliation(int64_t now_ns) {
+    if (!reconciliation_engine_) return;
+    if (last_reconciliation_ns_ > 0 &&
+        (now_ns - last_reconciliation_ns_) < kReconciliationIntervalNs) return;
+    last_reconciliation_ns_ = now_ns;
+
+    auto active_orders = execution_engine_->active_orders();
+    if (active_orders.empty()) return;
+
+    auto result = reconciliation_engine_->reconcile_active_orders(active_orders);
+
+    if (!result.mismatches.empty()) {
+        logger_->warn("reconciliation", "Обнаружены расхождения в runtime reconciliation",
+            {{"mismatches", std::to_string(result.mismatches.size())},
+             {"symbol", symbol_.get()}});
+
+        for (const auto& mismatch : result.mismatches) {
+            logger_->warn("reconciliation", "Расхождение",
+                {{"type", reconciliation::to_string(mismatch.type)},
+                 {"order_id", mismatch.order_id.get()},
+                 {"resolved", mismatch.resolved ? "true" : "false"}});
+        }
+    } else if (tick_count_ % 500 == 0) {
+        logger_->debug("reconciliation", "Runtime reconciliation OK",
+            {{"active_orders", std::to_string(active_orders.size())},
+             {"symbol", symbol_.get()}});
     }
 }
 

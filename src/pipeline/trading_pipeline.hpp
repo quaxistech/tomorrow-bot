@@ -56,6 +56,12 @@
 #include "ml/ml_signal_types.hpp"
 #include "self_diagnosis/self_diagnosis_engine.hpp"
 #include "shadow/shadow_mode_engine.hpp"
+#include "pipeline/pipeline_tick_context.hpp"
+#include "pipeline/pipeline_stage_result.hpp"
+#include "pipeline/pipeline_latency_tracker.hpp"
+#include "pipeline/order_watchdog.hpp"
+#include "reconciliation/reconciliation_engine.hpp"
+#include "exchange/bitget/bitget_exchange_query_adapter.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -235,6 +241,32 @@ private:
     /// Ссылка на BitgetOrderSubmitter для настройки precision (nullptr в paper mode)
     std::shared_ptr<exchange::bitget::BitgetOrderSubmitter> bitget_submitter_;
 
+    // ==================== Phase 0: Unified Context ========================
+    /// Счётчик тиков обработанных через новый staged pipeline (диагностика)
+    uint64_t staged_tick_count_{0};
+
+    // ==================== Phase 1: Latency SLA ============================
+    /// Трекер латентности по стадиям pipeline (P50/P95/P99)
+    std::unique_ptr<PipelineLatencyTracker> latency_tracker_;
+
+    // ==================== Phase 2: Order Watchdog =========================
+    /// Непрерывный монитор жизненного цикла ордеров
+    std::unique_ptr<OrderWatchdog> order_watchdog_;
+    /// Timestamp последней проверки watchdog
+    int64_t last_watchdog_ns_{0};
+    /// Интервал проверки watchdog: 10 секунд
+    static constexpr int64_t kWatchdogIntervalNs = 10'000'000'000LL;
+
+    // ==================== Phase 4: Continuous Reconciliation ==============
+    /// Движок reconciliation для непрерывной проверки состояния ордеров/позиций
+    std::shared_ptr<reconciliation::ReconciliationEngine> reconciliation_engine_;
+    /// Адаптер Bitget REST → IExchangeQueryService
+    std::shared_ptr<exchange::bitget::BitgetExchangeQueryAdapter> exchange_query_adapter_;
+    /// Timestamp последней reconciliation в runtime
+    int64_t last_reconciliation_ns_{0};
+    /// Интервал runtime reconciliation: 60 секунд
+    static constexpr int64_t kReconciliationIntervalNs = 60'000'000'000LL;
+
     /// Запросить баланс USDT с биржи и обновить капитал
     void sync_balance_from_exchange();
 
@@ -407,6 +439,18 @@ private:
     void update_current_mae(double current_price, bool is_long);
     /// Периодически проверять C/C рекомендации и логировать статус
     void check_champion_challenger_status();
+
+    /// Проверить свежесть котировки (Phase 1)
+    FreshnessResult check_quote_freshness(const features::FeatureSnapshot& snapshot) const;
+
+    /// Запустить периодические фоновые задачи (Phase 1/2/4)
+    void run_periodic_tasks(int64_t now_ns);
+
+    /// Запустить проверку watchdog ордеров (Phase 2)
+    void run_order_watchdog(int64_t now_ns);
+
+    /// Запустить непрерывную reconciliation (Phase 4)
+    void run_continuous_reconciliation(int64_t now_ns);
 };
 
 

@@ -2,6 +2,7 @@
 
 add_library(tb_pipeline STATIC
     trading_pipeline.cpp
+    order_watchdog.cpp
 )
 
 target_include_directories(tb_pipeline PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -40,4 +41,5 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_governance
     tb_self_diagnosis
     tb_shadow
+    tb_reconciliation
 )
