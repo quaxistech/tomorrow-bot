@@ -4,7 +4,7 @@
  * 
  * Проверяет: валидацию полей, граничные значения, межкомпонентные правила.
  */
-#include <gtest/gtest.h>
+#include <catch2/catch_test_macros.hpp>
 #include "config/config_types.hpp"
 #include "config/config_validator.hpp"
 
@@ -15,7 +15,7 @@ using namespace tb::config;
 // Вспомогательная функция: создаёт валидную конфигурацию по умолчанию
 // ============================================================
 
-AppConfig make_valid_config() {
+static AppConfig make_valid_config() {
     AppConfig cfg;
     cfg.exchange.endpoint_rest  = "https://api.bitget.com";
     cfg.exchange.endpoint_ws    = "wss://ws.bitget.com/v2/ws/public";
@@ -32,10 +32,13 @@ AppConfig make_valid_config() {
     cfg.health.enabled = true;
     cfg.health.port    = 8080;
 
-    cfg.risk.max_position_notional = 1000.0;
-    cfg.risk.max_daily_loss_pct    = 2.0;
-    cfg.risk.max_drawdown_pct      = 5.0;
-    cfg.risk.kill_switch_enabled   = true;
+    cfg.risk.max_position_notional       = 1000.0;
+    cfg.risk.max_daily_loss_pct          = 2.0;
+    cfg.risk.max_drawdown_pct            = 5.0;
+    cfg.risk.kill_switch_enabled         = true;
+    cfg.risk.max_strategy_daily_loss_pct = 2.0;
+    cfg.risk.max_strategy_exposure_pct   = 50.0;
+    cfg.risk.max_symbol_concentration_pct = 30.0;
 
     cfg.trading.mode = TradingMode::Paper;
 
@@ -46,141 +49,137 @@ AppConfig make_valid_config() {
 // Тесты валидной конфигурации
 // ============================================================
 
-TEST(ConfigValidatorTest, ValidConfigPasses) {
+TEST_CASE("Config: ValidConfigPasses", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     auto result = validator.validate(cfg);
-    EXPECT_TRUE(result.has_value()) << "Валидная конфигурация должна пройти валидацию";
+    REQUIRE(result.has_value());
 }
 
 // ============================================================
 // Тесты биржевой конфигурации
 // ============================================================
 
-TEST(ConfigValidatorTest, EmptyRestEndpointFails) {
+TEST_CASE("Config: EmptyRestEndpointFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.exchange.endpoint_rest = "";
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value()) << "Пустой endpoint_rest должен быть отклонён";
-    EXPECT_EQ(result.error(), TbError::ConfigValidationFailed);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error() == TbError::ConfigValidationFailed);
 }
 
-TEST(ConfigValidatorTest, EmptyApiKeyRefFails) {
+TEST_CASE("Config: EmptyApiKeyRefFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.exchange.api_key_ref = "";
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value());
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, TimeoutTooSmallFails) {
+TEST_CASE("Config: TimeoutTooSmallFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.exchange.timeout_ms = 50; // < 100 мс
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value()) << "Таймаут < 100мс должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, TimeoutTooLargeFails) {
+TEST_CASE("Config: TimeoutTooLargeFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.exchange.timeout_ms = 60000; // > 30с
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value()) << "Таймаут > 30000мс должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, ValidTimeoutPasses) {
+TEST_CASE("Config: ValidTimeoutPasses", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.exchange.timeout_ms = 100; // минимум допустимый
     auto result = validator.validate(cfg);
-    EXPECT_TRUE(result.has_value());
+    REQUIRE(result.has_value());
 }
 
 // ============================================================
 // Тесты риск-параметров
 // ============================================================
 
-TEST(ConfigValidatorTest, NegativePositionNotionalFails) {
+TEST_CASE("Config: NegativePositionNotionalFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.risk.max_position_notional = -100.0;
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value()) << "Отрицательный notional должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, DailyLossExceedsDrawdownFails) {
+TEST_CASE("Config: DailyLossExceedsDrawdownFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.risk.max_daily_loss_pct = 10.0;
     cfg.risk.max_drawdown_pct   = 5.0; // daily > drawdown — недопустимо
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value())
-        << "Дневной убыток > просадки должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, ZeroDailyLossFails) {
+TEST_CASE("Config: ZeroDailyLossFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.risk.max_daily_loss_pct = 0.0;
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value());
+    REQUIRE_FALSE(result.has_value());
 }
 
 // ============================================================
 // Тесты межкомпонентных правил
 // ============================================================
 
-TEST(ConfigValidatorTest, ProductionWithoutKillSwitchFails) {
+TEST_CASE("Config: ProductionWithoutKillSwitchFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.trading.mode           = TradingMode::Production;
     cfg.risk.kill_switch_enabled = false;
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value())
-        << "Production без kill-switch должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, ProductionWithDebugLogFails) {
+TEST_CASE("Config: ProductionWithDebugLogFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.trading.mode   = TradingMode::Production;
     cfg.logging.level  = "debug";
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value())
-        << "Production с debug логом должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, ProductionWithInfoLogPasses) {
+TEST_CASE("Config: ProductionWithInfoLogPasses", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.trading.mode   = TradingMode::Production;
     cfg.logging.level  = "info";
     auto result = validator.validate(cfg);
-    EXPECT_TRUE(result.has_value())
-        << "Production с info логом должен пройти";
+    REQUIRE(result.has_value());
 }
 
 // ============================================================
 // Тесты настроек логирования
 // ============================================================
 
-TEST(ConfigValidatorTest, InvalidLogLevelFails) {
+TEST_CASE("Config: InvalidLogLevelFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.logging.level = "verbose"; // Недопустимый уровень
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value());
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, AllValidLogLevelsPass) {
+TEST_CASE("Config: AllValidLogLevelsPass", "[config]") {
     ConfigValidator validator;
     for (const std::string& level : {"trace", "debug", "info", "warn", "error", "critical"}) {
         auto cfg = make_valid_config();
         cfg.logging.level = level;
         auto result = validator.validate(cfg);
-        EXPECT_TRUE(result.has_value()) << "Уровень '" << level << "' должен быть допустим";
+        REQUIRE(result.has_value());
     }
 }
 
@@ -188,19 +187,183 @@ TEST(ConfigValidatorTest, AllValidLogLevelsPass) {
 // Тесты настроек метрик
 // ============================================================
 
-TEST(ConfigValidatorTest, MetricsInvalidPortFails) {
+TEST_CASE("Config: MetricsInvalidPortFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.metrics.enabled = true;
     cfg.metrics.port    = 80; // < 1024
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value()) << "Порт < 1024 должен быть отклонён";
+    REQUIRE_FALSE(result.has_value());
 }
 
-TEST(ConfigValidatorTest, MetricsPathWithoutSlashFails) {
+TEST_CASE("Config: MetricsPathWithoutSlashFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.metrics.path = "metrics"; // Без начального '/'
     auto result = validator.validate(cfg);
-    EXPECT_FALSE(result.has_value());
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты валидации trading_params
+// ============================================================
+
+TEST_CASE("Config: TradingParamsValidDefaultPasses", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    // Defaults are valid
+    auto result = validator.validate(cfg);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsNegativeAtrStopFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.atr_stop_multiplier = -1.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsMaxLossOver100Fails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.max_loss_per_trade_pct = 150.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsPartialTpBelowBreakevenFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.breakeven_atr_threshold = 2.0;
+    cfg.trading_params.partial_tp_atr_threshold = 1.5; // < breakeven
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsInvalidPartialTpFractionFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.partial_tp_fraction = 1.0; // must be < 1
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsZeroHoldMinutesFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.max_hold_loss_minutes = 0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsAbsoluteHoldLessThanLossFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.max_hold_loss_minutes = 60;
+    cfg.trading_params.max_hold_absolute_minutes = 30; // < loss minutes
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты валидации decision
+// ============================================================
+
+TEST_CASE("Config: DecisionValidDefaultPasses", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    auto result = validator.validate(cfg);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Config: DecisionConvictionOverOneFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.decision.min_conviction_threshold = 1.5;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: DecisionNegativeConvictionFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.decision.min_conviction_threshold = -0.1;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: DecisionEnsembleMaxLessThanBonusFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.decision.ensemble_agreement_bonus = 0.15;
+    cfg.decision.ensemble_max_bonus = 0.05; // < agreement_bonus
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: DecisionZeroTimeDecayFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.decision.time_decay_halflife_ms = 0.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты валидации execution_alpha
+// ============================================================
+
+TEST_CASE("Config: ExecutionAlphaValidDefaultPasses", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    auto result = validator.validate(cfg);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Config: ExecutionAlphaSpreadAnyLessThanPassiveFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.execution_alpha.max_spread_bps_passive = 20.0;
+    cfg.execution_alpha.max_spread_bps_any = 10.0; // < passive
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: ExecutionAlphaUrgencyThresholdsInvertedFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.execution_alpha.urgency_passive_threshold = 0.9;
+    cfg.execution_alpha.urgency_aggressive_threshold = 0.3; // < passive
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: ExecutionAlphaAdverseSelectionOutOfRangeFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.execution_alpha.adverse_selection_threshold = 1.5;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты кросс-валидации
+// ============================================================
+
+TEST_CASE("Config: CrossMaxLossExceedsDailyLossFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.max_loss_per_trade_pct = 5.0;
+    cfg.risk.max_daily_loss_pct = 2.0;  // trade loss > daily limit
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: CrossZeroInitialCapitalFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading.initial_capital = 0.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
 }

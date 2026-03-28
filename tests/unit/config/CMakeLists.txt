@@ -13,11 +13,7 @@ target_link_libraries(test_config
     PRIVATE
         tb_config
         tb_common
-        GTest::gtest_main
+        Catch2::Catch2WithMain
 )
 
-target_compile_features(test_config PRIVATE cxx_std_20)
-
-# Регистрация тестов в CTest
-include(GoogleTest)
-gtest_discover_tests(test_config)
+catch_discover_tests(test_config)

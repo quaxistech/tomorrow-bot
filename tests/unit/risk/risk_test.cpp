@@ -769,3 +769,72 @@ TEST_CASE("Risk: get_risk_snapshot возвращает корректный с�
     REQUIRE(snapshot.strategy_budgets.size() == 2);
     REQUIRE(snapshot.computed_at.get() > 0);
 }
+
+// ========== Тесты spot-семантики (проверка 27) ==========
+
+TEST_CASE("Risk: SELL без открытой позиции отклоняется на споте", "[risk]") {
+    auto engine = make_risk_engine();
+    auto intent = make_intent();
+    intent.side = Side::Sell;
+    intent.symbol = Symbol("BTCUSDT");
+
+    auto portfolio = make_clean_portfolio();
+    portfolio.positions.clear(); // Нет позиций
+
+    auto decision = engine->evaluate(
+        intent, make_sizing(), portfolio,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    REQUIRE(decision.verdict == risk::RiskVerdict::Denied);
+    bool has_spot_reason = false;
+    for (const auto& r : decision.reasons) {
+        if (r.code == "SPOT_SELL_NO_POSITION") {
+            has_spot_reason = true;
+            break;
+        }
+    }
+    REQUIRE(has_spot_reason);
+}
+
+TEST_CASE("Risk: SELL с открытой long позицией одобряется", "[risk]") {
+    auto engine = make_risk_engine();
+    auto intent = make_intent();
+    intent.side = Side::Sell;
+    intent.symbol = Symbol("BTCUSDT");
+
+    auto portfolio = make_clean_portfolio();
+    portfolio::Position pos;
+    pos.symbol = Symbol("BTCUSDT");
+    pos.side = Side::Buy;
+    pos.size = Quantity(0.5);
+    pos.avg_entry_price = Price(50000.0);
+    pos.current_price = Price(51000.0);
+    pos.notional = NotionalValue(25000.0);
+    portfolio.positions.push_back(pos);
+
+    auto decision = engine->evaluate(
+        intent, make_sizing(), portfolio,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    // Не должно быть spot-denial
+    for (const auto& r : decision.reasons) {
+        REQUIRE(r.code != "SPOT_SELL_NO_POSITION");
+    }
+}
+
+TEST_CASE("Risk: BUY без позиции не блокируется spot-проверкой", "[risk]") {
+    auto engine = make_risk_engine();
+    auto intent = make_intent(); // side = Buy по умолчанию
+
+    auto portfolio = make_clean_portfolio();
+    portfolio.positions.clear();
+
+    auto decision = engine->evaluate(
+        intent, make_sizing(), portfolio,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    // Spot guard не должен вмешиваться в BUY
+    for (const auto& r : decision.reasons) {
+        REQUIRE(r.code != "SPOT_SELL_NO_POSITION");
+    }
+}
