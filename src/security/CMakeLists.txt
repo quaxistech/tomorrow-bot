@@ -4,6 +4,7 @@
 add_library(tb_security STATIC
     secret_provider.cpp
     redaction.cpp
+    production_guard.cpp
 )
 
 target_include_directories(tb_security

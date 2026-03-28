@@ -54,6 +54,30 @@ enum class TbError {
     // --- TA-Lib ---
     TaLibInitFailed,            ///< Не удалось инициализировать TA-Lib
     TaLibSmokeFailed,           ///< Дымовой тест TA-Lib провалился
+
+    // --- Reconciliation ---
+    ReconciliationFailed,           ///< Ошибка reconciliation
+    ReconciliationMismatch,         ///< Обнаружено расхождение
+
+    // --- Recovery ---
+    RecoveryFailed,                 ///< Ошибка восстановления
+    RecoveryIncomplete,             ///< Неполное восстановление
+
+    // --- Resilience ---
+    CircuitBreakerOpen,             ///< Circuit breaker открыт
+    RetryExhausted,                 ///< Все попытки исчерпаны
+    IdempotencyDuplicate,           ///< Дублирующий запрос
+
+    // --- WAL ---
+    WalWriteFailed,                 ///< Ошибка записи в WAL
+    WalRecoveryFailed,              ///< Ошибка восстановления из WAL
+
+    // --- Координация ---
+    SymbolLockFailed,               ///< Не удалось заблокировать символ
+    GlobalLimitExceeded,            ///< Превышен глобальный лимит
+
+    // --- Production safety ---
+    ProductionGuardFailed,          ///< Нет подтверждения production режима
 };
 
 // ============================================================
@@ -109,6 +133,30 @@ public:
                 return "Ошибка инициализации TA-Lib";
             case TbError::TaLibSmokeFailed:
                 return "Дымовой тест TA-Lib провалился";
+            case TbError::ReconciliationFailed:
+                return "Ошибка reconciliation";
+            case TbError::ReconciliationMismatch:
+                return "Обнаружено расхождение при сверке";
+            case TbError::RecoveryFailed:
+                return "Ошибка восстановления";
+            case TbError::RecoveryIncomplete:
+                return "Неполное восстановление";
+            case TbError::CircuitBreakerOpen:
+                return "Circuit breaker открыт";
+            case TbError::RetryExhausted:
+                return "Все попытки исчерпаны";
+            case TbError::IdempotencyDuplicate:
+                return "Дублирующий запрос (идемпотентность)";
+            case TbError::WalWriteFailed:
+                return "Ошибка записи в WAL";
+            case TbError::WalRecoveryFailed:
+                return "Ошибка восстановления из WAL";
+            case TbError::SymbolLockFailed:
+                return "Не удалось заблокировать символ";
+            case TbError::GlobalLimitExceeded:
+                return "Превышен глобальный лимит";
+            case TbError::ProductionGuardFailed:
+                return "Нет подтверждения production режима";
             default:
                 return "Неизвестная ошибка TomorrowBot";
         }
