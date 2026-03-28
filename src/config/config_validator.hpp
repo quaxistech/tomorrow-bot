@@ -63,6 +63,15 @@ private:
     /// Валидация настроек opportunity cost
     void validate_opportunity_cost(const OpportunityCostConfig& cfg, ValidationResult& result) const;
 
+    /// Валидация торговых параметров (стопы, TP, hold time, cooldowns)
+    void validate_trading_params(const TradingParamsConfig& cfg, ValidationResult& result) const;
+
+    /// Валидация настроек движка принятия решений
+    void validate_decision(const DecisionConfig& cfg, ValidationResult& result) const;
+
+    /// Валидация настроек исполнительной альфы
+    void validate_execution_alpha(const ExecutionAlphaConfig& cfg, ValidationResult& result) const;
+
     /// Межкомпонентная валидация (совместимость настроек)
     void validate_cross(const AppConfig& cfg, ValidationResult& result) const;
 };

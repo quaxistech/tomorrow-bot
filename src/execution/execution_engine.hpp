@@ -98,6 +98,14 @@ private:
     /// Генерировать уникальный идентификатор ордера
     std::string generate_order_id();
 
+    /// Обновить портфель при SELL fill: уменьшить позицию, рассчитать PnL, зафиксировать комиссию.
+    /// Вызывается из execute(), on_order_update() и on_fill_event(). Не блокирует mutex.
+    void apply_sell_fill_to_portfolio(const OrderRecord& order);
+
+    /// Обновить портфель при BUY fill: открыть позицию, освободить резерв, зафиксировать комиссию.
+    /// Вызывается из execute(), on_order_update() и on_fill_event(). Не блокирует mutex.
+    void apply_buy_fill_to_portfolio(const OrderRecord& order);
+
     std::shared_ptr<IOrderSubmitter> submitter_;
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
     std::shared_ptr<logging::ILogger> logger_;

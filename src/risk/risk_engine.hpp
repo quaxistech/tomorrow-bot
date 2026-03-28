@@ -221,6 +221,11 @@ private:
                                           const strategy::TradeIntent& intent,
                                           RiskDecision& decision) const;
 
+    /// Проверка 27: Spot-семантика — SELL без открытой long позиции невозможен
+    void check_spot_sell_without_position(const strategy::TradeIntent& intent,
+                                          const portfolio::PortfolioSnapshot& portfolio,
+                                          RiskDecision& decision) const;
+
     ExtendedRiskConfig config_;
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

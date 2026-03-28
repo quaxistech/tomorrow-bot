@@ -16,6 +16,9 @@ VoidResult ConfigValidator::validate(const AppConfig& cfg) const {
     validate_risk(cfg.risk, result);
     validate_adversarial(cfg.adversarial_defense, result);
     validate_opportunity_cost(cfg.opportunity_cost, result);
+    validate_trading_params(cfg.trading_params, result);
+    validate_decision(cfg.decision, result);
+    validate_execution_alpha(cfg.execution_alpha, result);
     validate_cross(cfg, result);
 
     if (!result.valid) {
@@ -312,6 +315,118 @@ void ConfigValidator::validate_opportunity_cost(
     }
 }
 
+void ConfigValidator::validate_trading_params(
+    const TradingParamsConfig& cfg, ValidationResult& result) const {
+    if (cfg.atr_stop_multiplier <= 0.0 || cfg.atr_stop_multiplier > 10.0) {
+        result.add_error("trading_params.atr_stop_multiplier должен быть в диапазоне (0, 10]");
+    }
+    if (cfg.max_loss_per_trade_pct <= 0.0 || cfg.max_loss_per_trade_pct > 100.0) {
+        result.add_error("trading_params.max_loss_per_trade_pct должен быть в диапазоне (0, 100]");
+    }
+    if (cfg.breakeven_atr_threshold <= 0.0) {
+        result.add_error("trading_params.breakeven_atr_threshold должен быть > 0");
+    }
+    if (cfg.partial_tp_atr_threshold <= 0.0) {
+        result.add_error("trading_params.partial_tp_atr_threshold должен быть > 0");
+    }
+    if (cfg.partial_tp_atr_threshold <= cfg.breakeven_atr_threshold) {
+        result.add_error("trading_params.partial_tp_atr_threshold должен быть > breakeven_atr_threshold");
+    }
+    if (cfg.partial_tp_fraction <= 0.0 || cfg.partial_tp_fraction >= 1.0) {
+        result.add_error("trading_params.partial_tp_fraction должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.max_hold_loss_minutes < 1 || cfg.max_hold_loss_minutes > 1440) {
+        result.add_error("trading_params.max_hold_loss_minutes должен быть в диапазоне [1, 1440]");
+    }
+    if (cfg.max_hold_absolute_minutes < 1 || cfg.max_hold_absolute_minutes > 10080) {
+        result.add_error("trading_params.max_hold_absolute_minutes должен быть в диапазоне [1, 10080]");
+    }
+    if (cfg.max_hold_absolute_minutes < cfg.max_hold_loss_minutes) {
+        result.add_error("trading_params.max_hold_absolute_minutes не может быть < max_hold_loss_minutes");
+    }
+    if (cfg.order_cooldown_seconds < 0 || cfg.order_cooldown_seconds > 3600) {
+        result.add_error("trading_params.order_cooldown_seconds должен быть в диапазоне [0, 3600]");
+    }
+    if (cfg.stop_loss_cooldown_seconds < 0 || cfg.stop_loss_cooldown_seconds > 86400) {
+        result.add_error("trading_params.stop_loss_cooldown_seconds должен быть в диапазоне [0, 86400]");
+    }
+}
+
+void ConfigValidator::validate_decision(
+    const DecisionConfig& cfg, ValidationResult& result) const {
+    if (cfg.min_conviction_threshold <= 0.0 || cfg.min_conviction_threshold >= 1.0) {
+        result.add_error("decision.min_conviction_threshold должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.conflict_dominance_threshold <= 0.0 || cfg.conflict_dominance_threshold >= 1.0) {
+        result.add_error("decision.conflict_dominance_threshold должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.time_decay_halflife_ms <= 0.0) {
+        result.add_error("decision.time_decay_halflife_ms должен быть > 0");
+    }
+    if (cfg.ensemble_agreement_bonus < 0.0 || cfg.ensemble_agreement_bonus > 1.0) {
+        result.add_error("decision.ensemble_agreement_bonus должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.ensemble_max_bonus < 0.0 || cfg.ensemble_max_bonus > 1.0) {
+        result.add_error("decision.ensemble_max_bonus должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.ensemble_max_bonus < cfg.ensemble_agreement_bonus) {
+        result.add_error("decision.ensemble_max_bonus не может быть < ensemble_agreement_bonus");
+    }
+    if (cfg.drawdown_boost_scale < 0.0 || cfg.drawdown_boost_scale > 1.0) {
+        result.add_error("decision.drawdown_boost_scale должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.max_acceptable_cost_bps < 0.0) {
+        result.add_error("decision.max_acceptable_cost_bps должен быть >= 0");
+    }
+}
+
+void ConfigValidator::validate_execution_alpha(
+    const ExecutionAlphaConfig& cfg, ValidationResult& result) const {
+    if (cfg.max_spread_bps_passive <= 0.0) {
+        result.add_error("execution_alpha.max_spread_bps_passive должен быть > 0");
+    }
+    if (cfg.max_spread_bps_any <= 0.0) {
+        result.add_error("execution_alpha.max_spread_bps_any должен быть > 0");
+    }
+    if (cfg.max_spread_bps_any < cfg.max_spread_bps_passive) {
+        result.add_error("execution_alpha.max_spread_bps_any должен быть >= max_spread_bps_passive");
+    }
+    if (cfg.adverse_selection_threshold <= 0.0 || cfg.adverse_selection_threshold >= 1.0) {
+        result.add_error("execution_alpha.adverse_selection_threshold должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.urgency_passive_threshold < 0.0 || cfg.urgency_passive_threshold >= 1.0) {
+        result.add_error("execution_alpha.urgency_passive_threshold должен быть в диапазоне [0, 1)");
+    }
+    if (cfg.urgency_aggressive_threshold <= cfg.urgency_passive_threshold ||
+        cfg.urgency_aggressive_threshold > 1.0) {
+        result.add_error("execution_alpha.urgency_aggressive_threshold должен быть в (passive_threshold, 1]");
+    }
+    if (cfg.large_order_slice_threshold <= 0.0 || cfg.large_order_slice_threshold >= 1.0) {
+        result.add_error("execution_alpha.large_order_slice_threshold должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.vpin_toxic_threshold <= 0.0 || cfg.vpin_toxic_threshold >= 1.0) {
+        result.add_error("execution_alpha.vpin_toxic_threshold должен быть в диапазоне (0, 1)");
+    }
+    if (cfg.vpin_weight < 0.0 || cfg.vpin_weight > 1.0) {
+        result.add_error("execution_alpha.vpin_weight должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.limit_price_passive_bps < 0.0) {
+        result.add_error("execution_alpha.limit_price_passive_bps должен быть >= 0");
+    }
+    if (cfg.min_fill_probability_passive < 0.0 || cfg.min_fill_probability_passive > 1.0) {
+        result.add_error("execution_alpha.min_fill_probability_passive должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.postonly_spread_threshold_bps < 0.0) {
+        result.add_error("execution_alpha.postonly_spread_threshold_bps должен быть >= 0");
+    }
+    if (cfg.postonly_urgency_max < 0.0 || cfg.postonly_urgency_max > 1.0) {
+        result.add_error("execution_alpha.postonly_urgency_max должен быть в диапазоне [0, 1]");
+    }
+    if (cfg.postonly_adverse_max < 0.0 || cfg.postonly_adverse_max > 1.0) {
+        result.add_error("execution_alpha.postonly_adverse_max должен быть в диапазоне [0, 1]");
+    }
+}
+
 void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& result) const {
     // В production обязательно включён kill-switch
     if (cfg.trading.mode == TradingMode::Production && !cfg.risk.kill_switch_enabled) {
@@ -321,6 +436,22 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
     if (cfg.trading.mode == TradingMode::Production &&
         (cfg.logging.level == "trace" || cfg.logging.level == "debug")) {
         result.add_error("В production режиме уровень логирования trace/debug недопустим");
+    }
+    // Начальный капитал должен покрывать хотя бы один минимальный ордер
+    if (cfg.trading.initial_capital <= 0.0) {
+        result.add_error("trading.initial_capital должен быть > 0");
+    }
+    // max_loss_per_trade не должен превышать daily loss limit
+    if (cfg.trading_params.max_loss_per_trade_pct > cfg.risk.max_daily_loss_pct) {
+        result.add_error("trading_params.max_loss_per_trade_pct не может превышать risk.max_daily_loss_pct");
+    }
+    // Execution alpha spread limits должны быть согласованы с adversarial defense
+    if (cfg.execution_alpha.max_spread_bps_any > 0.0 &&
+        cfg.adversarial_defense.spread_explosion_threshold_bps > 0.0 &&
+        cfg.execution_alpha.max_spread_bps_any > cfg.adversarial_defense.spread_explosion_threshold_bps) {
+        result.add_error(
+            "execution_alpha.max_spread_bps_any не должен превышать "
+            "adversarial_defense.spread_explosion_threshold_bps");
     }
 }
 

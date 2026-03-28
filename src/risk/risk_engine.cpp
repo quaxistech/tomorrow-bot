@@ -120,6 +120,9 @@ RiskDecision ProductionRiskEngine::evaluate(
     // 26. Режим исполнения неопределённости
     check_uncertainty_execution_mode(uncertainty, intent, decision);
 
+    // 27. Spot-семантика: SELL без открытой позиции невозможен на спотовом рынке
+    check_spot_sell_without_position(intent, portfolio, decision);
+
     // Рассчитать утилизацию рисков
     if (portfolio.total_capital > 0.0) {
         decision.risk_utilization_pct =
@@ -891,6 +894,32 @@ void ProductionRiskEngine::check_uncertainty_execution_mode(
         decision.reasons.push_back({
             "UNCERTAINTY_HALT",
             "Режим неопределённости HaltNewEntries — новые входы запрещены",
+            1.0
+        });
+    }
+}
+
+void ProductionRiskEngine::check_spot_sell_without_position(
+    const strategy::TradeIntent& intent,
+    const portfolio::PortfolioSnapshot& portfolio,
+    RiskDecision& decision) const
+{
+    if (intent.side != Side::Sell) {
+        return;
+    }
+    // На спотовом рынке SELL возможен только если есть открытая long-позиция по символу
+    bool has_long_position = false;
+    for (const auto& pos : portfolio.positions) {
+        if (pos.symbol == intent.symbol && pos.side == Side::Buy && pos.size.get() > 0.0) {
+            has_long_position = true;
+            break;
+        }
+    }
+    if (!has_long_position) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.reasons.push_back(RiskReasonCode{
+            "SPOT_SELL_NO_POSITION",
+            "Невозможно продать на спотовом рынке без открытой long-позиции",
             1.0
         });
     }

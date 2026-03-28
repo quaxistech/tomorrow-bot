@@ -2402,7 +2402,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             risk::RiskDecision empty_risk;
             empty_risk.verdict = risk::RiskVerdict::Denied;
             empty_risk.summary = "Комитет не одобрил сигнал: " + decision.rationale;
-            self_diagnosis_->explain_denial(
+            (void)self_diagnosis_->explain_denial(
                 decision, empty_risk, w_str, r_str, u_str);
         }
         return;
@@ -3051,7 +3051,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 std::string w_str = std::string(to_string(world.label));
                 std::string r_str = std::string(to_string(regime.label));
                 std::string u_str = std::string(to_string(uncertainty.level));
-                self_diagnosis_->explain_denial(
+                (void)self_diagnosis_->explain_denial(
                     decision, risk_decision, w_str, r_str, u_str);
             }
             return;
@@ -3105,7 +3105,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             std::string w_str = std::string(to_string(world.label));
             std::string r_str = std::string(to_string(regime.label));
             std::string u_str = std::string(to_string(uncertainty.level));
-            self_diagnosis_->explain_trade(
+            (void)self_diagnosis_->explain_trade(
                 decision, risk_decision, w_str, r_str, u_str);
         }
 
@@ -3183,7 +3183,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         // Self-Diagnosis: диагностика ошибки исполнения
         if (self_diagnosis_) {
-            self_diagnosis_->diagnose_execution_failure(
+            (void)self_diagnosis_->diagnose_execution_failure(
                 symbol_, intent.strategy_id, decision.correlation_id,
                 "Ордер отклонён биржей", consecutive_rejections_);
         }
