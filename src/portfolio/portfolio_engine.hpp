@@ -21,8 +21,13 @@ public:
     /// Обновить текущую цену по символу
     virtual void update_price(const Symbol& symbol, Price price) = 0;
 
-    /// Закрыть позицию
+    /// Закрыть позицию полностью
     virtual void close_position(const Symbol& symbol, Price close_price, double realized_pnl) = 0;
+
+    /// Уменьшить позицию на заданное количество (partial close).
+    /// Возвращает оставшийся размер позиции. При нулевом остатке позиция удаляется.
+    virtual double reduce_position(const Symbol& symbol, Quantity sold_qty,
+                                   Price close_price, double realized_pnl) = 0;
 
     /// Добавить реализованную прибыль/убыток
     virtual void add_realized_pnl(double amount) = 0;
@@ -94,6 +99,8 @@ public:
     void open_position(const Position& pos) override;
     void update_price(const Symbol& symbol, Price price) override;
     void close_position(const Symbol& symbol, Price close_price, double realized_pnl) override;
+    double reduce_position(const Symbol& symbol, Quantity sold_qty,
+                           Price close_price, double realized_pnl) override;
     void add_realized_pnl(double amount) override;
     std::optional<Position> get_position(const Symbol& symbol) const override;
     bool has_position(const Symbol& symbol) const override;

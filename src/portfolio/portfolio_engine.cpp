@@ -144,6 +144,95 @@ void InMemoryPortfolioEngine::close_position(
                " pnl=" + std::to_string(realized_pnl));
 }
 
+double InMemoryPortfolioEngine::reduce_position(
+    const Symbol& symbol, Quantity sold_qty,
+    Price close_price, double realized_pnl)
+{
+    std::lock_guard lock(mutex_);
+
+    auto it = positions_.find(symbol.get());
+    if (it == positions_.end()) {
+        logger_->warn("Portfolio", "Попытка уменьшить несуществующую позицию",
+                      {{"symbol", symbol.get()}});
+        return 0.0;
+    }
+
+    auto& pos = it->second;
+    const double old_size = pos.size.get();
+    const double reduce_qty = std::min(sold_qty.get(), old_size);
+    const double new_size = old_size - reduce_qty;
+
+    // Обновить реализованную P&L пропорционально закрытой части
+    realized_pnl_today_ += realized_pnl;
+    realized_pnl_gross_ += realized_pnl;
+
+    // Обновить cash ledger
+    cash_ledger_.realized_pnl_net += realized_pnl;
+    cash_ledger_.realized_pnl_gross += realized_pnl;
+    cash_ledger_.total_cash += realized_pnl;
+    cash_ledger_.available_cash += realized_pnl;
+
+    // Серия убытков обновляется только при полном закрытии
+    if (new_size <= 1e-12) {
+        trades_today_++;
+        if (realized_pnl < 0.0) {
+            consecutive_losses_++;
+        } else if (realized_pnl > 0.0) {
+            consecutive_losses_ = 0;
+        }
+    }
+
+    if (new_size <= 1e-12) {
+        // Полное закрытие — удаляем позицию
+        logger_->info("Portfolio", "Позиция полностью закрыта через reduce",
+                      {{"symbol", symbol.get()},
+                       {"close_price", std::to_string(close_price.get())},
+                       {"realized_pnl", std::to_string(realized_pnl)}});
+        positions_.erase(it);
+    } else {
+        // Частичное закрытие — обновляем размер, сохраняем avg_entry_price
+        pos.size = Quantity(new_size);
+        pos.current_price = close_price;
+        pos.notional = NotionalValue(new_size * close_price.get());
+        pos.updated_at = clock_->now();
+        recalculate_position_pnl(pos);
+
+        logger_->info("Portfolio", "Позиция частично уменьшена",
+                      {{"symbol", symbol.get()},
+                       {"sold_qty", std::to_string(reduce_qty)},
+                       {"remaining_size", std::to_string(new_size)},
+                       {"close_price", std::to_string(close_price.get())},
+                       {"realized_pnl", std::to_string(realized_pnl)}});
+    }
+
+    // Обновить peak equity
+    double current_equity = total_capital_ + realized_pnl_today_;
+    for (const auto& [_, p] : positions_) {
+        current_equity += p.unrealized_pnl;
+    }
+    if (current_equity > peak_equity_) {
+        peak_equity_ = current_equity;
+    }
+
+    if (metrics_) {
+        metrics_->gauge("portfolio_positions_count", {})->set(
+            static_cast<double>(positions_.size()));
+        if (new_size <= 1e-12) {
+            metrics_->counter("portfolio_trades_total", {})->increment();
+        }
+    }
+
+    emit_event(new_size <= 1e-12 ? PortfolioEventType::PositionClosed
+                                 : PortfolioEventType::PositionUpdated,
+               symbol, realized_pnl, cash_ledger_.available_cash,
+               "reduce_qty=" + std::to_string(reduce_qty) +
+               " remaining=" + std::to_string(new_size) +
+               " close_price=" + std::to_string(close_price.get()) +
+               " pnl=" + std::to_string(realized_pnl));
+
+    return new_size;
+}
+
 void InMemoryPortfolioEngine::add_realized_pnl(double amount) {
     std::lock_guard lock(mutex_);
     realized_pnl_today_ += amount;

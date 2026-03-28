@@ -1090,21 +1090,18 @@ void TradingPipeline::compute_htf_trend(const std::vector<double>& closes) {
 // ==================== Market Readiness Gate ====================
 
 bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& snapshot) {
-    // Профессиональная система не торгует "вслепую" при запуске.
-    // Проверяет несколько условий перед первой сделкой:
-    //
-    // 1. HTF-данные загружены и валидны
-    // 2. Индикаторы на рабочем таймфрейме стабилизированы
-    // 3. Нет экстремальных условий (RSI < 15 или > 85 на HTF)
-    // 4. Если HTF в сильном даунтренде — не покупаем (waiting for reversal)
-    //
-    // После прохождения всех проверок market_ready_ = true на весь цикл,
-    // пока не сбросится (ротация пар, перезапуск).
+    // Runtime-переоцениваемый gate: проверяет условия на КАЖДОМ тике.
+    // Если условия ухудшились после получения readiness — market_ready_ сбрасывается.
+    // Стоп-лосс и защита позиции работают НЕЗАВИСИМО от market_ready_.
 
-    if (market_ready_) return true;
+    bool was_ready = market_ready_;
 
     // 1. HTF должен быть загружен
     if (!htf_valid_) {
+        if (market_ready_) {
+            logger_->warn("pipeline", "Market readiness отозвана: HTF данные невалидны");
+        }
+        market_ready_ = false;
         if (tick_count_ % 500 == 0) {
             logger_->info("pipeline", "Ожидание HTF-данных перед началом торговли...");
         }
@@ -1114,6 +1111,10 @@ bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& sn
     // 2. Индикаторы рабочего таймфрейма должны быть готовы
     if (!snapshot.technical.sma_valid || !snapshot.technical.rsi_valid
         || !snapshot.technical.adx_valid || !snapshot.technical.macd_valid) {
+        if (market_ready_) {
+            logger_->warn("pipeline", "Market readiness отозвана: индикаторы невалидны");
+        }
+        market_ready_ = false;
         if (tick_count_ % 500 == 0) {
             logger_->info("pipeline", "Ожидание прогрева индикаторов...",
                 {{"sma", snapshot.technical.sma_valid ? "ok" : "wait"},
@@ -1126,6 +1127,12 @@ bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& sn
 
     // 3. Не входить в рынок при экстремальных HTF условиях
     if (htf_rsi_14_ < 15.0 || htf_rsi_14_ > 85.0) {
+        if (market_ready_) {
+            logger_->warn("pipeline",
+                "Market readiness отозвана: HTF RSI в экстремальной зоне",
+                {{"htf_rsi", std::to_string(htf_rsi_14_)}});
+        }
+        market_ready_ = false;
         if (tick_count_ % 1000 == 0) {
             logger_->warn("pipeline",
                 "HTF RSI в экстремальной зоне — ожидание нормализации",
@@ -1135,14 +1142,16 @@ bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& sn
     }
 
     // 4. Не входить при сильном даунтренде на HTF (сила > 0.6)
-    // Это защита от "ловли падающего ножа"
     if (htf_trend_direction_ == -1 && htf_trend_strength_ > 0.6) {
-        // Разрешаем вход если MACD histogram начал расти (потенциальный разворот)
         bool macd_reversal = htf_macd_histogram_ > 0.0;
-        // Или RSI вышел из перепроданности и растёт (> 35)
         bool rsi_recovery = htf_rsi_14_ > 35.0;
 
         if (!macd_reversal && !rsi_recovery) {
+            if (market_ready_) {
+                logger_->warn("pipeline",
+                    "Market readiness отозвана: сильный даунтренд на HTF");
+            }
+            market_ready_ = false;
             if (tick_count_ % 1000 == 0) {
                 logger_->warn("pipeline",
                     "Сильный даунтренд на HTF — ожидание сигнала разворота",
@@ -1156,14 +1165,16 @@ bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& sn
     }
 
     // Все проверки пройдены
+    if (!was_ready) {
+        market_ready_since_tick_ = tick_count_;
+        logger_->info("pipeline", "=== РЫНОК ГОТОВ К ТОРГОВЛЕ ===",
+            {{"tick", std::to_string(tick_count_)},
+             {"htf_trend", htf_trend_direction_ == 1 ? "UP" :
+                           htf_trend_direction_ == -1 ? "DOWN" : "SIDEWAYS"},
+             {"htf_strength", std::to_string(htf_trend_strength_)},
+             {"htf_rsi", std::to_string(htf_rsi_14_)}});
+    }
     market_ready_ = true;
-    market_ready_since_tick_ = tick_count_;
-    logger_->info("pipeline", "=== РЫНОК ГОТОВ К ТОРГОВЛЕ ===",
-        {{"tick", std::to_string(tick_count_)},
-         {"htf_trend", htf_trend_direction_ == 1 ? "UP" :
-                       htf_trend_direction_ == -1 ? "DOWN" : "SIDEWAYS"},
-         {"htf_strength", std::to_string(htf_trend_strength_)},
-         {"htf_rsi", std::to_string(htf_rsi_14_)}});
     return true;
 }
 

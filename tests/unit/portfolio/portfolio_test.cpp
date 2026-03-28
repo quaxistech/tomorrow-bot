@@ -348,3 +348,103 @@ TEST_CASE("Portfolio: reset_daily очищает fee и cash счётчики", 
     auto pnl_after = portfolio->pnl();
     REQUIRE_THAT(pnl_after.realized_pnl_today, WithinAbs(0.0, 0.01));
 }
+
+// ========== Regression: reduce_position (partial close) ==========
+
+TEST_CASE("Portfolio: reduce_position — частичное закрытие 50%", "[portfolio][regression]") {
+    auto portfolio = make_portfolio();
+    auto pos = make_position("BTCUSDT", Side::Buy, 1.0, 100.0);  // 1 BTC @ $100
+    portfolio->open_position(pos);
+
+    // Цена выросла до $110, продаём 50%
+    portfolio->update_price(Symbol("BTCUSDT"), Price(110.0));
+    double pnl_half = (110.0 - 100.0) * 0.5;  // $5 profit on 0.5 BTC
+    double remaining = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(0.5), Price(110.0), pnl_half);
+
+    REQUIRE_THAT(remaining, WithinAbs(0.5, 1e-9));
+    REQUIRE(portfolio->has_position(Symbol("BTCUSDT")));
+
+    auto after = portfolio->get_position(Symbol("BTCUSDT"));
+    REQUIRE(after.has_value());
+    REQUIRE_THAT(after->size.get(), WithinAbs(0.5, 1e-9));
+    // avg_entry_price сохраняется — это цена входа, не средняя
+    REQUIRE_THAT(after->avg_entry_price.get(), WithinAbs(100.0, 1e-9));
+}
+
+TEST_CASE("Portfolio: reduce_position — полное закрытие удаляет позицию", "[portfolio][regression]") {
+    auto portfolio = make_portfolio();
+    auto pos = make_position("ETHUSDT", Side::Buy, 2.0, 3000.0);
+    portfolio->open_position(pos);
+
+    double pnl = (3100.0 - 3000.0) * 2.0;  // $200 profit
+    double remaining = portfolio->reduce_position(
+        Symbol("ETHUSDT"), Quantity(2.0), Price(3100.0), pnl);
+
+    REQUIRE_THAT(remaining, WithinAbs(0.0, 1e-9));
+    REQUIRE_FALSE(portfolio->has_position(Symbol("ETHUSDT")));
+}
+
+TEST_CASE("Portfolio: reduce_position — несколько последовательных partial closes", "[portfolio][regression]") {
+    auto portfolio = make_portfolio();
+    auto pos = make_position("BTCUSDT", Side::Buy, 1.0, 100.0);
+    portfolio->open_position(pos);
+
+    // Close 30%
+    double pnl1 = (105.0 - 100.0) * 0.3;  // $1.50
+    double rem1 = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(0.3), Price(105.0), pnl1);
+    REQUIRE_THAT(rem1, WithinAbs(0.7, 1e-9));
+
+    // Close another 30%
+    double pnl2 = (108.0 - 100.0) * 0.3;  // $2.40
+    double rem2 = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(0.3), Price(108.0), pnl2);
+    REQUIRE_THAT(rem2, WithinAbs(0.4, 1e-9));
+
+    // Close remaining 40%
+    double pnl3 = (110.0 - 100.0) * 0.4;  // $4.00
+    double rem3 = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(0.4), Price(110.0), pnl3);
+    REQUIRE_THAT(rem3, WithinAbs(0.0, 1e-9));
+    REQUIRE_FALSE(portfolio->has_position(Symbol("BTCUSDT")));
+
+    // Проверяем суммарный realized PnL
+    auto pnl = portfolio->pnl();
+    REQUIRE_THAT(pnl.realized_pnl_today, WithinAbs(pnl1 + pnl2 + pnl3, 0.01));
+}
+
+TEST_CASE("Portfolio: reduce_position — reduce больше чем позиция обрезает до размера", "[portfolio][regression]") {
+    auto portfolio = make_portfolio();
+    auto pos = make_position("BTCUSDT", Side::Buy, 0.5, 200.0);
+    portfolio->open_position(pos);
+
+    // Пытаемся продать 1.0 при позиции 0.5
+    double remaining = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(1.0), Price(210.0), 5.0);
+
+    REQUIRE_THAT(remaining, WithinAbs(0.0, 1e-9));
+    REQUIRE_FALSE(portfolio->has_position(Symbol("BTCUSDT")));
+}
+
+TEST_CASE("Portfolio: reduce_position — несуществующая позиция возвращает 0", "[portfolio][regression]") {
+    auto portfolio = make_portfolio();
+
+    double remaining = portfolio->reduce_position(
+        Symbol("BTCUSDT"), Quantity(1.0), Price(100.0), 0.0);
+
+    REQUIRE_THAT(remaining, WithinAbs(0.0, 1e-9));
+}
+
+TEST_CASE("Portfolio: reduce_position — realized PnL корректно аккумулируется в cash ledger", "[portfolio][regression]") {
+    auto portfolio = make_portfolio(10000.0);
+    auto pos = make_position("BTCUSDT", Side::Buy, 1.0, 100.0);
+    portfolio->open_position(pos);
+
+    double pnl = 5.0;  // $5 profit on partial
+    portfolio->reduce_position(Symbol("BTCUSDT"), Quantity(0.5), Price(110.0), pnl);
+
+    auto ledger = portfolio->cash_ledger();
+    REQUIRE_THAT(ledger.realized_pnl_net, WithinAbs(5.0, 0.01));
+    REQUIRE_THAT(ledger.total_cash, WithinAbs(10005.0, 0.01));
+}

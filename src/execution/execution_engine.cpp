@@ -195,7 +195,7 @@ Result<OrderId> ExecutionEngine::execute(
         // (короткие позиции на споте невозможны). При BUY — открываем новую.
         if (portfolio_) {
             if (order.side == Side::Sell) {
-                // SELL на споте = закрытие длинной позиции.
+                // SELL на споте = закрытие (полное или частичное) длинной позиции.
                 // Рассчитываем реализованную P&L с учётом комиссий Bitget.
                 auto existing = portfolio_->get_position(order.symbol);
                 double realized_pnl = 0.0;
@@ -208,7 +208,9 @@ Result<OrderId> ExecutionEngine::execute(
                     double sell_fee = exit_proceeds * kTakerFeePct;
                     realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
                 }
-                portfolio_->close_position(order.symbol, fill_price, realized_pnl);
+                // reduce_position корректно обрабатывает и частичное, и полное закрытие
+                portfolio_->reduce_position(order.symbol, order.filled_quantity,
+                                            fill_price, realized_pnl);
                 // Зафиксировать комиссию SELL-стороны
                 double sell_fee = fill_price.get() * order.filled_quantity.get() * kTakerFeePct;
                 portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
@@ -332,7 +334,7 @@ void ExecutionEngine::on_order_update(
     }
 
     // При полном заполнении — обновить портфель.
-    // SELL на споте закрывает позицию, BUY открывает новую.
+    // SELL на споте закрывает (полностью или частично) позицию, BUY открывает новую.
     if (new_state == OrderState::Filled && portfolio_) {
         if (order.side == Side::Sell) {
             auto existing = portfolio_->get_position(order.symbol);
@@ -344,8 +346,8 @@ void ExecutionEngine::on_order_update(
                 double sell_fee = exit_proceeds * kTakerFeePct;
                 realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
             }
-            portfolio_->close_position(order.symbol, order.avg_fill_price, realized_pnl);
-            // Зафиксировать комиссию
+            portfolio_->reduce_position(order.symbol, order.filled_quantity,
+                                        order.avg_fill_price, realized_pnl);
             double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kTakerFeePct;
             portfolio_->record_fee(order.symbol, sell_fee, OrderId(order_id.get()));
         } else {
@@ -543,7 +545,8 @@ void ExecutionEngine::on_fill_event(const FillEvent& fill) {
                     double sell_fee = exit_proceeds * kTakerFeePct;
                     realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
                 }
-                portfolio_->close_position(order.symbol, order.avg_fill_price, realized_pnl);
+                portfolio_->reduce_position(order.symbol, order.filled_quantity,
+                                            order.avg_fill_price, realized_pnl);
                 double sell_fee = order.avg_fill_price.get()
                                 * order.filled_quantity.get() * kTakerFeePct;
                 portfolio_->record_fee(order.symbol, sell_fee, order.order_id);

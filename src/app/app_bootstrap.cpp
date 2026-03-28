@@ -6,6 +6,7 @@
 #include "clock/wall_clock.hpp"
 #include "common/enums.hpp"
 #include "governance/governance_audit_layer.hpp"
+#include "security/production_guard.hpp"
 #include <filesystem>
 
 namespace tb::app {
@@ -78,6 +79,39 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
         governance::AuditEventType::SystemStartup,
         "bootstrap", "system",
         "Инициализация завершена, режим: " + std::string(tb::to_string(components.config.trading.mode)));
+
+    // ---- 8. Production Guard — запрет запуска в production без явного подтверждения ----
+    if (components.config.trading.mode == TradingMode::Production ||
+        components.config.trading.mode == TradingMode::Testnet) {
+
+        security::ProductionGuard guard(components.logger);
+
+        // Получить API ключ и URL для валидации
+        std::string api_key;
+        std::string api_base_url = components.config.exchange.endpoint_rest;
+        auto key_result = components.secret_provider->get_secret(
+            security::SecretRef{"BITGET_API_KEY"});
+        if (key_result) {
+            api_key = *key_result;
+        }
+
+        auto guard_result = guard.validate(
+            components.config.trading.mode,
+            api_key,
+            api_base_url,
+            components.config.config_hash);
+
+        if (!guard_result.allowed) {
+            components.logger->error("bootstrap",
+                "ProductionGuard: запуск запрещён — " + guard_result.reason);
+            return Err<AppComponents>(TbError::ProductionGuardFailed);
+        }
+
+        components.governance->record_audit(
+            governance::AuditEventType::SystemStartup,
+            "production_guard", "system",
+            "Production guard passed: " + guard_result.reason);
+    }
 
     return Ok(std::move(components));
 }

@@ -625,7 +625,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_liquidity_vacuum
     return ThreatDetection{
         .type = ThreatType::LiquidityVacuum,
         .severity = severity,
-        .recommended_action = severity_to_action_soft(severity),
+        .recommended_action = severity_to_action(severity),
         .reason = "Минимальная глубина " + format_double(min_depth) +
                   " ниже порога " + format_double(config_.min_liquidity_depth),
         .detected_at = c.timestamp
@@ -717,7 +717,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_toxic_flow(
     return ThreatDetection{
         .type = ThreatType::ToxicFlow,
         .severity = severity,
-        .recommended_action = severity_to_action_soft(severity),
+        .recommended_action = severity_to_action(severity),
         .reason = "Токсичный поток: ratio=" + format_double(c.buy_sell_ratio) +
                   ", aggressive=" + format_double(c.aggressive_flow) +
                   ", vpin=" + format_double(c.vpin),
