@@ -245,3 +245,89 @@ regime:
   confidence_anomaly: 0.9
   stability_same_regime: 0.9
   stability_first_classification: 0.5
+
+# ── World Model v2 ────────────────────────────────────────────────────────────
+# Мировая модель: классификация состояний рынка, хрупкость, пригодность стратегий
+world_model:
+  model_version: "2.0.0"
+  min_valid_indicators: 2
+
+  # Пороги классификации состояний
+  toxic_microstructure:
+    book_instability_min: 0.7
+    aggressive_flow_min: 0.8
+    spread_bps_min: 15.0
+
+  liquidity_vacuum:
+    spread_bps_critical: 50.0
+    spread_bps_secondary: 20.0
+    liquidity_ratio_min: 0.3
+
+  exhaustion_spike:
+    rsi_upper: 80.0
+    rsi_lower: 20.0
+    momentum_abs_min: 0.02
+
+  fragile_breakout:
+    bb_percent_b_upper: 0.95
+    bb_percent_b_lower: 0.05
+    volatility_5_min: 0.02
+    book_imbalance_abs_min: 0.3
+
+  compression:
+    bb_bandwidth_max: 0.03
+    atr_normalized_max: 0.01
+    volatility_5_max: 0.01
+
+  stable_trend:
+    adx_min: 25.0
+    rsi_lower: 40.0
+    rsi_upper: 70.0
+
+  chop_noise:
+    adx_max: 20.0
+    rsi_lower: 40.0
+    rsi_upper: 60.0
+    spread_bps_max: 20.0
+
+  # Хрупкость (composite scoring)
+  fragility:
+    spread_stress_weight: 0.15
+    book_instability_weight: 0.20
+    volatility_accel_weight: 0.12
+    liquidity_imbalance_weight: 0.10
+    transition_instability_weight: 0.15
+    vpin_toxicity_weight: 0.10
+
+  # Гистерезис (сглаживание переходов между состояниями)
+  hysteresis:
+    enabled: true
+    confirmation_ticks: 2
+    min_dwell_ticks: 3
+    min_confidence_to_switch: 0.55
+
+  # История состояний
+  history:
+    max_entries: 200
+    transition_matrix_window: 100
+    tendency_lookback: 5
+
+  # Персистентность (blend base + empirical)
+  persistence:
+    history_blend_weight: 0.3
+    min_history_for_empirical: 10
+
+  # Пригодность стратегий
+  suitability:
+    feedback_blend_weight: 0.3
+    min_trades_for_feedback: 20
+    alpha_decay_weight: 0.2
+    hard_veto_threshold: 0.05
+
+  # Обратная связь (feedback loop)
+  feedback:
+    enabled: true
+    min_samples_per_state: 50
+    max_threshold_drift_pct: 20.0
+    ema_alpha: 0.05
+    evaluation_window: 500
