@@ -278,20 +278,25 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 | **Correlation Monitor** | Pearson correlation (short 20 / long 100 window) с BTC и ETH. Decorrelation → risk_mult 0.5 |
 | **RL Entry Timing (Thompson Sampling)** | 5-arm Beta bandit (EnterNow, Wait1/2/3, Skip). Exponential decay 0.995 для non-stationarity |
 
-### PairScanner — автоматический выбор пар
+### PairScanner v5 — профессиональный выбор торговых пар
 
-Модуль `pair_scanner` анализирует все доступные пары на Bitget и выбирает лучшие для торговли:
+Модуль `pair_scanner` — production-grade сервис формирования торгового universe для спотовой торговли:
 
-| Критерий | Описание |
-|----------|----------|
-| Объём 24ч | Пары с объёмом > 500K USDT (конфигурируемо) |
-| Спред | Пары со спредом < 50 bps (конфигурируемо) |
-| Волатильность | Оптимальная для краткосрочной торговли |
-| ATR | Достаточный диапазон для прибыли |
+| Компонент | Описание |
+|-----------|----------|
+| **Scoring v4** | Acceleration-based: Momentum(40) + Trend(25) + Tradability(25) + Quality(10) |
+| **Hard Filters** | 24ч change < -1% (отброс), > 20% (over-extended), exhausted pump detection |
+| **Parallel Fetch** | Bounded concurrency загрузка свечей (5 параллельных запросов) |
+| **Retry + Circuit Breaker** | Exponential backoff с jitter, circuit breaker (5 ошибок → блокировка) |
+| **Data Validation** | Bid/ask, хронология свечей, полнота данных, аномалии |
+| **Diversification** | Корреляция Пирсона, секторная концентрация, минимальная ликвидность |
+| **Observability** | Metrics (scan_duration, failures, turnover), health reporting, audit trail |
+| **Persistence** | Audit trail через IStorageAdapter, воспроизводимость по scan_id |
 
-**Режимы**: `auto` (автоматический скоринг) · `manual` (ручной список) · `hybrid` (авто + белый список)  
-**Ротация**: каждые 24 часа (конфигурируемо)  
-**Результат**: top-N пар (по умолчанию 5)
+**Режимы**: `auto` (автоматический скоринг) · `manual` (ручной список)
+**Ротация**: каждые 24 часа (конфигурируемо)
+**Результат**: top-N пар (по умолчанию 5) с полным score breakdown и data quality flags
+**Тесты**: 55 unit tests, 129 assertions
 
 ### HTF Trend Filter — мультитаймфреймный анализ
 
@@ -623,7 +628,7 @@ tomorrow-bot/
 │   ├── buffers/                # Lock-free кольцевые буферы
 │   ├── indicators/             # TA-Lib обёртки (SMA, EMA, RSI, MACD, BB, ATR, ADX)
 │   ├── features/               # FeatureEngine + AdvancedFeatures (CUSUM, VPIN, VolumeProfile, ToD)
-│   ├── pair_scanner/           # Автовыбор лучших торговых пар (объём, спред, ATR)
+│   ├── pair_scanner/           # PairScanner v5: scoring, parallel fetch, retry, diversification, audit
 │   ├── world_model/            # 9 состояний мира, fragility, tendency
 │   ├── regime/                 # 13 режимов рынка, confidence, stability
 │   ├── uncertainty/            # Uncertainty Engine v2: 9-мерная неопределённость, stateful (EMA, hysteresis, shock memory)

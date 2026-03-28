@@ -22,12 +22,16 @@
  */
 
 #include "pair_scanner_types.hpp"
+#include "config/config_types.hpp"
 #include <vector>
 
 namespace tb::pair_scanner {
 
 class PairScorer {
 public:
+    /// Конструктор с конфигурацией scorer-а
+    explicit PairScorer(config::ScorerConfig config = {});
+
     /// Оценить одну пару. Возвращает score с total_score = -1 если отфильтрована.
     PairScore score(const TickerData& ticker,
                     const std::vector<CandleData>& candles) const;
@@ -47,6 +51,8 @@ public:
     double compute_quality_score(const std::vector<CandleData>& candles) const;
 
 private:
+    config::ScorerConfig config_;
+
     double compute_daily_volatility(const std::vector<CandleData>& candles) const;
     double compute_body_ratio(const std::vector<CandleData>& candles) const;
     double compute_simple_adx(const std::vector<CandleData>& candles) const;

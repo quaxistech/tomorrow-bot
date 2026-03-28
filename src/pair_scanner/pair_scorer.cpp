@@ -19,6 +19,10 @@ namespace tb::pair_scanner {
 // Weights: Momentum(40) + Trend(25) + Tradability(25) + Quality(10) = 100
 // ========================================================================
 
+PairScorer::PairScorer(config::ScorerConfig config)
+    : config_(std::move(config))
+{}
+
 PairScore PairScorer::score(const TickerData& ticker,
                             const std::vector<CandleData>& candles) const {
     PairScore result;
@@ -32,7 +36,7 @@ PairScore PairScorer::score(const TickerData& ticker,
     // ЖЁСТКИЙ ФИЛЬТР: монеты с падением > 1% за 24ч — отбрасываем.
     // На споте падающая монета = гарантированный убыток.
     // ═══════════════════════════════════════════════════════════════
-    if (ticker.change_24h_pct < -1.0) {
+    if (ticker.change_24h_pct < config_.filter_min_change_24h) {
         result.total_score = -1.0;
         result.filtered_out = true;
         return result;
@@ -43,14 +47,14 @@ PairScore PairScorer::score(const TickerData& ticker,
     // <20% of the 24h rate → pump is exhausted, buying the top.
     // Hard cap: >20% 24h change = absolute reject (already extended)
     // ═══════════════════════════════════════════════════════════════
-    if (ticker.change_24h_pct > 20.0) {
+    if (ticker.change_24h_pct > config_.filter_max_change_24h) {
         result.total_score = -1.0;
         result.filtered_out = true;
         return result;
     }
     double roc_4h_filter = compute_roc(candles, 4);
-    if (ticker.change_24h_pct > 10.0 &&
-        roc_4h_filter < ticker.change_24h_pct * 0.25) {
+    if (ticker.change_24h_pct > config_.filter_exhausted_pump_24h &&
+        roc_4h_filter < ticker.change_24h_pct * config_.filter_exhausted_pump_ratio) {
         result.total_score = -1.0;
         result.filtered_out = true;
         return result;
@@ -79,16 +83,16 @@ PairScore PairScorer::score(const TickerData& ticker,
     // слишком вялые для скальпинга — стратегии не найдут сигналов.
     // Исключаем также стейблкоины (24h change ~0).
     // ═══════════════════════════════════════════════════════════════
-    if (std::abs(ticker.change_24h_pct) < 1.0) {
-        raw_total *= 0.3;  // Сильный штраф за стагнацию
+    if (std::abs(ticker.change_24h_pct) < config_.stagnation_threshold) {
+        raw_total *= config_.stagnation_penalty;  // Сильный штраф за стагнацию
     }
 
     // ═══════════════════════════════════════════════════════════════
     // STEADY GAINERS BONUS: монеты +2%..+10% за 24ч с бычьим трендом —
     // идеальный диапазон для momentum/breakout стратегий.
     // ═══════════════════════════════════════════════════════════════
-    if (ticker.change_24h_pct >= 2.0 && ticker.change_24h_pct <= 10.0) {
-        raw_total += 8.0;  // Бонус за "золотую зону" движения
+    if (ticker.change_24h_pct >= config_.steady_gainer_min && ticker.change_24h_pct <= config_.steady_gainer_max) {
+        raw_total += config_.steady_gainer_bonus;  // Бонус за "золотую зону" движения
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -96,7 +100,7 @@ PairScore PairScorer::score(const TickerData& ticker,
     // значит монета стагнирует — снижаем общий скор на 50%.
     // ═══════════════════════════════════════════════════════════════
     if (ticker.change_24h_pct < 0.0) {
-        raw_total *= 0.5;
+        raw_total *= config_.negative_change_penalty;
     }
 
     result.total_score = std::clamp(raw_total, 0.0, 100.0);
@@ -120,7 +124,7 @@ double PairScorer::compute_momentum_score(const TickerData& ticker,
     // Focus on RECENT price action, not 24h which includes stale history.
     // +0.5% → ~6, +1% → ~10, +2% → ~16, +3%+ → 20
     if (roc_4h > 0.0) {
-        score += std::clamp(std::log1p(roc_4h) * 14.5, 0.0, 20.0);
+        score += std::clamp(std::log1p(roc_4h) * config_.momentum_log_multiplier, 0.0, config_.momentum_max / 2.0);
     } else {
         score += std::max(-8.0, roc_4h * 4.0);
     }
@@ -132,7 +136,7 @@ double PairScorer::compute_momentum_score(const TickerData& ticker,
     double avg_4h_rate = roc_24h / 6.0;
     double accel = roc_4h - avg_4h_rate;
     if (accel > 0.0) {
-        score += std::clamp(std::log1p(accel) * 14.0, 0.0, 15.0);
+        score += std::clamp(std::log1p(accel) * config_.acceleration_log_multiplier, 0.0, config_.momentum_max * 0.375);
     } else {
         // Decelerating — mild penalty
         score += std::max(-5.0, accel * 2.0);
@@ -140,11 +144,11 @@ double PairScorer::compute_momentum_score(const TickerData& ticker,
 
     // --- Component 3: Fresh start bonus (0-5 pts) ---
     // Coin just started moving: moderate 24h change but meaningful 4h action.
-    if (roc_24h < 10.0 && roc_4h > 0.5) {
-        score += std::clamp(roc_4h * 2.5, 0.0, 5.0);
+    if (roc_24h < config_.fresh_start_roc_24h_cap && roc_4h > config_.fresh_start_roc_4h_min) {
+        score += std::clamp(roc_4h * config_.fresh_start_multiplier, 0.0, config_.momentum_max * 0.125);
     }
 
-    return std::clamp(score, 0.0, 40.0);
+    return std::clamp(score, 0.0, config_.momentum_max);
 }
 
 // ========== Trend Score (0-25) ==========
@@ -158,12 +162,12 @@ double PairScorer::compute_trend_score(const std::vector<CandleData>& candles) c
     // --- Компонент 1: Сила тренда ADX (0-10 баллов) ---
     double adx = compute_simple_adx(candles);
     double strength_score = 0.0;
-    if (adx < 15.0) {
-        strength_score = (adx / 15.0) * 3.0;        // Слабый: 0-3
-    } else if (adx < 25.0) {
-        strength_score = 3.0 + ((adx - 15.0) / 10.0) * 3.0;  // Умеренный: 3-6
-    } else if (adx < 50.0) {
-        strength_score = 6.0 + ((adx - 25.0) / 25.0) * 4.0;  // Сильный: 6-10
+    if (adx < config_.adx_weak_threshold) {
+        strength_score = (adx / config_.adx_weak_threshold) * 3.0;        // Слабый: 0-3
+    } else if (adx < config_.adx_moderate_threshold) {
+        strength_score = 3.0 + ((adx - config_.adx_weak_threshold) / 10.0) * 3.0;  // Умеренный: 3-6
+    } else if (adx < config_.adx_strong_threshold) {
+        strength_score = 6.0 + ((adx - config_.adx_moderate_threshold) / 25.0) * 4.0;  // Сильный: 6-10
     } else {
         strength_score = 9.5;  // Экстремально сильный
     }
@@ -175,16 +179,16 @@ double PairScorer::compute_trend_score(const std::vector<CandleData>& candles) c
 
     double direction_score = 0.0;
 
-    if (roc_24 > 0.0 && bullish_ratio > 0.50) {
+    if (roc_24 > 0.0 && bullish_ratio > config_.bullish_ratio_min) {
         // БЫЧИЙ ТРЕНД — основной балл
         // ROC contributes 0-8, bullish_ratio contributes 0-7
-        double roc_factor = std::clamp(roc_24 / 5.0, 0.0, 1.0);     // 1%→0.2, 5%+→1.0
-        double bull_factor = std::clamp((bullish_ratio - 0.50) / 0.25, 0.0, 1.0); // 0.50→0, 0.75+→1.0
+        double roc_factor = std::clamp(roc_24 / config_.roc_normalization_factor, 0.0, 1.0);     // 1%→0.2, 5%+→1.0
+        double bull_factor = std::clamp((bullish_ratio - config_.bullish_ratio_min) / 0.25, 0.0, 1.0); // 0.50→0, 0.75+→1.0
         direction_score = roc_factor * 8.0 + bull_factor * 7.0;
     }
     else if (roc_24 > 0.0) {
         // ROC положительный, но мало бычьих свечей — неуверенный тренд
-        direction_score = std::clamp(roc_24 / 5.0, 0.0, 1.0) * 5.0;
+        direction_score = std::clamp(roc_24 / config_.roc_normalization_factor, 0.0, 1.0) * 5.0;
     }
     else if (bullish_ratio > 0.55) {
         // Больше бычьих свечей, но ROC отрицательный — развернутся?
@@ -195,7 +199,7 @@ double PairScorer::compute_trend_score(const std::vector<CandleData>& candles) c
         direction_score = 0.0;
     }
 
-    return std::clamp(strength_score + direction_score, 0.0, 25.0);
+    return std::clamp(strength_score + direction_score, 0.0, config_.trend_max);
 }
 
 // ========== Tradability Score (0-25) ==========
@@ -210,16 +214,16 @@ double PairScorer::compute_tradability_score(const TickerData& ticker,
     // Пороговая модель: $500K достаточно для $10-30 ордеров.
     // Выше $1M → отлично, выше $5M → максимум.
     double vol = ticker.quote_volume_24h;
-    if (vol >= 5'000'000.0) {
+    if (vol >= config_.volume_tier_excellent) {
         score += 8.0;
-    } else if (vol >= 1'000'000.0) {
-        score += 5.0 + 3.0 * (vol - 1'000'000.0) / 4'000'000.0;
-    } else if (vol >= 500'000.0) {
-        score += 3.0 + 2.0 * (vol - 500'000.0) / 500'000.0;
-    } else if (vol >= 100'000.0) {
-        score += 1.0 + 2.0 * (vol - 100'000.0) / 400'000.0;
+    } else if (vol >= config_.volume_tier_good) {
+        score += 5.0 + 3.0 * (vol - config_.volume_tier_good) / (config_.volume_tier_excellent - config_.volume_tier_good);
+    } else if (vol >= config_.volume_tier_acceptable) {
+        score += 3.0 + 2.0 * (vol - config_.volume_tier_acceptable) / (config_.volume_tier_good - config_.volume_tier_acceptable);
+    } else if (vol >= config_.volume_tier_minimal) {
+        score += 1.0 + 2.0 * (vol - config_.volume_tier_minimal) / (config_.volume_tier_acceptable - config_.volume_tier_minimal);
     } else {
-        score += vol / 100'000.0;
+        score += vol / config_.volume_tier_minimal;
     }
 
     // --- Компонент 2: Spread (0-10 баллов) ---
@@ -228,7 +232,7 @@ double PairScorer::compute_tradability_score(const TickerData& ticker,
     // spread=0 означает отсутствие данных (bid/ask=0) — даём 0 баллов
     double spread = ticker.spread_bps;
     if (spread > 0.0) {
-        score += std::clamp(10.0 * std::exp(-spread / 15.0), 0.0, 10.0);
+        score += std::clamp(10.0 * std::exp(-spread / config_.spread_decay_constant), 0.0, 10.0);
     }
     // spread == 0.0 → нет данных → 0 баллов (а не максимум)
 
@@ -238,15 +242,15 @@ double PairScorer::compute_tradability_score(const TickerData& ticker,
     // Штрафуем только ОЧЕНЬ низкую (< 0.5% — нет движения) и
     // ЭКСТРЕМАЛЬНО высокую (> 20% — манипулятивные shitcoin).
     double daily_vol = compute_daily_volatility(candles);
-    if (daily_vol < 0.5) {
-        score += daily_vol / 0.5 * 3.0;   // 0-3 для < 0.5%
-    } else if (daily_vol < 20.0) {
+    if (daily_vol < config_.volatility_low_threshold) {
+        score += daily_vol / config_.volatility_low_threshold * 3.0;   // 0-3 для < 0.5%
+    } else if (daily_vol < config_.volatility_high_threshold) {
         score += 5.0 + std::min(2.0, daily_vol / 10.0);  // 5-7 для 0.5-20%
     } else {
-        score += std::max(0.0, 4.0 - (daily_vol - 20.0) / 10.0);  // Штраф > 20%
+        score += std::max(0.0, 4.0 - (daily_vol - config_.volatility_high_threshold) / 10.0);  // Штраф > 20%
     }
 
-    return std::clamp(score, 0.0, 25.0);
+    return std::clamp(score, 0.0, config_.tradability_max);
 }
 
 // ========== Quality Score (0-10) ==========
@@ -255,7 +259,7 @@ double PairScorer::compute_tradability_score(const TickerData& ticker,
 double PairScorer::compute_quality_score(const std::vector<CandleData>& candles) const {
     double body_ratio = compute_body_ratio(candles);
     // body_ratio 0.7 → 7, 1.0 → 10
-    return std::clamp(body_ratio * 10.0, 0.0, 10.0);
+    return std::clamp(body_ratio * 10.0, 0.0, config_.quality_max);
 }
 
 // ========== Вспомогательные методы ==========

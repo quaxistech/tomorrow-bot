@@ -8,7 +8,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Реальная торговля** на Bitget через REST API
 - **WebSocket**: ~1000+ сообщений в минуту
 - **Graceful shutdown** по SIGTERM/SIGINT
-- **Автоматический выбор пар** через PairScanner (24ч ротация)
+- **Автоматический выбор пар** через PairScanner v5 (parallel, retry, diversification, 24ч ротация)
 - **Мультитаймфреймный анализ**: 200 × 1h свечей (8+ дней) для HTF тренда
 - **Тренд-фильтрация**: стратегии не торгуют против HTF тренда
 - **6 ML-модулей**: entropy filter, fingerprinting, cascade detection, correlation, bayesian, thompson
@@ -21,7 +21,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 ## Полностью реализовано ✅
 
 - **Торговый pipeline**: WebSocket → Normalizer → Features → Strategies → Risk → Execution
-- **Автоматический выбор пар**: PairScanner (объём, спред, волатильность, ATR скоринг)
+- **Автоматический выбор пар**: PairScanner v5 (acceleration-based scoring, parallel fetch, retry/circuit breaker, diversification, audit trail, 55 unit tests)
 - **Загрузка истории**: 200 × 1m свечей (прогрев индикаторов) + 200 × 1h свечей (HTF тренд)
 - **HTF Trend Analysis**: EMA20/50, RSI14, MACD, ADX на часовом таймфрейме
 - **HTF Real-Time Update**: пересчёт HTF каждый час + экстренное обновление при > 3×ATR
@@ -138,7 +138,8 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - Для limit-ордеров — polling через REST API не реализован.
 
 ### Один торговый символ одновременно
-- Бот автоматически выбирает лучшую пару через PairScanner.
+- Бот автоматически выбирает лучшую пару через PairScanner v5 (с диверсификацией корзины).
+- Скоринг учитывает корреляции, секторную концентрацию и ликвидность.
 - Но торгует только одной парой одновременно (не портфель из N пар).
 - Архитектура поддерживает multi-symbol pipeline, но требует доработки.
 - Ротация пар происходит каждые 24 часа.

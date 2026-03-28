@@ -87,6 +87,53 @@ enum class PairSelectionMode {
     Manual    ///< Фиксированный список символов из конфига
 };
 
+/// Параметризованные веса скоринга (замена magic numbers)
+struct ScorerConfig {
+    /// Версия алгоритма скоринга
+    std::string version{"v4"};
+
+    // --- Веса компонентов (сумма = 100) ---
+    double momentum_max{40.0};
+    double trend_max{25.0};
+    double tradability_max{25.0};
+    double quality_max{10.0};
+
+    // --- Momentum параметры ---
+    double momentum_log_multiplier{14.5};
+    double acceleration_log_multiplier{14.0};
+    double fresh_start_multiplier{2.5};
+    double fresh_start_roc_24h_cap{10.0};
+    double fresh_start_roc_4h_min{0.5};
+
+    // --- Trend параметры ---
+    double adx_weak_threshold{15.0};
+    double adx_moderate_threshold{25.0};
+    double adx_strong_threshold{50.0};
+    double bullish_ratio_min{0.50};
+    double roc_normalization_factor{5.0};
+
+    // --- Tradability параметры ---
+    double volume_tier_excellent{5'000'000.0};
+    double volume_tier_good{1'000'000.0};
+    double volume_tier_acceptable{500'000.0};
+    double volume_tier_minimal{100'000.0};
+    double spread_decay_constant{15.0};
+    double volatility_low_threshold{0.5};
+    double volatility_high_threshold{20.0};
+
+    // --- Hard filters ---
+    double filter_min_change_24h{-1.0};
+    double filter_max_change_24h{20.0};
+    double filter_exhausted_pump_24h{10.0};
+    double filter_exhausted_pump_ratio{0.25};
+    double stagnation_threshold{1.0};
+    double stagnation_penalty{0.3};
+    double steady_gainer_min{2.0};
+    double steady_gainer_max{10.0};
+    double steady_gainer_bonus{8.0};
+    double negative_change_penalty{0.5};
+};
+
 /// Настройки системы выбора торговых пар
 struct PairSelectionConfig {
     PairSelectionMode mode{PairSelectionMode::Auto};
@@ -96,6 +143,22 @@ struct PairSelectionConfig {
     int rotation_interval_hours{24};             ///< Интервал ротации (в часах)
     std::vector<std::string> manual_symbols;     ///< Символы для ручного режима
     std::vector<std::string> blacklist;          ///< Символы, запрещённые для торговли
+
+    // --- Расширенные настройки сканера (professional-grade) ---
+    int max_candidates_for_candles{30};          ///< Макс. кандидатов для загрузки свечей
+    int candle_fetch_concurrency{5};             ///< Параллельных загрузок свечей
+    int candle_history_hours{48};                ///< Глубина истории свечей
+    int scan_timeout_ms{60'000};                 ///< Таймаут всего сканирования (мс)
+    int api_retry_max{3};                        ///< Макс. повторных попыток API
+    int api_retry_base_delay_ms{200};            ///< Базовая задержка retry (мс)
+    int circuit_breaker_threshold{5};            ///< Порог ошибок для circuit breaker
+    int circuit_breaker_reset_ms{300'000};       ///< Время сброса circuit breaker (мс)
+    double max_correlation_in_basket{0.85};      ///< Макс. корреляция между парами в корзине
+    int max_pairs_per_sector{2};                 ///< Макс. пар из одного сектора
+    double min_liquidity_depth_usdt{50'000.0};   ///< Мин. глубина ликвидности
+    bool enable_diversification{true};           ///< Включить диверсификацию корзины
+    bool persist_scan_results{true};             ///< Сохранять результаты в persistence
+    ScorerConfig scorer;                         ///< Конфигурация scorer-а (вложенный)
 };
 
 /// Runtime-настройки защиты от враждебных рыночных условий

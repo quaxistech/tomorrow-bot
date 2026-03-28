@@ -8,15 +8,21 @@
  * по 5 критериям (объём, волатильность, спред, тренд, качество)
  * и выбирает топ-N пар для торговли.
  *
- * Конфигурационные типы (PairSelectionMode, PairSelectionConfig) определены
- * в config/config_types.hpp — здесь только типы данных сканера/скорера.
+ * Конфигурационные типы (PairSelectionMode, PairSelectionConfig, ScorerConfig)
+ * определены в config/config_types.hpp — здесь только типы данных сканера/скорера.
  */
 
 #include <string>
 #include <vector>
 #include <chrono>
+#include <optional>
+#include <unordered_map>
 
 namespace tb::pair_scanner {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Базовые типы данных с биржи
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Информация о торговой паре с биржи
 struct PairInfo {
@@ -54,6 +60,73 @@ struct CandleData {
     double volume{0.0};
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Фильтрация и качество данных
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Причина фильтрации пары
+enum class FilterReason {
+    Passed,            ///< Прошла все фильтры
+    BelowMinVolume,    ///< Объём ниже минимального порога
+    AboveMaxSpread,    ///< Спред выше максимального порога
+    Blacklisted,       ///< Пара в чёрном списке
+    InvalidPrice,      ///< Невалидная цена (0 или отрицательная)
+    NotOnline,         ///< Пара не в статусе online
+    NotUsdtQuote,      ///< Котировочный актив не USDT
+    NegativeChange,    ///< Отрицательное изменение за 24ч
+    ExhaustedPump,     ///< Исчерпанный памп (рост слишком резкий)
+    OverExtended,      ///< Перекупленность
+    InsufficientData   ///< Недостаточно данных для скоринга
+};
+
+/// Вердикт фильтра с детализацией причины
+struct FilterVerdict {
+    FilterReason reason{FilterReason::Passed};
+    std::string details;
+
+    bool passed() const { return reason == FilterReason::Passed; }
+};
+
+/// Флаги качества входных данных для пары
+struct DataQualityFlags {
+    bool has_valid_bid_ask{false};       ///< Bid/ask валидны (>0, ask > bid)
+    bool has_sufficient_candles{false};  ///< Достаточно свечей для индикаторов
+    bool candles_chronological{false};   ///< Свечи в хронологическом порядке
+    bool no_duplicate_timestamps{false}; ///< Нет дубликатов таймстампов
+    int missing_candle_count{0};         ///< Количество пропущенных свечей
+    int total_candle_count{0};           ///< Общее количество свечей
+    double completeness_ratio{0.0};      ///< Полнота данных 0.0-1.0
+
+    /// Приемлемо ли качество данных для скоринга
+    bool is_acceptable() const {
+        return has_valid_bid_ask && has_sufficient_candles
+            && candles_chronological && completeness_ratio >= 0.75;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Контекст жизненного цикла сканирования
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Метаданные одного прогона сканирования
+struct ScanContext {
+    std::string scan_id;              ///< UUID уникальный для каждого scan run
+    int64_t started_at_ms{0};         ///< Время начала сканирования (epoch ms)
+    int64_t finished_at_ms{0};        ///< Время окончания сканирования (epoch ms)
+    int64_t duration_ms{0};           ///< Длительность сканирования (мс)
+    bool degraded_mode{false};        ///< Частичный результат из-за ошибок
+    int api_failures{0};              ///< Количество неудачных API вызовов
+    int api_retries{0};               ///< Количество повторных попыток
+    int symbols_fetched{0};           ///< Количество загруженных символов
+    int tickers_fetched{0};           ///< Количество загруженных тикеров
+    int candles_fetched{0};           ///< Количество загруженных свечей
+    std::vector<std::string> failure_details; ///< Детали ошибок (для аудита)
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Результаты скоринга
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Результат скоринга одной пары (v3 — ТОЛЬКО растущие монеты)
 struct PairScore {
     std::string symbol;
@@ -78,6 +151,12 @@ struct PairScore {
     int quantity_precision{6};    ///< Кол-во десятичных знаков количества
     int price_precision{2};       ///< Кол-во десятичных знаков цены
 
+    /// Расширенная диагностика (professional-grade)
+    FilterVerdict filter_verdict;     ///< Причина фильтрации/прохождения
+    DataQualityFlags data_quality;    ///< Качество входных данных
+    double liquidity_impact_bps{0.0}; ///< Оценка market impact для типового ордера
+    double correlation_btc{0.0};      ///< Корреляция с BTC за 24ч
+
     bool operator>(const PairScore& other) const {
         return total_score > other.total_score;
     }
@@ -90,6 +169,12 @@ struct ScanResult {
     int64_t scanned_at_ms{0};              ///< Время сканирования
     int total_pairs_found{0};              ///< Всего пар на бирже
     int pairs_after_filter{0};             ///< После фильтрации по объёму
+
+    /// Расширенные метаданные (professional-grade)
+    ScanContext context;                       ///< Метаданные жизненного цикла сканирования
+    std::vector<PairScore> rejected_pairs;     ///< Отклонённые пары (для аудита)
+    int api_errors{0};                         ///< Общее кол-во ошибок API
+    std::string config_hash;                   ///< Хэш конфигурации для воспроизводимости
 };
 
 } // namespace tb::pair_scanner

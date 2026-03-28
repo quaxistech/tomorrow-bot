@@ -1,9 +1,11 @@
 #include "pair_scanner.hpp"
+#include "data_validator.hpp"
 #include "config/config_types.hpp"
 
 #include <boost/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <random>
 #include <set>
 #include <sstream>
 #include <iomanip>
@@ -38,32 +40,77 @@ static std::string parse_string(const boost::json::value& v) {
 
 PairScanner::PairScanner(config::PairSelectionConfig config,
                          std::shared_ptr<exchange::bitget::BitgetRestClient> rest_client,
-                         std::shared_ptr<logging::ILogger> logger)
+                         std::shared_ptr<logging::ILogger> logger,
+                         std::shared_ptr<metrics::IMetricsRegistry> metrics_registry,
+                         std::shared_ptr<health::IHealthService> health,
+                         std::shared_ptr<persistence::IStorageAdapter> storage)
     : config_(std::move(config))
     , rest_client_(std::move(rest_client))
     , logger_(std::move(logger))
+    , scorer_(config_.scorer)
+    , metrics_(metrics_registry)
+    , diversification_(DiversificationConfig{
+          config_.max_correlation_in_basket,
+          config_.max_pairs_per_sector,
+          config_.min_liquidity_depth_usdt,
+          config_.enable_diversification})
+    , retry_policy_(RetryPolicy{config_.api_retry_max, config_.api_retry_base_delay_ms})
+    , circuit_breaker_(config_.circuit_breaker_threshold, config_.circuit_breaker_reset_ms)
+    , health_(std::move(health))
+    , storage_(std::move(storage))
 {
+    if (health_) {
+        health_->register_subsystem("pair_scanner");
+        health_->update_subsystem("pair_scanner", health::SubsystemState::Starting,
+                                  "Инициализация сканера пар");
+    }
 }
 
 PairScanner::~PairScanner() {
     stop_rotation();
 }
 
+// ========== UUID ==========
+
+std::string PairScanner::generate_scan_id() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<> dist(0x1000, 0xFFFF);
+    std::ostringstream oss;
+    oss << "scan-" << ms << "-" << std::hex << dist(gen);
+    return oss.str();
+}
+
 // ========== Основной API ==========
 
 ScanResult PairScanner::scan() {
+    ScanContext ctx;
+    ctx.scan_id = generate_scan_id();
+    auto scan_start = std::chrono::system_clock::now();
+    ctx.started_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        scan_start.time_since_epoch()).count();
+
     logger_->info(kComp, "Начало сканирования торговых пар...",
         {{"mode", config_.mode == config::PairSelectionMode::Auto ? "auto" : "manual"},
-         {"top_n", std::to_string(config_.top_n)}});
+         {"top_n", std::to_string(config_.top_n)},
+         {"scan_id", ctx.scan_id}});
+
+    // Capture previous selection for turnover calculation
+    std::vector<std::string> prev_selected;
+    {
+        std::lock_guard lock(mutex_);
+        prev_selected = last_result_.selected;
+    }
 
     ScanResult result;
-    auto now = std::chrono::system_clock::now();
-    result.scanned_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()).count();
+    result.scanned_at_ms = ctx.started_at_ms;
 
     // Ручной режим — берём символы из конфига, не сканируем
     if (config_.mode == config::PairSelectionMode::Manual) {
         result.selected = config_.manual_symbols;
+        result.context = ctx;
         logger_->info(kComp, "Ручной режим: " + std::to_string(result.selected.size()) + " пар");
         std::lock_guard lock(mutex_);
         last_result_ = result;
@@ -73,12 +120,17 @@ ScanResult PairScanner::scan() {
     // === Автоматический режим ===
 
     // Шаг 1: Получить список всех торговых пар
-    auto pairs = fetch_symbols();
+    auto pairs = fetch_symbols(ctx);
     result.total_pairs_found = static_cast<int>(pairs.size());
     logger_->info(kComp, "Загружено пар с биржи: " + std::to_string(pairs.size()));
 
     if (pairs.empty()) {
         logger_->error(kComp, "Не удалось загрузить список пар");
+        ctx.degraded_mode = true;
+        result.context = ctx;
+        result.api_errors = ctx.api_failures;
+        metrics_.record_scan_failure();
+        update_health(result);
         return result;
     }
 
@@ -92,28 +144,41 @@ ScanResult PairScanner::scan() {
     }
 
     // Шаг 2: Получить 24ч тикеры
-    auto tickers = fetch_tickers();
+    auto tickers = fetch_tickers(ctx);
     logger_->info(kComp, "Загружено тикеров: " + std::to_string(tickers.size()));
 
     if (tickers.empty()) {
         logger_->error(kComp, "Не удалось загрузить тикеры");
+        ctx.degraded_mode = true;
+        result.context = ctx;
+        result.api_errors = ctx.api_failures;
+        metrics_.record_scan_failure();
+        update_health(result);
         return result;
     }
 
-    // Шаг 3: Фильтрация кандидатов
-    auto candidates = filter_candidates(pairs, tickers);
+    // Шаг 3: Фильтрация кандидатов с отслеживанием отклонённых
+    std::vector<PairScore> rejected;
+    auto candidates = filter_candidates(pairs, tickers, rejected);
     result.pairs_after_filter = static_cast<int>(candidates.size());
+    result.rejected_pairs = std::move(rejected);
+
     logger_->info(kComp, "Кандидатов после фильтрации: " + std::to_string(candidates.size()),
         {{"min_volume", std::to_string(config_.min_volume_usdt)},
-         {"max_spread", std::to_string(config_.max_spread_bps)}});
+         {"max_spread", std::to_string(config_.max_spread_bps)},
+         {"rejected", std::to_string(result.rejected_pairs.size())}});
 
     if (candidates.empty()) {
         logger_->warn(kComp, "Нет подходящих пар после фильтрации");
+        ctx.degraded_mode = true;
+        result.context = ctx;
+        result.api_errors = ctx.api_failures;
+        metrics_.record_empty_scan();
+        update_health(result);
         return result;
     }
 
-    // Шаг 4: Для каждого кандидата загружаем свечи и считаем скоринг.
-    // Сортируем по 24h VOLUME (убывание): берём самые ликвидные пары
+    // Шаг 4: Сортируем по 24h VOLUME (убывание): берём самые ликвидные пары
     // для загрузки свечей. Не сортируем по 24h change — это отбирает
     // монеты, которые УЖЕ pumped (selection bias / buying at peaks).
     // Научный отбор (ускорение, fresh start) делается в scorer.
@@ -122,46 +187,64 @@ ScanResult PairScanner::scan() {
             return a.quote_volume_24h > b.quote_volume_24h;
         });
 
-    const size_t kMaxCandidatesForCandles = 30;
-    if (candidates.size() > kMaxCandidatesForCandles) {
-        candidates.resize(kMaxCandidatesForCandles);
+    const int max_for_candles = config_.max_candidates_for_candles;
+    if (static_cast<int>(candidates.size()) > max_for_candles) {
+        candidates.resize(static_cast<size_t>(max_for_candles));
     }
 
     logger_->info(kComp,
         "Загрузка свечей для " + std::to_string(candidates.size()) + " кандидатов...");
 
+    // Шаг 5: Параллельная загрузка свечей
+    auto candles_map = fetch_candles_parallel(candidates, ctx);
+
+    // Шаг 6: Скоринг каждого кандидата с валидацией качества данных
     for (const auto& ticker : candidates) {
-        auto candles = fetch_candles(ticker.symbol, 48);  // 48 часовых свечей
+        auto it = candles_map.find(ticker.symbol);
+        const auto& candles = (it != candles_map.end()) ? it->second : std::vector<CandleData>{};
 
         auto score = scorer_.score(ticker, candles);
 
-        // Пропускаем отфильтрованные монеты (24h change < -1%)
-        if (score.filtered_out) continue;
+        // Валидация качества данных
+        score.data_quality = DataValidator::validate(ticker, candles, config_.candle_history_hours);
+
+        if (score.filtered_out) {
+            score.filter_verdict = FilterVerdict{FilterReason::NegativeChange,
+                "Отфильтрована scorer-ом (24h change / exhausted pump)"};
+            result.rejected_pairs.push_back(std::move(score));
+            continue;
+        }
+
+        if (!score.data_quality.is_acceptable()) {
+            score.filter_verdict = FilterVerdict{FilterReason::InsufficientData,
+                "Недостаточное качество данных (completeness=" +
+                std::to_string(score.data_quality.completeness_ratio) + ")"};
+            ctx.degraded_mode = true;
+        }
 
         // Заполняем precision из кеша symbol_info_
         {
             std::lock_guard lock(mutex_);
-            auto it = symbol_info_.find(ticker.symbol);
-            if (it != symbol_info_.end()) {
-                score.quantity_precision = static_cast<int>(it->second.quantity_precision);
-                score.price_precision = static_cast<int>(it->second.price_precision);
+            auto info_it = symbol_info_.find(ticker.symbol);
+            if (info_it != symbol_info_.end()) {
+                score.quantity_precision = static_cast<int>(info_it->second.quantity_precision);
+                score.price_precision = static_cast<int>(info_it->second.price_precision);
             }
         }
 
         result.ranked_pairs.push_back(std::move(score));
     }
 
-    // Шаг 5: Сортировка по total_score (убывание)
+    // Шаг 7: Сортировка по total_score (убывание)
     std::sort(result.ranked_pairs.begin(), result.ranked_pairs.end(),
         [](const PairScore& a, const PairScore& b) {
             return a.total_score > b.total_score;
         });
 
-    // Шаг 6: Выбор топ-N
-    int top_n = std::min(config_.top_n, static_cast<int>(result.ranked_pairs.size()));
-    for (int i = 0; i < top_n; ++i) {
-        result.selected.push_back(result.ranked_pairs[i].symbol);
-    }
+    // Шаг 8: Применение диверсификации вместо наивного top-N
+    result.selected = diversification_.apply(result.ranked_pairs, candles_map, config_.top_n);
+
+    int top_n = static_cast<int>(result.selected.size());
 
     // Лог результатов (формат v4: Mom/Trend/Trade/Qual — acceleration-based)
     logger_->info(kComp, "=== РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ v4 (ACCELERATION-BASED) ===");
@@ -178,16 +261,61 @@ ScanResult PairScanner::scan() {
             << " | 24h:" << std::showpos << std::setprecision(2) << s.change_24h_pct << "%"
             << std::noshowpos
             << " | Vol24h: $" << std::setprecision(0) << s.quote_volume_24h;
-        bool selected = (i < top_n);
+
+        // Check if this symbol is in the selected set
+        bool is_selected = std::find(result.selected.begin(), result.selected.end(),
+                                     s.symbol) != result.selected.end();
         logger_->info(kComp, oss.str(),
             {{"rank", std::to_string(i + 1)},
-             {"selected", selected ? "YES" : "no"}});
+             {"selected", is_selected ? "YES" : "no"}});
     }
 
-    logger_->info(kComp, "Выбрано " + std::to_string(top_n) + " пар для торговли");
+    logger_->info(kComp, "Выбрано " + std::to_string(top_n) + " пар для торговли",
+        {{"scan_id", ctx.scan_id},
+         {"diversification", config_.enable_diversification ? "on" : "off"}});
 
-    std::lock_guard lock(mutex_);
-    last_result_ = result;
+    // Шаг 9: Завершение контекста сканирования
+    auto scan_end = std::chrono::system_clock::now();
+    ctx.finished_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        scan_end.time_since_epoch()).count();
+    ctx.duration_ms = ctx.finished_at_ms - ctx.started_at_ms;
+    if (ctx.api_failures > 0) {
+        ctx.degraded_mode = true;
+    }
+    result.context = ctx;
+    result.api_errors = ctx.api_failures;
+
+    // Шаг 10: Метрики
+    metrics_.observe_scan_duration(static_cast<double>(ctx.duration_ms));
+    metrics_.update_counts(static_cast<int>(result.ranked_pairs.size()), top_n);
+    metrics_.observe_scores(result.ranked_pairs);
+    double turnover = ScanMetrics::compute_turnover(prev_selected, result.selected);
+    metrics_.update_turnover(turnover);
+    metrics_.update_circuit_breaker(circuit_breaker_.current_state() == CircuitState::Open);
+
+    if (result.selected.empty()) {
+        metrics_.record_empty_scan();
+    }
+
+    // Шаг 11: Health
+    update_health(result);
+
+    // Шаг 12: Persistence
+    persist_result(result);
+
+    // Шаг 13: Сохранить последний результат
+    {
+        std::lock_guard lock(mutex_);
+        last_result_ = result;
+    }
+
+    logger_->info(kComp, "Сканирование завершено",
+        {{"scan_id", ctx.scan_id},
+         {"duration_ms", std::to_string(ctx.duration_ms)},
+         {"selected", std::to_string(top_n)},
+         {"degraded", ctx.degraded_mode ? "true" : "false"},
+         {"turnover", std::to_string(turnover)}});
+
     return result;
 }
 
@@ -251,13 +379,66 @@ void PairScanner::rotation_loop() {
     }
 }
 
+// ========== Retry / Circuit Breaker ==========
+
+exchange::bitget::RestResponse PairScanner::fetch_with_retry(
+    const std::string& path, const std::string& query,
+    ScanContext& ctx, const std::string& endpoint_name)
+{
+    if (!circuit_breaker_.allow_request()) {
+        ctx.api_failures++;
+        ctx.failure_details.push_back("Circuit breaker open for " + endpoint_name);
+        metrics_.record_api_failure(endpoint_name);
+        return {0, "", false, "Circuit breaker open"};
+    }
+
+    for (int attempt = 0; attempt <= retry_policy_.max_retries; ++attempt) {
+        if (attempt > 0) {
+            int delay = retry_policy_.delay_for_attempt(attempt - 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            ctx.api_retries++;
+            metrics_.record_api_retry();
+        }
+
+        auto resp = rest_client_->get(path, query);
+        if (resp.success) {
+            circuit_breaker_.record_success();
+            return resp;
+        }
+
+        auto err_class = classify_http_error(resp.status_code);
+        if (err_class == ErrorClass::Permanent) {
+            circuit_breaker_.record_failure();
+            ctx.api_failures++;
+            ctx.failure_details.push_back(endpoint_name + " permanent error: " +
+                std::to_string(resp.status_code) + " " +
+                resp.error_message.substr(0, 200));
+            metrics_.record_api_failure(endpoint_name);
+            return resp;
+        }
+
+        logger_->debug(kComp, "Retry " + std::to_string(attempt + 1) + "/" +
+            std::to_string(retry_policy_.max_retries) + " для " + endpoint_name,
+            {{"status", std::to_string(resp.status_code)}});
+    }
+
+    // All retries exhausted
+    circuit_breaker_.record_failure();
+    ctx.api_failures++;
+    ctx.failure_details.push_back(endpoint_name + " failed after " +
+        std::to_string(retry_policy_.max_retries) + " retries");
+    metrics_.record_api_failure(endpoint_name);
+    metrics_.update_circuit_breaker(circuit_breaker_.current_state() == CircuitState::Open);
+    return {0, "", false, "All retries exhausted"};
+}
+
 // ========== Загрузка данных с биржи ==========
 
-std::vector<PairInfo> PairScanner::fetch_symbols() {
+std::vector<PairInfo> PairScanner::fetch_symbols(ScanContext& ctx) {
     std::vector<PairInfo> result;
 
     try {
-        auto resp = rest_client_->get(kSymbolsPath, "");
+        auto resp = fetch_with_retry(kSymbolsPath, "", ctx, "symbols");
         if (!resp.success) {
             logger_->error(kComp, "Ошибка загрузки символов: " + resp.error_message);
             return result;
@@ -297,6 +478,8 @@ std::vector<PairInfo> PairScanner::fetch_symbols() {
 
             result.push_back(std::move(info));
         }
+
+        ctx.symbols_fetched = static_cast<int>(result.size());
     } catch (const std::exception& e) {
         logger_->error(kComp, "Исключение при загрузке символов: " + std::string(e.what()));
     }
@@ -304,11 +487,11 @@ std::vector<PairInfo> PairScanner::fetch_symbols() {
     return result;
 }
 
-std::vector<TickerData> PairScanner::fetch_tickers() {
+std::vector<TickerData> PairScanner::fetch_tickers(ScanContext& ctx) {
     std::vector<TickerData> result;
 
     try {
-        auto resp = rest_client_->get(kTickersPath, "");
+        auto resp = fetch_with_retry(kTickersPath, "", ctx, "tickers");
         if (!resp.success) {
             logger_->error(kComp, "Ошибка загрузки тикеров: " + resp.error_message);
             return result;
@@ -348,6 +531,8 @@ std::vector<TickerData> PairScanner::fetch_tickers() {
 
             result.push_back(std::move(td));
         }
+
+        ctx.tickers_fetched = static_cast<int>(result.size());
     } catch (const std::exception& e) {
         logger_->error(kComp, "Исключение при загрузке тикеров: " + std::string(e.what()));
     }
@@ -355,12 +540,15 @@ std::vector<TickerData> PairScanner::fetch_tickers() {
     return result;
 }
 
-std::vector<CandleData> PairScanner::fetch_candles(const std::string& symbol, int limit) {
+std::vector<CandleData> PairScanner::fetch_candles(const std::string& symbol, int limit,
+                                                    ScanContext& ctx) {
     std::vector<CandleData> result;
+
+    auto fetch_start = std::chrono::steady_clock::now();
 
     try {
         std::string query = "symbol=" + symbol + "&granularity=1h&limit=" + std::to_string(limit);
-        auto resp = rest_client_->get(kCandlesPath, query);
+        auto resp = fetch_with_retry(kCandlesPath, query, ctx, "candles/" + symbol);
         if (!resp.success) {
             logger_->debug(kComp, "Ошибка загрузки свечей для " + symbol);
             return result;
@@ -390,16 +578,73 @@ std::vector<CandleData> PairScanner::fetch_candles(const std::string& symbol, in
 
         // Bitget возвращает от новых к старым — переворачиваем
         std::reverse(result.begin(), result.end());
+
+        ctx.candles_fetched += static_cast<int>(result.size());
     } catch (const std::exception& e) {
         logger_->debug(kComp, "Исключение при загрузке свечей " + symbol + ": " + e.what());
+    }
+
+    auto fetch_end = std::chrono::steady_clock::now();
+    double latency_ms = std::chrono::duration<double, std::milli>(fetch_end - fetch_start).count();
+    metrics_.observe_candle_fetch(latency_ms);
+
+    return result;
+}
+
+// ========== Параллельная загрузка свечей ==========
+
+std::unordered_map<std::string, std::vector<CandleData>>
+PairScanner::fetch_candles_parallel(const std::vector<TickerData>& candidates, ScanContext& ctx) {
+    std::unordered_map<std::string, std::vector<CandleData>> result;
+    int concurrency = std::max(1, config_.candle_fetch_concurrency);
+    int limit = config_.candle_history_hours;
+
+    // Mutex for thread-safe ScanContext updates from parallel fetches
+    std::mutex ctx_mutex;
+
+    size_t i = 0;
+    while (i < candidates.size()) {
+        std::vector<std::future<std::pair<std::string, std::vector<CandleData>>>> futures;
+        for (int j = 0; j < concurrency && i < candidates.size(); ++j, ++i) {
+            const auto& sym = candidates[i].symbol;
+            futures.push_back(std::async(std::launch::async,
+                [this, sym, limit, &ctx, &ctx_mutex]()
+                    -> std::pair<std::string, std::vector<CandleData>> {
+                    // Use a local context to avoid data races on shared ctx
+                    ScanContext local_ctx;
+                    auto candles = fetch_candles(sym, limit, local_ctx);
+
+                    // Merge local stats back into shared ctx under lock
+                    {
+                        std::lock_guard lock(ctx_mutex);
+                        ctx.candles_fetched += local_ctx.candles_fetched;
+                        ctx.api_failures += local_ctx.api_failures;
+                        ctx.api_retries += local_ctx.api_retries;
+                        ctx.failure_details.insert(ctx.failure_details.end(),
+                            local_ctx.failure_details.begin(),
+                            local_ctx.failure_details.end());
+                    }
+
+                    return {sym, std::move(candles)};
+                }));
+        }
+        for (auto& f : futures) {
+            auto [sym, candles] = f.get();
+            if (!candles.empty()) {
+                result[sym] = std::move(candles);
+            }
+        }
     }
 
     return result;
 }
 
+// ========== Фильтрация ==========
+
 std::vector<TickerData> PairScanner::filter_candidates(
     const std::vector<PairInfo>& pairs,
-    const std::vector<TickerData>& tickers) const
+    const std::vector<TickerData>& tickers,
+    std::vector<PairScore>& rejected) const
 {
     // Множество допустимых символов (online USDT-пары)
     std::set<std::string> valid_symbols;
@@ -412,25 +657,113 @@ std::vector<TickerData> PairScanner::filter_candidates(
 
     std::vector<TickerData> result;
     for (const auto& t : tickers) {
+        auto make_rejected = [&](FilterReason reason, const std::string& details) {
+            PairScore ps;
+            ps.symbol = t.symbol;
+            ps.filtered_out = true;
+            ps.quote_volume_24h = t.quote_volume_24h;
+            ps.change_24h_pct = t.change_24h_pct;
+            ps.filter_verdict = FilterVerdict{reason, details};
+            rejected.push_back(std::move(ps));
+        };
+
         // Пара должна быть в списке валидных
-        if (!valid_symbols.contains(t.symbol)) continue;
+        if (!valid_symbols.contains(t.symbol)) {
+            make_rejected(FilterReason::NotOnline, "Символ не найден среди online USDT-пар");
+            continue;
+        }
 
         // Не в blacklist
-        if (blacklisted.contains(t.symbol)) continue;
+        if (blacklisted.contains(t.symbol)) {
+            make_rejected(FilterReason::Blacklisted, "В чёрном списке");
+            continue;
+        }
 
         // Минимальный объём
-        if (t.quote_volume_24h < config_.min_volume_usdt) continue;
+        if (t.quote_volume_24h < config_.min_volume_usdt) {
+            make_rejected(FilterReason::BelowMinVolume,
+                "Объём " + std::to_string(t.quote_volume_24h) +
+                " < " + std::to_string(config_.min_volume_usdt));
+            continue;
+        }
 
         // Максимальный спред
-        if (t.spread_bps > config_.max_spread_bps && config_.max_spread_bps > 0.0) continue;
+        if (t.spread_bps > config_.max_spread_bps && config_.max_spread_bps > 0.0) {
+            make_rejected(FilterReason::AboveMaxSpread,
+                "Спред " + std::to_string(t.spread_bps) +
+                " bps > " + std::to_string(config_.max_spread_bps));
+            continue;
+        }
 
         // Цена должна быть валидной
-        if (t.last_price <= 0.0) continue;
+        if (t.last_price <= 0.0) {
+            make_rejected(FilterReason::InvalidPrice, "Невалидная цена: " +
+                std::to_string(t.last_price));
+            continue;
+        }
 
         result.push_back(t);
     }
 
     return result;
+}
+
+// ========== Persistence ==========
+
+void PairScanner::persist_result(const ScanResult& result) {
+    if (!storage_ || !config_.persist_scan_results) return;
+    try {
+        // Journal entry for audit trail
+        persistence::JournalEntry entry;
+        entry.type = persistence::JournalEntryType::SystemEvent;
+        entry.timestamp = Timestamp{result.context.finished_at_ms * 1'000'000LL};
+        entry.correlation_id = CorrelationId{result.context.scan_id};
+
+        // Build payload JSON
+        boost::json::object payload;
+        payload["scan_id"] = result.context.scan_id;
+        payload["duration_ms"] = result.context.duration_ms;
+        payload["selected_count"] = static_cast<int>(result.selected.size());
+        payload["total_scored"] = static_cast<int>(result.ranked_pairs.size());
+        payload["api_errors"] = result.api_errors;
+        payload["degraded"] = result.context.degraded_mode;
+        boost::json::array sel;
+        for (const auto& s : result.selected) sel.push_back(boost::json::value(s));
+        payload["selected"] = std::move(sel);
+        entry.payload_json = boost::json::serialize(payload);
+
+        storage_->append_journal(entry);
+
+        // Snapshot for recovery
+        persistence::SnapshotEntry snap;
+        snap.type = persistence::SnapshotType::FullSystem;
+        snap.created_at = Timestamp{result.context.finished_at_ms * 1'000'000LL};
+        snap.payload_json = entry.payload_json;
+        storage_->store_snapshot(snap);
+    } catch (const std::exception& e) {
+        logger_->warn(kComp, "Ошибка сохранения результата: " + std::string(e.what()));
+    }
+}
+
+// ========== Health ==========
+
+void PairScanner::update_health(const ScanResult& result) {
+    if (!health_) return;
+
+    if (result.selected.empty() && config_.mode == config::PairSelectionMode::Auto) {
+        health_->update_subsystem("pair_scanner", health::SubsystemState::Failed,
+            "Сканирование не выбрало ни одной пары (api_errors=" +
+            std::to_string(result.api_errors) + ")");
+    } else if (result.context.degraded_mode) {
+        health_->update_subsystem("pair_scanner", health::SubsystemState::Degraded,
+            "Сканирование завершено с ошибками (api_errors=" +
+            std::to_string(result.api_errors) +
+            ", selected=" + std::to_string(result.selected.size()) + ")");
+    } else {
+        health_->update_subsystem("pair_scanner", health::SubsystemState::Healthy,
+            "Выбрано " + std::to_string(result.selected.size()) + " пар за " +
+            std::to_string(result.context.duration_ms) + " мс");
+    }
 }
 
 } // namespace tb::pair_scanner

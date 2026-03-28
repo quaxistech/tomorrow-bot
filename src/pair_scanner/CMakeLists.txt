@@ -5,6 +5,6 @@ add_library(tb_pair_scanner
 
 target_include_directories(tb_pair_scanner PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(tb_pair_scanner
-    PUBLIC tb_exchange_bitget tb_logging tb_config
+    PUBLIC tb_exchange_bitget tb_logging tb_config tb_metrics tb_health tb_persistence
     PRIVATE Boost::json
 )

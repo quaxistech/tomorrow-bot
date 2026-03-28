@@ -126,9 +126,10 @@ int main(int argc, const char* argv[]) {
     auto scanner_rest_client = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
         config.exchange.endpoint_rest, "", "", "", logger, config.exchange.timeout_ms);
 
-    // Создаём PairScanner
+    // Создаём PairScanner (v5: metrics, health, persistence)
     auto pair_scanner = std::make_shared<tb::pair_scanner::PairScanner>(
-        config.pair_selection, scanner_rest_client, logger);
+        config.pair_selection, scanner_rest_client, logger,
+        comp.metrics, comp.health, nullptr /* storage */);
 
     // Выполняем первичное сканирование
     logger->info("main", "Запуск сканирования торговых пар...");

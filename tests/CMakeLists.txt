@@ -44,6 +44,7 @@ add_subdirectory(unit/synthetic_scenarios)
 add_subdirectory(unit/governance)
 add_subdirectory(unit/operator_control)
 add_subdirectory(unit/supervisor)
+add_subdirectory(unit/pair_scanner)
 add_subdirectory(unit/scenario_integration)
 
 # Интеграционные тесты

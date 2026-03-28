@@ -2,14 +2,18 @@
 
 ## Архитектура потока данных
 
-### 1. Выбор торговых пар (PairScanner)
+### 1. Выбор торговых пар (PairScanner v5)
 
 ```
 Bitget REST API: /api/v2/spot/public/symbols + /api/v2/spot/market/tickers
-    → PairScanner.scan()
-    → фильтрация (объём > 500K, спред < 50bps, статус = online)
-    → скоринг (объём 40% + волатильность 30% + ATR 20% + ликвидность 10%)
+    → PairScanner.scan()   [scan_id UUID, timing, metrics]
+    → фильтрация (объём > 500K, спред < 50bps, статус = online, blacklist)
+    → параллельная загрузка свечей (bounded concurrency, retry + circuit breaker)
+    → валидация данных (DataValidator: bid/ask, chronology, completeness)
+    → скоринг v4: Momentum(40) + Trend(25) + Tradability(25) + Quality(10)
+    → диверсификация (корреляция, секторная концентрация, ликвидность)
     → top-N пар (по умолчанию 5)
+    → persistence (audit trail) + health reporting + metrics
     → выбор лучшей пары → передача в TradingPipeline
     → 24-часовая ротация (повторный скан и возможная смена пары)
 ```
@@ -56,28 +60,61 @@ Bitget WS → BitgetWsClient → RawWsMessage
 
 ## Компоненты
 
-### 0. PairScanner (новый)
+### 0. PairScanner v5 (professional-grade)
 
 **Расположение:** `src/pair_scanner/`
 
 Автоматически сканирует все доступные пары на Bitget и выбирает лучшие для торговли.
-Использует REST API для получения списка инструментов и текущих тикеров.
+Использует REST API для получения списка инструментов, тикеров и часовых свечей.
 
-**Алгоритм скоринга:**
-- Объём 24ч (вес 40%) — высокая ликвидность = узкий спред, быстрое исполнение
-- Волатильность (вес 30%) — достаточный диапазон для прибыли
-- ATR (вес 20%) — абсолютный диапазон движения
-- Ликвидность (вес 10%) — глубина стакана
+**Компоненты:**
+- `PairScanner` — оркестратор сканирования с параллельной загрузкой, retry, circuit breaker
+- `PairScorer` — параметризуемый скоринг через `ScorerConfig` (~30 настроек)
+- `DataValidator` — валидация качества данных (bid/ask, хронология, полнота, аномалии)
+- `DiversificationFilter` — корреляционный cap, секторная концентрация, ликвидность
+- `RetryPolicy` — экспоненциальный backoff с jitter
+- `CircuitBreaker` — защита от каскадных отказов (Closed → Open → HalfOpen)
+- `ScanMetrics` — Prometheus-style метрики (scan_duration, failures, candidates, turnover)
+
+**Алгоритм скоринга v4 (acceleration-based):**
+- Momentum (вес 40) — 4ч ROC + ускорение относительно среднего 24ч темпа + fresh start bonus
+- Trend (вес 25) — простой ADX + бычье направление (bullish ratio + ROC)
+- Tradability (вес 25) — volume tiers + экспоненциальное затухание спреда + волатильность
+- Quality (вес 10) — body ratio (чистота направленного движения)
+
+**Жёсткие фильтры:**
+- 24ч change < -1% → отброс (падающая монета = убыток на споте)
+- 24ч change > 20% → отброс (over-extended / pump)
+- Exhausted pump: 24ч > 10% но 4ч ROC < 25% от 24ч → отброс
+- Стагнация: |24ч change| < 1% → score × 0.3
+
+**Диверсификация корзины:**
+- Корреляция Пирсона на часовых returns (cap 0.85)
+- Секторная концентрация (max 2 пары с одного base coin)
+- Минимальная глубина ликвидности (50K USDT)
+
+**Отказоустойчивость:**
+- Retry с экспоненциальным backoff + jitter (до 3 попыток)
+- Circuit breaker (порог 5 ошибок, сброс 5 мин)
+- Bounded concurrency для параллельной загрузки свечей
+- Graceful degradation при частичных данных
+
+**Наблюдаемость:**
+- Structured logging для каждого scan run (scan_id UUID)
+- Метрики: scan_duration, failures, retries, candidates, score_distribution, turnover
+- Health reporting: subsystem state (Healthy/Degraded/Failed)
+- Persistence: audit trail через IStorageAdapter
 
 **Фильтры:**
 - `min_volume_usd` — минимальный суточный объём (по умолчанию 500,000 USDT)
 - `max_spread_bps` — максимальный спред (по умолчанию 50 bps)
 - Только пары со статусом `online`
 
-**Режимы:** `auto` (автоскоринг), `manual` (ручной список), `hybrid` (авто + белый список)  
+**Режимы:** `auto` (автоскоринг), `manual` (ручной список)
 **Ротация:** каждые 24 часа (конфигурируемо через `pair_selection.rotation_hours`)
 
-**Выход:** `PairScanResult` — ранжированный список пар с оценками
+**Выход:** `ScanResult` — ранжированный список пар с score breakdown, data quality flags,
+filter verdict, rejected pairs (для аудита), scan context (UUID, timing, API stats)
 
 ---
 
@@ -286,7 +323,7 @@ Bitget WS → BitgetWsClient → RawWsMessage
 
 | Компонент | Потокобезопасность | Исключения |
 |---|---|---|
-| PairScanner | нет (однопоточный, вызывается до pipeline) | не бросает |
+| PairScanner | мьютекс на результаты (parallel candle fetch) | не бросает |
 | HTF Bootstrap | нет (однопоточный, вызывается при старте) | не бросает |
 | HTF Real-Time Update | мьютекс на буферы (thread-safe) | не бросает |
 | BitgetNormalizer | нет (однопоточный) | не бросает |
