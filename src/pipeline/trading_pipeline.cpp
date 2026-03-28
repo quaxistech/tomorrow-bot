@@ -147,8 +147,11 @@ TradingPipeline::TradingPipeline(
         if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
             try {
                 cc_storage = persistence::make_postgres_adapter(pg_url);
+            } catch (const std::exception& e) {
+                logger_->warn("pipeline", "PostgreSQL storage недоступен — работаем in-memory",
+                    {{"error", e.what()}});
             } catch (...) {
-                // storage недоступен — работаем in-memory
+                logger_->warn("pipeline", "PostgreSQL storage недоступен — работаем in-memory");
             }
         }
 
@@ -568,7 +571,7 @@ void TradingPipeline::sync_balance_from_exchange() {
                     try {
                         estimated_notional = std::stod(
                             std::string(asset2.at("usdtValue").as_string()));
-                    } catch (...) {}
+                    } catch (...) { logger_->debug("pipeline", "Не удалось разобрать usdtValue для dust-фильтра"); }
                     break;
                 }
             }
@@ -660,7 +663,13 @@ double TradingPipeline::query_asset_balance(const std::string& coin) {
                 return std::stod(std::string(asset.at("available").as_string()));
             }
         }
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        logger_->warn("pipeline", "Ошибка при запросе баланса актива",
+            {{"coin", coin}, {"error", e.what()}});
+    } catch (...) {
+        logger_->warn("pipeline", "Неизвестная ошибка при запросе баланса актива",
+            {{"coin", coin}});
+    }
 
     return 0.0;
 }

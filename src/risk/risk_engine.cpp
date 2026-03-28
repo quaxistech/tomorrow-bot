@@ -202,10 +202,10 @@ void ProductionRiskEngine::record_order_sent() {
 }
 
 void ProductionRiskEngine::record_trade_result(bool is_loss) {
-    // Теперь consecutive_losses отслеживается в PortfolioEngine.
-    // Этот метод оставлен для совместимости с интерфейсом, но не используется.
     std::lock_guard lock(mutex_);
-    (void)is_loss; // Подавление предупреждения о неиспользуемом параметре
+    if (is_loss) {
+        logger_->trace("Risk", "Зафиксирован убыточный результат сделки (tracking in portfolio)");
+    }
 }
 
 // ========== Новые методы ==========

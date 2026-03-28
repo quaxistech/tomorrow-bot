@@ -175,7 +175,7 @@ int main(int argc, const char* argv[]) {
                         double usd_val = 0.0;
                         if (obj.contains("usdtValue")) {
                             try { usd_val = std::stod(std::string(obj["usdtValue"].as_string())); }
-                            catch (...) {}
+                            catch (...) { logger->debug("main", "Не удалось разобрать usdtValue", {{"coin", coin}}); }
                         }
 
                         // Fallback: если usdtValue ненадёжен (0), запрашиваем тикер
@@ -194,7 +194,7 @@ int main(int argc, const char* argv[]) {
                                             usd_val = avail * px;
                                         }
                                     }
-                                } catch (...) {}
+                                } catch (...) { logger->debug("main", "Не удалось получить тикер для оценки баланса", {{"symbol", sym}}); }
                             }
                         }
 
