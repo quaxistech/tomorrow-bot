@@ -459,11 +459,234 @@ OrderRecord ExecutionEngine::create_order_record(
         record.price = *intent.limit_price;
     }
 
+    // Установить политику partial fill и ожидаемую цену
+    record.execution_info.fill_policy = default_fill_policy_;
+    record.execution_info.expected_fill_price = record.price;
+    record.execution_info.client_order_id = record.order_id.get();
+
     return record;
 }
 
 std::string ExecutionEngine::generate_order_id() {
     return "ORD-" + std::to_string(next_order_seq_++);
+}
+
+// ========== Partial fills, timeout, symbol query ==========
+
+void ExecutionEngine::on_fill_event(const FillEvent& fill) {
+    std::lock_guard lock(mutex_);
+
+    auto it = orders_.find(fill.order_id.get());
+    if (it == orders_.end()) {
+        logger_->warn("Execution", "Fill для неизвестного ордера",
+                      {{"order_id", fill.order_id.get()},
+                       {"trade_id", fill.trade_id}});
+        return;
+    }
+
+    auto fsm_it = order_fsms_.find(fill.order_id.get());
+    if (fsm_it == order_fsms_.end()) {
+        return;
+    }
+
+    auto& order = it->second;
+    auto& info = order.execution_info;
+
+    // Записать fill event
+    info.fills.push_back(fill);
+
+    // Обновить накопленный объём (взвешенная средняя цена)
+    double prev_cost = order.filled_quantity.get() * order.avg_fill_price.get();
+    double fill_cost = fill.fill_quantity.get() * fill.fill_price.get();
+    double new_filled = order.filled_quantity.get() + fill.fill_quantity.get();
+
+    order.filled_quantity = Quantity(new_filled);
+    order.remaining_quantity = Quantity(
+        order.original_quantity.get() - new_filled);
+
+    // Пересчитать средневзвешенную цену
+    if (new_filled > 0.0) {
+        order.avg_fill_price = Price((prev_cost + fill_cost) / new_filled);
+    }
+
+    // Задержка до первого fill
+    if (info.fills.size() == 1 && order.created_at.get() > 0) {
+        info.first_fill_latency_ms =
+            (fill.occurred_at.get() - order.created_at.get()) / 1'000'000; // ns → ms
+    }
+
+    // Проскальзывание относительно ожидаемой цены
+    if (info.expected_fill_price.get() > 0.0) {
+        info.realized_slippage =
+            (order.avg_fill_price.get() - info.expected_fill_price.get())
+            / info.expected_fill_price.get();
+    }
+
+    order.last_updated = clock_->now();
+
+    // Переход FSM: полностью исполнен или частично
+    if (new_filled >= order.original_quantity.get()) {
+        fsm_it->second.transition(OrderState::Filled, "Полностью исполнен (fill event)");
+        order.state = OrderState::Filled;
+
+        // Обновить портфель при полном исполнении
+        if (portfolio_) {
+            if (order.side == Side::Sell) {
+                auto existing = portfolio_->get_position(order.symbol);
+                double realized_pnl = 0.0;
+                if (existing.has_value()) {
+                    double entry_cost = existing->avg_entry_price.get()
+                                      * order.filled_quantity.get();
+                    double exit_proceeds = order.avg_fill_price.get()
+                                         * order.filled_quantity.get();
+                    double buy_fee  = entry_cost * kTakerFeePct;
+                    double sell_fee = exit_proceeds * kTakerFeePct;
+                    realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
+                }
+                portfolio_->close_position(order.symbol, order.avg_fill_price, realized_pnl);
+                double sell_fee = order.avg_fill_price.get()
+                                * order.filled_quantity.get() * kTakerFeePct;
+                portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
+            } else {
+                portfolio::Position pos;
+                pos.symbol = order.symbol;
+                pos.side = order.side;
+                pos.size = order.filled_quantity;
+                pos.avg_entry_price = order.avg_fill_price;
+                pos.current_price = order.avg_fill_price;
+                pos.notional = NotionalValue(
+                    order.filled_quantity.get() * order.avg_fill_price.get());
+                pos.strategy_id = order.strategy_id;
+                pos.opened_at = clock_->now();
+                pos.updated_at = clock_->now();
+                portfolio_->open_position(pos);
+                portfolio_->release_cash(order.order_id);
+                double buy_fee = order.filled_quantity.get()
+                               * order.avg_fill_price.get() * kTakerFeePct;
+                portfolio_->record_fee(order.symbol, buy_fee, order.order_id);
+            }
+        }
+    } else {
+        // Частичное исполнение
+        fsm_it->second.transition(OrderState::PartiallyFilled,
+                                  "Частичное исполнение (fill event)");
+        order.state = OrderState::PartiallyFilled;
+
+        // Политика CancelRemaining — отменить остаток после первого fill
+        auto policy = info.fill_policy;
+        if (policy == PartialFillPolicy::CancelRemaining && info.fills.size() == 1) {
+            logger_->info("Execution",
+                "CancelRemaining: отмена остатка после первого fill",
+                {{"order_id", fill.order_id.get()},
+                 {"remaining", std::to_string(order.remaining_quantity.get())}});
+            // Переход в CancelPending и отправка отмены
+            fsm_it->second.transition(OrderState::CancelPending,
+                                      "CancelRemaining policy");
+            order.state = OrderState::CancelPending;
+            bool cancelled = submitter_->cancel_order(order.exchange_order_id);
+            if (cancelled) {
+                fsm_it->second.transition(OrderState::Cancelled,
+                                          "CancelRemaining: остаток отменён");
+                order.state = OrderState::Cancelled;
+                if (order.side == Side::Buy && portfolio_) {
+                    portfolio_->release_cash(order.order_id);
+                }
+            }
+        }
+    }
+
+    logger_->info("Execution", "Fill event обработан",
+                  {{"order_id", fill.order_id.get()},
+                   {"fill_qty", std::to_string(fill.fill_quantity.get())},
+                   {"fill_price", std::to_string(fill.fill_price.get())},
+                   {"cumulative", std::to_string(new_filled)},
+                   {"trade_id", fill.trade_id}});
+
+    if (metrics_) {
+        metrics_->counter("order_fills_total", {})->increment();
+    }
+}
+
+std::vector<OrderId> ExecutionEngine::cancel_timed_out_orders(
+    int64_t max_open_duration_ms)
+{
+    std::lock_guard lock(mutex_);
+
+    auto now_ms = clock_->now().get() / 1'000'000; // ns → ms
+    std::vector<OrderId> cancelled_ids;
+
+    for (auto& [id, order] : orders_) {
+        if (!order.is_active()) {
+            continue;
+        }
+
+        // Время с момента создания ордера (в ms)
+        int64_t open_duration_ms =
+            now_ms - (order.created_at.get() / 1'000'000);
+
+        if (open_duration_ms <= max_open_duration_ms) {
+            continue;
+        }
+
+        auto fsm_it = order_fsms_.find(id);
+        if (fsm_it == order_fsms_.end()) {
+            continue;
+        }
+
+        // Попытка перевести в CancelPending
+        if (!fsm_it->second.transition(OrderState::CancelPending,
+                                        "Timeout: превышено максимальное время")) {
+            continue;
+        }
+        order.state = OrderState::CancelPending;
+
+        bool cancelled = submitter_->cancel_order(order.exchange_order_id);
+        if (cancelled) {
+            fsm_it->second.transition(OrderState::Cancelled,
+                                      "Timeout: ордер отменён");
+            order.state = OrderState::Cancelled;
+            order.last_updated = clock_->now();
+            if (order.side == Side::Buy && portfolio_) {
+                portfolio_->release_cash(order.order_id);
+            }
+            cancelled_ids.push_back(order.order_id);
+
+            logger_->info("Execution", "Ордер отменён по timeout",
+                          {{"order_id", id},
+                           {"open_duration_ms", std::to_string(open_duration_ms)}});
+        }
+    }
+
+    return cancelled_ids;
+}
+
+std::vector<OrderRecord> ExecutionEngine::orders_for_symbol(
+    const Symbol& symbol) const
+{
+    std::lock_guard lock(mutex_);
+    std::vector<OrderRecord> result;
+    for (const auto& [_, order] : orders_) {
+        if (order.symbol == symbol) {
+            result.push_back(order);
+        }
+    }
+    return result;
+}
+
+std::optional<OrderExecutionInfo> ExecutionEngine::get_execution_info(
+    const OrderId& order_id) const
+{
+    std::lock_guard lock(mutex_);
+    auto it = orders_.find(order_id.get());
+    if (it == orders_.end()) {
+        return std::nullopt;
+    }
+    return it->second.execution_info;
+}
+
+void ExecutionEngine::set_default_fill_policy(PartialFillPolicy policy) {
+    std::lock_guard lock(mutex_);
+    default_fill_policy_ = policy;
 }
 
 } // namespace tb::execution

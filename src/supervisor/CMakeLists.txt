@@ -11,6 +11,7 @@ target_include_directories(tb_supervisor
 
 target_link_libraries(tb_supervisor
     PUBLIC
+        tb_common
         tb_health
         tb_logging
         tb_metrics

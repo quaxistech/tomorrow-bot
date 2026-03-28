@@ -3,7 +3,7 @@
 Производственная адаптивная торговая операционная система для биржи Bitget.
 Написана на C++23, развёртывается на Ubuntu 24.04.
 
-**Версия**: 0.3.0 | **Статус**: Production | **Тесты**: 407 тестов
+**Версия**: 0.4.0 | **Статус**: Production | **Тесты**: 559 тестов
 
 ---
 
@@ -226,19 +226,20 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 
 ## Архитектура
 
-### Модули (42+ подсистем)
+### Модули (49+ подсистем)
 
 | Слой | Модули |
 |------|--------|
-| **Инфраструктура** | common, config, security, logging, metrics, health, clock, supervisor, platform |
+| **Инфраструктура** | common, config, security (+ **production_guard**), logging, metrics, health, clock, supervisor (v2: **symbol lock registry, kill-switch broadcast, global position limits, shutdown timeout**), platform |
 | **Рыночные данные** | exchange/bitget (WS+REST), market_data, normalizer, order_book, buffers, indicators, features |
 | **Выбор пар** | pair_scanner (автоматический выбор лучших торговых пар) |
 | **Продвинутые признаки** | advanced_features (CUSUM, VPIN, Volume Profile, Time-of-Day Alpha) |
 | **Интеллект** | world_model, regime, uncertainty (v2: 9 измерений, stateful, ML/portfolio-aware), strategy (×5), strategy_allocator, decision, ai |
 | **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
-| **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution, pipeline, twap_executor |
-| **Аналитика** | persistence, replay (event-driven replay + backtest engine + fill simulator + performance metrics), telemetry, alpha_decay, shadow (v2.0: виртуальное исполнение, fill simulation, multi-leg positions, configurable eval windows, Prometheus metrics, PostgreSQL persistence), champion_challenger |
-| **Защита** | adversarial_defense (v4: 14 детекторов, percentile scoring, correlation matrix, multi-TF, hysteresis, audit log, calibration), synthetic_scenarios, self_diagnosis (v2: event-sourced, scorecards, corrective actions, pipeline-integrated), governance (runtime control plane), operator_control |
+| **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution (v2: **partial fill policy, fill events, order timeout, slippage tracking**), pipeline, twap_executor |
+| **Операционная надёжность** | **reconciliation** (startup order/position/balance reconciliation), **recovery** (snapshot + WAL journal restore, exchange sync), **resilience** (circuit breaker, retry executor, idempotency manager) |
+| **Аналитика** | persistence (+ **WAL writer**: write-ahead logging для crash recovery), replay, telemetry, alpha_decay, shadow (v2.0), champion_challenger |
+| **Защита** | adversarial_defense (v4: 14 детекторов), synthetic_scenarios, self_diagnosis (v2), governance (runtime control plane), operator_control |
 
 ### Продвинутые технологии v0.3
 
@@ -401,7 +402,7 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 └─────────────────────────────────────────────┘
 ```
 
-### Risk Engine — 14 проверок
+### Risk Engine — 26 проверок
 
 1. Kill switch
 2. Max daily loss
@@ -416,7 +417,75 @@ CREATE TABLE IF NOT EXISTS tb_snapshots (
 11. Invalid order book guard
 12. Spread threshold
 13. Liquidity threshold
-14. UTC cut-off
+14. Max loss per trade
+15. UTC cut-off
+16. Strategy budget
+17. Symbol concentration
+18. Same-direction positions
+19. Turnover rate
+20. Realized daily loss
+21. Trade interval per symbol
+22. Regime-scaled limits
+23. Uncertainty limits
+24. Uncertainty cooldown
+25. Uncertainty execution mode
+26. **Global position limits** (v0.4: через Supervisor coordination)
+
+### Production Hardening v0.4
+
+#### Reconciliation Engine
+
+При каждом рестарте система выполняет трёхступенчатую сверку:
+1. **Ордера**: загрузка активных ордеров с биржи → сопоставление с внутренним состоянием → обнаружение и разрешение расхождений
+2. **Позиции**: сверка открытых позиций с балансами на бирже → восстановление или закрытие «сирот»
+3. **Баланс**: проверка USDT-баланса с допуском ±0.5%
+
+Классификация расхождений: `OrderExistsOnlyOnExchange`, `StateMismatch`, `QuantityMismatch`, `PositionExistsOnlyLocally`, `BalanceMismatch`. Автоматическое разрешение с лимитом безопасности (max 10 auto-resolutions per run).
+
+#### Recovery Service
+
+Восстановление состояния после crash/restart:
+1. **Snapshot restore**: загрузка последнего снимка портфеля из PostgreSQL
+2. **WAL replay**: воспроизведение журнала событий после снимка
+3. **Exchange sync**: синхронизация позиций и баланса с биржей
+
+#### WAL (Write-Ahead Logging)
+
+Каждое критическое действие (отправка ордера, открытие/закрытие позиции) сначала записывается в WAL, затем выполняется. При crash незавершённые записи обнаруживаются и обрабатываются. Паттерн: `write_intent → execute → commit/rollback`.
+
+#### Resilience Layer
+
+| Компонент | Описание |
+|-----------|----------|
+| **CircuitBreaker** | Lock-free circuit breaker: Closed → Open (после N отказов) → HalfOpen (после timeout) → Closed (при success). Per-endpoint изоляция |
+| **RetryExecutor** | Экспоненциальный backoff с jitter: `min(base × 2^n + random, max_delay)`. Классификация ошибок: Transient (retry), RateLimit (retry с увеличенным delay), Permanent (fail), AuthFailure (kill switch) |
+| **IdempotencyManager** | Генерация стабильных `ClientOrderId` (`{prefix}_{strategy}_{symbol}_{side}_{ts}_{seq}`). Дедупликация в скользящем окне 5 минут |
+
+#### Supervisor v2 — Global Coordination
+
+| Функция | Описание |
+|---------|----------|
+| **Symbol Lock Registry** | Эксклюзивный лок на символ для предотвращения race condition между pipeline |
+| **Kill Switch Broadcast** | Мгновенное уведомление всех pipeline при активации kill switch через callback registry |
+| **Global Position Limits** | Атомарная проверка глобальных лимитов перед открытием позиции |
+| **Shutdown Timeout** | Контролируемое завершение с таймаутом (default: 30с), force-continue при превышении |
+
+#### Execution Engine v2
+
+| Улучшение | Описание |
+|-----------|----------|
+| **Partial Fill Policy** | `WaitForFull` / `CancelRemaining` / `AllowPartial` — явная политика на каждый ордер |
+| **Fill Event Tracking** | Каждый fill event записывается отдельно с ценой, объёмом, комиссией. Weighted average price |
+| **Order Timeout** | Автоматическая отмена ордеров в состоянии Open дольше threshold (configurable) |
+| **Slippage Tracking** | `realized_slippage = avg_fill_price - expected_fill_price` для post-trade аналитики |
+
+#### Production Guard
+
+Защита от случайного запуска в production:
+- Paper/Shadow/Testnet — всегда разрешены
+- Production — требует `TOMORROW_BOT_PRODUCTION_CONFIRM` env variable
+- Детекция production API URL (отсутствие «testnet» в base URL)
+- Верификация конфигурационного хэша
 
 ### Governance Control Plane
 
@@ -610,16 +679,16 @@ tomorrow-bot/
 │   └── spec/                   # Спецификации
 ├── logs/                       # Логи runtime (не в VCS)
 ├── scripts/                    # Build/run скрипты
-├── src/                        # Исходный код (42+ модулей, ~25K строк)
+├── src/                        # Исходный код (49+ модулей, ~30K строк)
 │   ├── app/                    # Точка входа, bootstrap, PairScanner интеграция
-│   ├── common/                 # StrongType, Result, Error, перечисления
+│   ├── common/                 # StrongType, Result, Error (27 кодов ошибок), перечисления
 │   ├── config/                 # Загрузка YAML, валидация, хеширование
-│   ├── security/               # EnvSecretProvider, маскирование
+│   ├── security/               # EnvSecretProvider, маскирование, **ProductionGuard**
 │   ├── logging/                # Структурированный JSON-логгер
 │   ├── metrics/                # Prometheus-совместимые метрики
 │   ├── health/                 # Health-check подсистем
 │   ├── clock/                  # Абстракция времени (SystemClock / TestClock)
-│   ├── supervisor/             # Жизненный цикл, SIGTERM/SIGINT, degraded mode
+│   ├── supervisor/             # Жизненный цикл, SIGTERM/SIGINT, degraded mode, **v2: symbol locks, kill-switch broadcast, global limits**
 │   ├── platform/               # Информация о хосте/ОС
 │   ├── exchange/bitget/        # WebSocket-клиент + REST-клиент + OrderSubmitter
 │   ├── normalizer/             # Нормализация сырых данных Bitget
@@ -647,10 +716,13 @@ tomorrow-bot/
 │   ├── opportunity_cost/       # Ранжирование кандидатов, suppress/defer
 │   ├── portfolio/              # Позиции, PnL (realized/unrealized), exposure
 │   ├── portfolio_allocator/    # Иерархический: global→regime→strategy→symbol
-│   ├── risk/                   # 14 жёстких проверок, kill switch
-│   ├── execution/              # FSM (10 состояний), Paper/Bitget submitter, TWAP executor
+│   ├── risk/                   # **26 проверок**, режимно-адаптивные лимиты, kill switch
+│   ├── execution/              # FSM (10 состояний), **partial fill policy, fill events, order timeout**, Paper/Bitget submitter, TWAP executor
 │   ├── pipeline/               # TradingPipeline + HTF Trend Filter + Market Readiness
-│   ├── persistence/            # EventJournal + SnapshotStore (IStorageAdapter)
+│   ├── reconciliation/         # **NEW: startup order/position/balance reconciliation**
+│   ├── recovery/               # **NEW: snapshot restore + WAL replay + exchange sync**
+│   ├── resilience/             # **NEW: circuit breaker + retry executor + idempotency manager**
+│   ├── persistence/            # EventJournal + SnapshotStore + **WalWriter** (IStorageAdapter → PostgreSQL)
 │   ├── replay/                 # ReplayEngine (pause/resume/seek, 4 режима, hooks) + BacktestEngine (fill simulation, equity curve, Sharpe/Sortino/Calmar)
 │   ├── telemetry/              # Исследовательская телеметрия (envelope)
 │   ├── alpha_decay/            # Мониторинг деградации (7 измерений: expectancy, hit-rate, slippage, MAE, Brier, regime, execution quality). PostgreSQL persistence
@@ -661,8 +733,8 @@ tomorrow-bot/
 │   ├── governance/             # Runtime control plane: governance gate, halt modes, incident FSM, strategy lifecycle, durable audit (23 event types)
 │   ├── operator_control/       # 11 команд оператора (kill-switch, shadow, inspect)
 │   └── synthetic_scenarios/    # 9 стресс-сценариев с валидацией
-├── tests/                      # 433 теста (unit + integration + scenario)
-│   ├── unit/                   # Модульные тесты
+├── tests/                      # 559 тестов (unit + integration + scenario)
+│   ├── unit/                   # Модульные тесты (вкл. reconciliation, recovery, resilience, persistence, security)
 │   ├── integration/            # Интеграционные тесты
 │   ├── mocks/                  # Моки (exchange, persistence)
 │   └── data/                   # Тестовые данные
@@ -686,16 +758,23 @@ tomorrow-bot/
 
 - API-ключи загружаются из `.env` через `EnvSecretProvider`
 - Секреты маскируются в логах (`[REDACTED]`)
+- **Production Guard**: запуск в production требует env `TOMORROW_BOT_PRODUCTION_CONFIRM` + детекция production API URL
 - Production требует `kill_switch_enabled: true`
 - Governance control plane — единый kill switch, halt modes, durable audit trail
-- 14 независимых проверок риск-движка перед каждым ордером
+- **Kill Switch Broadcast**: мгновенное уведомление всех pipeline через callback registry
+- **Symbol Lock Registry**: предотвращение race condition между параллельными pipeline
+- 26 независимых проверок риск-движка перед каждым ордером
+- **Idempotent Order Submission**: стабильный ClientOrderId + дедупликация
+- **Write-Ahead Logging**: критические действия записываются ДО выполнения
+- **Reconciliation**: автоматическая сверка ордеров/позиций/баланса при рестарте
 - Chandelier Exit / Trailing Stop — адаптивный стоп (1.5×–3×ATR)
 - Adversarial Defense v4 — 14 детекторов рыночных угроз с автоматической калибровкой
 - Entropy Filter — блокировка торговли при высоком шуме (entropy > 0.85)
 - Liquidation Cascade Detector — аварийная блокировка при каскадных ликвидациях
 - Correlation Monitor — снижение риска при decorrelation с BTC/ETH
 - Order FSM исключает дублирование и некорректные переходы
-- Graceful shutdown по SIGTERM/SIGINT с сохранением состояния
+- **Circuit Breaker + Retry Executor**: защита от каскадных отказов с экспоненциальным backoff
+- Graceful shutdown по SIGTERM/SIGINT с **таймаутом** и сохранением состояния
 - Systemd service с `PrivateTmp`, `ProtectSystem=strict`, `NoNewPrivileges`
 
 ---

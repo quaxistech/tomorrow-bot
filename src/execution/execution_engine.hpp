@@ -73,6 +73,21 @@ public:
     /// Проверка дублирования (не отправлять одинаковый интент дважды)
     bool is_duplicate(const strategy::TradeIntent& intent);
 
+    /// Обработать fill event (partial или full)
+    void on_fill_event(const FillEvent& fill);
+
+    /// Проверить ордера с истекшим timeout и отменить
+    std::vector<OrderId> cancel_timed_out_orders(int64_t max_open_duration_ms);
+
+    /// Получить все ордера для символа
+    [[nodiscard]] std::vector<OrderRecord> orders_for_symbol(const Symbol& symbol) const;
+
+    /// Получить статистику fills для ордера
+    [[nodiscard]] std::optional<OrderExecutionInfo> get_execution_info(const OrderId& order_id) const;
+
+    /// Установить partial fill policy по умолчанию
+    void set_default_fill_policy(PartialFillPolicy policy);
+
 private:
     /// Создать запись ордера из интента, решения риска и параметров исполнения
     OrderRecord create_order_record(const strategy::TradeIntent& intent,
@@ -94,6 +109,7 @@ private:
     std::unordered_map<std::string, int64_t> recent_intents_;  ///< Для обнаружения дублей (key -> timestamp_ns)
     mutable std::mutex mutex_;
     std::atomic<int> next_order_seq_{1};
+    PartialFillPolicy default_fill_policy_{PartialFillPolicy::WaitForFull};
 };
 
 } // namespace tb::execution

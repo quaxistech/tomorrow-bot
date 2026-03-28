@@ -19,6 +19,36 @@ enum class OrderState {
     UnknownRecovery         ///< Неизвестное состояние (восстановление)
 };
 
+/// Политика обработки частичного исполнения
+enum class PartialFillPolicy {
+    WaitForFull,        ///< Ждать полного исполнения
+    CancelRemaining,    ///< Отменить остаток после первого fill
+    AllowPartial        ///< Принять частичное исполнение как есть
+};
+
+/// Запись об отдельном fill event (partial или full)
+struct FillEvent {
+    OrderId order_id{OrderId("")};
+    Quantity fill_quantity{Quantity(0.0)};       ///< Объём этого fill
+    Price fill_price{Price(0.0)};               ///< Цена этого fill
+    Quantity cumulative_filled{Quantity(0.0)};   ///< Накопленный объём после этого fill
+    double fee{0.0};                             ///< Комиссия за этот fill
+    std::string trade_id;                        ///< ID сделки на бирже
+    Timestamp occurred_at{Timestamp(0)};
+};
+
+/// Расширенная информация об исполнении ордера
+struct OrderExecutionInfo {
+    std::vector<FillEvent> fills;                  ///< Все fill events
+    PartialFillPolicy fill_policy{PartialFillPolicy::WaitForFull};
+    std::string client_order_id;                   ///< Идемпотентный ключ
+    int retry_count{0};                            ///< Кол-во попыток отправки
+    int64_t time_in_open_ms{0};                    ///< Время в состоянии Open
+    int64_t first_fill_latency_ms{0};              ///< Задержка до первого fill
+    Price expected_fill_price{Price(0.0)};         ///< Ожидаемая цена (от execution alpha)
+    double realized_slippage{0.0};                 ///< Реальное проскальзывание
+};
+
 /// Запись об ордере
 struct OrderRecord {
     OrderId order_id{OrderId("")};
@@ -42,6 +72,7 @@ struct OrderRecord {
 
     std::string rejection_reason;
     int retry_count{0};
+    OrderExecutionInfo execution_info;  ///< Расширенная информация об исполнении
 
     /// Проверка, является ли состояние терминальным
     bool is_terminal() const {
@@ -74,6 +105,9 @@ struct OrderSubmitResult {
 
 /// Преобразование состояния ордера в строку
 std::string to_string(OrderState state);
+
+/// Преобразование политики частичного исполнения в строку
+std::string to_string(PartialFillPolicy policy);
 
 /// Проверка допустимости перехода FSM
 bool is_valid_transition(OrderState from, OrderState to);

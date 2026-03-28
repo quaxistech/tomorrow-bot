@@ -4,6 +4,8 @@ namespace tb::execution {
 
 OrderFSM::OrderFSM(OrderId order_id)
     : order_id_(std::move(order_id))
+    , created_at_ms_(0)
+    , last_transition_ms_(0)
 {
 }
 
@@ -26,6 +28,7 @@ bool OrderFSM::transition(OrderState new_state, const std::string& reason) {
     });
 
     state_ = new_state;
+    last_transition_ms_ = 0; // Обновляется вызывающим кодом через occurred_at
     return true;
 }
 
@@ -41,6 +44,34 @@ bool OrderFSM::is_terminal() const {
 bool OrderFSM::is_active() const {
     return state_ == OrderState::Open || state_ == OrderState::PartiallyFilled ||
            state_ == OrderState::PendingAck || state_ == OrderState::CancelPending;
+}
+
+void OrderFSM::force_transition(OrderState new_state, const std::string& reason) {
+    // Принудительный переход — обходит валидацию (для recovery-сценариев)
+    history_.push_back(OrderTransition{
+        .from = state_,
+        .to = new_state,
+        .reason = "[FORCED] " + reason,
+        .occurred_at = Timestamp(0)
+    });
+
+    state_ = new_state;
+    last_transition_ms_ = 0;
+}
+
+Timestamp OrderFSM::last_transition_time() const {
+    if (history_.empty()) {
+        return Timestamp(created_at_ms_);
+    }
+    return history_.back().occurred_at;
+}
+
+Timestamp OrderFSM::created_at() const {
+    return Timestamp(created_at_ms_);
+}
+
+int64_t OrderFSM::time_in_current_state_ms(int64_t now_ms) const {
+    return now_ms - last_transition_ms_;
 }
 
 } // namespace tb::execution

@@ -138,7 +138,8 @@ void Supervisor::wait_for_shutdown() {
 }
 
 void Supervisor::stop() {
-    logger_->info("supervisor", "Завершение работы системы...");
+    logger_->info("supervisor", "Завершение работы системы (таймаут: "
+                  + std::to_string(shutdown_timeout_.count()) + "с)...");
 
     // Governance: записываем SystemShutdown
     if (governance_) {
@@ -148,8 +149,15 @@ void Supervisor::stop() {
             "Корректное завершение работы системы");
     }
 
-    // Остановка подсистем в обратном порядке регистрации
+    const auto deadline = std::chrono::steady_clock::now() + shutdown_timeout_;
+
+    // Остановка подсистем в обратном порядке регистрации с учётом таймаута
     for (auto it = subsystems_.rbegin(); it != subsystems_.rend(); ++it) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            logger_->warn("supervisor",
+                          "Таймаут graceful shutdown исчерпан — принудительное продолжение");
+            break;
+        }
         if (it->started && it->stop_fn) {
             logger_->info("supervisor", "Остановка подсистемы: " + it->name);
             try {
@@ -267,6 +275,168 @@ void Supervisor::register_subsystem(std::string name, std::function<bool()> star
 
 size_t Supervisor::subsystem_count() const noexcept {
     return subsystems_.size();
+}
+
+// ============================================================
+// Symbol Lock Registry
+// ============================================================
+
+bool Supervisor::try_lock_symbol(const Symbol& symbol, const std::string& pipeline_id) {
+    std::lock_guard<std::mutex> lock(symbol_lock_mutex_);
+    const auto& key = symbol.get();
+    auto it = symbol_locks_.find(key);
+    if (it == symbol_locks_.end()) {
+        symbol_locks_.emplace(key, pipeline_id);
+        logger_->debug("supervisor", "Символ залочен: " + key + " пайплайном: " + pipeline_id);
+        return true;
+    }
+    // Уже залочен тем же пайплайном — разрешаем (идемпотентность)
+    if (it->second == pipeline_id) {
+        return true;
+    }
+    logger_->warn("supervisor", "Символ " + key + " уже залочен пайплайном: " + it->second
+                  + ", отказ для: " + pipeline_id);
+    return false;
+}
+
+void Supervisor::unlock_symbol(const Symbol& symbol, const std::string& pipeline_id) {
+    std::lock_guard<std::mutex> lock(symbol_lock_mutex_);
+    const auto& key = symbol.get();
+    auto it = symbol_locks_.find(key);
+    if (it != symbol_locks_.end() && it->second == pipeline_id) {
+        symbol_locks_.erase(it);
+        logger_->debug("supervisor", "Символ разлочен: " + key + " пайплайном: " + pipeline_id);
+    } else {
+        logger_->warn("supervisor", "Попытка разлочить символ " + key
+                      + " пайплайном " + pipeline_id + ", но лок принадлежит другому");
+    }
+}
+
+bool Supervisor::is_symbol_locked(const Symbol& symbol) const {
+    std::lock_guard<std::mutex> lock(symbol_lock_mutex_);
+    return symbol_locks_.contains(symbol.get());
+}
+
+// ============================================================
+// Global Kill Switch Broadcast
+// ============================================================
+
+void Supervisor::register_kill_switch_listener(std::string listener_id, KillSwitchCallback callback) {
+    std::lock_guard<std::mutex> lock(kill_switch_mutex_);
+    kill_switch_listeners_.emplace(std::move(listener_id), std::move(callback));
+}
+
+void Supervisor::activate_global_kill_switch(const std::string& reason) {
+    // Устанавливаем флаг атомарно
+    bool was_active = kill_switch_active_.exchange(true, std::memory_order_acq_rel);
+    if (was_active) {
+        logger_->warn("supervisor", "Kill switch уже активен, повторная активация: " + reason);
+        return;
+    }
+
+    logger_->error("supervisor", "KILL SWITCH АКТИВИРОВАН: " + reason);
+
+    // Копируем listener'ов под локом, вызываем вне лока (избегаем deadlock)
+    std::vector<KillSwitchCallback> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(kill_switch_mutex_);
+        kill_switch_reason_ = reason;
+        callbacks.reserve(kill_switch_listeners_.size());
+        for (const auto& [id, cb] : kill_switch_listeners_) {
+            callbacks.push_back(cb);
+        }
+    }
+
+    // Уведомляем всех listener'ов
+    for (const auto& cb : callbacks) {
+        try {
+            cb(reason);
+        } catch (const std::exception& e) {
+            logger_->error("supervisor", "Ошибка в kill switch listener: " + std::string(e.what()));
+        }
+    }
+
+    // Governance audit
+    if (governance_) {
+        governance_->record_audit(
+            governance::AuditEventType::KillSwitchActivated,
+            "supervisor", "system",
+            "Kill switch активирован: " + reason);
+    }
+}
+
+void Supervisor::deactivate_global_kill_switch() {
+    bool was_active = kill_switch_active_.exchange(false, std::memory_order_acq_rel);
+    if (!was_active) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(kill_switch_mutex_);
+        kill_switch_reason_.clear();
+    }
+
+    logger_->info("supervisor", "Kill switch деактивирован");
+
+    // Governance audit
+    if (governance_) {
+        governance_->record_audit(
+            governance::AuditEventType::KillSwitchDeactivated,
+            "supervisor", "system",
+            "Kill switch деактивирован");
+    }
+}
+
+bool Supervisor::is_kill_switch_active() const noexcept {
+    return kill_switch_active_.load(std::memory_order_acquire);
+}
+
+// ============================================================
+// Global Position/Order Limits
+// ============================================================
+
+void Supervisor::register_open_position(const Symbol& symbol, const std::string& pipeline_id) {
+    std::lock_guard<std::mutex> lock(positions_mutex_);
+    open_positions_.emplace(symbol.get(), pipeline_id);
+    logger_->info("supervisor", "Позиция зарегистрирована: " + symbol.get()
+                  + " пайплайн: " + pipeline_id
+                  + " (всего: " + std::to_string(open_positions_.size()) + ")");
+}
+
+void Supervisor::unregister_position(const Symbol& symbol, const std::string& pipeline_id) {
+    std::lock_guard<std::mutex> lock(positions_mutex_);
+    auto it = open_positions_.find(symbol.get());
+    if (it != open_positions_.end() && it->second == pipeline_id) {
+        open_positions_.erase(it);
+        logger_->info("supervisor", "Позиция снята: " + symbol.get()
+                      + " пайплайн: " + pipeline_id
+                      + " (всего: " + std::to_string(open_positions_.size()) + ")");
+    }
+}
+
+int Supervisor::global_open_positions_count() const {
+    std::lock_guard<std::mutex> lock(positions_mutex_);
+    return static_cast<int>(open_positions_.size());
+}
+
+void Supervisor::set_max_global_positions(int max_positions) {
+    std::lock_guard<std::mutex> lock(positions_mutex_);
+    max_global_positions_ = max_positions;
+    logger_->info("supervisor", "Глобальный лимит позиций: " + std::to_string(max_positions));
+}
+
+bool Supervisor::can_open_position() const {
+    std::lock_guard<std::mutex> lock(positions_mutex_);
+    return static_cast<int>(open_positions_.size()) < max_global_positions_;
+}
+
+// ============================================================
+// Shutdown Timeout
+// ============================================================
+
+void Supervisor::set_shutdown_timeout(std::chrono::seconds timeout) {
+    shutdown_timeout_ = timeout;
+    logger_->info("supervisor", "Таймаут graceful shutdown: " + std::to_string(timeout.count()) + "с");
 }
 
 } // namespace tb::supervisor

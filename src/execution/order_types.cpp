@@ -18,6 +18,15 @@ std::string to_string(OrderState state) {
     return "Unknown";
 }
 
+std::string to_string(PartialFillPolicy policy) {
+    switch (policy) {
+        case PartialFillPolicy::WaitForFull:      return "WaitForFull";
+        case PartialFillPolicy::CancelRemaining:  return "CancelRemaining";
+        case PartialFillPolicy::AllowPartial:     return "AllowPartial";
+    }
+    return "Unknown";
+}
+
 bool is_valid_transition(OrderState from, OrderState to) {
     // Терминальные состояния — переходы из них недопустимы
     if (from == OrderState::Filled || from == OrderState::Cancelled ||
