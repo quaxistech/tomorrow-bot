@@ -3,8 +3,8 @@
 ## Текущее состояние
 
 Tomorrow Bot — полностью рабочая production-grade торговая система:
-- **42+ модулей** реализованы без заглушек
-- **314 unit-тестов** проходят
+- **49+ модулей** реализованы без заглушек
+- **602 unit-тестов** проходят (100%)
 - **Реальная торговля** на Bitget через REST API
 - **WebSocket**: ~1000+ сообщений в минуту
 - **Graceful shutdown** по SIGTERM/SIGINT
@@ -15,6 +15,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Smart TWAP**: адаптивное исполнение крупных ордеров
 - **Chandelier Exit / Trailing Stop**: адаптивный ATR-based стоп
 - **Volatility Targeting**: динамический сайзинг позиций
+- **12 встроенных индикаторов**: SMA, EMA, RSI, MACD, Bollinger, ATR, ADX, OBV, VWAP, Rolling VWAP, ROC, Z-Score
 
 ---
 
@@ -34,12 +35,12 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **9 торговых стратегий**: Momentum, MeanReversion, Breakout, VolatilityExpansion, MicrostructureScalp, EmaPullback, RsiDivergence, VwapReversion, VolumeProfile
 - **Typed Strategy Configs**: Все пороги стратегий конфигурируемы через типизированные структуры
 - **Spot Signal Semantics**: SignalIntent (LongEntry/LongExit/Reduce/Hold), ExitReason attribution
-- **14-проверочный Risk Engine**: Kill switch, daily loss, drawdown, exposure, stale feed, spread и др.
+- **27-проверочный Risk Engine**: Kill switch, daily loss, drawdown, exposure, stale feed, spread, liquidity, global limits, spot SELL guard и др.
 - **Order FSM**: 10 состояний (New → PendingAck → Open → PartiallyFilled → Filled/Cancelled/Rejected/Expired)
 - **Портфель**: Позиции, realized/unrealized PnL, exposure, concentration
 - **WorldModel**: 9 состояний мира (StableTrend, FragileBreakout, ChopNoise и др.)
 - **RegimeEngine**: 13 режимов рынка с config-driven порогами, hysteresis FSM, explainability, stress policies
-- **UncertaintyEngine**: 4 измерения (regime, signal, data quality, execution)
+- **UncertaintyEngine v2**: 9 измерений (regime, signal, data quality, execution, portfolio, ML, correlation, transition, operational), EMA-сглаживание, hysteresis, shock memory
 - **StrategyAllocator**: Аллокация по режиму и world suitability
 - **DecisionAggregationEngine**: Комитетное голосование с вето
 - **ExecutionAlpha**: Passive/Aggressive/Hybrid execution style, urgency, slice plans
@@ -52,7 +53,7 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Shadow**: Теневые решения, гипотетический PnL в bps
     - **ChampionChallenger v2**: net P&L (gross-fee-slippage), drawdown tracking, hit rate, pre-promotion audit (4 критерия), observer callbacks, Prometheus metrics, persistence
 - **SelfDiagnosis**: Объяснение решений (structured + human-readable)
-- **AdversarialDefense**: 6 видов угроз (spread explosion, liquidity vacuum, toxic flow и др.)
+- **AdversarialDefense v4**: 14 детекторов рыночных угроз (spread explosion, liquidity vacuum, toxic flow, reject storm, latency spike и др.), percentile scoring, correlation matrix, hysteresis
 - **SyntheticScenarios**: 9 стресс-сценариев с валидацией реакций
 - **Governance**: Audit log (15+ типов), strategy registry, config hashing
 - **OperatorControl**: 11 команд (kill-switch, safe-mode, shadow, inspect и др.)
@@ -123,6 +124,32 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Release on Cancel/Reject**: Автоматическое освобождение при отмене/reject/expire
 - **Fee Consistency Fix**: on_order_update() теперь учитывает комиссии (было: без комиссий)
 - **record_fee()**: Комиссии фиксируются при каждом fill (BUY и SELL стороны)
+
+---
+
+### Production Hardening v0.5 ✅ (новое)
+
+**Критические исправления торговой логики:**
+- **Partial close**: `reduce_position()` корректно уменьшает размер (а не удаляет позицию) при частичном закрытии (TP 50%)
+- **Adversarial defense**: `LiquidityVacuum` и `ToxicFlow` — корректный `VetoTrade` при severity ≥ 0.85
+- **ProductionGuard**: подключён к bootstrap — блокирует production без env-подтверждения
+
+**Стабилизация:**
+- Исключены `catch(...)` без логирования в main.cpp, trading_pipeline.cpp
+- `parse_double()` с именем поля для 167 вызовов config loader
+- Удалён vestigial `record_trade_result()`
+
+**Production hardening:**
+- Дедупликация execution engine: `apply_sell_fill_to_portfolio()` / `apply_buy_fill_to_portfolio()`
+- Config validators: trading_params (9 полей), decision (8), execution_alpha (14) + cross-validation
+- Spot SELL guard (risk check #27): запрет продажи без открытой long-позиции
+- 37 новых тестов (31 config + 3 spot-semantic + 3 regression)
+
+**Удаление TA-Lib:**
+- Полное удаление зависимости TA-Lib (cmake, conditional blocks, error codes)
+- Все 12 индикаторов — встроенные реализации (SMA, EMA, RSI, MACD, BB, ATR, ADX, OBV, VWAP, Rolling VWAP, ROC, Z-Score)
+- Централизация комиссий Bitget: `common::fees::kDefaultTakerFeePct` / `kDefaultMakerFeePct`
+- Исправлена maker_fee_pct: 0.001 → 0.0008 (корректная комиссия Bitget)
 
 ---
 

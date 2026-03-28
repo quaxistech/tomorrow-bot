@@ -2,7 +2,7 @@
 
 ## Обзор
 
-`ProductionRiskEngine` — desk-grade риск-движок с **23 правилами pre-trade контроля**,
+`ProductionRiskEngine` — desk-grade риск-движок с **27 правилами pre-trade контроля**,
 **intra-trade мониторингом** открытых позиций и **post-trade учётом** per-strategy budgets.
 
 Каждое нарушение добавляет `RiskReasonCode` в решение.
@@ -12,7 +12,7 @@
 
 | Фаза | Метод | Описание |
 |------|-------|----------|
-| **PreTrade** | `evaluate()` | 23 проверки перед отправкой ордера |
+| **PreTrade** | `evaluate()` | 27 проверок перед отправкой ордера |
 | **IntraTrade** | `evaluate_position()` | Мониторинг MAE и времени удержания |
 | **PostTrade** | `record_trade_close()` | Обновление per-strategy budgets и turnover |
 
@@ -42,7 +42,11 @@
 | 20 | `TURNOVER_RATE` | Превышен лимит сделок в час | 8/час | Throttled |
 | 21 | `REALIZED_DAILY_LOSS` | Реализованный дневной убыток | 1.5% капитала | Denied |
 | 22 | `TRADE_INTERVAL` | Слишком частые сделки по символу | 30 сек | Throttled |
-| 23 | — | Масштабирование лимитов по режиму | regime_aware | — |
+| 23 | `REGIME_SCALED` | Масштабирование лимитов по режиму | regime_aware | ReduceSize |
+| 24 | `UNCERTAINTY_LIMITS` | Uncertainty превышает порог | 0.8 | Denied |
+| 25 | `UNCERTAINTY_COOLDOWN` | Uncertainty cooldown активен | 60 сек | Throttled |
+| 26 | `GLOBAL_POSITION_LIMITS` | Глобальные лимиты позиций (v0.4, Supervisor) | max_positions | Denied |
+| 27 | `SPOT_SELL_WITHOUT_POSITION` | SELL без открытой long-позиции (v0.5) | has_position | Denied |
 
 ## Intra-Trade мониторинг
 
