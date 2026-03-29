@@ -3,71 +3,18 @@
  * @brief Тесты CircuitBreaker, RetryExecutor, IdempotencyManager
  */
 #include <catch2/catch_test_macros.hpp>
+#include "test_mocks.hpp"
 #include "resilience/circuit_breaker.hpp"
 #include "resilience/retry_executor.hpp"
 #include "resilience/idempotency_manager.hpp"
 #include "resilience/resilience_types.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
-#include "metrics/metrics_registry.hpp"
 
 #include <set>
 #include <thread>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::resilience;
-
-// ========== Тестовые заглушки ==========
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-    mutable int64_t time_{1000000};
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(time_); }
-    void advance(int64_t ns) { time_ += ns; }
-};
-
-class TestMetrics : public metrics::IMetricsRegistry {
-    struct NullCounter : metrics::ICounter {
-        std::string name_{"null"};
-        void increment(double) override {}
-        void increment(double, const metrics::MetricTags&) override {}
-        [[nodiscard]] double value() const override { return 0; }
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-    struct NullGauge : metrics::IGauge {
-        std::string name_{"null"};
-        void set(double) override {}
-        void set(double, const metrics::MetricTags&) override {}
-        void increment(double) override {}
-        void decrement(double) override {}
-        [[nodiscard]] double value() const override { return 0; }
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-    struct NullHistogram : metrics::IHistogram {
-        std::string name_{"null"};
-        void observe(double) override {}
-        void observe(double, const metrics::MetricTags&) override {}
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-public:
-    std::shared_ptr<metrics::ICounter> counter(std::string, metrics::MetricTags) override {
-        return std::make_shared<NullCounter>();
-    }
-    std::shared_ptr<metrics::IGauge> gauge(std::string, metrics::MetricTags) override {
-        return std::make_shared<NullGauge>();
-    }
-    std::shared_ptr<metrics::IHistogram> histogram(std::string, std::vector<double>, metrics::MetricTags) override {
-        return std::make_shared<NullHistogram>();
-    }
-    [[nodiscard]] std::string export_prometheus() const override { return ""; }
-};
 
 // ========== Тесты CircuitBreaker ==========
 
@@ -277,7 +224,7 @@ TEST_CASE("IdempotencyManager: очистка истекших записей", 
     REQUIRE(mgr.active_count() == 1);
 
     // Продвигаем время за пределы окна дедупликации
-    clk->advance(200 * 1'000'000);  // 200ms в наносекундах
+    clk->current_time += 200 * 1'000'000;  // 200ms в наносекундах
 
     mgr.cleanup_expired();
     REQUIRE(mgr.active_count() == 0);

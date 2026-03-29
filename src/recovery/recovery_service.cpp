@@ -6,6 +6,7 @@
 #include "recovery/recovery_service.hpp"
 #include "persistence/persistence_types.hpp"
 
+#include <boost/json.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -480,14 +481,64 @@ bool RecoveryService::replay_journal_after_snapshot(Timestamp snapshot_time) {
     int replay_errors = 0;
 
     for (const auto& entry : entries) {
-        // Каждая запись содержит payload_json с событием портфеля.
-        // Минимальная обработка: логируем и считаем.
-        // Полный replay потребовал бы десериализации каждого события.
         if (entry.payload_json.empty()) {
             ++replay_errors;
             continue;
         }
-        ++replayed;
+
+        // Десериализация и применение каждого события к портфелю.
+        // Формат payload_json: {"event":"<type>","symbol":"<sym>","amount":<val>,"price":<val>,...}
+        try {
+            auto json = boost::json::parse(entry.payload_json);
+            auto& obj = json.as_object();
+
+            std::string event_type = obj.contains("event")
+                ? std::string(obj.at("event").as_string()) : "";
+            std::string sym = obj.contains("symbol")
+                ? std::string(obj.at("symbol").as_string()) : "";
+            double amount = obj.contains("amount")
+                ? obj.at("amount").as_double() : 0.0;
+            double price = obj.contains("price")
+                ? obj.at("price").as_double() : 0.0;
+
+            if (event_type == "PositionOpened" && !sym.empty() && price > 0.0) {
+                portfolio::Position pos;
+                pos.symbol = Symbol(sym);
+                pos.side = Side::Buy;
+                pos.size = Quantity(amount);
+                pos.avg_entry_price = Price(price);
+                pos.current_price = Price(price);
+                pos.notional = NotionalValue(amount * price);
+                if (obj.contains("strategy_id")) {
+                    pos.strategy_id = StrategyId(std::string(obj.at("strategy_id").as_string()));
+                }
+                portfolio_->open_position(pos);
+            } else if (event_type == "PositionClosed" && !sym.empty()) {
+                double pnl = obj.contains("pnl") ? obj.at("pnl").as_double() : 0.0;
+                portfolio_->close_position(Symbol(sym), Price(price), pnl);
+            } else if (event_type == "FeeCharged" && !sym.empty()) {
+                portfolio_->record_fee(Symbol(sym), amount);
+            } else if (event_type == "CashReserved") {
+                // Резервирования пересоздаются при перезапуске ордеров — пропускаем
+            } else if (event_type == "CapitalSynced") {
+                if (amount > 0.0) {
+                    portfolio_->set_capital(amount);
+                }
+            } else {
+                // Неизвестный тип события — логируем и пропускаем (не ошибка)
+                logger_->debug(kComponent, "Пропущено неизвестное событие журнала",
+                    {{"event_type", event_type},
+                     {"seq_id", std::to_string(entry.sequence_id)}});
+            }
+
+            ++replayed;
+        } catch (const std::exception& ex) {
+            ++replay_errors;
+            logger_->warn(kComponent, "Ошибка десериализации записи журнала",
+                {{"seq_id", std::to_string(entry.sequence_id)},
+                 {"error", ex.what()},
+                 {"payload", entry.payload_json.substr(0, 200)}});
+        }
     }
 
     if (replay_errors > 0) {

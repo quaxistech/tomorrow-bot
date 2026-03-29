@@ -1,38 +1,17 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "test_mocks.hpp"
 #include "regime/regime_engine.hpp"
 #include "regime/regime_config.hpp"
-#include "metrics/metrics_registry.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
 #include <memory>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::regime;
 using namespace tb::features;
 
 namespace {
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
-
-class TestMetrics : public metrics::IMetricsRegistry {
-public:
-    std::shared_ptr<metrics::ICounter> counter(std::string, metrics::MetricTags) override { return nullptr; }
-    std::shared_ptr<metrics::IGauge> gauge(std::string, metrics::MetricTags) override { return nullptr; }
-    std::shared_ptr<metrics::IHistogram> histogram(std::string, std::vector<double>, metrics::MetricTags) override { return nullptr; }
-    std::string export_prometheus() const override { return ""; }
-};
 
 auto make_deps() {
     struct Deps {

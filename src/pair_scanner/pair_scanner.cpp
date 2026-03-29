@@ -229,6 +229,8 @@ ScanResult PairScanner::scan() {
             if (info_it != symbol_info_.end()) {
                 score.quantity_precision = static_cast<int>(info_it->second.quantity_precision);
                 score.price_precision = static_cast<int>(info_it->second.price_precision);
+                score.min_trade_usdt = info_it->second.min_trade_amount > 0.0
+                    ? info_it->second.min_trade_amount : 1.0;
             }
         }
 

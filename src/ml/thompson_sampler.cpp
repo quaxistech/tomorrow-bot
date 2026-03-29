@@ -2,19 +2,12 @@
 /// @brief Реализация Thompson Sampling для оптимизации момента входа
 
 #include "ml/thompson_sampler.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace tb::ml {
-
-namespace {
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-} // namespace
 
 // ==================== Конструктор ====================
 
@@ -95,7 +88,7 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    last_reward_ns_ = now_ns();
+    last_reward_ns_ = clock::steady_now_ns();
     ++total_rewards_;
     ++records_since_decay_;
 
@@ -178,7 +171,7 @@ MlComponentStatus ThompsonSampler::status() const {
         s.warmup_remaining = static_cast<int>(config_.min_pulls - min_pulls_seen);
         return s;
     }
-    if (numeric::is_stale(last_reward_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_reward_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

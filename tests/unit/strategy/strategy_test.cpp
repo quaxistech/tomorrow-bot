@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "test_mocks.hpp"
 #include "strategy/momentum/momentum_strategy.hpp"
 #include "strategy/mean_reversion/mean_reversion_strategy.hpp"
 #include "strategy/breakout/breakout_strategy.hpp"
@@ -11,27 +12,14 @@
 #include "strategy/vwap_reversion/vwap_reversion_strategy.hpp"
 #include "strategy/volume_profile/volume_profile_strategy.hpp"
 #include "strategy/strategy_registry.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
 #include <memory>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::strategy;
 using namespace tb::features;
 
 namespace {
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
 
 StrategyContext make_context() {
     StrategyContext ctx;

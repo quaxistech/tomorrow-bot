@@ -58,4 +58,11 @@ namespace tb::clock {
     return (end.get() - start.get()) / 1000LL;
 }
 
+/// Получить текущее время steady_clock в наносекундах (монотонные часы).
+/// Используется для вычисления интервалов и staleness — не зависит от коррекции системных часов.
+[[nodiscard]] inline int64_t steady_now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 } // namespace tb::clock

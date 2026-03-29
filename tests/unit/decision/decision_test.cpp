@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "test_mocks.hpp"
 #include "decision/decision_aggregation_engine.hpp"
 #include "strategy/strategy_types.hpp"
 #include "strategy_allocator/allocation_types.hpp"
@@ -9,11 +10,10 @@
 #include "uncertainty/uncertainty_types.hpp"
 #include "portfolio/portfolio_types.hpp"
 #include "features/feature_snapshot.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
 #include <memory>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::decision;
 using namespace tb::strategy;
 using namespace tb::strategy_allocator;
@@ -22,18 +22,6 @@ using namespace tb::world_model;
 using namespace tb::uncertainty;
 
 namespace {
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
 
 TradeIntent make_intent(const std::string& id, Side side, double conviction) {
     TradeIntent intent;

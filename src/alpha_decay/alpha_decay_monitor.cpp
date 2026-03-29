@@ -9,11 +9,11 @@
  *   - Персистентностью истории сделок через IStorageAdapter
  */
 #include "alpha_decay/alpha_decay_monitor.hpp"
+#include "clock/timestamp_utils.hpp"
 #include "persistence/persistence_types.hpp"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <boost/json.hpp>
@@ -21,13 +21,6 @@
 namespace tb::alpha_decay {
 
 namespace {
-
-/// Текущее время в наносекундах (wall clock)
-int64_t now_ns() {
-    return static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-}
 
 /// Скользящее среднее по [start, end) в deque
 double window_mean(const std::deque<TradeOutcome>& t,
@@ -159,7 +152,7 @@ void AlphaDecayMonitor::restore_from_storage() {
     if (!storage_) return;
 
     // Загружаем всю историю за последние 30 дней
-    int64_t now = now_ns();
+    int64_t now = clock::steady_now_ns();
     int64_t thirty_days_ns = 30LL * 24 * 3600 * 1'000'000'000LL;
     Timestamp from{now - thirty_days_ns};
     Timestamp to{now};
@@ -216,7 +209,7 @@ AlphaDecayReport AlphaDecayMonitor::analyze_unlocked(
     report.alerts = std::move(alerts);
     report.overall_recommendation = recommendation;
     report.overall_health = overall_health;
-    report.computed_at = Timestamp{now_ns()};
+    report.computed_at = Timestamp{clock::steady_now_ns()};
     return report;
 }
 
@@ -605,7 +598,7 @@ std::vector<DecayAlert> AlphaDecayMonitor::generate_alerts(
     const std::vector<DecayMetric>& metrics) const
 {
     std::vector<DecayAlert> alerts;
-    int64_t ts = now_ns();
+    int64_t ts = clock::steady_now_ns();
 
     for (const auto& m : metrics) {
         if (!m.is_degraded) continue;

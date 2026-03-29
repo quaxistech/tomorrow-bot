@@ -9,6 +9,7 @@
 
 #include "market_data/market_data_gateway.hpp"
 #include "features/feature_engine.hpp"
+#include "common/exchange_rules.hpp"
 #include "features/advanced_features.hpp"
 #include "order_book/order_book.hpp"
 #include "indicators/indicator_engine.hpp"
@@ -96,6 +97,9 @@ public:
 
     /// Установить точность ордеров для символа (из PairScanner exchange info)
     void set_symbol_precision(int quantity_precision, int price_precision);
+
+    /// Установить правила инструмента (из PairScanner exchange info)
+    void set_exchange_rules(const ExchangeSymbolRules& rules);
 
     /// Установить количество параллельных pipeline (для корректного деления капитала)
     void set_num_pipelines(int n) { num_pipelines_ = std::max(1, n); }
@@ -219,12 +223,10 @@ private:
 
     /// Время последнего отправленного ордера (для cooldown между сделками)
     int64_t last_order_time_ns_{0};
-    /// Минимальный интервал между ордерами: 30 секунд
-    static constexpr int64_t kOrderCooldownNs = 10'000'000'000LL;
 
     /// Счётчик последовательных отклонений ордеров (для экспоненциального backoff)
     int consecutive_rejections_{0};
-    /// Максимальный backoff: 10 минут
+    /// Максимальный backoff между ордерами: 2 минуты (120 секунд)
     static constexpr int64_t kMaxRejectionBackoffNs = 120'000'000'000LL;
 
     /// Время последнего стоп-лосс ордера (отдельный cooldown от обычных сделок).
@@ -240,6 +242,9 @@ private:
 
     /// Ссылка на BitgetOrderSubmitter для настройки precision (nullptr в paper mode)
     std::shared_ptr<exchange::bitget::BitgetOrderSubmitter> bitget_submitter_;
+
+    /// Правила инструмента для текущего символа (из exchange info)
+    ExchangeSymbolRules exchange_rules_;
 
     // ==================== Phase 0: Unified Context ========================
     /// Счётчик тиков обработанных через новый staged pipeline (диагностика)
@@ -266,6 +271,11 @@ private:
     int64_t last_reconciliation_ns_{0};
     /// Интервал runtime reconciliation: 60 секунд
     static constexpr int64_t kReconciliationIntervalNs = 60'000'000'000LL;
+
+    /// Timestamp последней периодической синхронизации баланса
+    int64_t last_balance_sync_ns_{0};
+    /// Интервал синхронизации баланса с биржей: 5 минут
+    static constexpr int64_t kBalanceSyncIntervalNs = 300'000'000'000LL;
 
     /// Запросить баланс USDT с биржи и обновить капитал
     void sync_balance_from_exchange();
@@ -422,6 +432,12 @@ private:
     /// Интервал периодической проверки C/C статуса (каждые 5 минут)
     static constexpr int64_t kCCCheckIntervalNs = 300'000'000'000LL;
     int64_t last_cc_check_ns_{0};
+
+    /// Пары champion↔challenger стратегий (конфигурируемые, без hardcode)
+    std::vector<std::pair<StrategyId, StrategyId>> cc_strategy_pairs_ = {
+        {StrategyId("momentum"),  StrategyId("mean_reversion")},
+        {StrategyId("breakout"),  StrategyId("vol_expansion")}
+    };
 
     /// Минимальный порог conviction для открытия новой позиции
     static constexpr double kDefaultConvictionThreshold = 0.3;

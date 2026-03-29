@@ -1,28 +1,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <cmath>
+#include "test_mocks.hpp"
 #include "opportunity_cost/opportunity_cost_engine.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
-#include "metrics/metrics_registry.hpp"
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::opportunity_cost;
 using namespace Catch::Matchers;
-
-// ========== Тестовые заглушки ==========
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
 
 // ========== Вспомогательные функции ==========
 

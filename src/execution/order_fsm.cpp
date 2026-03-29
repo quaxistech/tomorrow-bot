@@ -13,22 +13,23 @@ OrderState OrderFSM::current_state() const {
     return state_;
 }
 
-bool OrderFSM::transition(OrderState new_state, const std::string& reason) {
-    // Проверить допустимость перехода
+bool OrderFSM::transition(OrderState new_state, const std::string& reason,
+                           Timestamp now) {
     if (!is_valid_transition(state_, new_state)) {
         return false;
     }
 
-    // Сохранить переход в истории
+    int64_t now_ms = now.get() / 1'000'000; // нс → мс (0 если не передано)
+
     history_.push_back(OrderTransition{
         .from = state_,
         .to = new_state,
         .reason = reason,
-        .occurred_at = Timestamp(0) // Время устанавливается вызывающим кодом
+        .occurred_at = now
     });
 
     state_ = new_state;
-    last_transition_ms_ = 0; // Обновляется вызывающим кодом через occurred_at
+    last_transition_ms_ = now_ms;
     return true;
 }
 
@@ -46,17 +47,19 @@ bool OrderFSM::is_active() const {
            state_ == OrderState::PendingAck || state_ == OrderState::CancelPending;
 }
 
-void OrderFSM::force_transition(OrderState new_state, const std::string& reason) {
-    // Принудительный переход — обходит валидацию (для recovery-сценариев)
+void OrderFSM::force_transition(OrderState new_state, const std::string& reason,
+                                 Timestamp now) {
+    int64_t now_ms = now.get() / 1'000'000;
+
     history_.push_back(OrderTransition{
         .from = state_,
         .to = new_state,
         .reason = "[FORCED] " + reason,
-        .occurred_at = Timestamp(0)
+        .occurred_at = now
     });
 
     state_ = new_state;
-    last_transition_ms_ = 0;
+    last_transition_ms_ = now_ms;
 }
 
 Timestamp OrderFSM::last_transition_time() const {

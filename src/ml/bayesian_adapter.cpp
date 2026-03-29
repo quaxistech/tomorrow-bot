@@ -2,18 +2,11 @@
 /// @brief Реализация байесовского онлайн-адаптера параметров
 
 #include "ml/bayesian_adapter.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <numeric>
 
 namespace tb::ml {
-
-namespace {
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-} // namespace
 
 BayesianAdapter::BayesianAdapter(
     BayesianConfig config,
@@ -65,7 +58,7 @@ void BayesianAdapter::record_observation(
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    last_observation_ns_ = now_ns();
+    last_observation_ns_ = clock::steady_now_ns();
     ++total_observations_;
 
     // Сохраняем наблюдение в глобальную историю
@@ -171,7 +164,7 @@ MlComponentStatus BayesianAdapter::status() const {
         s.warmup_remaining = static_cast<int>(config_.min_observations - total_observations_);
         return s;
     }
-    if (numeric::is_stale(last_observation_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_observation_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

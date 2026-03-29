@@ -19,6 +19,7 @@ static constexpr char kComp[] = "BitgetSubmitter";
 // Эндпоинты Bitget Spot v2 API
 static constexpr char kPlaceOrderPath[]  = "/api/v2/spot/trade/place-order";
 static constexpr char kCancelOrderPath[] = "/api/v2/spot/trade/cancel-order";
+static constexpr char kOrderInfoPath[]   = "/api/v2/spot/trade/orderInfo";
 
 BitgetOrderSubmitter::BitgetOrderSubmitter(
     std::shared_ptr<BitgetRestClient> rest_client,
@@ -85,44 +86,44 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     // Для market sell — size = количество в BTC (base currency)
     // Для limit — size = количество в BTC (base currency)
     if (is_market && order.side == Side::Buy) {
-        // Рыночная покупка: size = сколько USDT потратить.
-        // original_quantity в base currency (BTC), price — оценочная рыночная цена.
-        // Если price задана, конвертируем base → quote. Иначе используем quantity как USDT.
-        double quote_amount = 0.0;
-        if (order.price.get() > 0.0) {
-            quote_amount = order.original_quantity.get() * order.price.get();
+        // Bitget Spot market buy: size = quote amount (USDT to spend).
+        // order.price MUST be set to estimated market price.
+        // Reject if price is not set — prevents dust orders.
+        if (order.price.get() <= 0.0) {
+            logger_->error(kComp, "Market buy отклонён: цена не задана (нельзя вычислить quote amount)",
+                {{"symbol", order.symbol.get()},
+                 {"qty", std::to_string(order.original_quantity.get())}});
+            return "{}";
         }
-        if (quote_amount <= 0.0) {
-            // Fallback: если цена не задана, используем quantity как USDT напрямую.
-            // Это корректно только если вызывающий код задал qty уже в USDT.
-            quote_amount = order.original_quantity.get();
-            // Защита: если quote_amount слишком мал (< $1), скорее всего это base qty
-            // без цены — логируем предупреждение
-            if (quote_amount < 1.0) {
-                logger_->warn(kComp, "Market buy: quote_amount подозрительно мал, возможно base qty без цены",
-                    {{"quote_amount", std::to_string(quote_amount)}});
-            }
+        double quote_amount = order.original_quantity.get() * order.price.get();
+        if (quote_amount < rules_.min_trade_usdt) {
+            logger_->error(kComp, "Market buy отклонён: quote amount ниже минимума",
+                {{"quote_amount", std::to_string(quote_amount)},
+                 {"min_trade_usdt", std::to_string(rules_.min_trade_usdt)}});
+            return "{}";
         }
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(price_scale_) << quote_amount;
-        obj["size"] = oss.str();
+        obj["size"] = rules_.format_price(quote_amount);
     } else {
-        // Limit или market sell: size = количество base currency.
-        // Используем quantity_scale_ из exchange info (checkScale для данного символа).
-        // floor (обрезание вниз), чтобы не превысить реальный баланс.
-        double scale_factor = std::pow(10.0, quantity_scale_);
-        double base_qty = std::floor(order.original_quantity.get() * scale_factor) / scale_factor;
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(quantity_scale_) << base_qty;
-        obj["size"] = oss.str();
+        // Limit или market sell: size = base currency quantity.
+        double floored_qty = rules_.floor_quantity(order.original_quantity.get());
+        if (!rules_.is_quantity_valid(floored_qty)) {
+            logger_->error(kComp, "Ордер отклонён: quantity невалиден после округления",
+                {{"original_qty", std::to_string(order.original_quantity.get())},
+                 {"floored_qty", std::to_string(floored_qty)},
+                 {"symbol", order.symbol.get()}});
+            return "{}";
+        }
+        obj["size"] = rules_.format_quantity(floored_qty);
     }
 
     // Цена — только для лимитных ордеров
-    // Используем price_scale_ из exchange info (quotePrecision для данного символа).
     if (!is_market) {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(price_scale_) << order.price.get();
-        obj["price"] = oss.str();
+        if (order.price.get() <= 0.0) {
+            logger_->error(kComp, "Лимитный ордер без цены",
+                {{"symbol", order.symbol.get()}});
+            return "{}";
+        }
+        obj["price"] = rules_.format_price(order.price.get());
     }
 
     return boost::json::serialize(obj);
@@ -145,8 +146,6 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
             result.error_message = "Неподдерживаемый тип ордера";
             return result;
         }
-
-        last_order_symbol_ = order.symbol.get();  // Запоминаем символ для cancel_order
 
         logger_->info(kComp, "Отправка ордера на биржу",
             {{"symbol", order.symbol.get()},
@@ -207,18 +206,16 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
 
 // ==================== cancel_order ====================
 
-bool BitgetOrderSubmitter::cancel_order(const OrderId& order_id) {
+bool BitgetOrderSubmitter::cancel_order(const OrderId& order_id, const Symbol& symbol) {
     try {
         boost::json::object obj;
-        // Используем символ последнего отправленного ордера (т.к. interface IOrderSubmitter
-        // не передаёт symbol в cancel_order). Бот торгует одним символом за раз.
-        obj["symbol"] = last_order_symbol_;
+        obj["symbol"] = symbol.get();
         obj["orderId"] = order_id.get();
 
         std::string body = boost::json::serialize(obj);
 
         logger_->info(kComp, "Запрос отмены ордера",
-            {{"order_id", order_id.get()}});
+            {{"order_id", order_id.get()}, {"symbol", symbol.get()}});
 
         auto response = rest_client_->post(kCancelOrderPath, body);
 
@@ -248,6 +245,67 @@ bool BitgetOrderSubmitter::cancel_order(const OrderId& order_id) {
         logger_->error(kComp, "Исключение при отмене ордера",
             {{"error", ex.what()}, {"order_id", order_id.get()}});
         return false;
+    }
+}
+
+// ==================== query_order_fill_price ====================
+
+Price BitgetOrderSubmitter::query_order_fill_price(const OrderId& exchange_order_id) {
+    try {
+        std::string query = "orderId=" + exchange_order_id.get();
+
+        logger_->debug(kComp, "Запрос fill price для market ордера",
+            {{"exchange_order_id", exchange_order_id.get()}});
+
+        auto response = rest_client_->get(kOrderInfoPath, query);
+
+        if (!response.success) {
+            logger_->warn(kComp, "Не удалось запросить fill price (HTTP)",
+                {{"error", response.error_message}});
+            return Price(0.0);
+        }
+
+        auto json = boost::json::parse(response.body);
+        auto& obj = json.as_object();
+
+        std::string code = std::string(obj.at("code").as_string());
+        if (code != "00000") {
+            std::string msg = obj.contains("msg")
+                ? std::string(obj.at("msg").as_string()) : "";
+            logger_->warn(kComp, "Bitget API ошибка при запросе fill price",
+                {{"code", code}, {"msg", msg}});
+            return Price(0.0);
+        }
+
+        auto& data_arr = obj.at("data").as_array();
+        if (data_arr.empty()) {
+            logger_->warn(kComp, "Пустой ответ orderInfo",
+                {{"exchange_order_id", exchange_order_id.get()}});
+            return Price(0.0);
+        }
+
+        auto& data = data_arr[0].as_object();
+
+        // priceAvg — средняя цена исполнения
+        if (data.contains("priceAvg") && !data.at("priceAvg").is_null()) {
+            std::string price_str = std::string(data.at("priceAvg").as_string());
+            double fill_price = std::stod(price_str);
+            if (fill_price > 0.0) {
+                logger_->info(kComp, "Получена реальная fill price",
+                    {{"exchange_order_id", exchange_order_id.get()},
+                     {"fill_price", price_str}});
+                return Price(fill_price);
+            }
+        }
+
+        logger_->debug(kComp, "priceAvg не доступен в ответе",
+            {{"exchange_order_id", exchange_order_id.get()}});
+        return Price(0.0);
+
+    } catch (const std::exception& ex) {
+        logger_->warn(kComp, "Исключение при запросе fill price",
+            {{"error", ex.what()}, {"exchange_order_id", exchange_order_id.get()}});
+        return Price(0.0);
     }
 }
 

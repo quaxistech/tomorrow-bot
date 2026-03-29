@@ -19,7 +19,7 @@ OrderSubmitResult PaperOrderSubmitter::submit_order(const OrderRecord& order) {
     return result;
 }
 
-bool PaperOrderSubmitter::cancel_order(const OrderId& /*order_id*/) {
+bool PaperOrderSubmitter::cancel_order(const OrderId& /*order_id*/, const Symbol& /*symbol*/) {
     // Всегда успешно в paper mode
     return true;
 }
@@ -106,8 +106,7 @@ Result<OrderId> ExecutionEngine::execute(
     // Если fill price = 0, отклоняем ДО отправки, чтобы не создать phantom position.
     Price market_fill_price{0.0};
     if (order.order_type == OrderType::Market) {
-        market_fill_price = order.price.get() > 0.0
-            ? order.price : Price(intent.limit_price.value_or(Price(0.0)));
+        market_fill_price = order.price;
         if (market_fill_price.get() <= 0.0) {
             logger_->error("Execution", "Fill price = 0 для market ордера — отмена ДО отправки",
                 {{"order_id", order_id_str},
@@ -179,8 +178,17 @@ Result<OrderId> ExecutionEngine::execute(
     // канал для трекинга fill-ов не реализован. Это безопасное допущение
     // для spot market-ордеров, которые исполняются мгновенно.
     if (order.order_type == OrderType::Market) {
-        // fill price уже проверен выше (market_fill_price > 0)
+        // Запрашиваем реальную цену исполнения с биржи (если доступна).
+        // Это устраняет drift между расчётной mid_price и фактической ценой fill.
         auto fill_price = market_fill_price;
+        auto real_price = submitter_->query_order_fill_price(order.exchange_order_id);
+        if (real_price.get() > 0.0) {
+            fill_price = real_price;
+            logger_->info("Execution", "Используем реальную fill price с биржи",
+                {{"order_id", order_id_str},
+                 {"estimated", std::to_string(market_fill_price.get())},
+                 {"actual", std::to_string(real_price.get())}});
+        }
         // PendingAck → Filled — допустимый переход в FSM
         fsm.transition(OrderState::Filled, "Рыночный ордер исполнен");
         order.state = OrderState::Filled;
@@ -194,10 +202,16 @@ Result<OrderId> ExecutionEngine::execute(
         // На спотовом рынке SELL закрывает существующую BUY позицию
         // (короткие позиции на споте невозможны). При BUY — открываем новую.
         if (portfolio_) {
-            if (order.side == Side::Sell) {
-                apply_sell_fill_to_portfolio(order);
+            if (fill_applied_.contains(order_id_str)) {
+                logger_->warn("Execution", "Fill уже применён к портфелю (idempotency guard)",
+                    {{"order_id", order_id_str}});
             } else {
-                apply_buy_fill_to_portfolio(order);
+                fill_applied_.insert(order_id_str);
+                if (order.side == Side::Sell) {
+                    apply_sell_fill_to_portfolio(order);
+                } else {
+                    apply_buy_fill_to_portfolio(order);
+                }
             }
         }
 
@@ -234,7 +248,7 @@ VoidResult ExecutionEngine::cancel(const OrderId& order_id) {
     it->second.state = OrderState::CancelPending;
 
     // Отправить запрос отмены — используем exchange_order_id, а не internal
-    bool cancelled = submitter_->cancel_order(it->second.exchange_order_id);
+    bool cancelled = submitter_->cancel_order(it->second.exchange_order_id, it->second.symbol);
     if (cancelled) {
         fsm_it->second.transition(OrderState::Cancelled, "Отменён");
         it->second.state = OrderState::Cancelled;
@@ -298,10 +312,16 @@ void ExecutionEngine::on_order_update(
     // При полном заполнении — обновить портфель.
     // SELL на споте закрывает (полностью или частично) позицию, BUY открывает новую.
     if (new_state == OrderState::Filled && portfolio_) {
-        if (order.side == Side::Sell) {
-            apply_sell_fill_to_portfolio(order);
+        if (fill_applied_.contains(order_id.get())) {
+            logger_->warn("Execution", "Fill уже применён к портфелю (idempotency guard)",
+                {{"order_id", order_id.get()}});
         } else {
-            apply_buy_fill_to_portfolio(order);
+            fill_applied_.insert(order_id.get());
+            if (order.side == Side::Sell) {
+                apply_sell_fill_to_portfolio(order);
+            } else {
+                apply_buy_fill_to_portfolio(order);
+            }
         }
     }
 
@@ -412,22 +432,24 @@ std::string ExecutionEngine::generate_order_id() {
 
 void ExecutionEngine::apply_sell_fill_to_portfolio(const OrderRecord& order) {
     auto existing = portfolio_->get_position(order.symbol);
-    double realized_pnl = 0.0;
+    // Gross PnL: без комиссий. Комиссии записываются отдельно через record_fee(),
+    // чтобы избежать двойного списания. При BUY — record_fee(buy_fee) уже был вызван.
+    // При SELL — record_fee(sell_fee) вызывается ниже. Каждая комиссия проходит ровно один раз.
+    double gross_pnl = 0.0;
     if (existing.has_value()) {
         double entry_cost    = existing->avg_entry_price.get() * order.filled_quantity.get();
         double exit_proceeds = order.avg_fill_price.get()      * order.filled_quantity.get();
-        double buy_fee       = entry_cost    * kDefaultTakerFeePct;
-        double sell_fee      = exit_proceeds * kDefaultTakerFeePct;
-        realized_pnl = exit_proceeds - entry_cost - buy_fee - sell_fee;
+        gross_pnl = exit_proceeds - entry_cost;
     }
     portfolio_->reduce_position(order.symbol, order.filled_quantity,
-                                order.avg_fill_price, realized_pnl);
+                                order.avg_fill_price, gross_pnl);
     double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
     portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
     logger_->info("Execution", "Позиция уменьшена (SELL fill)",
         {{"symbol", order.symbol.get()},
          {"qty", std::to_string(order.filled_quantity.get())},
-         {"realized_pnl", std::to_string(realized_pnl)}});
+         {"gross_pnl", std::to_string(gross_pnl)},
+         {"sell_fee", std::to_string(sell_fee)}});
 }
 
 void ExecutionEngine::apply_buy_fill_to_portfolio(const OrderRecord& order) {
@@ -508,10 +530,16 @@ void ExecutionEngine::on_fill_event(const FillEvent& fill) {
 
         // Обновить портфель при полном исполнении
         if (portfolio_) {
-            if (order.side == Side::Sell) {
-                apply_sell_fill_to_portfolio(order);
+            if (fill_applied_.contains(fill.order_id.get())) {
+                logger_->warn("Execution", "Fill уже применён к портфелю (idempotency guard)",
+                    {{"order_id", fill.order_id.get()}});
             } else {
-                apply_buy_fill_to_portfolio(order);
+                fill_applied_.insert(fill.order_id.get());
+                if (order.side == Side::Sell) {
+                    apply_sell_fill_to_portfolio(order);
+                } else {
+                    apply_buy_fill_to_portfolio(order);
+                }
             }
         }
     } else {
@@ -526,18 +554,35 @@ void ExecutionEngine::on_fill_event(const FillEvent& fill) {
             logger_->info("Execution",
                 "CancelRemaining: отмена остатка после первого fill",
                 {{"order_id", fill.order_id.get()},
+                 {"filled_qty", std::to_string(order.filled_quantity.get())},
                  {"remaining", std::to_string(order.remaining_quantity.get())}});
             // Переход в CancelPending и отправка отмены
             fsm_it->second.transition(OrderState::CancelPending,
                                       "CancelRemaining policy");
             order.state = OrderState::CancelPending;
-            bool cancelled = submitter_->cancel_order(order.exchange_order_id);
+            bool cancelled = submitter_->cancel_order(order.exchange_order_id, order.symbol);
             if (cancelled) {
                 fsm_it->second.transition(OrderState::Cancelled,
                                           "CancelRemaining: остаток отменён");
                 order.state = OrderState::Cancelled;
                 if (order.side == Side::Buy && portfolio_) {
                     portfolio_->release_cash(order.order_id);
+                }
+            }
+
+            // Обновить портфель для фактически исполненной части.
+            // Без этого на бирже монеты/деньги уже потрачены, но портфель бота не знает об этом.
+            if (portfolio_ && order.filled_quantity.get() > 0.0) {
+                if (fill_applied_.contains(fill.order_id.get())) {
+                    logger_->warn("Execution", "Fill уже применён к портфелю (idempotency guard)",
+                        {{"order_id", fill.order_id.get()}});
+                } else {
+                    fill_applied_.insert(fill.order_id.get());
+                    if (order.side == Side::Sell) {
+                        apply_sell_fill_to_portfolio(order);
+                    } else {
+                        apply_buy_fill_to_portfolio(order);
+                    }
                 }
             }
         }
@@ -588,7 +633,7 @@ std::vector<OrderId> ExecutionEngine::cancel_timed_out_orders(
         }
         order.state = OrderState::CancelPending;
 
-        bool cancelled = submitter_->cancel_order(order.exchange_order_id);
+        bool cancelled = submitter_->cancel_order(order.exchange_order_id, order.symbol);
         if (cancelled) {
             fsm_it->second.transition(OrderState::Cancelled,
                                       "Timeout: ордер отменён");
@@ -635,6 +680,38 @@ std::optional<OrderExecutionInfo> ExecutionEngine::get_execution_info(
 void ExecutionEngine::set_default_fill_policy(PartialFillPolicy policy) {
     std::lock_guard lock(mutex_);
     default_fill_policy_ = policy;
+}
+
+size_t ExecutionEngine::cleanup_terminal_orders(int64_t max_age_ns) {
+    std::lock_guard lock(mutex_);
+    const int64_t now_ns = clock_->now().get();
+    size_t removed = 0;
+
+    auto it = orders_.begin();
+    while (it != orders_.end()) {
+        const auto& order = it->second;
+        if (!order.is_terminal()) {
+            ++it;
+            continue;
+        }
+        // Удаляем ордер если он в терминальном состоянии дольше max_age_ns
+        int64_t age = now_ns - order.last_updated.get();
+        if (age > max_age_ns) {
+            fill_applied_.erase(it->first);
+            order_fsms_.erase(it->first);
+            it = orders_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+
+    if (removed > 0) {
+        logger_->debug("Execution", "Удалены терминальные ордера",
+            {{"removed", std::to_string(removed)},
+             {"remaining", std::to_string(orders_.size())}});
+    }
+    return removed;
 }
 
 } // namespace tb::execution

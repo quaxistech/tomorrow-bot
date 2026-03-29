@@ -9,7 +9,9 @@ include(Catch)
 function(add_tb_test target_name source_file)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE Catch2::Catch2WithMain ${ARGN})
-    target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(${target_name} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/common)
     catch_discover_tests(${target_name})
 endfunction()
 

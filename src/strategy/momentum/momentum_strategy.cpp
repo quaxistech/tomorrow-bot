@@ -46,12 +46,13 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
         return std::nullopt;
     }
 
-    // Momentum ACCELERATION check: momentum_5 vs momentum_20/4
-    // If short-term momentum EXCEEDS long-term average → accelerating
+    // Momentum ACCELERATION check: разность краткосрочного и долгосрочного momentum.
+    // Положительное значение = momentum ускоряется в направлении тренда.
+    // Прямое сравнение (без нормализации 20→5 делением на 4, что математически
+    // некорректно для составных доходностей). Дельта mom5-mom20 — стандартный подход.
     double momentum_accel = 0.0;
     if (tech.momentum_valid) {
-        double avg_short_rate = tech.momentum_20 / 4.0;
-        momentum_accel = tech.momentum_5 - avg_short_rate;
+        momentum_accel = tech.momentum_5 - tech.momentum_20;
     }
 
     TradeIntent intent;

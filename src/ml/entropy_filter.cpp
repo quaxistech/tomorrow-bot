@@ -2,22 +2,13 @@
 /// @brief Реализация фильтра энтропии Шеннона для оценки качества сигналов
 
 #include "ml/entropy_filter.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <vector>
 
 namespace tb::ml {
-
-namespace {
-
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-} // anonymous namespace
 
 EntropyFilter::EntropyFilter(
     EntropyConfig config,
@@ -52,7 +43,7 @@ void EntropyFilter::on_tick(
         return;
     }
 
-    last_tick_ns_ = now_ns();
+    last_tick_ns_ = clock::steady_now_ns();
     ++total_ticks_;
 
     // Вычисляем доходность (log-return)
@@ -107,7 +98,7 @@ EntropyResult EntropyFilter::compute() const
             return s;
         }
 
-        if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+        if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
             s.health = MlComponentHealth::Stale;
             s.warmup_remaining = 0;
             return s;
@@ -176,7 +167,7 @@ MlComponentStatus EntropyFilter::status() const
         return s;
     }
 
-    if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

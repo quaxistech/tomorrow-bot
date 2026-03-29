@@ -13,6 +13,7 @@
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tb::uncertainty { struct UncertaintySnapshot; }
@@ -27,15 +28,19 @@ public:
     /// Отправить ордер
     virtual OrderSubmitResult submit_order(const OrderRecord& order) = 0;
 
-    /// Отменить ордер
-    virtual bool cancel_order(const OrderId& order_id) = 0;
+    /// Отменить ордер. Symbol обязателен для Bitget API.
+    virtual bool cancel_order(const OrderId& order_id, const Symbol& symbol) = 0;
+
+    /// Запросить реальную цену исполнения market-ордера с биржи.
+    /// Возвращает avg fill price > 0 при успехе, 0.0 при неудаче.
+    virtual Price query_order_fill_price(const OrderId& exchange_order_id) { (void)exchange_order_id; return Price(0.0); }
 };
 
 /// Реализация для paper/shadow торговли — немедленно подтверждает ордера без отправки на биржу
 class PaperOrderSubmitter : public IOrderSubmitter {
 public:
     OrderSubmitResult submit_order(const OrderRecord& order) override;
-    bool cancel_order(const OrderId& order_id) override;
+    bool cancel_order(const OrderId& order_id, const Symbol& symbol) override;
 
 private:
     int next_exchange_id_{1};
@@ -88,6 +93,11 @@ public:
     /// Установить partial fill policy по умолчанию
     void set_default_fill_policy(PartialFillPolicy policy);
 
+    /// Удалить ордера в терминальных состояниях старше max_age_ns.
+    /// Предотвращает утечку памяти на долгоработающем боте.
+    /// @return Количество удалённых ордеров
+    size_t cleanup_terminal_orders(int64_t max_age_ns);
+
 private:
     /// Создать запись ордера из интента, решения риска и параметров исполнения
     OrderRecord create_order_record(const strategy::TradeIntent& intent,
@@ -118,6 +128,9 @@ private:
     mutable std::mutex mutex_;
     std::atomic<int> next_order_seq_{1};
     PartialFillPolicy default_fill_policy_{PartialFillPolicy::WaitForFull};
+
+    /// Набор order_id для которых fill уже применён к портфелю (идемпотентность)
+    std::unordered_set<std::string> fill_applied_;
 };
 
 } // namespace tb::execution

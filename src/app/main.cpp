@@ -18,6 +18,7 @@
 #include "supervisor/supervisor.hpp"
 #include "pipeline/trading_pipeline.hpp"
 #include "pair_scanner/pair_scanner.hpp"
+#include "common/exchange_rules.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "security/secret_provider.hpp"
 #include "common/enums.hpp"
@@ -242,11 +243,16 @@ int main(int argc, const char* argv[]) {
             {{"symbols", symbols_str}});
     }
 
-    // Собираем precision для cada выбранного символа из результатов сканирования
-    // (PairScanner уже загрузил quantityPrecision/pricePrecision из exchange info)
-    std::unordered_map<std::string, std::pair<int, int>> symbol_precisions;
+    // Собираем правила инструментов для cada выбранного символа из результатов сканирования
+    // (PairScanner уже загрузил quantityPrecision/pricePrecision/minTradeUSDT из exchange info)
+    std::unordered_map<std::string, tb::ExchangeSymbolRules> symbol_rules;
     for (const auto& ps : scan_result.ranked_pairs) {
-        symbol_precisions[ps.symbol] = {ps.quantity_precision, ps.price_precision};
+        tb::ExchangeSymbolRules rules;
+        rules.symbol = tb::Symbol(ps.symbol);
+        rules.quantity_precision = ps.quantity_precision;
+        rules.price_precision = ps.price_precision;
+        rules.min_trade_usdt = ps.min_trade_usdt;
+        symbol_rules[ps.symbol] = rules;
     }
 
     // ---- 5. Создание и запуск супервизора ----
@@ -271,10 +277,10 @@ int main(int argc, const char* argv[]) {
             config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, comp.health,
             comp.governance, sym);
 
-        // Устанавливаем точность ордеров из данных сканирования
-        auto prec_it = symbol_precisions.find(sym);
-        if (prec_it != symbol_precisions.end()) {
-            pipeline->set_symbol_precision(prec_it->second.first, prec_it->second.second);
+        // Устанавливаем правила инструмента из данных сканирования
+        auto rules_it = symbol_rules.find(sym);
+        if (rules_it != symbol_rules.end()) {
+            pipeline->set_exchange_rules(rules_it->second);
         }
 
         // Устанавливаем количество pipeline для корректного деления капитала
@@ -401,10 +407,15 @@ int main(int argc, const char* argv[]) {
                 }
                 pipelines.clear();
 
-                // 2. Обновляем precision из нового сканирования
-                symbol_precisions.clear();
+                // 2. Обновляем правила инструментов из нового сканирования
+                symbol_rules.clear();
                 for (const auto& ps : rescan.ranked_pairs) {
-                    symbol_precisions[ps.symbol] = {ps.quantity_precision, ps.price_precision};
+                    tb::ExchangeSymbolRules rules;
+                    rules.symbol = tb::Symbol(ps.symbol);
+                    rules.quantity_precision = ps.quantity_precision;
+                    rules.price_precision = ps.price_precision;
+                    rules.min_trade_usdt = ps.min_trade_usdt;
+                    symbol_rules[ps.symbol] = rules;
                 }
 
                 // 3. Обновляем список активных символов
@@ -417,9 +428,9 @@ int main(int argc, const char* argv[]) {
                         config, comp.secret_provider, comp.logger, comp.clock,
                         comp.metrics, comp.health, comp.governance, sym);
 
-                    auto prec_it = symbol_precisions.find(sym);
-                    if (prec_it != symbol_precisions.end()) {
-                        pipeline->set_symbol_precision(prec_it->second.first, prec_it->second.second);
+                    auto rules_it = symbol_rules.find(sym);
+                    if (rules_it != symbol_rules.end()) {
+                        pipeline->set_exchange_rules(rules_it->second);
                     }
                     pipeline->set_num_pipelines(static_cast<int>(active_symbols.size()));
                     pipeline->start();

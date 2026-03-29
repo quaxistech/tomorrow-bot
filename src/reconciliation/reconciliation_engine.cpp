@@ -101,6 +101,11 @@ ReconciliationResult ReconciliationEngine::reconcile_on_startup(
         }
         if (try_auto_resolve(mismatch)) {
             ++auto_resolved_count;
+        } else if (!mismatch.resolved) {
+            logger_->error("Reconciliation", "Авто-разрешение расхождения не удалось",
+                {{"type", to_string(mismatch.type)},
+                 {"order_id", mismatch.order_id.get()},
+                 {"description", mismatch.description}});
         }
     }
 
@@ -187,6 +192,11 @@ ReconciliationResult ReconciliationEngine::reconcile_active_orders(
         }
         if (try_auto_resolve(mismatch)) {
             ++auto_resolved_count;
+        } else if (!mismatch.resolved) {
+            logger_->error("Reconciliation", "Авто-разрешение расхождения не удалось",
+                {{"type", to_string(mismatch.type)},
+                 {"order_id", mismatch.order_id.get()},
+                 {"description", mismatch.description}});
         }
     }
 
@@ -281,7 +291,9 @@ std::optional<MismatchRecord> ReconciliationEngine::reconcile_single_order(
     // Проверить filled_qty
     double local_filled = local_order.filled_quantity.get();
     double exchange_filled = exchange_order.filled_quantity.get();
-    if (std::abs(local_filled - exchange_filled) > 1e-8) {
+    // Use relative tolerance: max(1e-8, 0.001% of quantity)
+    double tolerance = std::max(1e-8, exchange_filled * 1e-5);
+    if (std::abs(local_filled - exchange_filled) > tolerance) {
         MismatchRecord mismatch;
         mismatch.type = MismatchType::QuantityMismatch;
         mismatch.symbol = local_order.symbol;
@@ -409,7 +421,9 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_orders(
         // Проверить filled_qty
         double local_filled = local.filled_quantity.get();
         double exchange_filled = found->filled_quantity.get();
-        if (std::abs(local_filled - exchange_filled) > 1e-8) {
+        // Use relative tolerance: max(1e-8, 0.001% of quantity)
+        double tolerance = std::max(1e-8, exchange_filled * 1e-5);
+        if (std::abs(local_filled - exchange_filled) > tolerance) {
             MismatchRecord m;
             m.type = MismatchType::QuantityMismatch;
             m.symbol = local.symbol;

@@ -12,9 +12,11 @@ public:
     /// Текущее состояние
     [[nodiscard]] OrderState current_state() const;
 
-    /// Попытка перехода в новое состояние
+    /// Попытка перехода в новое состояние.
+    /// @param now Текущее время (устанавливается в записи перехода)
     /// Возвращает false если переход недопустим
-    bool transition(OrderState new_state, const std::string& reason = "");
+    bool transition(OrderState new_state, const std::string& reason = "",
+                    Timestamp now = Timestamp(0));
 
     /// Получить историю переходов
     [[nodiscard]] const std::vector<OrderTransition>& history() const;
@@ -26,7 +28,8 @@ public:
     [[nodiscard]] bool is_active() const;
 
     /// Принудительный переход для recovery (обходит валидацию)
-    void force_transition(OrderState new_state, const std::string& reason);
+    void force_transition(OrderState new_state, const std::string& reason,
+                          Timestamp now = Timestamp(0));
 
     /// Время последнего перехода
     [[nodiscard]] Timestamp last_transition_time() const;

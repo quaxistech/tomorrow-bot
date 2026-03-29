@@ -3,21 +3,13 @@
  * @brief Реализация сервиса мониторинга здоровья подсистем
  */
 #include "health_service.hpp"
-#include <chrono>
+#include "clock/timestamp_utils.hpp"
 #include <sstream>
 #include <mutex>
 
 namespace tb::health {
 
 namespace {
-
-/// Получить текущее время в наносекундах
-Timestamp now_ns() {
-    auto now = std::chrono::system_clock::now();
-    auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now.time_since_epoch()).count();
-    return Timestamp{ns};
-}
 
 /// Экранирование строк для JSON
 std::string json_escape(std::string_view s) {
@@ -42,7 +34,7 @@ void HealthService::register_subsystem(std::string name) {
             .name         = name,
             .state        = SubsystemState::Unknown,
             .message      = "Инициализация",
-            .last_updated = now_ns()
+            .last_updated = Timestamp{clock::steady_now_ns()}
         });
     }
 }
@@ -58,12 +50,12 @@ void HealthService::update_subsystem(std::string name,
             .name         = name,
             .state        = state,
             .message      = std::move(message),
-            .last_updated = now_ns()
+            .last_updated = Timestamp{clock::steady_now_ns()}
         });
     } else {
         it->second.state        = state;
         it->second.message      = std::move(message);
-        it->second.last_updated = now_ns();
+        it->second.last_updated = Timestamp{clock::steady_now_ns()};
     }
 }
 

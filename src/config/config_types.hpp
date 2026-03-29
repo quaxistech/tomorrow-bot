@@ -257,6 +257,8 @@ struct DecisionConfig {
 struct TradingParamsConfig {
     double atr_stop_multiplier{2.0};            ///< Множитель ATR для trailing stop (Chandelier Exit)
     double max_loss_per_trade_pct{1.0};         ///< Макс. убыток на сделку (% от капитала)
+    double price_stop_loss_pct{3.0};            ///< Макс. убыток на сделку (% от цены входа, спот)
+    double min_risk_reward_ratio{1.5};          ///< Минимальный R:R для открытия позиции
     double breakeven_atr_threshold{1.5};        ///< ATR-профит для переноса стопа в breakeven
     double partial_tp_atr_threshold{2.0};       ///< ATR-профит для частичного тейк-профита
     double partial_tp_fraction{0.5};            ///< Доля позиции для частичного TP (0.5 = 50%)

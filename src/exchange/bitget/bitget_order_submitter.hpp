@@ -9,6 +9,7 @@
 
 #include "bitget_rest_client.hpp"
 #include "execution/execution_engine.hpp"
+#include "common/exchange_rules.hpp"
 #include <memory>
 #include <string>
 
@@ -30,13 +31,14 @@ public:
     );
 
     execution::OrderSubmitResult submit_order(const execution::OrderRecord& order) override;
-    bool cancel_order(const OrderId& order_id) override;
+    bool cancel_order(const OrderId& order_id, const Symbol& symbol) override;
+    Price query_order_fill_price(const OrderId& exchange_order_id) override;
 
-    /// Установить точность для конкретного символа (из exchange info)
-    void set_symbol_precision(int quantity_scale, int price_scale) {
-        quantity_scale_ = quantity_scale;
-        price_scale_ = price_scale;
-    }
+    /// Установить правила инструмента (precision, min notional, min qty)
+    void set_rules(const ExchangeSymbolRules& rules) { rules_ = rules; }
+
+    /// Получить текущие правила (для диагностики)
+    [[nodiscard]] const ExchangeSymbolRules& rules() const { return rules_; }
 
 private:
     /// Построить JSON тело запроса для размещения ордера
@@ -46,12 +48,8 @@ private:
     std::shared_ptr<logging::ILogger> logger_;
     std::string product_type_;
 
-    /// Точность ордера для текущего символа (из exchange info)
-    int quantity_scale_{6};   ///< Кол-во знаков количества (по умолчанию 6 для BTC)
-    int price_scale_{2};      ///< Кол-во знаков цены (по умолчанию 2 для USDT пар)
-
-    /// Символ последнего отправленного ордера (для cancel_order, которому нужен symbol)
-    mutable std::string last_order_symbol_{"BTCUSDT"};
+    /// Правила инструмента для текущего символа (из exchange info)
+    ExchangeSymbolRules rules_;
 };
 
 } // namespace tb::exchange::bitget

@@ -1,32 +1,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "test_mocks.hpp"
 #include "uncertainty/uncertainty_engine.hpp"
 #include "regime/regime_types.hpp"
 #include "world_model/world_model_types.hpp"
 #include "portfolio/portfolio_types.hpp"
 #include "ml/ml_signal_types.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
 #include <memory>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::uncertainty;
 using namespace tb::features;
 
 namespace {
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
 
 FeatureSnapshot make_good_snapshot() {
     FeatureSnapshot snap;

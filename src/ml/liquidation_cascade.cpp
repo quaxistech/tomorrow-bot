@@ -2,21 +2,12 @@
 /// @brief Реализация детектора ликвидационных каскадов
 
 #include "ml/liquidation_cascade.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <numeric>
 
 namespace tb::ml {
-
-namespace {
-
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-} // anonymous namespace
 
 // ==================== Конструктор ====================
 
@@ -68,7 +59,7 @@ void LiquidationCascadeDetector::on_tick(
         return;
     }
 
-    last_tick_ns_ = now_ns();
+    last_tick_ns_ = clock::steady_now_ns();
     ++total_ticks_;
 
     // Compute rolling volatility (stddev of log-returns)
@@ -117,7 +108,7 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     CascadeSignal signal;
 
     // Fill component status
-    const int64_t ts = now_ns();
+    const int64_t ts = clock::steady_now_ns();
     signal.component_status.last_update_ns = last_tick_ns_;
     signal.component_status.samples_processed = static_cast<int>(total_ticks_);
     signal.samples_used = static_cast<int>(prices_.size());
@@ -237,7 +228,7 @@ MlComponentStatus LiquidationCascadeDetector::status() const {
         return s;
     }
 
-    if (numeric::is_stale(last_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

@@ -3,22 +3,14 @@
  * @brief Тесты ProductionGuard — защита от случайного production запуска
  */
 #include <catch2/catch_test_macros.hpp>
+#include "test_mocks.hpp"
 #include "security/production_guard.hpp"
-#include "logging/logger.hpp"
 
 #include <cstdlib>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::security;
-
-// ========== Тестовые заглушки ==========
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
 
 // ========== Тесты ==========
 

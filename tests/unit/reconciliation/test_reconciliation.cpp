@@ -3,66 +3,15 @@
  * @brief Тесты движка reconciliation
  */
 #include <catch2/catch_test_macros.hpp>
+#include "test_mocks.hpp"
 #include "reconciliation/reconciliation_engine.hpp"
 #include "reconciliation/reconciliation_types.hpp"
 #include "execution/order_types.hpp"
 #include "portfolio/portfolio_types.hpp"
-#include "logging/logger.hpp"
-#include "clock/clock.hpp"
-#include "metrics/metrics_registry.hpp"
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::reconciliation;
-
-// ========== Тестовые заглушки ==========
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
-
-class TestClock : public clock::IClock {
-public:
-    [[nodiscard]] Timestamp now() const override { return Timestamp(1000000); }
-};
-
-class TestMetrics : public metrics::IMetricsRegistry {
-    struct NullCounter : metrics::ICounter {
-        std::string name_{"null"};
-        void increment(double) override {}
-        void increment(double, const metrics::MetricTags&) override {}
-        [[nodiscard]] double value() const override { return 0; }
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-    struct NullGauge : metrics::IGauge {
-        std::string name_{"null"};
-        void set(double) override {}
-        void set(double, const metrics::MetricTags&) override {}
-        void increment(double) override {}
-        void decrement(double) override {}
-        [[nodiscard]] double value() const override { return 0; }
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-    struct NullHistogram : metrics::IHistogram {
-        std::string name_{"null"};
-        void observe(double) override {}
-        void observe(double, const metrics::MetricTags&) override {}
-        [[nodiscard]] const std::string& name() const override { return name_; }
-    };
-public:
-    std::shared_ptr<metrics::ICounter> counter(std::string, metrics::MetricTags) override {
-        return std::make_shared<NullCounter>();
-    }
-    std::shared_ptr<metrics::IGauge> gauge(std::string, metrics::MetricTags) override {
-        return std::make_shared<NullGauge>();
-    }
-    std::shared_ptr<metrics::IHistogram> histogram(std::string, std::vector<double>, metrics::MetricTags) override {
-        return std::make_shared<NullHistogram>();
-    }
-    [[nodiscard]] std::string export_prometheus() const override { return ""; }
-};
 
 // ========== Mock IExchangeQueryService ==========
 

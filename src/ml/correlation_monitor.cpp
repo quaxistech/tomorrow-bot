@@ -2,19 +2,12 @@
 /// @brief Реализация монитора корреляций между активами
 
 #include "ml/correlation_monitor.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <numeric>
 
 namespace tb::ml {
-
-namespace {
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-}
 
 // ==================== Конструктор ====================
 
@@ -39,7 +32,7 @@ CorrelationMonitor::CorrelationMonitor(
 void CorrelationMonitor::on_primary_tick(double price) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!numeric::is_valid_price(price)) return;
-    last_primary_tick_ns_ = now_ns();
+    last_primary_tick_ns_ = clock::steady_now_ns();
     ++total_ticks_;
 
     if (last_primary_price_ > 0.0 && price > 0.0) {
@@ -59,7 +52,7 @@ void CorrelationMonitor::on_primary_tick(double price) {
 void CorrelationMonitor::on_reference_tick(const std::string& asset, double price) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!numeric::is_valid_price(price) || asset.empty()) return;
-    last_reference_tick_ns_[asset] = now_ns();
+    last_reference_tick_ns_[asset] = clock::steady_now_ns();
     ++total_ticks_;
 
     auto it = last_reference_prices_.find(asset);
@@ -137,7 +130,7 @@ CorrelationResult CorrelationMonitor::evaluate() const {
     result.component_status = status();
     double total_corr = 0.0;
     size_t valid_count = 0;
-    const int64_t ts = now_ns();
+    const int64_t ts = clock::steady_now_ns();
 
     for (const auto& asset : config_.reference_assets) {
         CorrelationSnapshot snap;
@@ -245,7 +238,7 @@ MlComponentStatus CorrelationMonitor::status() const {
         s.warmup_remaining = static_cast<int>(5 - std::min<size_t>(5, primary_returns_.size()));
         return s;
     }
-    if (numeric::is_stale(last_primary_tick_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_primary_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

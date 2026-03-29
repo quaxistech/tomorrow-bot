@@ -4,29 +4,18 @@
  */
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include "test_mocks.hpp"
 #include "ai/ai_advisory_engine.hpp"
 #include "ai/ai_advisory_types.hpp"
 #include "features/feature_snapshot.hpp"
-#include "logging/logger.hpp"
-#include "metrics/metrics_registry.hpp"
 #include <memory>
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::ai;
 using namespace tb::features;
 
 namespace {
-
-// ============================================================
-// Test mocks
-// ============================================================
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent) override {}
-    void set_level(logging::LogLevel) override {}
-    logging::LogLevel get_level() const override { return logging::LogLevel::Trace; }
-};
 
 // ============================================================
 // Helpers

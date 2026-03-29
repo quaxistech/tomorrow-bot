@@ -8,6 +8,7 @@
 #include "exchange/bitget/bitget_order_submitter.hpp"
 #include "normalizer/normalized_events.hpp"
 #include "common/enums.hpp"
+#include "common/constants.hpp"
 #include "persistence/postgres_storage_adapter.hpp"
 #include "shadow/shadow_mode_engine.hpp"
 #include <boost/json.hpp>
@@ -121,55 +122,39 @@ TradingPipeline::TradingPipeline(
     adversarial_defense_ = std::make_shared<defense::AdversarialMarketDefense>(
         defense::make_defense_config(config_.adversarial_defense));
 
-    // 5.5. Монитор деградации альфы — с metrics и PostgreSQL storage (если задан POSTGRES_URL)
-    {
-        std::shared_ptr<persistence::IStorageAdapter> decay_storage;
-        if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
-            try {
-                decay_storage = persistence::make_postgres_adapter(pg_url);
-                logger_->info("pipeline", "Alpha decay: PostgreSQL storage подключён",
-                    {{"url_prefix", std::string(pg_url).substr(0, 20) + "..."}});
-            } catch (const std::exception& ex) {
-                logger_->warn("pipeline",
-                    "Alpha decay: не удалось подключиться к PostgreSQL, работаем in-memory",
-                    {{"error", ex.what()}});
-            }
+    // Общий PostgreSQL storage — создаём один раз, передаём всем компонентам.
+    // Если POSTGRES_URL не задан или подключение не удалось — nullptr (in-memory fallback).
+    std::shared_ptr<persistence::IStorageAdapter> shared_pg_storage;
+    if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
+        try {
+            shared_pg_storage = persistence::make_postgres_adapter(pg_url);
+            logger_->info("pipeline", "PostgreSQL storage подключён",
+                {{"url_prefix", std::string(pg_url).substr(0, 20) + "..."}});
+        } catch (const std::exception& ex) {
+            logger_->warn("pipeline",
+                "Не удалось подключиться к PostgreSQL, работаем in-memory",
+                {{"error", ex.what()}});
         }
-        alpha_decay_monitor_ = std::make_shared<alpha_decay::AlphaDecayMonitor>(
-            alpha_decay::DecayConfig{}, metrics_, decay_storage);
-        // Восстанавливаем историю из хранилища (если оно подключено)
-        alpha_decay_monitor_->restore_from_storage();
     }
+
+    // 5.5. Монитор деградации альфы
+    alpha_decay_monitor_ = std::make_shared<alpha_decay::AlphaDecayMonitor>(
+        alpha_decay::DecayConfig{}, metrics_, shared_pg_storage);
+    alpha_decay_monitor_->restore_from_storage();
 
     // 5.5b. Champion-Challenger A/B тестирование стратегий
     {
-        std::shared_ptr<persistence::IStorageAdapter> cc_storage;
-        if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
-            try {
-                cc_storage = persistence::make_postgres_adapter(pg_url);
-            } catch (const std::exception& e) {
-                logger_->warn("pipeline", "PostgreSQL storage недоступен — работаем in-memory",
-                    {{"error", e.what()}});
-            } catch (...) {
-                logger_->warn("pipeline", "PostgreSQL storage недоступен — работаем in-memory");
-            }
-        }
-
         champion_challenger::ChampionChallengerConfig cc_cfg;
-        cc_cfg.min_evaluation_trades = 30;   // Снижен для более быстрой обратной связи
-        cc_cfg.promotion_threshold   = 0.20; // +20% чистый net P&L delta
+        cc_cfg.min_evaluation_trades = 30;
+        cc_cfg.promotion_threshold   = 0.20;
         cc_cfg.rejection_threshold   = -0.10;
-        cc_cfg.min_hit_rate          = 0.40; // 40% прибыльных сделок — минимум для spot
-        cc_cfg.max_drawdown_bps      = -600.0; // просадка не хуже -600bps
+        cc_cfg.min_hit_rate          = 0.40;
+        cc_cfg.max_drawdown_bps      = -600.0;
         cc_cfg.min_regime_samples    = 3;
 
         cc_engine_ = std::make_shared<champion_challenger::ChampionChallengerEngine>(
-            cc_cfg, logger_, metrics_, cc_storage);
+            cc_cfg, logger_, metrics_, shared_pg_storage);
 
-        // Регистрируем пары стратегий для A/B сравнения:
-        //  momentum (champion) vs mean_reversion (challenger) — оба работают live,
-        //  сравниваем по накопленным результатам за период оценки.
-        //  breakout (champion) vs vol_expansion (challenger) — аналогично.
         (void)cc_engine_->register_challenger(
             StrategyId("momentum"),
             StrategyId("mean_reversion"),
@@ -185,22 +170,9 @@ TradingPipeline::TradingPipeline(
 
     // 5.4b. Shadow trading подсистема
     {
+        auto shadow_storage = (config_.shadow.persist_to_db) ? shared_pg_storage : nullptr;
         shadow_engine_ = std::make_shared<shadow::ShadowModeEngine>(
-            config_.shadow, logger_, clock_, metrics_, governance_);
-        if (config_.shadow.persist_to_db) {
-            // PostgreSQL storage для shadow — если задан POSTGRES_URL
-            if (const char* pg_url = std::getenv("POSTGRES_URL"); pg_url && *pg_url) {
-                try {
-                    auto shadow_storage = persistence::make_postgres_adapter(pg_url);
-                    shadow_engine_ = std::make_shared<shadow::ShadowModeEngine>(
-                        config_.shadow, logger_, clock_, metrics_, governance_, shadow_storage);
-                    logger_->info("pipeline", "Shadow: PostgreSQL storage подключён");
-                } catch (const std::exception& ex) {
-                    logger_->warn("pipeline", "Shadow: PostgreSQL недоступен, работаем in-memory",
-                        {{"error", ex.what()}});
-                }
-            }
-        }
+            config_.shadow, logger_, clock_, metrics_, governance_, shadow_storage);
         logger_->info("pipeline", "Shadow подсистема инициализирована",
             {{"enabled", config_.shadow.enabled ? "true" : "false"},
              {"mode", config_.shadow.mode == shadow::ShadowMode::Observation ? "observation"
@@ -450,12 +422,22 @@ TradingPipeline::~TradingPipeline() {
 }
 
 void TradingPipeline::set_symbol_precision(int quantity_precision, int price_precision) {
+    ExchangeSymbolRules rules;
+    rules.symbol = symbol_;
+    rules.quantity_precision = quantity_precision;
+    rules.price_precision = price_precision;
+    set_exchange_rules(rules);
+}
+
+void TradingPipeline::set_exchange_rules(const ExchangeSymbolRules& rules) {
+    exchange_rules_ = rules;
     if (bitget_submitter_) {
-        bitget_submitter_->set_symbol_precision(quantity_precision, price_precision);
-        logger_->info("pipeline", "Установлена точность ордеров",
-            {{"symbol", symbol_.get()},
-             {"qty_precision", std::to_string(quantity_precision)},
-             {"price_precision", std::to_string(price_precision)}});
+        bitget_submitter_->set_rules(rules);
+        logger_->info("pipeline", "Exchange rules установлены",
+            {{"symbol", rules.symbol.get()},
+             {"qty_precision", std::to_string(rules.quantity_precision)},
+             {"price_precision", std::to_string(rules.price_precision)},
+             {"min_trade_usdt", std::to_string(rules.min_trade_usdt)}});
     }
 }
 
@@ -483,18 +465,29 @@ void TradingPipeline::fetch_symbol_precision() {
             if (sym != symbol_.get()) continue;
 
             int qty_prec = 6, price_prec = 2;
+            double min_trade = 1.0;
             if (o.contains("quantityPrecision")) {
                 qty_prec = static_cast<int>(parse_json_double(o.at("quantityPrecision")));
             }
             if (o.contains("pricePrecision")) {
                 price_prec = static_cast<int>(parse_json_double(o.at("pricePrecision")));
             }
+            if (o.contains("minTradeUSDT")) {
+                min_trade = parse_json_double(o.at("minTradeUSDT"));
+                if (min_trade <= 0.0) min_trade = 1.0;
+            }
 
-            bitget_submitter_->set_symbol_precision(qty_prec, price_prec);
+            ExchangeSymbolRules rules;
+            rules.symbol = symbol_;
+            rules.quantity_precision = qty_prec;
+            rules.price_precision = price_prec;
+            rules.min_trade_usdt = min_trade;
+            set_exchange_rules(rules);
             logger_->info("pipeline", "Precision загружена с биржи",
                 {{"symbol", sym},
                  {"qty_precision", std::to_string(qty_prec)},
-                 {"price_precision", std::to_string(price_prec)}});
+                 {"price_precision", std::to_string(price_prec)},
+                 {"min_trade_usdt", std::to_string(min_trade)}});
             return;
         }
     } catch (const std::exception& e) {
@@ -1419,15 +1412,16 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         }
         bool fixed_stop_triggered = loss_pct_of_capital >= config_.trading_params.max_loss_per_trade_pct;
 
-        // === 3b. Per-trade price stop: убыток > 3% от цены входа ===
-        // Независимо от размера позиции — ограничение максимального ценового движения
+        // === 3b. Per-trade price stop: ценовой убыток превысил порог от цены входа ===
+        // Только для long (спот: short невозможен). Защита от резкого падения цены.
         bool price_stop_triggered = false;
         if (pos.side == Side::Buy && entry > 0.0) {
             double price_loss_pct = (entry - price) / entry * 100.0;
-            if (price_loss_pct >= 3.0) {
+            if (price_loss_pct >= config_.trading_params.price_stop_loss_pct) {
                 price_stop_triggered = true;
-                logger_->warn("pipeline", "PRICE STOP: убыток > 3% от цены входа",
+                logger_->warn("pipeline", "PRICE STOP: убыток превысил порог от цены входа",
                     {{"price_loss_pct", std::to_string(price_loss_pct)},
+                     {"threshold_pct", std::to_string(config_.trading_params.price_stop_loss_pct)},
                      {"entry", std::to_string(entry)},
                      {"current", std::to_string(price)},
                      {"symbol", symbol_.get()}});
@@ -1495,9 +1489,9 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             reset_trailing_state();
             return true;
         }
-        // Пылевая позиция (< $0.50) — невозможно продать, пропускаем
+        // Пылевая позиция — невозможно продать на бирже, пропускаем
         double actual_notional = actual_qty * price;
-        if (actual_notional < 0.50) {
+        if (actual_notional < common::exchange_limits::kDustNotionalUsdt) {
             logger_->debug("pipeline", "Пылевая позиция, пропускаем стоп-лосс",
                 {{"notional", std::to_string(actual_notional)},
                  {"symbol", symbol_.get()}});
@@ -1513,13 +1507,15 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         std::string reason;
 
         if (partial_tp_triggered && !trailing_stop_triggered && !fixed_stop_triggered) {
-            // Partial TP: закрываем 50% позиции
-            close_qty = actual_qty * 0.5;
+            // Partial TP: закрываем сконфигурированную долю позиции
+            close_qty = actual_qty * config_.trading_params.partial_tp_fraction;
             // Минимальный ордер Bitget
-            if (close_qty < 0.00001) close_qty = actual_qty;
+            double min_qty_notional = common::exchange_limits::kMinBitgetNotionalUsdt / price;
+            if (close_qty < min_qty_notional) close_qty = actual_qty;
             is_full_close = false;
             partial_tp_taken_ = true;
-            reason = "PARTIAL_TP: профит >= 2×ATR, закрытие 50%";
+            reason = "PARTIAL_TP: профит >= " + std::to_string(config_.trading_params.partial_tp_atr_threshold)
+                   + "×ATR, закрытие " + std::to_string(static_cast<int>(config_.trading_params.partial_tp_fraction * 100)) + "%";
 
             logger_->info("pipeline", "PARTIAL TAKE-PROFIT — закрытие 50% позиции",
                 {{"symbol", symbol_.get()},
@@ -1801,14 +1797,24 @@ void TradingPipeline::record_trade_for_decay(
 
     // Champion-Challenger: записываем net P&L (gross - fee - slippage) для честного сравнения
     if (cc_engine_) {
-        // Оцениваем комиссию по типу исполнения (maker=2bps, taker=6bps, hybrid=4bps)
-        double fee_bps = 4.0; // default: hybrid
+        // Реальные комиссии Bitget: maker=8bps, taker=10bps.
+        // Используем централизованные константы из common/constants.hpp.
+        double fee_bps = common::fees::kDefaultTakerFeePct * common::finance::kBasisPointsScaler; // default: taker (10 bps)
         if (last_exec_alpha_.has_value()) {
             using ES = execution_alpha::ExecutionStyle;
             switch (last_exec_alpha_->recommended_style) {
-                case ES::Passive:    fee_bps = 2.0; break;
-                case ES::Aggressive: fee_bps = 6.0; break;
-                default:             fee_bps = 4.0; break;
+                case ES::Passive:
+                case ES::PostOnly:
+                    fee_bps = common::fees::kDefaultMakerFeePct * common::finance::kBasisPointsScaler; // maker: 8 bps
+                    break;
+                case ES::Aggressive:
+                    fee_bps = common::fees::kDefaultTakerFeePct * common::finance::kBasisPointsScaler; // taker: 10 bps
+                    break;
+                default:
+                    // Hybrid: среднее между maker и taker
+                    fee_bps = (common::fees::kDefaultMakerFeePct + common::fees::kDefaultTakerFeePct)
+                              / 2.0 * common::finance::kBasisPointsScaler; // 9 bps
+                    break;
             }
         }
 
@@ -1821,15 +1827,15 @@ void TradingPipeline::record_trade_for_decay(
         const std::string regime_str = std::string{to_string(outcome.regime)};
         const std::string sid        = std::string{strategy_id.get()};
 
-        // Проверяем, является ли стратегия champion-ом или challenger-ом
-        const bool is_challenger = (sid == "mean_reversion" || sid == "vol_expansion");
-
-        if (is_challenger) {
-            (void)cc_engine_->record_challenger_outcome(
-                strategy_id, breakdown, regime_str, conviction);
-        } else if (sid == "momentum" || sid == "breakout") {
-            (void)cc_engine_->record_champion_outcome(
-                strategy_id, breakdown, regime_str);
+        // Маппинг champion↔challenger определён парами в cc_strategy_pairs_
+        for (const auto& [champ_id, chall_id] : cc_strategy_pairs_) {
+            if (sid == chall_id.get()) {
+                (void)cc_engine_->record_challenger_outcome(
+                    strategy_id, breakdown, regime_str, conviction);
+            } else if (sid == champ_id.get()) {
+                (void)cc_engine_->record_champion_outcome(
+                    strategy_id, breakdown, regime_str);
+            }
         }
         // microstructure_scalp — вне C/C пар, не записываем
     }
@@ -1874,35 +1880,42 @@ void TradingPipeline::check_champion_challenger_status() {
         (now_ns - last_cc_check_ns_) < kCCCheckIntervalNs) return;
     last_cc_check_ns_ = now_ns;
 
-    // Проверяем пары стратегий
-    const std::vector<std::pair<StrategyId, StrategyId>> pairs = {
-        {StrategyId("momentum"),     StrategyId("mean_reversion")},
-        {StrategyId("breakout"),     StrategyId("vol_expansion")}
-    };
-
-    for (const auto& [champion, challenger] : pairs) {
-        // Получаем отчёт по champion-стратегии
+    for (const auto& [champion, challenger] : cc_strategy_pairs_) {
         auto report = cc_engine_->evaluate(champion);
         if (!report) continue;
 
         const auto champ_str = std::string{champion.get()};
         const auto chall_str = std::string{challenger.get()};
 
-        // Проверяем, нужен ли промоушен или отклонение challenger-а
         if (cc_engine_->should_promote(challenger)) {
-            logger_->warn("CC", "Challenger готов к промоушену",
+            logger_->warn("CC", "Challenger promoted — деактивируем champion",
                 {{"champion",   champ_str},
                  {"challenger", chall_str}});
-            (void)cc_engine_->promote(challenger);
+            auto result = cc_engine_->promote(challenger);
+            if (result) {
+                auto strat = strategy_registry_->get(champion);
+                if (strat) {
+                    strat->set_active(false);
+                    logger_->info("CC", "Champion деактивирован",
+                        {{"strategy", champ_str}});
+                }
+            }
 
         } else if (cc_engine_->should_reject(challenger)) {
-            logger_->warn("CC", "Challenger отклонён — уступает champion-у",
+            logger_->warn("CC", "Challenger rejected — деактивируем challenger",
                 {{"champion",   champ_str},
                  {"challenger", chall_str}});
-            (void)cc_engine_->reject(challenger);
+            auto result = cc_engine_->reject(challenger);
+            if (result) {
+                auto strat = strategy_registry_->get(challenger);
+                if (strat) {
+                    strat->set_active(false);
+                    logger_->info("CC", "Challenger деактивирован",
+                        {{"strategy", chall_str}});
+                }
+            }
         }
 
-        // Логируем сводный отчёт
         for (const auto& entry : report->challengers) {
             const auto& cm = entry.challenger_metrics;
             logger_->info("CC", "Сводка C/C",
@@ -2158,22 +2171,39 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             auto now_ms = clock_->now().get() / 1'000'000;  // нс → мс
             auto slice_intent = twap_executor_->get_next_slice(twap, snapshot, now_ms);
             if (slice_intent) {
-                // Исполняем слайс через обычный pipeline (размер уже рассчитан)
-                // TWAP слайсы используют дефолтную неопределённость — размер уже зафиксирован
+                // TWAP-слайсы проходят через risk engine для критических проверок
+                // (kill switch, daily loss, max drawdown), но размер уже зафиксирован
                 uncertainty::UncertaintySnapshot twap_uncertainty{};
                 auto exec_alpha = execution_alpha_->evaluate(*slice_intent, snapshot, twap_uncertainty);
-                risk::RiskDecision slice_risk;
-                slice_risk.decided_at = clock_->now();
-                slice_risk.approved_quantity = slice_intent->suggested_quantity;
-                slice_risk.verdict = risk::RiskVerdict::Approved;
-                slice_risk.summary = "TWAP slice";
+
+                // Прогоняем через risk engine вместо ручного Approved
+                auto port_snap = portfolio_->snapshot();
+                auto slice_risk = risk_engine_->evaluate(
+                    *slice_intent, port_snap, twap_uncertainty);
+
+                if (slice_risk.verdict == risk::RiskVerdict::Denied) {
+                    logger_->warn("pipeline", "TWAP slice заблокирован risk engine",
+                        {{"reason", slice_risk.summary},
+                         {"slice", std::to_string(twap.next_slice)}});
+                    // Abort TWAP при критическом блоке (kill switch, daily loss)
+                    twap_executor_->active_twap().reset();
+                    return;
+                }
+
+                // Risk может уменьшить размер — используем approved_quantity
+                slice_intent->suggested_quantity = slice_risk.approved_quantity;
 
                 auto result = execution_engine_->execute(*slice_intent, slice_risk, exec_alpha, twap_uncertainty);
                 if (result) {
                     risk_engine_->record_order_sent();
+                    // Записываем fill только после успешного исполнения
                     twap_executor_->record_slice_fill(twap, twap.next_slice - 1,
-                        slice_intent->suggested_quantity,
+                        slice_risk.approved_quantity,
                         slice_intent->limit_price ? *slice_intent->limit_price : snapshot.mid_price);
+                } else {
+                    logger_->warn("pipeline", "TWAP slice execution failed",
+                        {{"slice", std::to_string(twap.next_slice)},
+                         {"error", "execute returned error"}});
                 }
             }
             return;  // Не обрабатываем новые сигналы, пока TWAP активен
@@ -2601,10 +2631,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
         
         double rr_ratio = (risk_distance > 0.0) ? (reward_distance / risk_distance) : 0.0;
-        if (rr_ratio < 1.5) {
+        if (rr_ratio < config_.trading_params.min_risk_reward_ratio) {
             if (tick_count_ % 200 == 0) {
-                logger_->info("pipeline", "Trade skipped: poor Risk:Reward (min 1.5:1)",
+                logger_->info("pipeline", "Trade skipped: poor Risk:Reward",
                     {{"rr_ratio", std::to_string(rr_ratio)},
+                     {"min_rr", std::to_string(config_.trading_params.min_risk_reward_ratio)},
                      {"risk", std::to_string(risk_distance / price * 100.0)},
                      {"reward", std::to_string(reward_distance / price * 100.0)},
                      {"strategy", intent.strategy_id.get()},
@@ -2767,9 +2798,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         bool intent_is_buy = (intent.side == Side::Buy);
 
-        // Минимальный торгуемый нотионал на Bitget ($1 USDT).
+        // Минимальный торгуемый нотионал на Bitget (реальный минимум $1 USDT, с запасом $1.10).
         // Пылевые остатки ниже этого порога не считаются реальной позицией.
-        constexpr double kMinTradeableNotional = 0.50;  // $0.50 — ниже невозможно продать
+        const double kMinTradeableNotional = common::exchange_limits::kMinBitgetNotionalUsdt;
         double position_notional = position_size.get() * snapshot.mid_price.get();
 
         // Нельзя SELL на спот без реальной длинной позиции (>= min notional)
@@ -3284,6 +3315,14 @@ FreshnessResult TradingPipeline::check_quote_freshness(
 void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
     run_order_watchdog(now_ns);
     run_continuous_reconciliation(now_ns);
+
+    // Периодическая синхронизация баланса с биржей (каждые 5 минут).
+    // Обнаруживает расхождения после ручных сделок, сбоев API, или пропущенных fill'ов.
+    if (rest_client_ &&
+        (last_balance_sync_ns_ == 0 || (now_ns - last_balance_sync_ns_) >= kBalanceSyncIntervalNs)) {
+        last_balance_sync_ns_ = now_ns;
+        sync_balance_from_exchange();
+    }
 }
 
 void TradingPipeline::run_order_watchdog(int64_t now_ns) {
@@ -3309,6 +3348,10 @@ void TradingPipeline::run_order_watchdog(int64_t now_ns) {
                  {"age_ms", std::to_string(rep.age_ms)}});
         }
     }
+
+    // Очистка терминальных ордеров старше 1 часа для предотвращения утечки памяти
+    static constexpr int64_t kTerminalOrderMaxAgeNs = 3600'000'000'000LL;
+    execution_engine_->cleanup_terminal_orders(kTerminalOrderMaxAgeNs);
 }
 
 void TradingPipeline::run_continuous_reconciliation(int64_t now_ns) {

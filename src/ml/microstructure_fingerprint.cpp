@@ -2,19 +2,12 @@
 /// @brief Реализация fingerprinting микроструктуры рынка
 
 #include "ml/microstructure_fingerprint.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace tb::ml {
-
-namespace {
-int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-}
 
 MicrostructureFingerprinter::MicrostructureFingerprinter(
     FingerprintConfig config,
@@ -93,7 +86,7 @@ void MicrostructureFingerprinter::record_outcome(
 {
     if (!numeric::is_finite(return_pct)) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    last_update_ns_ = now_ns();
+    last_update_ns_ = clock::steady_now_ns();
     ++total_updates_;
 
     auto& stats = knowledge_base_[fp];
@@ -173,7 +166,7 @@ MlComponentStatus MicrostructureFingerprinter::status() const {
         s.warmup_remaining = static_cast<int>(config_.min_samples - total_updates_);
         return s;
     }
-    if (numeric::is_stale(last_update_ns_, now_ns(), config_.stale_threshold_ns)) {
+    if (numeric::is_stale(last_update_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
         s.health = MlComponentHealth::Stale;
         s.warmup_remaining = 0;
         return s;

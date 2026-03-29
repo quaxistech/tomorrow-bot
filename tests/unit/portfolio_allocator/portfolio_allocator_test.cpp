@@ -1,22 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include "test_mocks.hpp"
 #include "portfolio_allocator/portfolio_allocator.hpp"
 #include "portfolio/portfolio_types.hpp"
 #include "strategy/strategy_types.hpp"
-#include "logging/logger.hpp"
 
 using namespace tb;
+using namespace tb::test;
 using namespace tb::portfolio_allocator;
 using namespace Catch::Matchers;
-
-// ========== Тестовые заглушки ==========
-
-class TestLogger : public logging::ILogger {
-public:
-    void log(logging::LogEvent /*event*/) override {}
-    void set_level(logging::LogLevel /*level*/) override {}
-    [[nodiscard]] logging::LogLevel get_level() const override { return logging::LogLevel::Debug; }
-};
 
 // ========== Вспомогательные функции ==========
 

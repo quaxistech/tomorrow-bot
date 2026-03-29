@@ -24,4 +24,14 @@ namespace fees {
     constexpr double kDefaultMakerFeePct = 0.0008; ///< Maker-комиссия 0.08%
 } // namespace fees
 
+/// Лимиты биржи Bitget (spot)
+namespace exchange_limits {
+    /// Минимальный нотионал ордера на Bitget (USDT).
+    /// Реальный минимум биржи = $1.00, используем $1.10 с запасом.
+    constexpr double kMinBitgetNotionalUsdt = 1.10;
+
+    /// Минимальный нотионал для определения пылевой позиции (ниже — игнорируется)
+    constexpr double kDustNotionalUsdt = 0.50;
+} // namespace exchange_limits
+
 } // namespace tb::common

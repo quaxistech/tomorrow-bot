@@ -150,6 +150,7 @@ struct PairScore {
     /// Точность ордеров для данного символа (из exchange info)
     int quantity_precision{6};    ///< Кол-во десятичных знаков количества
     int price_precision{2};       ///< Кол-во десятичных знаков цены
+    double min_trade_usdt{1.0};   ///< Минимальный notional (USDT) для ордера
 
     /// Расширенная диагностика (professional-grade)
     FilterVerdict filter_verdict;     ///< Причина фильтрации/прохождения

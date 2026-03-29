@@ -7,6 +7,7 @@ add_executable(test_config
 target_include_directories(test_config
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/common
 )
 
 target_link_libraries(test_config
