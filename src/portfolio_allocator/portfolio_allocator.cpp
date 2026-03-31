@@ -37,8 +37,9 @@ SizingResult HierarchicalAllocator::compute_size(
 
     if (qty <= 0.0) {
         // Стратегия не указала объём — вычисляем из доступного капитала.
-        // С учётом leverage: доступный капитал × leverage = максимальный нотионал.
-        double leveraged_capital = portfolio.available_capital * config_.max_leverage;
+        // ИСПРАВЛЕНИЕ: используем total_capital (согласованно с compute_budget_limit)
+        // С учётом leverage: total_capital × leverage = максимальный нотионал.
+        double leveraged_capital = portfolio.total_capital * config_.max_leverage;
         double max_notional = leveraged_capital * config_.max_concentration_pct;
         qty = max_notional / price;
     }
@@ -133,7 +134,8 @@ SizingResult HierarchicalAllocator::compute_size(
     }
 
     // Шаг 6: Ограничить доступным капиталом (с учётом плеча)
-    double effective_capital = portfolio.available_capital * config_.max_leverage;
+    // ИСПРАВЛЕНИЕ: используем total_capital согласованно с compute_budget_limit
+    double effective_capital = portfolio.total_capital * config_.max_leverage;
     double final_notional = qty * price;
     if (effective_capital <= 0.0) {
         result.approved = false;
