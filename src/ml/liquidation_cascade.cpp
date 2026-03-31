@@ -101,8 +101,19 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Возвращаем кэшированный результат, если данные не изменились
+    // и cooldown не истёк с момента последнего вычисления.
     if (cache_valid_) {
-        return cached_signal_;
+        // Time-based invalidation: cooldown may have expired between ticks.
+        // If cached signal was in_cooldown, re-evaluate once cooldown window passes.
+        if (cached_signal_.in_cooldown && last_cascade_signal_ns_ > 0) {
+            const int64_t now = clock::steady_now_ns();
+            if ((now - last_cascade_signal_ns_) >= config_.cooldown_ns) {
+                cache_valid_ = false;  // cooldown expired — must re-evaluate
+            }
+        }
+        if (cache_valid_) {
+            return cached_signal_;
+        }
     }
 
     CascadeSignal signal;
@@ -151,10 +162,13 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     // 4. Adaptive velocity threshold based on rolling volatility
     double adapted_velocity_threshold = config_.velocity_threshold;
     if (rolling_volatility_ > numeric::kEpsilon && config_.velocity_adaptation_factor > 0.0) {
-        // Scale threshold: higher current vol → higher threshold (more tolerant)
-        const double vol_scale = std::max(0.5,
+        // Scale threshold: higher current vol → higher threshold (more tolerant).
+        // Clamp [0.5, 3.0] prevents threshold from expanding beyond 3× base,
+        // which would disable cascade detection entirely.
+        const double vol_scale = std::clamp(
             rolling_volatility_ / std::max(config_.velocity_threshold, numeric::kEpsilon)
-            * config_.velocity_adaptation_factor);
+            * config_.velocity_adaptation_factor,
+            0.5, 3.0);
         adapted_velocity_threshold = config_.velocity_threshold * vol_scale;
     }
 

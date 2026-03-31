@@ -110,6 +110,8 @@ TradingPipeline::TradingPipeline(
     adv_decision.ensemble_max_bonus = config_.decision.ensemble_max_bonus;
     adv_decision.enable_portfolio_awareness = config_.decision.enable_portfolio_awareness;
     adv_decision.drawdown_boost_scale = config_.decision.drawdown_boost_scale;
+    adv_decision.drawdown_max_boost = config_.decision.drawdown_max_boost;
+    adv_decision.consecutive_loss_boost = config_.decision.consecutive_loss_boost;
     adv_decision.enable_execution_cost_modeling = config_.decision.enable_execution_cost_modeling;
     adv_decision.max_acceptable_cost_bps = config_.decision.max_acceptable_cost_bps;
     adv_decision.enable_time_skew_detection = config_.decision.enable_time_skew_detection;
@@ -232,17 +234,25 @@ TradingPipeline::TradingPipeline(
     // 6. Портфель (капитал из конфигурации)
     portfolio_ = std::make_shared<portfolio::InMemoryPortfolioEngine>(
         config_.trading.initial_capital, logger_, clock_, metrics_);
+    if (config_.futures.enabled) {
+        portfolio_->set_leverage(static_cast<double>(config_.futures.default_leverage));
+    }
 
     // 7. Размер позиции (адаптация под размер капитала)
     portfolio_allocator::HierarchicalAllocator::Config alloc_cfg;
     alloc_cfg.budget.global_budget = config_.trading.initial_capital;
+    // Для фьючерсов — масштабировать бюджет на leverage
+    if (config_.futures.enabled) {
+        alloc_cfg.max_leverage = static_cast<double>(config_.futures.default_leverage);
+        alloc_cfg.budget.global_budget *= alloc_cfg.max_leverage;
+    }
     // Для маленьких аккаунтов (< $100) — ослабляем лимиты концентрации
     // и повышаем target_vol, чтобы не блокировать минимальные ордера биржи ($1 USDT)
     if (config_.trading.initial_capital < 100.0) {
-        alloc_cfg.max_concentration_pct = 0.80;
-        alloc_cfg.max_strategy_allocation_pct = 0.80;
-        alloc_cfg.budget.symbol_budget_pct = 0.80;
-        alloc_cfg.target_annual_vol = 0.50;       // 50% — адекватнее для крипто
+        alloc_cfg.max_concentration_pct = 0.35;
+        alloc_cfg.max_strategy_allocation_pct = 0.50;
+        alloc_cfg.budget.symbol_budget_pct = 0.50;
+        alloc_cfg.target_annual_vol = 1.50;       // 150% — адекватнее для крипто-фьючерсов
         alloc_cfg.min_size_multiplier = 0.60;     // Не ниже 60% — малый аккаунт не может дробить
         alloc_cfg.kelly_fraction = 0.50;           // Half-Kelly — не ждать статистику
     }
@@ -323,10 +333,30 @@ TradingPipeline::TradingPipeline(
     if (config_.trading.initial_capital < 100.0) {
         risk_cfg.min_liquidity_depth = 1.0;
     }
+    // v11: Фьючерсы с плечом — экспозиция и leverage пропорциональны default_leverage
+    // С плечом 20x notional = 20× capital → exposure = 2000%
+    if (config_.futures.enabled) {
+        const double lev = static_cast<double>(config_.futures.default_leverage);
+        risk_cfg.max_gross_exposure_pct = lev * 150.0;  // 20x → 3000% headroom
+        risk_cfg.max_leverage = lev * 1.5;               // 20x → 30x headroom
+        risk_cfg.max_symbol_concentration_pct = lev * 150.0; // Same for single-pair
+    }
     risk_engine_ = std::make_shared<risk::ProductionRiskEngine>(
         risk_cfg, logger_, clock_, metrics_, governance_);
 
-    // 10. Исполнение — выбор submitter в зависимости от режима
+    // 9.5. Адаптивное управление кредитным плечом (USDT-M фьючерсы)
+    // Инстанцируется ТОЛЬКО если указано futures.enabled в конфиге
+    if (config_.futures.enabled) {
+        leverage_engine_ = std::make_shared<leverage::LeverageEngine>(config_.futures);
+        logger_->info("pipeline", "LeverageEngine инициализирован",
+            {{"max_leverage", std::to_string(config_.futures.max_leverage)},
+             {"margin_mode", config_.futures.margin_mode},
+             {"liquidation_buffer_pct", std::to_string(config_.futures.liquidation_buffer_pct)}});
+    } else {
+        logger_->info("pipeline", "Фьючерсный режим отключен (futures.enabled=false)");
+    }
+
+    // 10. Исполнение — выбор submitter в зависимости от режима и типа торговли (spot vs futures)
     std::shared_ptr<execution::IOrderSubmitter> submitter;
 
     if (config_.trading.mode == TradingMode::Production ||
@@ -352,13 +382,24 @@ TradingPipeline::TradingPipeline(
 
         rest_client_ = rest_client;  // Сохраняем для запроса баланса
 
-        auto bitget_sub = std::make_shared<exchange::bitget::BitgetOrderSubmitter>(
-            rest_client, logger_);
-        bitget_submitter_ = bitget_sub;  // Сохраняем для set_symbol_precision
-        submitter = bitget_sub;
-
-        logger_->info("pipeline",
-            "Режим исполнения: РЕАЛЬНАЯ БИРЖА (Bitget REST API)");
+        // Выбор в зависимости от типа торговли
+        if (config_.futures.enabled) {
+            // Фьючерсный режим
+            auto futures_sub = std::make_shared<exchange::bitget::BitgetFuturesOrderSubmitter>(
+                rest_client, logger_, config_.futures);
+            futures_submitter_ = futures_sub;
+            submitter = futures_sub;
+            logger_->info("pipeline",
+                "Режим исполнения: ФЬЮЧЕРСЫ USDT-M (Bitget Mix API v2)");
+        } else {
+            // Спотовый режим
+            auto bitget_sub = std::make_shared<exchange::bitget::BitgetOrderSubmitter>(
+                rest_client, logger_);
+            bitget_submitter_ = bitget_sub;  // Сохраняем для set_symbol_precision
+            submitter = bitget_sub;
+            logger_->info("pipeline",
+                "Режим исполнения: СПОТ (Bitget REST API v2)");
+        }
     } else {
         // Paper/Shadow — локальная симуляция
         submitter = std::make_shared<execution::PaperOrderSubmitter>();
@@ -368,6 +409,9 @@ TradingPipeline::TradingPipeline(
 
     execution_engine_ = std::make_shared<execution::ExecutionEngine>(
         submitter, portfolio_, logger_, clock_, metrics_);
+    if (config_.futures.enabled) {
+        execution_engine_->set_leverage(static_cast<double>(config_.futures.default_leverage));
+    }
 
     // 10a. Smart TWAP — адаптивное нарезание крупных ордеров
     twap_executor_ = std::make_shared<execution::SmartTwapExecutor>(
@@ -377,6 +421,9 @@ TradingPipeline::TradingPipeline(
     market_data::GatewayConfig gw_cfg;
     gw_cfg.ws_config.url = config_.exchange.endpoint_ws;
     gw_cfg.symbols = {symbol_};
+    if (config_.futures.enabled) {
+        gw_cfg.inst_type = "USDT-FUTURES";
+    }
 
     gateway_ = std::make_shared<market_data::MarketDataGateway>(
         gw_cfg, feature_engine_, order_book_, health_, logger_, metrics_, clock_,
@@ -406,14 +453,27 @@ TradingPipeline::TradingPipeline(
     // ==================== Phase 4: Reconciliation ====================
     // Инициализируем reconciliation только для production/testnet (нужен REST)
     if (rest_client_) {
-        exchange_query_adapter_ = std::make_shared<exchange::bitget::BitgetExchangeQueryAdapter>(
-            rest_client_, logger_);
-        reconciliation::ReconciliationConfig rec_cfg;
-        rec_cfg.auto_resolve_state_mismatches = true;
-        rec_cfg.balance_tolerance_pct = 1.0;
-        reconciliation_engine_ = std::make_shared<reconciliation::ReconciliationEngine>(
-            rec_cfg, exchange_query_adapter_, logger_, clock_, metrics_);
-        logger_->info("pipeline", "Continuous reconciliation engine инициализирован");
+        if (config_.futures.enabled) {
+            // Фьючерсный режим — используем futures query adapter
+            futures_query_adapter_ = std::make_shared<exchange::bitget::BitgetFuturesQueryAdapter>(
+                rest_client_, logger_, config_.futures);
+            reconciliation::ReconciliationConfig rec_cfg;
+            rec_cfg.auto_resolve_state_mismatches = true;
+            rec_cfg.balance_tolerance_pct = 1.0;
+            reconciliation_engine_ = std::make_shared<reconciliation::ReconciliationEngine>(
+                rec_cfg, futures_query_adapter_, logger_, clock_, metrics_);
+            logger_->info("pipeline", "Continuous reconciliation engine инициализирован (Futures режим)");
+        } else {
+            // Спотовый режим — используем spot query adapter
+            exchange_query_adapter_ = std::make_shared<exchange::bitget::BitgetExchangeQueryAdapter>(
+                rest_client_, logger_);
+            reconciliation::ReconciliationConfig rec_cfg;
+            rec_cfg.auto_resolve_state_mismatches = true;
+            rec_cfg.balance_tolerance_pct = 1.0;
+            reconciliation_engine_ = std::make_shared<reconciliation::ReconciliationEngine>(
+                rec_cfg, exchange_query_adapter_, logger_, clock_, metrics_);
+            logger_->info("pipeline", "Continuous reconciliation engine инициализирован (Spot режим)");
+        }
     }
 }
 
@@ -432,8 +492,16 @@ void TradingPipeline::set_symbol_precision(int quantity_precision, int price_pre
 void TradingPipeline::set_exchange_rules(const ExchangeSymbolRules& rules) {
     exchange_rules_ = rules;
     if (bitget_submitter_) {
-        bitget_submitter_->set_rules(rules);
-        logger_->info("pipeline", "Exchange rules установлены",
+        bitget_submitter_->set_rules(rules.symbol, rules);
+        logger_->info("pipeline", "Exchange rules установлены (Spot)",
+            {{"symbol", rules.symbol.get()},
+             {"qty_precision", std::to_string(rules.quantity_precision)},
+             {"price_precision", std::to_string(rules.price_precision)},
+             {"min_trade_usdt", std::to_string(rules.min_trade_usdt)}});
+    }
+    if (futures_submitter_) {
+        futures_submitter_->set_rules(rules.symbol, rules);
+        logger_->info("pipeline", "Exchange rules установлены (Futures)",
             {{"symbol", rules.symbol.get()},
              {"qty_precision", std::to_string(rules.quantity_precision)},
              {"price_precision", std::to_string(rules.price_precision)},
@@ -444,13 +512,21 @@ void TradingPipeline::set_exchange_rules(const ExchangeSymbolRules& rules) {
 // ==================== Загрузка точности ордеров ====================
 
 void TradingPipeline::fetch_symbol_precision() {
-    if (!rest_client_ || !bitget_submitter_) return;
+    if (!rest_client_ || (!bitget_submitter_ && !futures_submitter_)) return;
 
     try {
-        auto resp = rest_client_->get("/api/v2/spot/public/symbols",
-                                       "symbol=" + symbol_.get());
+        // Выбор endpoint в зависимости от режима торговли
+        std::string endpoint = config_.futures.enabled
+            ? "/api/v2/mix/market/contracts"
+            : "/api/v2/spot/public/symbols";
+        std::string params = config_.futures.enabled
+            ? "productType=USDT-FUTURES&symbol=" + symbol_.get()
+            : "symbol=" + symbol_.get();
+
+        auto resp = rest_client_->get(endpoint, params);
         if (!resp.success) {
-            logger_->warn("pipeline", "Не удалось запросить precision для " + symbol_.get());
+            logger_->warn("pipeline", "Не удалось запросить precision для " + symbol_.get(),
+                {{"endpoint", endpoint}});
             return;
         }
 
@@ -466,15 +542,25 @@ void TradingPipeline::fetch_symbol_precision() {
 
             int qty_prec = 6, price_prec = 2;
             double min_trade = 1.0;
+            double min_qty = 0.0;
+            // Spot API: quantityPrecision, pricePrecision
+            // Futures API: volumePlace, pricePlace
             if (o.contains("quantityPrecision")) {
                 qty_prec = static_cast<int>(parse_json_double(o.at("quantityPrecision")));
+            } else if (o.contains("volumePlace")) {
+                qty_prec = static_cast<int>(parse_json_double(o.at("volumePlace")));
             }
             if (o.contains("pricePrecision")) {
                 price_prec = static_cast<int>(parse_json_double(o.at("pricePrecision")));
+            } else if (o.contains("pricePlace")) {
+                price_prec = static_cast<int>(parse_json_double(o.at("pricePlace")));
             }
             if (o.contains("minTradeUSDT")) {
                 min_trade = parse_json_double(o.at("minTradeUSDT"));
                 if (min_trade <= 0.0) min_trade = 1.0;
+            }
+            if (o.contains("minTradeNum")) {
+                min_qty = parse_json_double(o.at("minTradeNum"));
             }
 
             ExchangeSymbolRules rules;
@@ -482,12 +568,14 @@ void TradingPipeline::fetch_symbol_precision() {
             rules.quantity_precision = qty_prec;
             rules.price_precision = price_prec;
             rules.min_trade_usdt = min_trade;
+            rules.min_quantity = min_qty;
             set_exchange_rules(rules);
             logger_->info("pipeline", "Precision загружена с биржи",
                 {{"symbol", sym},
                  {"qty_precision", std::to_string(qty_prec)},
                  {"price_precision", std::to_string(price_prec)},
-                 {"min_trade_usdt", std::to_string(min_trade)}});
+                 {"min_trade_usdt", std::to_string(min_trade)},
+                 {"min_quantity", std::to_string(min_qty)}});
             return;
         }
     } catch (const std::exception& e) {
@@ -500,11 +588,17 @@ void TradingPipeline::fetch_symbol_precision() {
 void TradingPipeline::sync_balance_from_exchange() {
     logger_->info("pipeline", "Запрос балансов с биржи...");
 
+    // Выбор endpoint в зависимости от режима торговли
+    std::string endpoint = config_.futures.enabled
+        ? "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
+        : "/api/v2/spot/account/assets";
+
     // Запрашиваем ВСЕ ассеты (без фильтра по монете)
-    auto resp = rest_client_->get("/api/v2/spot/account/assets");
+    auto resp = rest_client_->get(endpoint);
     if (!resp.success) {
         logger_->warn("pipeline", "Не удалось запросить баланс",
-            {{"error", resp.error_message}});
+            {{"error", resp.error_message},
+             {"endpoint", endpoint}});
         return;
     }
 
@@ -526,9 +620,27 @@ void TradingPipeline::sync_balance_from_exchange() {
         auto& data = obj.at("data").as_array();
         for (const auto& item : data) {
             auto& asset = item.as_object();
-            std::string coin(asset.at("coin").as_string());
-            double available = std::stod(
-                std::string(asset.at("available").as_string()));
+            // Futures API uses "marginCoin", Spot API uses "coin"
+            std::string coin;
+            bool is_futures = asset.contains("marginCoin");
+            if (is_futures) {
+                coin = std::string(asset.at("marginCoin").as_string());
+            } else if (asset.contains("coin")) {
+                coin = std::string(asset.at("coin").as_string());
+            } else {
+                continue;
+            }
+            double available = 0.0;
+            if (is_futures && asset.contains("usdtEquity")) {
+                // Для фьючерсов используем usdtEquity (полный equity),
+                // а не available (который уже вычел margin открытых позиций).
+                // Это предотвращает двойной учёт margin при расчёте portfolio exposure.
+                available = std::stod(
+                    std::string(asset.at("usdtEquity").as_string()));
+            } else if (asset.contains("available")) {
+                available = std::stod(
+                    std::string(asset.at("available").as_string()));
+            }
 
             if (coin == "USDT") {
                 usdt_available = available;
@@ -606,25 +718,86 @@ void TradingPipeline::sync_balance_from_exchange() {
                     ? estimated_notional / base_available
                     : 0.0;
 
-                portfolio::Position base_pos;
-                base_pos.symbol = symbol_;
-                base_pos.side = Side::Buy;
-                base_pos.size = Quantity(base_available);
-                base_pos.avg_entry_price = Price(entry_price_estimate);
-                base_pos.opened_at = clock_->now();
-                base_pos.strategy_id = StrategyId("sync_from_exchange");
-                portfolio_->open_position(base_pos);
+                // Проверяем, есть ли уже позиция по этому символу.
+                // Если да — НЕ добавляем (balance sync не должен дублировать позицию).
+                auto existing_pos = portfolio_->get_position(symbol_);
+                if (existing_pos.has_value()) {
+                    // Позиция уже отслеживается — пропускаем
+                    logger_->debug("pipeline", "Позиция уже отслеживается, balance sync пропущен",
+                        {{"coin", base_coin},
+                         {"tracked_size", std::to_string(existing_pos->size.get())},
+                         {"exchange_size", std::to_string(base_available)}});
+                } else {
+                    portfolio::Position base_pos;
+                    base_pos.symbol = symbol_;
+                    base_pos.side = Side::Buy;
+                    base_pos.size = Quantity(base_available);
+                    base_pos.avg_entry_price = Price(entry_price_estimate);
+                    base_pos.opened_at = clock_->now();
+                    base_pos.strategy_id = StrategyId("sync_from_exchange");
+                    portfolio_->open_position(base_pos);
 
-                logger_->info("pipeline", "Восстановлена позиция с биржи",
-                    {{"coin", base_coin},
-                     {"size", std::to_string(base_available)},
-                     {"entry_price", std::to_string(entry_price_estimate)},
-                     {"notional", std::to_string(estimated_notional)}});
+                    logger_->info("pipeline", "Восстановлена позиция с биржи",
+                        {{"coin", base_coin},
+                         {"size", std::to_string(base_available)},
+                         {"entry_price", std::to_string(entry_price_estimate)},
+                         {"notional", std::to_string(estimated_notional)}});
+                }
             } else {
                 logger_->info("pipeline", "Пылевой баланс проигнорирован",
                     {{"coin", base_coin},
                      {"size", std::to_string(base_available)},
                      {"notional", std::to_string(estimated_notional)}});
+            }
+        }
+
+        // Фьючерсы: синхронизация открытых позиций с биржей
+        if (config_.futures.enabled && futures_query_adapter_) {
+            auto existing_pos = portfolio_->get_position(symbol_);
+            auto fp_result = futures_query_adapter_->get_positions(symbol_);
+            if (fp_result) {
+                double exchange_qty = 0.0;
+                PositionSide exchange_side = PositionSide::Long;
+                double exchange_entry = 0.0;
+                for (const auto& fp : *fp_result) {
+                    if (fp.total.get() > 0.0) {
+                        exchange_qty = fp.total.get();
+                        exchange_side = fp.position_side;
+                        exchange_entry = fp.entry_price.get();
+                        break;
+                    }
+                }
+
+                if (exchange_qty > 0.0 && !existing_pos.has_value()) {
+                    // Биржа имеет позицию, но портфель — нет. Восстанавливаем.
+                    portfolio::Position sync_pos;
+                    sync_pos.symbol = symbol_;
+                    sync_pos.side = (exchange_side == PositionSide::Long) ? Side::Buy : Side::Sell;
+                    sync_pos.size = Quantity(exchange_qty);
+                    sync_pos.avg_entry_price = Price(exchange_entry);
+                    sync_pos.opened_at = clock_->now();
+                    sync_pos.strategy_id = StrategyId("sync_from_exchange");
+                    portfolio_->open_position(sync_pos);
+                    current_position_side_ = exchange_side;
+                    // Инициализация trailing state для recovered позиции
+                    reset_trailing_state();
+                    highest_price_since_entry_ = exchange_entry;
+                    lowest_price_since_entry_ = exchange_entry;
+                    position_entry_time_ns_ = clock_->now().get();
+                    initial_position_size_ = exchange_qty;
+
+                    logger_->info("pipeline", "Восстановлена фьючерсная позиция с биржи",
+                        {{"symbol", symbol_.get()},
+                         {"side", exchange_side == PositionSide::Long ? "long" : "short"},
+                         {"size", std::to_string(exchange_qty)},
+                         {"entry", std::to_string(exchange_entry)}});
+                } else if (exchange_qty <= 0.0 && existing_pos.has_value()) {
+                    // Портфель имеет позицию, но биржа — нет. Фантом: очищаем.
+                    logger_->warn("pipeline", "Фантомная позиция обнаружена на старте — очистка",
+                        {{"symbol", symbol_.get()},
+                         {"portfolio_size", std::to_string(existing_pos->size.get())}});
+                    portfolio_->close_position(symbol_, Price(0.0), 0.0);
+                }
             }
         }
 
@@ -640,7 +813,10 @@ double TradingPipeline::query_asset_balance(const std::string& coin) {
     // а не сохранённый при старте (может отличаться из-за комиссий/пыли).
     if (!rest_client_) return 0.0;
 
-    auto resp = rest_client_->get("/api/v2/spot/account/assets");
+    std::string endpoint = config_.futures.enabled
+        ? "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
+        : "/api/v2/spot/account/assets";
+    auto resp = rest_client_->get(endpoint);
     if (!resp.success) return 0.0;
 
     try {
@@ -651,7 +827,15 @@ double TradingPipeline::query_asset_balance(const std::string& coin) {
         auto& data = obj.at("data").as_array();
         for (const auto& item : data) {
             auto& asset = item.as_object();
-            std::string asset_coin(asset.at("coin").as_string());
+            // Futures: "marginCoin", Spot: "coin"
+            std::string asset_coin;
+            if (asset.contains("marginCoin")) {
+                asset_coin = std::string(asset.at("marginCoin").as_string());
+            } else if (asset.contains("coin")) {
+                asset_coin = std::string(asset.at("coin").as_string());
+            } else {
+                continue;
+            }
             if (asset_coin == coin) {
                 return std::stod(std::string(asset.at("available").as_string()));
             }
@@ -688,11 +872,18 @@ void TradingPipeline::bootstrap_historical_candles() {
     };
 
     auto client = get_client();
-    std::string path = "/api/v2/spot/market/candles";
+    std::string path = config_.futures.enabled
+        ? "/api/v2/mix/market/candles"
+        : "/api/v2/spot/market/candles";
 
     // --- Шаг 1: 200 минутных свечей для прогрева индикаторов ---
     logger_->info("pipeline", "Загрузка 200 минутных свечей...");
-    std::string query_1m = "symbol=" + symbol_.get() + "&granularity=1min&limit=200";
+    std::string granularity_1m = config_.futures.enabled ? "1m" : "1min";
+    std::string query_1m = "symbol=" + symbol_.get()
+        + "&granularity=" + granularity_1m + "&limit=200";
+    if (config_.futures.enabled) {
+        query_1m += "&productType=" + config_.futures.product_type;
+    }
     auto resp_1m = client->get(path, query_1m);
 
     if (resp_1m.success) {
@@ -734,8 +925,8 @@ void TradingPipeline::bootstrap_historical_candles() {
                     candles.push_back(std::move(candle));
                 }
 
-                // Разворачиваем: Bitget отдаёт новые→старые
-                std::reverse(candles.begin(), candles.end());
+                // Bitget API v2 отдаёт свечи в хронологическом порядке (oldest→newest)
+                // Порядок уже правильный для feature_engine
 
                 for (const auto& candle : candles) {
                     feature_engine_->on_candle(candle);
@@ -779,8 +970,15 @@ void TradingPipeline::bootstrap_htf_candles() {
     };
 
     auto client = get_client();
-    std::string path = "/api/v2/spot/market/candles";
-    std::string query = "symbol=" + symbol_.get() + "&granularity=1h&limit=200";
+    std::string path = config_.futures.enabled
+        ? "/api/v2/mix/market/candles"
+        : "/api/v2/spot/market/candles";
+    std::string granularity_htf = config_.futures.enabled ? "1H" : "1h";
+    std::string query = "symbol=" + symbol_.get()
+        + "&granularity=" + granularity_htf + "&limit=200";
+    if (config_.futures.enabled) {
+        query += "&productType=" + config_.futures.product_type;
+    }
 
     auto resp = client->get(path, query);
     if (!resp.success) {
@@ -803,6 +1001,7 @@ void TradingPipeline::bootstrap_htf_candles() {
         }
 
         // Собираем цены закрытия (от старых к новым)
+        // Bitget API v2 отдаёт свечи в хронологическом порядке (oldest→newest)
         std::vector<double> closes;
         std::vector<double> highs;
         std::vector<double> lows;
@@ -810,9 +1009,8 @@ void TradingPipeline::bootstrap_htf_candles() {
         highs.reserve(data.size());
         lows.reserve(data.size());
 
-        for (auto it = data.end(); it != data.begin(); ) {
-            --it;
-            const auto& arr = it->as_array();
+        for (const auto& item : data) {
+            const auto& arr = item.as_array();
             if (arr.size() < 6) continue;
             closes.push_back(parse_json_double(arr[4]));
             highs.push_back(parse_json_double(arr[2]));
@@ -1279,7 +1477,7 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
 
             current_trail_mult_ = base * adx_factor * depth_factor
                                 * spread_factor * bb_factor * pressure_factor;
-            current_trail_mult_ = std::clamp(current_trail_mult_, 1.5, 5.0);
+            current_trail_mult_ = std::clamp(current_trail_mult_, 0.8, 3.0);
 
             if (tick_count_ % 500 == 0) {
                 logger_->debug("pipeline", "Dynamic stop multiplier computed",
@@ -1306,19 +1504,26 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
                 if (profit_in_atr >= config_.trading_params.breakeven_atr_threshold) {
                     // Достигли breakeven уровня → активируем trailing
                     breakeven_activated_ = true;
-                    // Лочим 50% текущего профита, но не менее round-trip fees + buffer
+                    // Лочим 50% текущего профита выше entry
                     double current_profit = price - entry;
-                    double fee_buffer = entry * 0.005;  // 0.4% fees + 0.1% buffer
-                    double breakeven_level = entry + std::max(current_profit * 0.5, fee_buffer);
+                    double breakeven_level = entry + current_profit * 0.5;
+                    // Fee-aware floor: стоп минимум покрывает round-trip комиссии
+                    double min_fee_offset = entry * common::fees::kDefaultTakerFeePct * 3.0;
+                    breakeven_level = std::max(breakeven_level, entry + min_fee_offset);
+                    // Гарантируем: стоп минимум на 1 тик выше entry
+                    breakeven_level = std::max(breakeven_level, entry + 0.001);
                     current_stop_level_ = breakeven_level;
                     logger_->info("pipeline", "Breakeven + Trailing активирован",
                         {{"entry", std::to_string(entry)},
                          {"stop", std::to_string(breakeven_level)},
                          {"locked_pct", std::to_string((breakeven_level - entry) / entry * 100.0)},
                          {"profit_atr", std::to_string(profit_in_atr)},
+                         {"fee_floor", std::to_string(min_fee_offset)},
                          {"symbol", symbol_.get()}});
+                } else if (current_stop_level_ <= 0.0) {
+                    // Начальный ATR-стоп: защита до активации breakeven
+                    current_stop_level_ = entry - current_trail_mult_ * atr;
                 }
-                // До breakeven — стоп НЕ обновляется (= 0, не сработает)
             } else {
                 // Фаза 2: После breakeven — классический Chandelier Exit
                 double new_stop = highest_price_since_entry_ - current_trail_mult_ * atr;
@@ -1335,14 +1540,21 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
                 if (profit_in_atr >= config_.trading_params.breakeven_atr_threshold) {
                     breakeven_activated_ = true;
                     double current_profit = entry - price;
-                    double fee_buffer = entry * 0.005;
-                    double breakeven_level = entry - std::max(current_profit * 0.5, fee_buffer);
+                    double breakeven_level = entry - current_profit * 0.5;
+                    // Fee-aware floor: стоп минимум покрывает round-trip комиссии
+                    double min_fee_offset = entry * common::fees::kDefaultTakerFeePct * 3.0;
+                    breakeven_level = std::min(breakeven_level, entry - min_fee_offset);
+                    breakeven_level = std::min(breakeven_level, entry - 0.001);
                     current_stop_level_ = breakeven_level;
                     logger_->info("pipeline", "Breakeven + Trailing активирован (SELL)",
                         {{"entry", std::to_string(entry)},
                          {"stop", std::to_string(breakeven_level)},
                          {"locked_pct", std::to_string((entry - breakeven_level) / entry * 100.0)},
+                         {"fee_floor", std::to_string(min_fee_offset)},
                          {"symbol", symbol_.get()}});
+                } else if (current_stop_level_ <= 0.0) {
+                    // Начальный ATR-стоп: защита до активации breakeven
+                    current_stop_level_ = entry + current_trail_mult_ * atr;
                 }
             } else {
                 double new_stop = lowest_price_since_entry_ + current_trail_mult_ * atr;
@@ -1413,10 +1625,20 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         bool fixed_stop_triggered = loss_pct_of_capital >= config_.trading_params.max_loss_per_trade_pct;
 
         // === 3b. Per-trade price stop: ценовой убыток превысил порог от цены входа ===
-        // Только для long (спот: short невозможен). Защита от резкого падения цены.
+        // Для long: цена упала ниже entry. Для short: цена выросла выше entry.
         bool price_stop_triggered = false;
-        if (pos.side == Side::Buy && entry > 0.0) {
-            double price_loss_pct = (entry - price) / entry * 100.0;
+        if (entry > 0.0) {
+            double price_loss_pct = 0.0;
+            bool is_long_position = (pos.side == Side::Buy);
+            // На фьючерсах определяем по сохранённой стороне позиции
+            if (config_.futures.enabled) {
+                is_long_position = (current_position_side_ == PositionSide::Long);
+            }
+            if (is_long_position) {
+                price_loss_pct = (entry - price) / entry * 100.0;
+            } else {
+                price_loss_pct = (price - entry) / entry * 100.0;
+            }
             if (price_loss_pct >= config_.trading_params.price_stop_loss_pct) {
                 price_stop_triggered = true;
                 logger_->warn("pipeline", "PRICE STOP: убыток превысил порог от цены входа",
@@ -1424,6 +1646,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                      {"threshold_pct", std::to_string(config_.trading_params.price_stop_loss_pct)},
                      {"entry", std::to_string(entry)},
                      {"current", std::to_string(price)},
+                     {"position_side", is_long_position ? "Long" : "Short"},
                      {"symbol", symbol_.get()}});
             }
         }
@@ -1471,12 +1694,35 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             return true;
         }
 
-        // Для SELL всегда используем РЕАЛЬНЫЙ баланс с биржи,
-        // а не портфель — портфель может расходиться из-за комиссий/частичных ордеров
-        double actual_qty = query_asset_balance(extract_base_coin(symbol_.get()));
-        if (actual_qty <= 0.0) {
-            // Фолбэк на портфель если API недоступен
-            actual_qty = pos.size.get();
+        // Определяем реальный размер позиции для закрытия
+        double actual_qty = 0.0;
+        if (config_.futures.enabled && futures_query_adapter_) {
+            // Фьючерсы: запрашиваем позицию напрямую (не баланс base coin)
+            auto fp_list = futures_query_adapter_->get_positions(symbol_);
+            bool exchange_query_ok = fp_list.has_value();
+            if (fp_list) {
+                for (const auto& fp : *fp_list) {
+                    if (fp.position_side == current_position_side_ && fp.total.get() > 0.0) {
+                        actual_qty = fp.total.get();
+                        break;
+                    }
+                }
+            }
+            if (actual_qty <= 0.0 && exchange_query_ok) {
+                // Биржа подтвердила: позиции нет. Очищаем фантомную позицию из портфеля.
+                logger_->warn("pipeline", "Позиция не найдена на бирже — очистка фантомной позиции",
+                    {{"symbol", symbol_.get()},
+                     {"portfolio_size", std::to_string(pos.size.get())}});
+                record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
+                portfolio_->close_position(symbol_, pos.current_price, 0.0);
+                reset_trailing_state();
+                return true;
+            }
+            if (actual_qty <= 0.0) actual_qty = pos.size.get(); // fallback (query failed)
+        } else {
+            // Спот: запрашиваем реальный баланс base coin с биржи
+            actual_qty = query_asset_balance(extract_base_coin(symbol_.get()));
+            if (actual_qty <= 0.0) actual_qty = pos.size.get(); // fallback
         }
         if (actual_qty < 0.00001) {
             // Токен уже продан (стоп-лосс сработал ранее), но позиция
@@ -1560,7 +1806,23 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             : time_exit_triggered ? "time_exit"
             : "stop_loss");
         close_intent.limit_price = snapshot.mid_price;
+        close_intent.snapshot_mid_price = snapshot.mid_price;
         close_intent.suggested_quantity = Quantity(close_qty);
+
+        // Фьючерсы: устанавливаем trade_side=Close и position_side для корректного ордера.
+        // Без этого Bitget Mix API получит tradeSide=open и откроет встречную позицию
+        // вместо закрытия текущей.
+        if (config_.futures.enabled) {
+            close_intent.trade_side = TradeSide::Close;
+            close_intent.position_side = current_position_side_;
+            close_intent.signal_intent = (current_position_side_ == PositionSide::Long)
+                ? strategy::SignalIntent::LongExit : strategy::SignalIntent::ShortExit;
+            // Для short-позиции side=Buy (закрытие short = покупка на фьючерсах)
+            if (current_position_side_ == PositionSide::Short) {
+                close_intent.side = Side::Buy;
+            }
+        }
+
         // Уникальный correlation_id для предотвращения дублирования
         close_intent.correlation_id = CorrelationId(
             "SL-" + std::to_string(now_ns));
@@ -1646,6 +1908,41 @@ bool TradingPipeline::start() {
         fetch_symbol_precision();
     }
 
+    // Фьючерсы: установка margin mode и hold mode на бирже ПЕРЕД первым ордером.
+    // Без этого Bitget может использовать one-way mode, и ордера
+    // с tradeSide/holdSide будут отклонены.
+    if (futures_submitter_) {
+        // 1. Position mode = hedge_mode (long + short одновременно)
+        bool hold_ok = futures_submitter_->set_hold_mode(
+            config_.futures.product_type, "hedge_mode");
+        if (!hold_ok) {
+            logger_->warn("pipeline",
+                "Не удалось установить position mode (hedge_mode). "
+                "Фьючерсные ордера могут быть отклонены биржей.");
+        }
+
+        // 2. Margin mode (isolated/crossed) для текущего символа
+        bool margin_ok = futures_submitter_->set_margin_mode(
+            symbol_, config_.futures.margin_mode);
+        if (!margin_ok) {
+            logger_->warn("pipeline",
+                "Не удалось установить margin mode. "
+                "Используется текущий режим маржи на бирже.",
+                {{"requested_mode", config_.futures.margin_mode},
+                 {"symbol", symbol_.get()}});
+        }
+
+        // 3. Установка default leverage для обеих сторон
+        futures_submitter_->set_leverage(symbol_, config_.futures.default_leverage, "long");
+        futures_submitter_->set_leverage(symbol_, config_.futures.default_leverage, "short");
+
+        logger_->info("pipeline", "Фьючерсный режим настроен",
+            {{"hold_mode", "hedge_mode"},
+             {"margin_mode", config_.futures.margin_mode},
+             {"default_leverage", std::to_string(config_.futures.default_leverage)},
+             {"symbol", symbol_.get()}});
+    }
+
     // Загрузка исторических свечей для прогрева индикаторов.
     // КРИТИЧНО: без этого SMA/RSI/ADX/EMA не имеют данных,
     // и microstructure_scalp торгует вслепую.
@@ -1677,7 +1974,20 @@ bool TradingPipeline::has_open_position() const {
     if (!portfolio_) return false;
     auto pos = portfolio_->get_position(symbol_);
     if (!pos.has_value()) return false;
-    return pos->size.get() > 0.0;
+    // Проверяем размер позиции: на спот size > 0 для long,
+    // на фьючерсах size > 0 для любого направления (long или short)
+    if (pos->size.get() > 0.0) return true;
+    // Для фьючерсов: дополнительно проверяем позицию на бирже,
+    // т.к. portfolio может не отслеживать short корректно
+    if (config_.futures.enabled && futures_query_adapter_) {
+        auto positions = futures_query_adapter_->get_positions(symbol_);
+        if (positions) {
+            for (const auto& fp : *positions) {
+                if (fp.total.get() > 0.0) return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool TradingPipeline::is_idle(int64_t threshold_ns) const {
@@ -1964,9 +2274,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // Если предыдущая обработка тика была слишком долгой (pipeline не успевает),
     // логируем предупреждение. Детектируем по gap между тиками.
     {
-        static thread_local int64_t last_tick_ingress_ns = 0;
-        if (last_tick_ingress_ns > 0) {
-            int64_t gap_ns = now_ns - last_tick_ingress_ns;
+        if (last_tick_ingress_ns_ > 0) {
+            int64_t gap_ns = now_ns - last_tick_ingress_ns_;
             constexpr int64_t kMaxTickGapNs = 2'000'000'000LL;  // 2 секунды
             if (gap_ns > kMaxTickGapNs && tick_count_ > kMinWarmupTicks) {
                 logger_->warn("pipeline", "Tick gap обнаружен — возможен backlog",
@@ -1977,7 +2286,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 }
             }
         }
-        last_tick_ingress_ns = now_ns;
+        last_tick_ingress_ns_ = now_ns;
     }
 
     // ─── Phase 2/4: Periodic Background Tasks ────────────────────────────
@@ -2092,7 +2401,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         auto gate_result = governance_->evaluate_trading_gate(StrategyId(""));
         if (!gate_result.trading_allowed) {
             if (tick_count_ % 200 == 0) {
-                logger_->debug("pipeline",
+                logger_->info("pipeline",
                     "Governance gate заблокировал торговлю",
                     {{"reason", gate_result.denial_reason},
                      {"halt_mode", governance::to_string(gate_result.current_halt)},
@@ -2116,7 +2425,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     if (entropy_filter_ && entropy_filter_->is_noisy()) {
         if (tick_count_ % 200 == 0) {
             auto ent = entropy_filter_->compute();
-            logger_->debug("pipeline",
+            logger_->info("pipeline",
                 "Энтропийный фильтр: рынок зашумлён, торговля приостановлена",
                 {{"composite_entropy", std::to_string(ent.composite_entropy)},
                  {"signal_quality", std::to_string(ent.signal_quality)}});
@@ -2153,6 +2462,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             // Обновляем цену intent'а до текущей
             if (snapshot.mid_price.get() > 0.0) {
                 pe.intent.limit_price = snapshot.mid_price;
+                pe.intent.snapshot_mid_price = snapshot.mid_price;
             }
             // Сбрасываем pending и помечаем bypass, чтобы Thompson ниже
             // НЕ создал новый pending (иначе бесконечный цикл Wait1)
@@ -2165,11 +2475,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     // 0f. TWAP: проверяем есть ли активный TWAP ордер для исполнения следующего слайса
-    if (twap_executor_ && twap_executor_->active_twap().has_value()) {
-        auto& twap = *twap_executor_->active_twap();
-        if (!twap_executor_->is_complete(twap)) {
+    if (twap_executor_ && twap_executor_->has_active_twap()) {
+        auto twap = twap_executor_->get_active_twap();
+        if (twap && !twap_executor_->is_complete(*twap)) {
             auto now_ms = clock_->now().get() / 1'000'000;  // нс → мс
-            auto slice_intent = twap_executor_->get_next_slice(twap, snapshot, now_ms);
+            auto slice_intent = twap_executor_->get_next_slice(*twap, snapshot, now_ms);
             if (slice_intent) {
                 // TWAP-слайсы проходят через risk engine для критических проверок
                 // (kill switch, daily loss, max drawdown), но размер уже зафиксирован
@@ -2178,15 +2488,22 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
                 // Прогоняем через risk engine вместо ручного Approved
                 auto port_snap = portfolio_->snapshot();
+
+                // Формируем SizingResult из TWAP-слайса (размер уже определён)
+                portfolio_allocator::SizingResult twap_sizing;
+                twap_sizing.approved_quantity = slice_intent->suggested_quantity;
+                twap_sizing.approved_notional = NotionalValue(
+                    slice_intent->suggested_quantity.get() * snapshot.mid_price.get());
+
                 auto slice_risk = risk_engine_->evaluate(
-                    *slice_intent, port_snap, twap_uncertainty);
+                    *slice_intent, twap_sizing, port_snap, snapshot, exec_alpha, twap_uncertainty);
 
                 if (slice_risk.verdict == risk::RiskVerdict::Denied) {
                     logger_->warn("pipeline", "TWAP slice заблокирован risk engine",
                         {{"reason", slice_risk.summary},
-                         {"slice", std::to_string(twap.next_slice)}});
+                         {"slice", std::to_string(twap->next_slice)}});
                     // Abort TWAP при критическом блоке (kill switch, daily loss)
-                    twap_executor_->active_twap().reset();
+                    twap_executor_->clear_active_twap();
                     return;
                 }
 
@@ -2197,19 +2514,21 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 if (result) {
                     risk_engine_->record_order_sent();
                     // Записываем fill только после успешного исполнения
-                    twap_executor_->record_slice_fill(twap, twap.next_slice - 1,
+                    twap_executor_->record_slice_fill(*twap, twap->next_slice - 1,
                         slice_risk.approved_quantity,
                         slice_intent->limit_price ? *slice_intent->limit_price : snapshot.mid_price);
                 } else {
                     logger_->warn("pipeline", "TWAP slice execution failed",
-                        {{"slice", std::to_string(twap.next_slice)},
+                        {{"slice", std::to_string(twap->next_slice)},
                          {"error", "execute returned error"}});
                 }
             }
+            // Записываем изменённый TWAP обратно
+            twap_executor_->set_active_twap(*twap);
             return;  // Не обрабатываем новые сигналы, пока TWAP активен
         } else {
             // TWAP завершён — сбрасываем
-            twap_executor_->active_twap().reset();
+            twap_executor_->clear_active_twap();
         }
     }
 
@@ -2332,17 +2651,21 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     std::vector<strategy::TradeIntent> intents;
 
     // Проверяем текущую позицию ДО оценки стратегий.
-    // На споте: без позиции нужны только BUY сигналы, с позицией — только SELL.
-    // Фильтрация ДО стратегий экономит CPU и избавляет от лог-спама.
+    // На СПОТ: без позиции нужны только BUY сигналы, с позицией — только SELL.
+    // На ФЬЮЧЕРСАХ: допускаются любые сигналы (LongEntry, LongExit, ShortEntry, ShortExit)
+    // Фильтрация ДО стратегий экономит CPU и избавляет от лог-спама (только для спота).
     bool has_long_position = false;
+    bool has_short_position = false;
     {
         auto port_snap = portfolio_->snapshot();
         for (const auto& pos : port_snap.positions) {
-            if (pos.symbol.get() == symbol_.get()
-                && pos.side == Side::Buy
-                && pos.size.get() >= 0.00001) {
-                has_long_position = true;
-                break;
+            if (pos.symbol.get() == symbol_.get()) {
+                if (pos.side == Side::Buy && pos.size.get() >= 0.00001) {
+                    has_long_position = true;
+                }
+                if (pos.side == Side::Sell && pos.size.get() >= 0.00001) {
+                    has_short_position = true;
+                }
             }
         }
     }
@@ -2359,16 +2682,35 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         ctx.uncertainty = uncertainty.level;
         ctx.uncertainty_size_multiplier = uncertainty.size_multiplier;
         ctx.uncertainty_threshold_multiplier = uncertainty.threshold_multiplier;
+        ctx.futures_enabled = config_.futures.enabled;
 
         auto intent = strat->evaluate(ctx);
         if (intent.has_value()) {
             ++total_intents;
-            // Фильтруем неисполнимые сигналы на споте:
-            // - SELL без открытой long-позиции бесполезен
-            // - BUY при уже открытой long-позиции — нарастить нельзя
-            bool is_buy = (intent->side == Side::Buy);
-            if (is_buy && has_long_position) { ++filtered_intents; continue; }
-            if (!is_buy && !has_long_position) { ++filtered_intents; continue; }
+
+            // ФИЛЬТРАЦИЯ СИГНАЛОВ: различается для спота и фьючерсов
+            if (!config_.futures.enabled) {
+                // СПОТ режим (только long позиции):
+                // - BUY при открытой long-позиции — нарастить нельзя
+                // - SELL без открытой long-позиции бесполезен
+                bool is_buy = (intent->side == Side::Buy);
+                if (is_buy && has_long_position) {
+                    ++filtered_intents;
+                    continue;
+                }
+                if (!is_buy && !has_long_position) {
+                    ++filtered_intents;
+                    continue;
+                }
+            }
+            // ФЬЮЧЕРСЫ: допускаем все сигналы - risk_engine проверит их валидность
+
+            // Генерируем correlation_id если стратегия не установила его
+            if (intent->correlation_id.get().empty()) {
+                intent->correlation_id = CorrelationId(
+                    intent->strategy_id.get() + "-" + std::to_string(tick_count_));
+            }
+
             intents.push_back(std::move(*intent));
         }
     }
@@ -2379,7 +2721,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             {{"total_intents", std::to_string(total_intents)},
              {"filtered", std::to_string(filtered_intents)},
              {"actionable", std::to_string(intents.size())},
-             {"has_position", has_long_position ? "true" : "false"},
+             {"has_position", (has_long_position || has_short_position) ? "true" : "false"},
              {"tick", std::to_string(tick_count_)}});
     }
 
@@ -2509,87 +2851,53 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         // Абсолютный потолок — conviction шкала [0, 1]
-        // 0.95 вместо 0.85: позволяет блокировать даже стратегии с высоким conviction
-        effective_threshold = std::min(effective_threshold, 0.95);
+        effective_threshold = std::min(effective_threshold, 0.90);
 
-        // HTF фильтр: mean_reversion BUY в медвежьем HTF тренде — слишком рискованно
-        if (intent.strategy_id.get() == "mean_reversion" &&
-            intent.side == Side::Buy &&
-            htf_trend_direction_ < 0) {
-            effective_threshold += 0.15;  // Сильно поднимаем порог
-        }
+        // ═══════════════════════════════════════════════════════════
+        // v11: УПРОЩЁННЫЙ фильтр — только критические блокировки
+        // Стратегии уже имеют собственные RSI/EMA/BB фильтры.
+        // Pipeline НЕ дублирует их, а блокирует только ЭКСТРЕМАЛЬНЫЕ ситуации.
+        // ═══════════════════════════════════════════════════════════
 
-        // EMA bearish filter: BUY при медвежьем 1-мин EMA (20<50) — рискованно
-        if (intent.side == Side::Buy &&
-            snapshot.technical.ema_valid &&
-            snapshot.technical.ema_20 < snapshot.technical.ema_50) {
-            effective_threshold += 0.10;  // Поднимаем порог на 10%
-        }
-
-        // RSI extreme filter: BUY при RSI < 25 — "ловля падающего ножа"
+        // Hard block: RSI > 92 BUY = экстремальный перегрев (крайне редко)
         if (intent.side == Side::Buy &&
             snapshot.technical.rsi_valid &&
-            snapshot.technical.rsi_14 < 25.0) {
-            effective_threshold += 0.10;
-        }
-
-        // RSI overbought filter: BUY при RSI > 70 — рынок перегрет, откат вероятен
-        if (intent.side == Side::Buy &&
-            snapshot.technical.rsi_valid &&
-            snapshot.technical.rsi_14 > 70.0) {
-            if (snapshot.technical.rsi_14 > 78.0) {
-                // RSI > 78: жёсткая блокировка — слишком опасно входить
-                if (tick_count_ % 200 == 0) {
-                    logger_->warn("pipeline", "RSI OVERBOUGHT: BUY заблокирован (RSI>78)",
-                        {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
-                         {"strategy", intent.strategy_id.get()},
-                         {"symbol", symbol_.get()}});
-                }
-                return;
-            }
-            // RSI 70-78: значительно повышаем порог
-            effective_threshold += 0.25;
+            snapshot.technical.rsi_14 > 92.0) {
             if (tick_count_ % 200 == 0) {
-                logger_->info("pipeline", "RSI overbought: порог повышен",
+                logger_->warn("pipeline", "RSI EXTREME: BUY заблокирован (RSI>92)",
                     {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
-                     {"new_threshold", std::to_string(effective_threshold)},
+                     {"strategy", intent.strategy_id.get()},
                      {"symbol", symbol_.get()}});
             }
+            return;
         }
 
-        // Time-of-Day: корректировка порога в неблагоприятные часы
-        if (snapshot.technical.tod_valid && snapshot.technical.tod_alpha_score < -0.2) {
-            effective_threshold += 0.05;  // Поднимаем порог в тихие часы
-        }
-
-        // Hard adversarial veto: BUY в токсичном режиме при высокой серьёзности → БЛОКИРОВКА
-        // Исключение: mean_reversion с высоким conviction (>0.70) — она ПРЕДНАЗНАЧЕНА
-        // для покупки на перепроданности (RSI<30), когда все продают ("blood in the streets")
-        if (adversarial_defense_ && intent.side == Side::Buy &&
-            adversarial_assessment.regime == adversarial::MarketRegime::Toxic &&
-            adversarial_assessment.compound_severity >= 0.8) {
-            
-            bool is_mean_reversion_override = 
-                (intent.strategy_id.get() == "mean_reversion" && intent.conviction >= 0.70);
-            
-            if (!is_mean_reversion_override) {
-                if (tick_count_ % 200 == 0) {
-                    logger_->warn("pipeline",
-                        "ADVERSARIAL VETO: BUY заблокирован в токсичном режиме",
-                        {{"severity", std::to_string(adversarial_assessment.compound_severity)},
-                         {"conviction", std::to_string(intent.conviction)},
-                         {"threshold", std::to_string(effective_threshold)},
-                         {"strategy", intent.strategy_id.get()},
-                         {"symbol", symbol_.get()}});
-                }
-                return;
+        // Hard block: RSI < 8 SELL = экстремальная перепроданность
+        if (intent.side == Side::Sell &&
+            snapshot.technical.rsi_valid &&
+            snapshot.technical.rsi_14 < 8.0) {
+            if (tick_count_ % 200 == 0) {
+                logger_->warn("pipeline", "RSI EXTREME: SELL заблокирован (RSI<8)",
+                    {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
+                     {"strategy", intent.strategy_id.get()},
+                     {"symbol", symbol_.get()}});
             }
-            
-            logger_->info("pipeline",
-                "Mean reversion OVERRIDE: BUY разрешён в Toxic (высокий conviction)",
-                {{"conviction", std::to_string(intent.conviction)},
-                 {"severity", std::to_string(adversarial_assessment.compound_severity)},
-                 {"symbol", symbol_.get()}});
+            return;
+        }
+
+        // Adversarial hard veto: ТОЛЬКО при severity >= 0.96 (экстремально токсичные условия)
+        if (adversarial_defense_ &&
+            adversarial_assessment.regime == adversarial::MarketRegime::Toxic &&
+            adversarial_assessment.compound_severity >= 0.96) {
+            if (tick_count_ % 200 == 0) {
+                logger_->warn("pipeline",
+                    "ADVERSARIAL VETO: заблокировано в экстремально токсичном режиме",
+                    {{"severity", std::to_string(adversarial_assessment.compound_severity)},
+                     {"conviction", std::to_string(intent.conviction)},
+                     {"strategy", intent.strategy_id.get()},
+                     {"symbol", symbol_.get()}});
+            }
+            return;
         }
 
         if (intent.conviction < effective_threshold) {
@@ -2625,9 +2933,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             (intent.side == Side::Sell && htf_trend_direction_ == -1)) {
             reward_distance *= 1.3;
         }
-        // Штраф если momentum слабый: ADX < 20 = no trend → -20% expected move
+        // ADX-based adjustment: reward зависит от типа стратегии
         if (snapshot.technical.adx_valid && snapshot.technical.adx < 20.0) {
-            reward_distance *= 0.80;
+            // Mean reversion и VWAP reversion ВЫИГРЫВАЮТ от low ADX (ranging)
+            auto sid = intent.strategy_id.get();
+            if (sid == "mean_reversion" || sid == "vwap_reversion" ||
+                sid == "volume_profile" || sid == "rsi_divergence") {
+                reward_distance *= 1.10; // +10% в ranging — MR edge сильнее
+            } else {
+                reward_distance *= 0.85; // Тренд-стратегии: мягкий штраф
+            }
         }
         
         double rr_ratio = (risk_distance > 0.0) ? (reward_distance / risk_distance) : 0.0;
@@ -2718,8 +3033,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         bool has_open_long = portfolio_->has_position(symbol_);
 
         bool blocked = false;
-        // Блокируем BUY в сильном даунтренде HTF (EMA20 < EMA50, сила > 0.2)
-        if (intent.side == Side::Buy && htf_trend_direction_ == -1 && htf_trend_strength_ > 0.2) {
+        // Блокируем BUY в сильном даунтренде HTF (EMA20 < EMA50, сила > 0.4)
+        if (intent.side == Side::Buy && htf_trend_direction_ == -1 && htf_trend_strength_ > 0.4) {
             // Разрешаем только если есть явный разворот: MACD > 0 И RSI > 40
             bool reversal_confirmed = (htf_macd_histogram_ > 0.0 && htf_rsi_14_ > 40.0);
             if (!reversal_confirmed) {
@@ -2803,54 +3118,157 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         const double kMinTradeableNotional = common::exchange_limits::kMinBitgetNotionalUsdt;
         double position_notional = position_size.get() * snapshot.mid_price.get();
 
-        // Нельзя SELL на спот без реальной длинной позиции (>= min notional)
-        bool has_real_position = has_position && position_notional >= kMinTradeableNotional;
-        if (!intent_is_buy && (!has_real_position || !position_is_long)) {
-            logger_->debug("pipeline",
-                "Пропуск SELL: нет длинной позиции для продажи",
-                {{"symbol", symbol_.get()}});
-            return;
-        }
+        if (config_.futures.enabled) {
+            // === Фьючерсная логика определения закрытия / открытия ===
 
-        // Не наращиваем позицию в том же направлении.
-        // Пылевые позиции (< min notional) игнорируем — они не могут быть проданы
-        // и не должны блокировать новые ордера.
-        if (has_position && (position_is_long == intent_is_buy)
-            && position_notional >= kMinTradeableNotional) {
-            logger_->debug("pipeline",
-                "Пропуск: уже есть позиция в том же направлении",
-                {{"symbol", symbol_.get()},
-                 {"side", intent_is_buy ? "BUY" : "SELL"},
-                 {"size", std::to_string(position_size.get())}});
-            return;
-        }
+            // Проверяем signal_intent из стратегии для определения семантики:
+            //   LongExit / ShortExit → закрытие соответствующей позиции
+            //   ShortEntry → открытие short (SELL + Open)
+            //   LongEntry → открытие long (BUY + Open)
+            //   ReducePosition → частичное сокращение текущей позиции
 
-        // SELL при открытой BUY = закрытие позиции (только если нотионал достаточный)
-        if (!intent_is_buy && has_position && position_is_long
-            && position_notional >= kMinTradeableNotional) {
-            // Minimum hold time: don't allow strategy SELL within first 5 minutes
-            // Exception: stop-loss strategies bypass this (urgency == 1.0)
-            if (position_entry_time_ns_ > 0 && intent.urgency < 1.0) {
+            const bool is_exit_signal =
+                intent.signal_intent == strategy::SignalIntent::LongExit ||
+                intent.signal_intent == strategy::SignalIntent::ShortExit ||
+                intent.signal_intent == strategy::SignalIntent::ReducePosition;
+
+            if (is_exit_signal && has_position && position_notional >= kMinTradeableNotional) {
+                // Закрытие существующей позиции
+                is_closing_position = true;
+                closing_qty = position_size;
+                position_size_for_log = position_size.get();
+
+                // Устанавливаем trade_side=Close и корректную position_side
+                intent.trade_side = TradeSide::Close;
+                intent.position_side = current_position_side_;
+
+                // Корректируем side для API: закрытие long=sell, закрытие short=buy
+                intent.side = (current_position_side_ == PositionSide::Long)
+                    ? Side::Sell : Side::Buy;
+
+            } else if (is_exit_signal && !has_position) {
+                // Сигнал закрытия, но позиции нет — пропускаем
+                logger_->debug("pipeline",
+                    "Пропуск EXIT-сигнала: нет открытой позиции (фьючерсы)",
+                    {{"symbol", symbol_.get()},
+                     {"signal", intent.signal_name}});
+                return;
+
+            } else if (!is_exit_signal) {
+                // Открытие новой позиции (LongEntry / ShortEntry)
+                intent.trade_side = TradeSide::Open;
+
+                if (intent.signal_intent == strategy::SignalIntent::ShortEntry) {
+                    intent.position_side = PositionSide::Short;
+                    intent.side = Side::Sell;
+                } else {
+                    intent.position_side = PositionSide::Long;
+                    intent.side = Side::Buy;
+                }
+
+                // Не открываем позицию при уже существующей в том же направлении
+                if (has_position && position_notional >= kMinTradeableNotional) {
+                    bool same_direction =
+                        (intent.position_side == PositionSide::Long && position_is_long) ||
+                        (intent.position_side == PositionSide::Short && !position_is_long);
+                    if (same_direction) {
+                        logger_->debug("pipeline",
+                            "Пропуск: уже есть позиция в том же направлении (фьючерсы)",
+                            {{"symbol", symbol_.get()},
+                             {"position_side", std::string(to_string(intent.position_side))}});
+                        return;
+                    }
+                }
+            }
+
+            // Minimum hold time для стратегического закрытия (не стоп)
+            if (is_closing_position && position_entry_time_ns_ > 0 && intent.urgency < 1.0) {
                 int64_t hold_ns = clock_->now().get() - position_entry_time_ns_;
-                constexpr int64_t kMinHoldNs = 5LL * 60LL * 1'000'000'000LL; // 5 min
-                if (hold_ns < kMinHoldNs) {
+                int64_t min_hold_ns = static_cast<int64_t>(config_.trading_params.min_hold_minutes) * 60LL * 1'000'000'000LL;
+                if (hold_ns < min_hold_ns) {
                     logger_->debug("pipeline",
-                        "Пропуск SELL: позиция слишком молодая для стратегического закрытия",
+                        "Пропуск: позиция слишком молодая для стратегического закрытия",
                         {{"hold_sec", std::to_string(hold_ns / 1'000'000'000LL)},
-                         {"min_hold_sec", "300"},
                          {"symbol", symbol_.get()}});
                     return;
                 }
             }
-            is_closing_position = true;
-            closing_qty = position_size;
-            position_size_for_log = position_size.get();
+
+            // Фильтр: стратегический EXIT должен иметь conviction >= 0.5
+            if (is_closing_position && intent.urgency < 1.0 && intent.conviction < 0.5) {
+                logger_->debug("pipeline",
+                    "Пропуск: conviction слишком низкий для стратегического закрытия (фьючерсы)",
+                    {{"conviction", std::to_string(intent.conviction)},
+                     {"symbol", symbol_.get()}});
+                return;
+            }
+        } else {
+            // === Спотовая логика (без изменений) ===
+
+            // Спот-специфичная проверка: SELL без длинной позиции
+            if (!intent_is_buy && (!has_position || !position_is_long)) {
+                logger_->info("pipeline",
+                    "Пропуск SELL: нет длинной позиции для продажи (спот режим)",
+                    {{"symbol", symbol_.get()}});
+                return;
+            }
+
+            // Не наращиваем позицию в том же направлении (только на спот).
+            // Пылевые позиции (< min notional) игнорируем — они не могут быть проданы
+            // и не должны блокировать новые ордера.
+            if (has_position && (position_is_long == intent_is_buy)
+                && position_notional >= kMinTradeableNotional) {
+                logger_->info("pipeline",
+                    "Пропуск: уже есть позиция в том же направлении (спот режим)",
+                    {{"symbol", symbol_.get()},
+                     {"side", intent_is_buy ? "BUY" : "SELL"},
+                     {"size", std::to_string(position_size.get())}});
+                return;
+            }
+
+            // SELL при открытой BUY = закрытие позиции (только если нотионал достаточный)
+            if (!intent_is_buy && has_position && position_is_long
+                && position_notional >= kMinTradeableNotional) {
+                // Minimum hold time: don't allow strategy SELL within min_hold_minutes
+                // Exception: stop-loss strategies bypass this (urgency == 1.0)
+                if (position_entry_time_ns_ > 0 && intent.urgency < 1.0) {
+                    int64_t hold_ns = clock_->now().get() - position_entry_time_ns_;
+                    int64_t min_hold_ns = static_cast<int64_t>(config_.trading_params.min_hold_minutes) * 60LL * 1'000'000'000LL;
+                    if (hold_ns < min_hold_ns) {
+                        logger_->debug("pipeline",
+                            "Пропуск SELL: позиция слишком молодая для стратегического закрытия",
+                            {{"hold_sec", std::to_string(hold_ns / 1'000'000'000LL)},
+                             {"min_hold_min", std::to_string(config_.trading_params.min_hold_minutes)},
+                             {"symbol", symbol_.get()}});
+                        return;
+                    }
+                }
+
+                // Фильтр: стратегический SELL (не стоп) должен иметь conviction >= 0.5
+                if (intent.urgency < 1.0 && intent.conviction < 0.5) {
+                    logger_->debug("pipeline",
+                        "Пропуск SELL: conviction стратегии слишком низкий для закрытия",
+                        {{"conviction", std::to_string(intent.conviction)},
+                         {"min_exit_conviction", "0.50"},
+                         {"strategy", intent.strategy_id.get()},
+                         {"symbol", symbol_.get()}});
+                    return;
+                }
+
+                is_closing_position = true;
+                closing_qty = position_size;
+                position_size_for_log = position_size.get();
+            }
         }
     }
 
     // 9c. Установить цену для расчёта размера позиции (если стратегия не задала)
     if (!intent.limit_price.has_value() && snapshot.mid_price.get() > 0.0) {
         intent.limit_price = snapshot.mid_price;
+    }
+    // Всегда устанавливаем snapshot_mid_price как fallback для market ордеров
+    if (snapshot.mid_price.get() > 0.0) {
+        intent.snapshot_mid_price = snapshot.mid_price;
     }
 
     if (adversarial_defense_ && !is_closing_position &&
@@ -2888,22 +3306,45 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         exec_alpha.urgency_score = 1.0;
         intent.urgency = 1.0;
 
-        // Закрытие позиции — обходим allocator и risk проверки экспозиции,
-        // т.к. закрытие УМЕНЬШАЕТ риск, а не увеличивает.
-        // Запрашиваем актуальный баланс base coin, чтобы избежать "Insufficient balance"
-        // (портфельный размер может не учитывать комиссии/пыль)
-        std::string base_coin = extract_base_coin(symbol_.get());
-        double actual_base = query_asset_balance(base_coin);
-        if (actual_base > 1e-8) {
-            closing_qty = Quantity(actual_base);
-            logger_->info("pipeline", "Актуальный баланс " + base_coin + " для закрытия",
-                {{"portfolio_qty", std::to_string(position_size_for_log)},
-                 {"exchange_qty", std::to_string(actual_base)}});
+        // Определяем размер для закрытия в зависимости от режима
+        if (config_.futures.enabled) {
+            // Фьючерсы: размер позиции берём из портфеля (на фьючерсах нет "баланса base coin",
+            // позиция — это маржинальный контракт с размером в base currency)
+            if (futures_query_adapter_) {
+                auto positions = futures_query_adapter_->get_positions(symbol_);
+                if (positions) {
+                    for (const auto& fp : *positions) {
+                        if (fp.position_side == current_position_side_ && fp.total.get() > 0.0) {
+                            closing_qty = fp.total;
+                            logger_->info("pipeline", "Фьючерсная позиция для закрытия",
+                                {{"exchange_qty", std::to_string(fp.total.get())},
+                                 {"portfolio_qty", std::to_string(position_size_for_log)},
+                                 {"position_side", (current_position_side_ == PositionSide::Long) ? "long" : "short"}});
+                            break;
+                        }
+                    }
+                }
+            }
+            // Fallback на размер из портфеля
+            if (closing_qty.get() < 1e-8) {
+                closing_qty = Quantity(position_size_for_log);
+            }
+        } else {
+            // Спот: запрашиваем актуальный баланс base coin,
+            // чтобы избежать "Insufficient balance" (портфель может расходиться)
+            std::string base_coin = extract_base_coin(symbol_.get());
+            double actual_base = query_asset_balance(base_coin);
+            if (actual_base > 1e-8) {
+                closing_qty = Quantity(actual_base);
+                logger_->info("pipeline", "Актуальный баланс " + base_coin + " для закрытия",
+                    {{"portfolio_qty", std::to_string(position_size_for_log)},
+                     {"exchange_qty", std::to_string(actual_base)}});
+            }
         }
 
         // Минимальный ордер Bitget: 0.00001 BTC (или ~$5)
         if (closing_qty.get() < 0.00001) {
-            logger_->warn("pipeline", "BTC баланс слишком мал для закрытия",
+            logger_->warn("pipeline", "Размер позиции слишком мал для закрытия",
                 {{"qty", std::to_string(closing_qty.get())}});
             return;
         }
@@ -2924,13 +3365,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             auto port_snap = portfolio_->snapshot();
 
             opportunity_cost::PortfolioContext oc_ctx;
-            oc_ctx.gross_exposure_pct = port_snap.exposure.exposure_pct;
+            // exposure_pct из PortfolioEngine приходит в масштабе 0-100%,
+            // а пороги в конфиге — в масштабе 0-1. Нормализуем:
+            oc_ctx.gross_exposure_pct = port_snap.exposure.exposure_pct / 100.0;
             oc_ctx.net_exposure_pct = (port_snap.total_capital > 0.0)
                 ? port_snap.exposure.net_exposure / port_snap.total_capital : 0.0;
             oc_ctx.available_capital = port_snap.available_capital;
             oc_ctx.total_capital = port_snap.total_capital;
             oc_ctx.open_positions_count = port_snap.exposure.open_positions_count;
-            oc_ctx.current_drawdown_pct = port_snap.pnl.current_drawdown_pct;
+            oc_ctx.current_drawdown_pct = port_snap.pnl.current_drawdown_pct / 100.0;
             oc_ctx.consecutive_losses = port_snap.pnl.consecutive_losses;
 
             // Расчёт концентрации по символу и стратегии
@@ -2944,9 +3387,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                     strategy_notional += std::abs(pos.notional.get());
                 }
             }
+            // Для фьючерсов: пересчитываем exposure по margin (notional / leverage),
+            // чтобы корректно сравнивать с порогами concentration (0-1 масштаб).
+            double leverage_div = config_.futures.enabled
+                ? std::max(1.0, static_cast<double>(config_.futures.default_leverage))
+                : 1.0;
             if (port_snap.total_capital > 0.0) {
-                oc_ctx.symbol_exposure_pct = symbol_notional / port_snap.total_capital;
-                oc_ctx.strategy_exposure_pct = strategy_notional / port_snap.total_capital;
+                oc_ctx.symbol_exposure_pct = (symbol_notional / leverage_div) / port_snap.total_capital;
+                oc_ctx.strategy_exposure_pct = (strategy_notional / leverage_div) / port_snap.total_capital;
             }
 
             auto oc_result = opportunity_cost_engine_->evaluate(
@@ -2963,7 +3411,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             }
 
             if (oc_result.action == opportunity_cost::OpportunityAction::Defer) {
-                logger_->debug("pipeline", "Вход отложен opportunity cost: Defer",
+                logger_->info("pipeline", "Вход отложен opportunity cost: Defer",
                     {{"symbol", symbol_.get()},
                      {"reason", opportunity_cost::to_string(oc_result.reason)},
                      {"net_bps", std::to_string(oc_result.score.net_expected_bps)}});
@@ -3056,14 +3504,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 adversarial_size_mult *
                 decision.advisory_size_multiplier;
         if (config_.trading.initial_capital < 100.0) {
-            combined_size_mult = std::max(combined_size_mult, 0.60);
+            combined_size_mult = std::max(combined_size_mult, 0.80);
         }
 
         auto sizing = portfolio_allocator_->compute_size(
             intent, portfolio_->snapshot(), combined_size_mult);
 
         if (!sizing.approved || sizing.approved_quantity.get() <= 0.0) {
-            logger_->debug("pipeline", "Размер позиции не одобрен аллокатором");
+            logger_->info("pipeline", "Размер позиции не одобрен аллокатором");
             return;
         }
 
@@ -3104,13 +3552,71 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     if ((exec_alpha_wants_twap || twap_independently_triggered) && twap_executor_) {
         auto twap_plan = twap_executor_->create_twap_plan(
             intent, snapshot, risk_decision.approved_quantity);
-        twap_executor_->active_twap() = twap_plan;
+        twap_executor_->set_active_twap(twap_plan);
         logger_->info("pipeline", "Активирован Smart TWAP",
             {{"symbol", symbol_.get()},
              {"total_qty", std::to_string(twap_plan.total_qty.get())},
              {"slices", std::to_string(twap_plan.slices.size())},
              {"trigger", exec_alpha_wants_twap ? "execution_alpha" : "twap_engine"}});
         return;  // Первый слайс отправится на следующем тике
+    }
+
+    // 11b. Адаптивное кредитное плечо для фьючерсов (только если enabled)
+    if (leverage_engine_) {
+        // Рассчитываем ATR-нормализованную волатильность
+        double atr_normalized = 0.0;
+        if (snapshot.technical.atr_valid && snapshot.technical.atr_14 > 0.0 && snapshot.mid_price.get() > 0.0) {
+            atr_normalized = snapshot.technical.atr_14 / snapshot.mid_price.get();
+        }
+
+        // Вычисляем оптимальное плечо на основе рыночных условий
+        leverage::LeverageContext lev_ctx;
+        lev_ctx.regime = regime.label;
+        lev_ctx.uncertainty = uncertainty.level;
+        lev_ctx.atr_normalized = atr_normalized;
+        lev_ctx.drawdown_pct = portfolio_->snapshot().pnl.current_drawdown_pct;
+        lev_ctx.adversarial_severity = adversarial_assessment.compound_severity;
+        lev_ctx.conviction = intent.conviction;
+        lev_ctx.funding_rate = current_funding_rate_;
+        lev_ctx.position_side = intent.position_side;
+        lev_ctx.entry_price = snapshot.mid_price.get();
+
+        auto lev_decision = leverage_engine_->compute_leverage(lev_ctx);
+
+        // Проверяем, что плечо безопасно (достаточный буфер до ликвидации)
+        if (!lev_decision.is_safe) {
+            logger_->warn("pipeline", "Ликвидационный буфер недостаточен — сделка отклонена",
+                {{"leverage", std::to_string(lev_decision.leverage)},
+                 {"liquidation_buffer_pct", std::to_string(lev_decision.liquidation_buffer_pct)},
+                 {"min_buffer_pct", std::to_string(config_.futures.liquidation_buffer_pct)},
+                 {"symbol", symbol_.get()}});
+            return;
+        }
+
+        // Устанавливаем плечо на бирже перед отправкой ордера
+        if (futures_submitter_ && intent.trade_side == TradeSide::Open) {
+            std::string hold_side = (intent.position_side == PositionSide::Long) ? "long" : "short";
+            bool set_lev_ok = futures_submitter_->set_leverage(symbol_, lev_decision.leverage, hold_side);
+            if (!set_lev_ok) {
+                logger_->error("pipeline",
+                    "Не удалось установить плечо на бирже — ордер отклонён. "
+                    "Торговля с неверным плечом может привести к ликвидации.",
+                    {{"leverage", std::to_string(lev_decision.leverage)},
+                     {"hold_side", hold_side},
+                     {"symbol", symbol_.get()}});
+                // Устанавливаем cooldown чтобы не спамить биржу на каждом тике
+                last_order_time_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
+                return;
+            }
+            // v11: синхронизируем leverage в execution engine для корректного reserve_cash
+            if (execution_engine_) {
+                execution_engine_->set_leverage(static_cast<double>(lev_decision.leverage));
+            }
+            logger_->debug("pipeline", "Плечо установлено на бирже",
+                {{"leverage", std::to_string(lev_decision.leverage)},
+                 {"hold_side", hold_side},
+                 {"rationale", lev_decision.rationale}});
+        }
     }
 
     // 12. Исполнение ордера
@@ -3141,8 +3647,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         // Инициализация trailing stop при открытии новой позиции
-        if (intent.side == Side::Buy) {
+        // Фьючерсы: открытие = trade_side==Open (и Long, и Short)
+        // Спот: открытие = side==Buy
+        const bool is_new_position = config_.futures.enabled
+            ? (intent.trade_side == TradeSide::Open)
+            : (intent.side == Side::Buy);
+
+        if (is_new_position) {
             current_position_strategy_    = intent.strategy_id;
+            current_position_side_        = intent.position_side;
             current_position_conviction_  = intent.conviction;
             current_entry_thompson_action_ = thompson_action;
             // Fix: сохраняем проскальзывание из execution_context для последующей записи в alpha decay
@@ -3164,10 +3677,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             }
         }
 
-        // Сброс trailing state при полном закрытии позиции (SELL всей позиции)
-        // Execution engine уже вызовет portfolio_->close_position() при fill.
-        // Здесь только записываем данные для аналитики.
-        if (intent.side == Side::Sell && is_closing_position) {
+        // Сброс trailing state при полном закрытии позиции
+        // Фьючерсы: закрытие = trade_side==Close
+        // Спот: закрытие = side==Sell и is_closing_position
+        const bool is_position_close = config_.futures.enabled
+            ? (intent.trade_side == TradeSide::Close && is_closing_position)
+            : (intent.side == Side::Sell && is_closing_position);
+
+        if (is_position_close) {
             record_trade_for_decay(current_position_strategy_,
                 closing_pnl,
                 current_position_conviction_);
@@ -3261,6 +3778,8 @@ void TradingPipeline::print_status(
         {{"tick", std::to_string(tick_count_)},
          {"price", fmt(snap.mid_price.get(), price_prec)},
          {"rsi14", fmt(snap.technical.rsi_14, 1)},
+         {"adx", fmt(snap.technical.adx, 1)},
+         {"mom5", fmt(snap.technical.momentum_5, 4)},
          {"ema", ema_signal},
          {"bb_pos", fmt(bb_pos, 2)},
          {"atr", fmt(snap.technical.atr_14, atr_prec)},
@@ -3322,6 +3841,21 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
         (last_balance_sync_ns_ == 0 || (now_ns - last_balance_sync_ns_) >= kBalanceSyncIntervalNs)) {
         last_balance_sync_ns_ = now_ns;
         sync_balance_from_exchange();
+    }
+
+    // Периодическое обновление funding rate для фьючерсов (каждые 5 минут).
+    // Funding rate используется LeverageEngine для адаптивного снижения плеча при высоком фандинге.
+    if (futures_query_adapter_ &&
+        (last_funding_rate_update_ns_ == 0 || (now_ns - last_funding_rate_update_ns_) >= kFundingRateUpdateIntervalNs)) {
+        last_funding_rate_update_ns_ = now_ns;
+        double new_rate = futures_query_adapter_->get_current_funding_rate(symbol_);
+        if (std::abs(new_rate - current_funding_rate_) > 1e-8) {
+            logger_->info("pipeline", "Funding rate обновлён",
+                {{"symbol", symbol_.get()},
+                 {"old_rate", std::to_string(current_funding_rate_)},
+                 {"new_rate", std::to_string(new_rate)}});
+        }
+        current_funding_rate_ = new_rate;
     }
 }
 

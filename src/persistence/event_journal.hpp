@@ -35,7 +35,7 @@ public:
 
 private:
     std::shared_ptr<IStorageAdapter> adapter_;
-    std::atomic<uint64_t> sequence_counter_{0};
+    uint64_t sequence_counter_{0};   ///< Protected by mutex_ — not atomic
     std::mutex mutex_;
 };
 

@@ -51,22 +51,28 @@ std::string journal_type_str(JournalEntryType t) {
 }
 
 JournalEntryType journal_type_from_str(const std::string& s) {
-    if (s == "MarketEvent")    return JournalEntryType::MarketEvent;
-    if (s == "DecisionTrace")  return JournalEntryType::DecisionTrace;
-    if (s == "RiskDecision")   return JournalEntryType::RiskDecision;
-    if (s == "OrderEvent")     return JournalEntryType::OrderEvent;
-    if (s == "PortfolioChange")return JournalEntryType::PortfolioChange;
-    if (s == "StrategySignal") return JournalEntryType::StrategySignal;
-    if (s == "SystemEvent")    return JournalEntryType::SystemEvent;
-    return JournalEntryType::TelemetrySnapshot;
+    if (s == "MarketEvent")       return JournalEntryType::MarketEvent;
+    if (s == "DecisionTrace")     return JournalEntryType::DecisionTrace;
+    if (s == "RiskDecision")      return JournalEntryType::RiskDecision;
+    if (s == "OrderEvent")        return JournalEntryType::OrderEvent;
+    if (s == "PortfolioChange")   return JournalEntryType::PortfolioChange;
+    if (s == "StrategySignal")    return JournalEntryType::StrategySignal;
+    if (s == "SystemEvent")       return JournalEntryType::SystemEvent;
+    if (s == "TelemetrySnapshot") return JournalEntryType::TelemetrySnapshot;
+    if (s == "GovernanceEvent")   return JournalEntryType::GovernanceEvent;
+    if (s == "DiagnosticEvent")   return JournalEntryType::DiagnosticEvent;
+    if (s == "ShadowEvent")       return JournalEntryType::ShadowEvent;
+    throw std::invalid_argument("Unknown JournalEntryType: " + s);
 }
 
 SnapshotType snapshot_type_from_str(const std::string& s) {
-    if (s == "Portfolio")    return SnapshotType::Portfolio;
-    if (s == "RiskCounters") return SnapshotType::RiskCounters;
-    if (s == "StrategyMeta") return SnapshotType::StrategyMeta;
-    if (s == "WorldState")   return SnapshotType::WorldState;
-    return SnapshotType::FullSystem;
+    if (s == "Portfolio")       return SnapshotType::Portfolio;
+    if (s == "RiskCounters")    return SnapshotType::RiskCounters;
+    if (s == "StrategyMeta")    return SnapshotType::StrategyMeta;
+    if (s == "WorldState")      return SnapshotType::WorldState;
+    if (s == "FullSystem")      return SnapshotType::FullSystem;
+    if (s == "GovernanceState") return SnapshotType::GovernanceState;
+    throw std::invalid_argument("Unknown SnapshotType: " + s);
 }
 
 } // anonymous namespace

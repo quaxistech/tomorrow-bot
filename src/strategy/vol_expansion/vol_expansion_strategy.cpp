@@ -36,6 +36,12 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(tech.atr_14) || !std::isfinite(tech.rsi_14) ||
+        !std::isfinite(tech.adx) || !std::isfinite(tech.momentum_5)) {
+        return std::nullopt;
+    }
+
     // Обновляем буфер ATR
     std::lock_guard lock(history_mutex_);
     atr_history_.push_back(tech.atr_14);
@@ -124,9 +130,16 @@ std::optional<TradeIntent> VolExpansionStrategy::evaluate(const StrategyContext&
         intent.reason_codes = {"compression_to_expansion", "bullish_direction", "adx_rising"};
     } else if (tech.momentum_5 < -cfg_.momentum_threshold && tech.rsi_14 <= 50.0) {
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "vol_compress_breakout_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "vol_compress_breakout_sell";
+        }
         intent.exit_reason = ExitReason::VolatilitySpikeExit;
-        intent.signal_name = "vol_compress_breakout_sell";
         intent.reason_codes = {"compression_to_expansion", "bearish_direction", "adx_rising"};
     } else {
         return std::nullopt; // No clear direction during expansion

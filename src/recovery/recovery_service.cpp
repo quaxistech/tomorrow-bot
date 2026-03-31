@@ -88,11 +88,12 @@ RecoveryResult RecoveryService::recover_on_startup() {
     }
 
     // Шаг 3: синхронизация позиций с биржи
-    auto recovered = sync_positions_from_exchange();
+    std::vector<reconciliation::ExchangePositionInfo> cached_balances;
+    auto recovered = sync_positions_from_exchange(cached_balances);
     last_result_.recovered_positions = std::move(recovered);
 
-    // Шаг 4: синхронизация баланса
-    double balance = sync_balance_from_exchange();
+    // Шаг 4: синхронизация баланса (из кэшированных балансов, без повторного API-вызова)
+    double balance = extract_usdt_balance(cached_balances);
     last_result_.recovered_cash_balance = balance;
 
     // Финализация
@@ -143,10 +144,11 @@ RecoveryResult RecoveryService::recover_positions() {
 
     logger_->info(kComponent, "Начало восстановления позиций");
 
-    auto recovered = sync_positions_from_exchange();
+    std::vector<reconciliation::ExchangePositionInfo> cached_balances;
+    auto recovered = sync_positions_from_exchange(cached_balances);
     last_result_.recovered_positions = std::move(recovered);
 
-    double balance = sync_balance_from_exchange();
+    double balance = extract_usdt_balance(cached_balances);
     last_result_.recovered_cash_balance = balance;
 
     const auto end = clock_->now();
@@ -262,7 +264,8 @@ RecoveryStatus RecoveryService::status() const {
 // sync_positions_from_exchange (private)
 // ============================================================
 
-std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange() {
+std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange(
+    std::vector<reconciliation::ExchangePositionInfo>& out_balances) {
     std::vector<RecoveredPosition> result;
 
     auto balances_result = exchange_query_->get_account_balances();
@@ -273,7 +276,8 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange() {
         return result;
     }
 
-    const auto& balances = balances_result.value();
+    out_balances = balances_result.value();
+    const auto& balances = out_balances;
     logger_->info(kComponent, "Получены балансы с биржи",
         {{"count", std::to_string(balances.size())}});
 
@@ -358,20 +362,14 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange() {
 }
 
 // ============================================================
-// sync_balance_from_exchange (private)
+// extract_usdt_balance (private) — извлечение USDT из кэша
 // ============================================================
 
-double RecoveryService::sync_balance_from_exchange() {
-    auto balances_result = exchange_query_->get_account_balances();
-    if (!balances_result.has_value()) {
-        logger_->error(kComponent, "Не удалось получить баланс USDT с биржи");
-        last_result_.messages.emplace_back("Failed to fetch USDT balance from exchange");
-        ++last_result_.errors;
-        return 0.0;
-    }
+double RecoveryService::extract_usdt_balance(
+    const std::vector<reconciliation::ExchangePositionInfo>& balances) {
 
     double usdt_balance = 0.0;
-    for (const auto& info : balances_result.value()) {
+    for (const auto& info : balances) {
         if (info.symbol.get() == kUsdtSymbol) {
             usdt_balance = info.available.get() + info.frozen.get();
             break;
@@ -423,28 +421,26 @@ bool RecoveryService::restore_from_snapshot() {
         {{"snapshot_id", std::to_string(entry.snapshot_id)},
          {"created_at", std::to_string(entry.created_at.get())}});
 
-    // Восстановить капитал из payload (парсинг JSON строки — базовый)
-    // Ищем поле "total_capital" в payload_json
+    // Восстановить капитал из payload через boost::json
     const auto& payload = entry.payload_json;
-    auto capital_pos = payload.find("\"total_capital\"");
-    if (capital_pos != std::string::npos) {
-        auto colon_pos = payload.find(':', capital_pos);
-        if (colon_pos != std::string::npos) {
-            auto value_start = payload.find_first_of("0123456789.-", colon_pos + 1);
-            if (value_start != std::string::npos) {
-                auto value_end = payload.find_first_not_of("0123456789.eE+-", value_start);
-                std::string value_str = payload.substr(value_start, value_end - value_start);
-                try {
-                    double capital = std::stod(value_str);
-                    portfolio_->set_capital(capital);
-                    logger_->info(kComponent, "Капитал восстановлен из снимка",
-                        {{"capital", std::to_string(capital)}});
-                } catch (...) {
-                    logger_->warn(kComponent, "Не удалось распарсить капитал из снимка");
-                    return false;
-                }
+    try {
+        auto json = boost::json::parse(payload);
+        auto& obj = json.as_object();
+        if (obj.contains("total_capital")) {
+            double capital = obj.at("total_capital").as_double();
+            if (std::isfinite(capital) && capital > 0.0) {
+                portfolio_->set_capital(capital);
+                logger_->info(kComponent, "Капитал восстановлен из снимка",
+                    {{"capital", std::to_string(capital)}});
+            } else {
+                logger_->warn(kComponent, "Некорректное значение капитала в снимке");
+                return false;
             }
         }
+    } catch (const std::exception& ex) {
+        logger_->warn(kComponent, "Не удалось распарсить снимок портфеля",
+            {{"error", ex.what()}});
+        return false;
     }
 
     last_result_.messages.emplace_back(

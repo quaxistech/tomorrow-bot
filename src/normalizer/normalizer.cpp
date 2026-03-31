@@ -49,6 +49,7 @@ BitgetNormalizer::BitgetNormalizer(NormalizedEventCallback callback,
 {}
 
 void BitgetNormalizer::set_symbols(std::vector<tb::Symbol> symbols) {
+    std::lock_guard<std::mutex> lock(symbols_mutex_);
     symbols_ = std::move(symbols);
 }
 
@@ -85,10 +86,13 @@ void BitgetNormalizer::process_raw_message(const exchange::bitget::RawWsMessage&
     std::string action   = safe_string(*root_obj, "action");
 
     // Фильтрация по символам, если список задан
-    if (!symbols_.empty() && !inst_id.empty()) {
-        tb::Symbol sym{inst_id};
-        bool found = std::ranges::find(symbols_, sym) != symbols_.end();
-        if (!found) return;
+    if (!inst_id.empty()) {
+        std::lock_guard<std::mutex> sym_lock(symbols_mutex_);
+        if (!symbols_.empty()) {
+            tb::Symbol sym{inst_id};
+            bool found = std::ranges::find(symbols_, sym) != symbols_.end();
+            if (!found) return;
+        }
     }
 
     // Извлекаем массив data

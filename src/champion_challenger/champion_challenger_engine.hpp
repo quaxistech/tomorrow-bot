@@ -118,11 +118,13 @@ private:
     void persist_event(const StrategyId& challenger_id, const std::string& event_type,
                        const std::string& payload_json) const;
 
-    /// Уведомить наблюдателей о промоушене
-    void notify_promotion(const ChallengerEntry& entry);
+    /// Уведомить наблюдателей о промоушене (вызывается вне mutex_)
+    void notify_promotion(const ChallengerEntry& entry,
+                          const std::vector<std::shared_ptr<IChallengerObserver>>& observers);
 
-    /// Уведомить наблюдателей об отклонении
-    void notify_rejection(const ChallengerEntry& entry);
+    /// Уведомить наблюдателей об отклонении (вызывается вне mutex_)
+    void notify_rejection(const ChallengerEntry& entry,
+                          const std::vector<std::shared_ptr<IChallengerObserver>>& observers);
 };
 
 } // namespace tb::champion_challenger

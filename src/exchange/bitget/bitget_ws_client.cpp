@@ -5,6 +5,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
+#include <boost/json.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -232,18 +233,32 @@ struct BitgetWsClient::Impl {
 
             if (payload == "pong" || payload.find("\"pong\"") != std::string::npos) {
                 raw.type = WsMsgType::Heartbeat;
-            } else if (payload.find("\"ticker\"") != std::string::npos) {
-                raw.type = WsMsgType::Ticker;
-            } else if (payload.find("\"trade\"") != std::string::npos) {
-                raw.type = WsMsgType::Trade;
-            } else if (payload.find("\"books\"") != std::string::npos) {
-                raw.type = WsMsgType::OrderBook;
-            } else if (payload.find("\"candle\"") != std::string::npos) {
-                raw.type = WsMsgType::Candle;
-            } else if (payload.find("\"subscribe\"") != std::string::npos) {
-                raw.type = WsMsgType::Subscribe;
-            } else if (payload.find("\"error\"") != std::string::npos) {
-                raw.type = WsMsgType::Error;
+            } else {
+                // Структурный разбор JSON: определяем тип по arg.channel
+                try {
+                    auto jv = boost::json::parse(payload);
+                    auto& obj = jv.as_object();
+
+                    if (obj.contains("event")) {
+                        auto ev = obj.at("event").as_string();
+                        if (ev == "subscribe") raw.type = WsMsgType::Subscribe;
+                        else if (ev == "error") raw.type = WsMsgType::Error;
+                    } else if (obj.contains("arg")) {
+                        auto& arg = obj.at("arg").as_object();
+                        if (arg.contains("channel")) {
+                            auto ch = arg.at("channel").as_string();
+                            if (ch == "ticker") raw.type = WsMsgType::Ticker;
+                            else if (ch == "trade") raw.type = WsMsgType::Trade;
+                            else if (ch.starts_with("books")) raw.type = WsMsgType::OrderBook;
+                            else if (ch.starts_with("candle")) raw.type = WsMsgType::Candle;
+                        }
+                    }
+                } catch (...) {
+                    // JSON parse failure — fallback to substring classification
+                    if (payload.find("\"error\"") != std::string::npos) {
+                        raw.type = WsMsgType::Error;
+                    }
+                }
             }
 
             if (on_message) on_message(std::move(raw));

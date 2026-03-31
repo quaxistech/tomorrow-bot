@@ -177,7 +177,7 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
 {
     using ResponseType = decltype(operation());
 
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     last_attempts_.clear();
 
     constexpr const char* kComponent = "RetryExecutor";
@@ -295,7 +295,9 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
              {"delay_ms", std::to_string(delay)},
              {"msg", msg}});
 
+        lock.unlock();
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        lock.lock();
     }
 
     return last_response;

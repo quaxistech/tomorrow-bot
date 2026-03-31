@@ -16,12 +16,15 @@ VoidResult EventJournal::append(
     const StrategyId& strategy_id,
     const ConfigHash& config_hash) {
 
-    // Генерация монотонного sequence_id (атомарно)
-    uint64_t seq = sequence_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    // Текущее время в наносекундах
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    // Текущее время в наносекундах (system_clock for cross-restart portability)
+    auto now = std::chrono::system_clock::now().time_since_epoch();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+    std::lock_guard lock(mutex_);
+
+    // Генерация монотонного sequence_id под mutex, чтобы гарантировать
+    // совпадение порядка sequence_id с порядком записи в adapter.
+    uint64_t seq = ++sequence_counter_;
 
     JournalEntry entry;
     entry.sequence_id = seq;
@@ -32,7 +35,6 @@ VoidResult EventJournal::append(
     entry.config_hash = config_hash;
     entry.payload_json = payload_json;
 
-    std::lock_guard lock(mutex_);
     return adapter_->append_journal(entry);
 }
 

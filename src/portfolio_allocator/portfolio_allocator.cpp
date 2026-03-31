@@ -37,8 +37,9 @@ SizingResult HierarchicalAllocator::compute_size(
 
     if (qty <= 0.0) {
         // Стратегия не указала объём — вычисляем из доступного капитала.
-        // Выделяем до max_concentration_pct от капитала на одну сделку.
-        double max_notional = portfolio.available_capital * config_.max_concentration_pct;
+        // С учётом leverage: доступный капитал × leverage = максимальный нотионал.
+        double leveraged_capital = portfolio.available_capital * config_.max_leverage;
+        double max_notional = leveraged_capital * config_.max_concentration_pct;
         qty = max_notional / price;
     }
 
@@ -131,16 +132,16 @@ SizingResult HierarchicalAllocator::compute_size(
         }
     }
 
-    // Шаг 6: Ограничить доступным капиталом
-    double max_from_capital = portfolio.available_capital;
+    // Шаг 6: Ограничить доступным капиталом (с учётом плеча)
+    double effective_capital = portfolio.available_capital * config_.max_leverage;
     double final_notional = qty * price;
-    if (max_from_capital <= 0.0) {
+    if (effective_capital <= 0.0) {
         result.approved = false;
         result.reduction_reason = "Доступный капитал исчерпан";
         return result;
     }
-    if (final_notional > max_from_capital) {
-        qty = max_from_capital / price;
+    if (final_notional > effective_capital) {
+        qty = effective_capital / price;
         result.was_reduced = true;
         result.reduction_reason = "Ограничен доступным капиталом";
     }
@@ -153,7 +154,7 @@ SizingResult HierarchicalAllocator::compute_size(
     constexpr double kMinOrderNotional = 1.10;
     if (final_notional > 0.0 && final_notional < kMinOrderNotional && price > 0.0) {
         double min_qty = kMinOrderNotional / price;
-        if (min_qty * price <= max_from_capital) {
+        if (min_qty * price <= effective_capital) {
             qty = min_qty;
             final_notional = qty * price;
             result.was_reduced = false;
@@ -185,10 +186,9 @@ SizingResult HierarchicalAllocator::compute_size(
 double HierarchicalAllocator::compute_budget_limit(
     const portfolio::PortfolioSnapshot& portfolio) const
 {
-    // Бюджет для символа = реальный капитал * доля символа.
-    // Используем фактический капитал из портфеля, а не статический config.
+    // Бюджет для символа = реальный капитал × leverage × доля символа.
     double effective_capital = portfolio.total_capital > 0.0
-        ? portfolio.total_capital
+        ? portfolio.total_capital * config_.max_leverage
         : config_.budget.global_budget;
     return effective_capital * config_.budget.symbol_budget_pct;
 }
@@ -196,8 +196,8 @@ double HierarchicalAllocator::compute_budget_limit(
 double HierarchicalAllocator::compute_concentration_limit(
     const portfolio::PortfolioSnapshot& portfolio) const
 {
-    // Одна позиция не более max_concentration_pct от капитала
-    return portfolio.total_capital * config_.max_concentration_pct;
+    // Одна позиция не более max_concentration_pct от leveraged капитала
+    return portfolio.total_capital * config_.max_leverage * config_.max_concentration_pct;
 }
 
 double HierarchicalAllocator::compute_strategy_limit(
@@ -213,7 +213,7 @@ double HierarchicalAllocator::compute_strategy_limit(
     }
 
     // Лимит стратегии = max_strategy_allocation_pct * капитал - существующая экспозиция
-    double max_strategy_notional = portfolio.total_capital * config_.max_strategy_allocation_pct;
+    double max_strategy_notional = portfolio.total_capital * config_.max_leverage * config_.max_strategy_allocation_pct;
     double remaining = max_strategy_notional - existing_strategy_exposure;
 
     return std::max(remaining, 0.0);

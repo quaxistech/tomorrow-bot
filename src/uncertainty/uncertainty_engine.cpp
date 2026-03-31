@@ -97,13 +97,12 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
         agg = std::min(1.0, agg + 0.1);
     }
 
-    // 4. Retrieve/create SymbolState
-    SymbolState* state_ptr = nullptr;
+    // 4. Retrieve/create SymbolState (copy to avoid dangling pointer on rehash)
+    SymbolState state;
     {
         std::lock_guard lock(mutex_);
-        state_ptr = &states_[features.symbol.get()];
+        state = states_[features.symbol.get()];
     }
-    auto& state = *state_ptr;
 
     // 5. EMA smoothing → persistent_score
     double persistent = config_.ema_alpha * agg +
@@ -192,12 +191,14 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     result.persistent_score       = persistent;
     result.spike_score            = spike;
 
-    // 16. Update state
+    // 16. Update local state copy
     update_state(state, agg, level, now_ns);
 
-    // 17. Update diagnostics & 18. Cache snapshot
+    // 17. Update diagnostics & 18. Cache snapshot & 19. Write state back
     {
         std::lock_guard lock(mutex_);
+        states_[features.symbol.get()] = state;
+
         diagnostics_.total_assessments++;
         if (action == UncertaintyAction::NoTrade) {
             diagnostics_.veto_count++;

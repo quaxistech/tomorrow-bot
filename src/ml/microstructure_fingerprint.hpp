@@ -26,15 +26,28 @@ struct MicroFingerprint {
     int volatility_bucket{0};          ///< Бакет волатильности (0..N-1)
     int depth_bucket{0};               ///< Бакет глубины (0..N-1)
 
-    /// Хеш для использования в unordered_map
+    /// Хеш для использования в unordered_map.
+    /// Использует FNV-1a для устойчивости к любому num_buckets.
     uint32_t hash() const {
-        return static_cast<uint32_t>(
-            spread_bucket * 625 + imbalance_bucket * 125
-            + flow_bucket * 25 + volatility_bucket * 5 + depth_bucket);
+        uint32_t h = 2166136261u;
+        auto mix = [&](int val) {
+            h ^= static_cast<uint32_t>(val);
+            h *= 16777619u;
+        };
+        mix(spread_bucket);
+        mix(imbalance_bucket);
+        mix(flow_bucket);
+        mix(volatility_bucket);
+        mix(depth_bucket);
+        return h;
     }
 
     bool operator==(const MicroFingerprint& other) const {
-        return hash() == other.hash();
+        return spread_bucket == other.spread_bucket
+            && imbalance_bucket == other.imbalance_bucket
+            && flow_bucket == other.flow_bucket
+            && volatility_bucket == other.volatility_bucket
+            && depth_bucket == other.depth_bucket;
     }
 };
 

@@ -37,6 +37,12 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(last_price) || !std::isfinite(tech.bb_upper) ||
+        !std::isfinite(tech.bb_lower) || !std::isfinite(tech.bb_bandwidth)) {
+        return std::nullopt;
+    }
+
     // Обновляем буфер bandwidth
     std::lock_guard lock(history_mutex_);
     bandwidth_history_.push_back(tech.bb_bandwidth);
@@ -149,6 +155,14 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
 
     // Пробой вниз: цена ниже нижней BB
     if (last_price < tech.bb_lower) {
+        // Block SELL breakout against BULL trend — likely false breakdown
+        if (trend_bullish && !cfg_.allow_counter_trend) {
+            logger_->debug("Breakout", "SELL пробой отклонён — бычий тренд EMA",
+                {{"ema20", std::to_string(tech.ema_20)},
+                 {"ema50", std::to_string(tech.ema_50)}});
+            return std::nullopt;
+        }
+
         // Volume confirmation for downside breakout
         bool volume_ok = true;
         if (tech.obv_valid && tech.obv_normalized > -cfg_.obv_block_threshold) {
@@ -163,9 +177,16 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
         }
 
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "bb_breakout_down_short_v2";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "bb_breakout_down_v2";
+        }
         intent.exit_reason = ExitReason::TrendFailure;
-        intent.signal_name = "bb_breakout_down_v2";
         intent.reason_codes = {"compression_detected", "expansion_confirmed", "price_below_lower_bb"};
 
         double expansion_strength = std::min(1.0, (current_bw / min_bw - 1.0) / 3.0);
@@ -178,6 +199,11 @@ std::optional<TradeIntent> BreakoutStrategy::evaluate(const StrategyContext& con
 
         if (tech.adx_valid && tech.adx > cfg_.adx_strong) {
             intent.conviction = std::min(cfg_.max_conviction, intent.conviction + cfg_.adx_bonus);
+        }
+
+        // Контр-тренд множитель conviction
+        if (trend_bullish && cfg_.allow_counter_trend) {
+            intent.conviction *= cfg_.counter_trend_conviction_mult;
         }
 
         intent.entry_score = intent.conviction * 0.80;

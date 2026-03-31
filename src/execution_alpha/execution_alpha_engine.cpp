@@ -273,11 +273,27 @@ double RuleBasedExecutionAlpha::compute_urgency(
         urgency += vol_factor;
     }
 
-    // ── Моментум: сильное движение → не ждать лучшей цены ────────────────
+    // ── Моментум: учитываем направление относительно сделки ────────────
+    // Adverse momentum (цена убегает) → увеличить urgency
+    // Favorable momentum (цена движется к нам) → можно не спешить
     if (features.technical.momentum_valid) {
-        double momentum_factor = std::min(std::abs(features.technical.momentum_5) * 0.5, 0.15);
-        factors.urgency_momentum_adj = momentum_factor;
-        urgency += momentum_factor;
+        double raw_momentum = features.technical.momentum_5;
+        double direction_sign = (intent.side == Side::Buy) ? 1.0 : -1.0;
+        // Положительный directional = цена движется в нашу сторону (favorable)
+        // Отрицательный directional = цена убегает (adverse)
+        double directional = raw_momentum * direction_sign;
+
+        if (directional < 0.0) {
+            // Adverse: цена убегает — увеличить urgency
+            double momentum_factor = std::min(std::abs(directional) * 0.5, 0.15);
+            factors.urgency_momentum_adj = momentum_factor;
+            urgency += momentum_factor;
+        } else {
+            // Favorable: цена движется к нам — не спешить (небольшое снижение)
+            double relief = std::min(directional * 0.25, 0.10);
+            factors.urgency_momentum_adj = -relief;
+            urgency -= relief;
+        }
     }
 
     // ── CUSUM: сигнал смены режима → срочность выше ───────────────────────

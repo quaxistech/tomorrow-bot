@@ -146,11 +146,13 @@ std::optional<DepthSummary> LocalOrderBook::depth_summary(int levels) const {
     return ds;
 }
 
-const std::map<tb::Price, tb::Quantity, std::greater<tb::Price>>& LocalOrderBook::bids() const {
+std::map<tb::Price, tb::Quantity, std::greater<tb::Price>> LocalOrderBook::bids() const {
+    std::scoped_lock lock(mutex_);
     return bids_;
 }
 
-const std::map<tb::Price, tb::Quantity>& LocalOrderBook::asks() const {
+std::map<tb::Price, tb::Quantity> LocalOrderBook::asks() const {
+    std::scoped_lock lock(mutex_);
     return asks_;
 }
 

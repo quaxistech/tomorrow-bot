@@ -35,6 +35,12 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(micro.book_imbalance_5) || !std::isfinite(micro.buy_sell_ratio) ||
+        !std::isfinite(micro.spread_bps)) {
+        return std::nullopt;
+    }
+
     // VPIN Toxicity Filter: Do NOT scalp when VPIN indicates toxic flow
     // Reference: de Prado "Advances in FML" — VPIN > 0.7 = informed trading
     // Scalping against informed traders = guaranteed loss
@@ -51,9 +57,24 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
         return std::nullopt;
     }
 
-    // Не торговать в экстремальных зонах RSI — защита от покупки на вершине
-    if (tech.rsi_14 > cfg_.rsi_upper_guard || tech.rsi_14 < cfg_.rsi_lower_guard) {
+    // RSI guard перенесён в секции BUY/SELL ниже — направленная фильтрация
+    // вместо симметричной блокировки обоих направлений
+
+    // ADX guard: не скальпируем в слабом/неясном тренде — слишком шумно
+    if (tech.adx_valid && tech.adx < cfg_.adx_min) {
         return std::nullopt;
+    }
+
+    // BB overextension guard: не входим когда цена на краю Bollinger Band
+    // Скальпинг при bb_pos > 0.85 (BUY) или < 0.15 (SELL) = высокий risk mean-reversion
+    double bb_pos = 0.0;
+    bool bb_pos_valid = false;
+    if (tech.bb_valid) {
+        double bb_range = tech.bb_upper - tech.bb_lower;
+        if (bb_range > 1e-10) {
+            bb_pos = (context.features.mid_price.get() - tech.bb_lower) / bb_range;
+            bb_pos_valid = true;
+        }
     }
 
     // Спред должен быть узким для скальпинга
@@ -82,6 +103,20 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
     // В медвежьем тренде — разрешаем BUY при ОЧЕНЬ сильном дисбалансе (>0.5)
     // с пониженным conviction (order flow может предсказать разворот)
     if (micro.book_imbalance_5 > cfg_.imbalance_threshold && micro.buy_sell_ratio > cfg_.buy_sell_ratio_buy) {
+        // RSI guard: блокируем BUY при overbought (RSI слишком высок для входа в лонг)
+        if (tech.rsi_14 > cfg_.rsi_upper_guard) {
+            return std::nullopt;
+        }
+
+        // BB overextension: блокируем BUY когда цена уже у верхней границы BB
+        if (bb_pos_valid && bb_pos > cfg_.bb_max_buy) {
+            logger_->debug("MicroScalp",
+                "BUY заблокирован — цена перекуплена по BB",
+                {{"bb_pos", std::to_string(bb_pos)},
+                 {"threshold", std::to_string(cfg_.bb_max_buy)}});
+            return std::nullopt;
+        }
+
         // Block BUY scalps in bear trend
         if (trend_bearish && cfg_.block_counter_trend) {
             logger_->debug("MicroScalp",
@@ -124,6 +159,20 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
     // Продажа: сильный дисбаланс в сторону ask + продавцы доминируют
     // + тренд НЕ бычий
     if (micro.book_imbalance_5 < -cfg_.imbalance_threshold && micro.buy_sell_ratio < cfg_.buy_sell_ratio_sell) {
+        // RSI guard: блокируем SELL при oversold (RSI слишком низок для выхода)
+        if (tech.rsi_14 < cfg_.rsi_lower_guard) {
+            return std::nullopt;
+        }
+
+        // BB overextension: блокируем SELL когда цена уже у нижней границы BB
+        if (bb_pos_valid && bb_pos < cfg_.bb_min_sell) {
+            logger_->debug("MicroScalp",
+                "SELL заблокирован — цена перепродана по BB",
+                {{"bb_pos", std::to_string(bb_pos)},
+                 {"threshold", std::to_string(cfg_.bb_min_sell)}});
+            return std::nullopt;
+        }
+
         // Блокируем SELL скальп в бычьем тренде
         if (trend_bullish && cfg_.block_counter_trend) {
             logger_->debug("MicroScalp",
@@ -134,9 +183,16 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
         }
 
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "imbalance_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "imbalance_sell";
+        }
         intent.exit_reason = ExitReason::InventoryRiskExit;
-        intent.signal_name = "imbalance_sell";
         intent.reason_codes = {"strong_ask_imbalance", "seller_dominance", "tight_spread"};
 
         double spread_factor = 1.0 - micro.spread_bps / (cfg_.max_spread_bps * 2.0);

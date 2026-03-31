@@ -26,8 +26,8 @@ public:
     std::optional<TopOfBook> top_of_book() const;
     std::optional<DepthSummary> depth_summary(int levels = 10) const;
 
-    const std::map<tb::Price, tb::Quantity, std::greater<tb::Price>>& bids() const;
-    const std::map<tb::Price, tb::Quantity>& asks() const;
+    std::map<tb::Price, tb::Quantity, std::greater<tb::Price>> bids() const;
+    std::map<tb::Price, tb::Quantity> asks() const;
 
     tb::Symbol symbol() const;
     tb::Timestamp last_updated() const;

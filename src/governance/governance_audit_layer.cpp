@@ -836,7 +836,11 @@ GovernanceGateResult GovernanceAuditLayer::evaluate_trading_gate(
         }
     }
 
-    // 5. Проверка стратегии
+    // 5. Проверка стратегии (пропускаем для глобальной проверки с пустым ID)
+    if (strategy_id.get().empty()) {
+        return result;
+    }
+
     auto it = strategy_registry_.find(strategy_id.get());
     if (it == strategy_registry_.end()) {
         result.trading_allowed = false;

@@ -53,6 +53,9 @@ public:
     /// Установить капитал (для синхронизации с биржей)
     virtual void set_capital(double capital) = 0;
 
+    /// Установить кредитное плечо (для фьючерсов — корректирует exposure/available_capital)
+    virtual void set_leverage(double leverage) { (void)leverage; }
+
     // === Cash Reserve Management (Phase 1) ===
 
     /// Зарезервировать cash под BUY-ордер (вызывается перед отправкой на биржу)
@@ -109,6 +112,7 @@ public:
     PnlSummary pnl() const override;
     void reset_daily() override;
     void set_capital(double capital) override;
+    void set_leverage(double leverage) override;
 
     // === Cash Reserve Management overrides ===
     bool reserve_cash(const OrderId& order_id, const Symbol& symbol,
@@ -140,6 +144,7 @@ private:
     void recompute_cash_ledger();
 
     double total_capital_;
+    double leverage_{1.0};
     double peak_equity_;
     double realized_pnl_today_{0.0};
     int trades_today_{0};

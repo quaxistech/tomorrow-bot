@@ -260,8 +260,11 @@ void SmartTwapExecutor::record_slice_fill(
     }
     twap_order.filled_qty = Quantity(new_total_qty);
 
-    // Проверяем завершение
-    if (twap_order.next_slice >= twap_order.slices.size()) {
+    // Проверяем завершение: все слайсы должны быть заполнены (не просто отправлены)
+    bool all_filled = std::all_of(
+        twap_order.slices.begin(), twap_order.slices.end(),
+        [](const TwapSlice& s) { return s.filled; });
+    if (all_filled) {
         twap_order.completed = true;
         logger_->info("TWAP", "TWAP ордер завершён",
             {{"twap_id", twap_order.twap_id},

@@ -5,23 +5,23 @@
 ### 1. Выбор торговых пар (PairScanner v5)
 
 ```
-Bitget REST API: /api/v2/spot/public/symbols + /api/v2/spot/market/tickers
+Bitget REST API: /api/v2/mix/market/tickers (USDT-M Futures)
     → PairScanner.scan()   [scan_id UUID, timing, metrics]
     → фильтрация (объём > 500K, спред < 50bps, статус = online, blacklist)
     → параллельная загрузка свечей (bounded concurrency, retry + circuit breaker)
     → валидация данных (DataValidator: bid/ask, chronology, completeness)
     → скоринг v4: Momentum(40) + Trend(25) + Tradability(25) + Quality(10)
     → диверсификация (корреляция, секторная концентрация, ликвидность)
-    → top-N пар (по умолчанию 5)
+    → top-N пар (по умолчанию 1)
     → persistence (audit trail) + health reporting + metrics
     → выбор лучшей пары → передача в TradingPipeline
-    → 24-часовая ротация (повторный скан и возможная смена пары)
+    → 12-часовая ротация (повторный скан и возможная смена пары)
 ```
 
 ### 2. Bootstrap: загрузка исторических данных
 
 ```
-Bitget REST API: /api/v2/spot/market/candles
+Bitget REST API: /api/v2/mix/market/candles (USDT-M Futures)
     → bootstrap_historical_candles(): 200 × 1m свечей (≈3.3 часа)
         → FeatureEngine.on_candle() для каждой свечи
         → прогрев технических индикаторов (SMA, EMA, RSI, MACD, BB, ATR, ADX)
@@ -47,7 +47,7 @@ Bitget WS → BitgetWsClient → RawWsMessage
 
 ```
 Каждые 60 минут (таймер):
-    → Bitget REST API: /api/v2/spot/market/candles (1h)
+    → Bitget REST API: /api/v2/mix/market/candles (1h)
     → пересчёт HTF индикаторов (EMA20/50, RSI14, MACD, ADX14)
     → обновление htf_trend_direction_ и htf_trend_strength_
 

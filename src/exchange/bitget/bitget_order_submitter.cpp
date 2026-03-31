@@ -33,14 +33,46 @@ BitgetOrderSubmitter::BitgetOrderSubmitter(
         {{"product_type", product_type_}});
 }
 
+// ==================== Управление правилами символов ====================
+
+void BitgetOrderSubmitter::set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules) {
+    std::lock_guard lock(rules_mutex_);
+    rules_by_symbol_[symbol.get()] = rules;
+    logger_->debug(kComp, "Правила символа установлены",
+        {{"symbol", symbol.get()},
+         {"price_precision", std::to_string(rules.price_precision)},
+         {"quantity_precision", std::to_string(rules.quantity_precision)},
+         {"min_trade_usdt", std::to_string(rules.min_trade_usdt)}});
+}
+
+const ExchangeSymbolRules& BitgetOrderSubmitter::rules(const Symbol& symbol) const {
+    return get_rules(symbol);
+}
+
+const ExchangeSymbolRules& BitgetOrderSubmitter::get_rules(const Symbol& symbol) const {
+    std::lock_guard lock(rules_mutex_);
+    auto it = rules_by_symbol_.find(symbol.get());
+    if (it != rules_by_symbol_.end()) {
+        return it->second;
+    }
+    return default_rules_;
+}
+
 // ==================== Формирование JSON тела запроса ====================
 
 std::string BitgetOrderSubmitter::build_place_order_json(
     const execution::OrderRecord& order) const
 {
+    const auto& sym_rules = get_rules(order.symbol);
+
     boost::json::object obj;
 
     obj["symbol"] = order.symbol.get();
+
+    // Идемпотентный clientOid для защиты от дублирования при retry
+    if (!order.execution_info.client_order_id.empty()) {
+        obj["clientOid"] = order.execution_info.client_order_id;
+    }
 
     // Направление: buy / sell
     obj["side"] = std::string(to_string(order.side));
@@ -54,7 +86,7 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     if (order.order_type == OrderType::StopMarket || order.order_type == OrderType::StopLimit) {
         logger_->error(kComp, "Стоп-ордера не поддерживаются Bitget Spot API v2",
             {{"order_type", std::string(to_string(order.order_type))}});
-        return "{}"; // Вернуть пустой JSON для индикации ошибки
+        return "{}";
     }
 
     if (is_market) {
@@ -64,7 +96,6 @@ std::string BitgetOrderSubmitter::build_place_order_json(
         obj["orderType"] = "limit";
         obj["force"] = "post_only";
     } else if (is_limit) {
-        // Limit
         obj["orderType"] = "limit";
 
         // TimeInForce → force
@@ -75,7 +106,6 @@ std::string BitgetOrderSubmitter::build_place_order_json(
             default:                             obj["force"] = "gtc"; break;
         }
     } else {
-        // Неизвестный тип ордера
         logger_->error(kComp, "Неизвестный тип ордера",
             {{"order_type", std::string(to_string(order.order_type))}});
         return "{}";
@@ -87,8 +117,6 @@ std::string BitgetOrderSubmitter::build_place_order_json(
     // Для limit — size = количество в BTC (base currency)
     if (is_market && order.side == Side::Buy) {
         // Bitget Spot market buy: size = quote amount (USDT to spend).
-        // order.price MUST be set to estimated market price.
-        // Reject if price is not set — prevents dust orders.
         if (order.price.get() <= 0.0) {
             logger_->error(kComp, "Market buy отклонён: цена не задана (нельзя вычислить quote amount)",
                 {{"symbol", order.symbol.get()},
@@ -96,24 +124,24 @@ std::string BitgetOrderSubmitter::build_place_order_json(
             return "{}";
         }
         double quote_amount = order.original_quantity.get() * order.price.get();
-        if (quote_amount < rules_.min_trade_usdt) {
+        if (quote_amount < sym_rules.min_trade_usdt) {
             logger_->error(kComp, "Market buy отклонён: quote amount ниже минимума",
                 {{"quote_amount", std::to_string(quote_amount)},
-                 {"min_trade_usdt", std::to_string(rules_.min_trade_usdt)}});
+                 {"min_trade_usdt", std::to_string(sym_rules.min_trade_usdt)}});
             return "{}";
         }
-        obj["size"] = rules_.format_price(quote_amount);
+        obj["size"] = sym_rules.format_price(quote_amount);
     } else {
         // Limit или market sell: size = base currency quantity.
-        double floored_qty = rules_.floor_quantity(order.original_quantity.get());
-        if (!rules_.is_quantity_valid(floored_qty)) {
+        double floored_qty = sym_rules.floor_quantity(order.original_quantity.get());
+        if (!sym_rules.is_quantity_valid(floored_qty)) {
             logger_->error(kComp, "Ордер отклонён: quantity невалиден после округления",
                 {{"original_qty", std::to_string(order.original_quantity.get())},
                  {"floored_qty", std::to_string(floored_qty)},
                  {"symbol", order.symbol.get()}});
             return "{}";
         }
-        obj["size"] = rules_.format_quantity(floored_qty);
+        obj["size"] = sym_rules.format_quantity(floored_qty);
     }
 
     // Цена — только для лимитных ордеров
@@ -123,7 +151,7 @@ std::string BitgetOrderSubmitter::build_place_order_json(
                 {{"symbol", order.symbol.get()}});
             return "{}";
         }
-        obj["price"] = rules_.format_price(order.price.get());
+        obj["price"] = sym_rules.format_price(order.price.get());
     }
 
     return boost::json::serialize(obj);
@@ -143,7 +171,7 @@ execution::OrderSubmitResult BitgetOrderSubmitter::submit_order(
         // Проверка на ошибку формирования JSON (пустой объект)
         if (body == "{}") {
             result.success = false;
-            result.error_message = "Неподдерживаемый тип ордера";
+            result.error_message = "Ошибка формирования JSON ордера";
             return result;
         }
 
@@ -250,12 +278,17 @@ bool BitgetOrderSubmitter::cancel_order(const OrderId& order_id, const Symbol& s
 
 // ==================== query_order_fill_price ====================
 
-Price BitgetOrderSubmitter::query_order_fill_price(const OrderId& exchange_order_id) {
+Price BitgetOrderSubmitter::query_order_fill_price(
+    const OrderId& exchange_order_id, const Symbol& symbol)
+{
     try {
-        std::string query = "orderId=" + exchange_order_id.get();
+        // Bitget orderInfo API требует обязательный параметр symbol
+        std::string query = "orderId=" + exchange_order_id.get()
+                          + "&symbol=" + symbol.get();
 
         logger_->debug(kComp, "Запрос fill price для market ордера",
-            {{"exchange_order_id", exchange_order_id.get()}});
+            {{"exchange_order_id", exchange_order_id.get()},
+             {"symbol", symbol.get()}});
 
         auto response = rest_client_->get(kOrderInfoPath, query);
 

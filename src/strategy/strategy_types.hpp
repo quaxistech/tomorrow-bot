@@ -7,11 +7,13 @@
 
 namespace tb::strategy {
 
-/// Тип торгового намерения для спотовой торговли.
-/// На споте короткие позиции невозможны — SELL означает выход из лонга.
+/// Тип торгового намерения (spot + futures).
+/// На фьючерсах поддерживаются SHORT позиции через ShortEntry/ShortExit.
 enum class SignalIntent {
     LongEntry,          ///< Открытие длинной позиции (BUY)
     LongExit,           ///< Полное закрытие длинной позиции (SELL)
+    ShortEntry,         ///< Открытие короткой позиции (SELL на фьючерсах)
+    ShortExit,          ///< Закрытие короткой позиции (BUY на фьючерсах)
     ReducePosition,     ///< Частичное сокращение позиции
     Hold                ///< Удерживать текущую позицию без действий
 };
@@ -28,13 +30,16 @@ enum class ExitReason {
     InventoryRiskExit,  ///< Управление инвентарем (слишком долгое удержание)
     SignalDecay,        ///< Сигнал деградировал, alpha исчезла
     TimeExit,           ///< Превышено максимальное время удержания
-    RegimeChange        ///< Смена рыночного режима
+    RegimeChange,       ///< Смена рыночного режима
+    PartialReduction    ///< Частичное сокращение позиции (SignalIntent::ReducePosition)
 };
 
 inline const char* to_string(SignalIntent si) {
     switch (si) {
         case SignalIntent::LongEntry:       return "LongEntry";
         case SignalIntent::LongExit:        return "LongExit";
+        case SignalIntent::ShortEntry:      return "ShortEntry";
+        case SignalIntent::ShortExit:       return "ShortExit";
         case SignalIntent::ReducePosition:  return "ReducePosition";
         case SignalIntent::Hold:            return "Hold";
     }
@@ -54,6 +59,7 @@ inline const char* to_string(ExitReason er) {
         case ExitReason::SignalDecay:        return "SignalDecay";
         case ExitReason::TimeExit:           return "TimeExit";
         case ExitReason::RegimeChange:       return "RegimeChange";
+        case ExitReason::PartialReduction:   return "PartialReduction";
     }
     return "Unknown";
 }
@@ -64,10 +70,13 @@ struct TradeIntent {
     StrategyVersion strategy_version{StrategyVersion(0)};
     Symbol symbol{Symbol("")};
     Side side{Side::Buy};
-    SignalIntent signal_intent{SignalIntent::LongEntry}; ///< Спотовая семантика сигнала
+    PositionSide position_side{PositionSide::Long};     ///< Сторона позиции (Long/Short)
+    SignalIntent signal_intent{SignalIntent::LongEntry}; ///< Семантика сигнала
+    TradeSide trade_side{TradeSide::Open};               ///< Открытие/закрытие (для фьючерсов)
     ExitReason exit_reason{ExitReason::None};            ///< Причина выхода (для SELL-сигналов)
     Quantity suggested_quantity{Quantity(0.0)};
     std::optional<Price> limit_price;                 ///< Рекомендуемая лимитная цена (или nullopt для рыночного)
+    std::optional<Price> snapshot_mid_price;          ///< Mid price из snapshot на момент генерации (fallback для market ордеров)
     double conviction{0.0};                           ///< Убеждённость стратегии [0.0, 1.0]
     std::string signal_name;                          ///< Имя сигнала ("ma_crossover", "rsi_oversold", ...)
     std::vector<std::string> reason_codes;            ///< Коды причин
@@ -88,6 +97,7 @@ struct StrategyContext {
     double uncertainty_threshold_multiplier{1.0};
     bool is_strategy_enabled{true};
     double strategy_weight{1.0};
+    bool futures_enabled{false};  ///< Фьючерсы включены → стратегии могут генерировать ShortEntry/ShortExit
 };
 
 /// Метаданные стратегии

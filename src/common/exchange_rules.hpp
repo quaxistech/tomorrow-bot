@@ -25,16 +25,32 @@ struct ExchangeSymbolRules {
     double min_quantity{0.0};     ///< Минимальный quantity (base), 0 = не задан
     double max_quantity{0.0};     ///< Максимальный quantity (base), 0 = не задан
 
-    /// Округлить quantity вниз до допустимой точности (floor)
+    /// Округлить quantity вниз до допустимой точности (floor).
+    /// Использует snprintf для избежания накопленных ошибок floating-point
+    /// при высоком значении quantity_precision (>6).
     [[nodiscard]] double floor_quantity(double qty) const noexcept {
-        double factor = std::pow(10.0, quantity_precision);
-        return std::floor(qty * factor) / factor;
+        if (qty <= 0.0) return 0.0;
+        // Округляем вниз через целочисленную арифметику на масштабированном значении
+        // std::pow избегается намеренно — precompute factor inline
+        double factor = 1.0;
+        for (int i = 0; i < quantity_precision; ++i) factor *= 10.0;
+        // floor на целочисленной части масштабированного значения
+        double scaled = qty * factor;
+        double floored = std::floor(scaled);
+        // Используем snprintf → parse roundtrip для точного представления
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.*f", quantity_precision, floored / factor);
+        return std::strtod(buf, nullptr);
     }
 
-    /// Округлить цену до допустимой точности (round)
+    /// Округлить цену до допустимой точности (round half-up)
     [[nodiscard]] double round_price(double price) const noexcept {
-        double factor = std::pow(10.0, price_precision);
-        return std::round(price * factor) / factor;
+        if (price <= 0.0) return 0.0;
+        double factor = 1.0;
+        for (int i = 0; i < price_precision; ++i) factor *= 10.0;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.*f", price_precision, std::round(price * factor) / factor);
+        return std::strtod(buf, nullptr);
     }
 
     /// Проверить, что quantity допустим (не ноль, не пыль, >= min_quantity)

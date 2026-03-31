@@ -69,13 +69,14 @@ AllocationResult RegimeAwareAllocator::allocate(
         alloc.size_multiplier = uncertainty.size_multiplier;
 
         // 4. Отключаем стратегии с очень низким весом.
-        // Порог 0.001: при экстремальных условиях (LiquidityStress+LiquidityVacuum)
-        // min weight = 0.2 × 0.05 × 0.2 = 0.002. Порог должен быть ниже,
-        // чтобы хотя бы одна стратегия оставалась активной — иначе вето на часы.
-        if (alloc.weight < 0.001) {
+        // Порог 0.00001: при micro-cap торговле uncertainty multiplier
+        // бывает очень мал (0.002), а world suitability 0.3 для Unknown,
+        // итого weight = base * 0.3 * 0.002 = 0.0006 — это рабочий вес.
+        // Блокировать только совсем нулевые.
+        if (alloc.weight < 0.00001) {
             alloc.is_enabled = false;
             if (!alloc.reason.empty()) alloc.reason += " | ";
-            alloc.reason += "Вес ниже порога (< 0.001)";
+            alloc.reason += "Вес ниже порога (< 0.00001)";
         }
 
         result.allocations.push_back(std::move(alloc));

@@ -144,8 +144,9 @@ void MarketDataGateway::subscribe_to_channels() {
         const std::string inst = symbol.get();
 
         // Bitget v2 API: подписка требует JSON-объекты {instType, channel, instId}
+        const auto& inst_type = config_.inst_type;
         auto make_sub = [&](const std::string& channel) -> std::string {
-            return R"({"instType":"SPOT","channel":")" + channel +
+            return R"({"instType":")" + inst_type + R"(","channel":")" + channel +
                    R"(","instId":")" + inst + R"("})";
         };
 

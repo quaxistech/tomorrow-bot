@@ -222,92 +222,112 @@ bool ChampionChallengerEngine::should_reject(StrategyId challenger) const {
 // ============================================================
 
 VoidResult ChampionChallengerEngine::promote(StrategyId challenger, bool force) {
-    std::lock_guard lock(mutex_);
+    ChallengerEntry entry_copy;
+    std::vector<std::shared_ptr<IChallengerObserver>> observers_copy;
 
-    auto it = entries_.find(challenger.get());
-    if (it == entries_.end()) {
-        return ErrVoid(TbError::ConfigValidationFailed);
-    }
+    {
+        std::lock_guard lock(mutex_);
 
-    auto& entry = it->second;
-
-    // Pre-promotion аудит (если не force)
-    if (!force) {
-        auto audit = run_pre_promotion_audit(entry);
-        if (!audit.all_passed()) {
-            if (logger_) {
-                logger_->warn("champion_challenger", "Промоушен отклонён аудитом",
-                    {{"challenger",  challenger.get()},
-                     {"reason",      audit.failure_reason}});
-            }
+        auto it = entries_.find(challenger.get());
+        if (it == entries_.end()) {
             return ErrVoid(TbError::ConfigValidationFailed);
         }
+
+        auto& entry = it->second;
+
+        // Pre-promotion аудит (если не force)
+        if (!force) {
+            auto audit = run_pre_promotion_audit(entry);
+            if (!audit.all_passed()) {
+                if (logger_) {
+                    logger_->warn("champion_challenger", "Промоушен отклонён аудитом",
+                        {{"challenger",  challenger.get()},
+                         {"reason",      audit.failure_reason}});
+                }
+                return ErrVoid(TbError::ConfigValidationFailed);
+            }
+        }
+
+        double delta_pct = compute_performance_delta(entry) * 100.0;
+        entry.status = ChallengerStatus::Promoted;
+        entry.promotion_reason =
+            "Net P&L delta +" + std::to_string(delta_pct) + "%" +
+            " | hit_rate " + std::to_string(entry.challenger_metrics.hit_rate() * 100.0) + "%" +
+            " | drawdown " + std::to_string(entry.challenger_metrics.max_drawdown_bps) + "bps" +
+            (force ? " [forced]" : "");
+
+        if (logger_) {
+            logger_->info("champion_challenger", "CHALLENGER PROMOTED",
+                {{"challenger",  challenger.get()},
+                 {"champion",    entry.champion_id.get()},
+                 {"delta_pct",   std::to_string(delta_pct)},
+                 {"hit_rate",    std::to_string(entry.challenger_metrics.hit_rate())},
+                 {"drawdown",    std::to_string(entry.challenger_metrics.max_drawdown_bps)},
+                 {"trades",      std::to_string(entry.challenger_metrics.decision_count)},
+                 {"forced",      force ? "true" : "false"}});
+        }
+
+        if (metrics_) {
+            metrics::MetricTags tags{{"champion",   entry.champion_id.get()},
+                                      {"challenger", challenger.get()}};
+            metrics_->counter("cc_promotions_total", tags)->increment();
+        }
+
+        persist_event(challenger, "promoted", entry.promotion_reason);
+
+        entry_copy = entry;
+        observers_copy = observers_;
     }
 
-    double delta_pct = compute_performance_delta(entry) * 100.0;
-    entry.status = ChallengerStatus::Promoted;
-    entry.promotion_reason =
-        "Net P&L delta +" + std::to_string(delta_pct) + "%" +
-        " | hit_rate " + std::to_string(entry.challenger_metrics.hit_rate() * 100.0) + "%" +
-        " | drawdown " + std::to_string(entry.challenger_metrics.max_drawdown_bps) + "bps" +
-        (force ? " [forced]" : "");
-
-    if (logger_) {
-        logger_->info("champion_challenger", "CHALLENGER PROMOTED",
-            {{"challenger",  challenger.get()},
-             {"champion",    entry.champion_id.get()},
-             {"delta_pct",   std::to_string(delta_pct)},
-             {"hit_rate",    std::to_string(entry.challenger_metrics.hit_rate())},
-             {"drawdown",    std::to_string(entry.challenger_metrics.max_drawdown_bps)},
-             {"trades",      std::to_string(entry.challenger_metrics.decision_count)},
-             {"forced",      force ? "true" : "false"}});
-    }
-
-    if (metrics_) {
-        metrics::MetricTags tags{{"champion",   entry.champion_id.get()},
-                                  {"challenger", challenger.get()}};
-        metrics_->counter("cc_promotions_total", tags)->increment();
-    }
-
-    persist_event(challenger, "promoted", entry.promotion_reason);
-    notify_promotion(entry);
+    // Notify outside mutex to prevent deadlock if observer calls back into engine
+    notify_promotion(entry_copy, observers_copy);
     return OkVoid();
 }
 
 VoidResult ChampionChallengerEngine::reject(StrategyId challenger) {
-    std::lock_guard lock(mutex_);
+    ChallengerEntry entry_copy;
+    std::vector<std::shared_ptr<IChallengerObserver>> observers_copy;
 
-    auto it = entries_.find(challenger.get());
-    if (it == entries_.end()) {
-        return ErrVoid(TbError::ConfigValidationFailed);
+    {
+        std::lock_guard lock(mutex_);
+
+        auto it = entries_.find(challenger.get());
+        if (it == entries_.end()) {
+            return ErrVoid(TbError::ConfigValidationFailed);
+        }
+
+        auto& entry = it->second;
+        double delta_pct = std::abs(compute_performance_delta(entry)) * 100.0;
+        entry.status = ChallengerStatus::Rejected;
+        entry.rejection_reason =
+            "Net P&L delta -" + std::to_string(delta_pct) + "%" +
+            " | hit_rate " + std::to_string(entry.challenger_metrics.hit_rate() * 100.0) + "%" +
+            " | drawdown " + std::to_string(entry.challenger_metrics.max_drawdown_bps) + "bps";
+
+        if (logger_) {
+            logger_->warn("champion_challenger", "CHALLENGER REJECTED",
+                {{"challenger",  challenger.get()},
+                 {"champion",    entry.champion_id.get()},
+                 {"delta_pct",   std::to_string(-delta_pct)},
+                 {"hit_rate",    std::to_string(entry.challenger_metrics.hit_rate())},
+                 {"drawdown",    std::to_string(entry.challenger_metrics.max_drawdown_bps)},
+                 {"trades",      std::to_string(entry.challenger_metrics.decision_count)}});
+        }
+
+        if (metrics_) {
+            metrics::MetricTags tags{{"champion",   entry.champion_id.get()},
+                                      {"challenger", challenger.get()}};
+            metrics_->counter("cc_rejections_total", tags)->increment();
+        }
+
+        persist_event(challenger, "rejected", entry.rejection_reason);
+
+        entry_copy = entry;
+        observers_copy = observers_;
     }
 
-    auto& entry = it->second;
-    double delta_pct = std::abs(compute_performance_delta(entry)) * 100.0;
-    entry.status = ChallengerStatus::Rejected;
-    entry.rejection_reason =
-        "Net P&L delta -" + std::to_string(delta_pct) + "%" +
-        " | hit_rate " + std::to_string(entry.challenger_metrics.hit_rate() * 100.0) + "%" +
-        " | drawdown " + std::to_string(entry.challenger_metrics.max_drawdown_bps) + "bps";
-
-    if (logger_) {
-        logger_->warn("champion_challenger", "CHALLENGER REJECTED",
-            {{"challenger",  challenger.get()},
-             {"champion",    entry.champion_id.get()},
-             {"delta_pct",   std::to_string(-delta_pct)},
-             {"hit_rate",    std::to_string(entry.challenger_metrics.hit_rate())},
-             {"drawdown",    std::to_string(entry.challenger_metrics.max_drawdown_bps)},
-             {"trades",      std::to_string(entry.challenger_metrics.decision_count)}});
-    }
-
-    if (metrics_) {
-        metrics::MetricTags tags{{"champion",   entry.champion_id.get()},
-                                  {"challenger", challenger.get()}};
-        metrics_->counter("cc_rejections_total", tags)->increment();
-    }
-
-    persist_event(challenger, "rejected", entry.rejection_reason);
-    notify_rejection(entry);
+    // Notify outside mutex to prevent deadlock if observer calls back into engine
+    notify_rejection(entry_copy, observers_copy);
     return OkVoid();
 }
 
@@ -453,14 +473,18 @@ void ChampionChallengerEngine::persist_event(
     (void)storage_->append_journal(je);  // best-effort
 }
 
-void ChampionChallengerEngine::notify_promotion(const ChallengerEntry& entry) {
-    for (auto& obs : observers_) {
+void ChampionChallengerEngine::notify_promotion(
+    const ChallengerEntry& entry,
+    const std::vector<std::shared_ptr<IChallengerObserver>>& observers) {
+    for (const auto& obs : observers) {
         if (obs) obs->on_promotion(entry);
     }
 }
 
-void ChampionChallengerEngine::notify_rejection(const ChallengerEntry& entry) {
-    for (auto& obs : observers_) {
+void ChampionChallengerEngine::notify_rejection(
+    const ChallengerEntry& entry,
+    const std::vector<std::shared_ptr<IChallengerObserver>>& observers) {
+    for (const auto& obs : observers) {
         if (obs) obs->on_rejection(entry);
     }
 }

@@ -4,6 +4,7 @@
 #include "clock/clock.hpp"
 #include "logging/logger.hpp"
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <optional>
 #include <atomic>
@@ -34,6 +35,7 @@ private:
     std::shared_ptr<tb::clock::IClock> clock_;
     std::shared_ptr<tb::logging::ILogger> logger_;
     std::vector<tb::Symbol> symbols_;
+    mutable std::mutex symbols_mutex_;   ///< Protects symbols_ from concurrent access
     std::atomic<uint64_t> sequence_{0};
 };
 

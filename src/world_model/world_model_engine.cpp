@@ -46,6 +46,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.4, "Тренд уже установлен, пробой менее вероятен");
         add(v, "microstructure_scalp", 0.5, "Стабильная микроструктура допускает скальпинг");
         add(v, "vol_expansion",        0.3, "Волатильность стабильна, расширение маловероятно");
+        add(v, "ema_pullback",         0.9, "Устойчивый тренд — идеально для pullback");
+        add(v, "rsi_divergence",       0.4, "Дивергенции в тренде — средняя пригодность");
+        add(v, "vwap_reversion",       0.5, "VWAP reversion в тренде — умеренно");
+        add(v, "volume_profile",       0.5, "POC/VA уровни актуальны");
     }
     // FragileBreakout (1)
     {
@@ -55,6 +59,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.8, "Пробой — основной сценарий");
         add(v, "microstructure_scalp", 0.3, "Хрупкая микроструктура");
         add(v, "vol_expansion",        0.7, "Волатильность расширяется");
+        add(v, "ema_pullback",         0.3, "Пробой — pullback маловероятен");
+        add(v, "rsi_divergence",       0.5, "Дивергенции на пробое — средне");
+        add(v, "vwap_reversion",       0.3, "VWAP reversion на пробое — рискованно");
+        add(v, "volume_profile",       0.6, "Объёмные уровни важны при пробое");
     }
     // CompressionBeforeExpansion (2)
     {
@@ -64,6 +72,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.9, "Сжатие — лучший сетап для пробоя");
         add(v, "microstructure_scalp", 0.6, "Узкие спреды в сжатии");
         add(v, "vol_expansion",        0.8, "Ожидание расширения волатильности");
+        add(v, "ema_pullback",         0.4, "Сжатие — pullback возможен");
+        add(v, "rsi_divergence",       0.5, "Дивергенции в сжатии — средне");
+        add(v, "vwap_reversion",       0.7, "VWAP reversion в диапазоне — хорошо");
+        add(v, "volume_profile",       0.7, "POC/VA актуальны в диапазоне");
     }
     // ChopNoise (3)
     {
@@ -73,6 +85,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.1, "Ложные пробои в боковике");
         add(v, "microstructure_scalp", 0.8, "Стабильный стакан — хорошо для скальпинга");
         add(v, "vol_expansion",        0.1, "Низкая волатильность, расширение маловероятно");
+        add(v, "ema_pullback",         0.3, "Слабые pullback без тренда");
+        add(v, "rsi_divergence",       0.6, "RSI дивергенции в боковике — хорошо");
+        add(v, "vwap_reversion",       0.8, "VWAP reversion в боковике — отлично");
+        add(v, "volume_profile",       0.8, "POC/VA в боковике — очень актуальны");
     }
     // ExhaustionSpike (4)
     {
@@ -82,24 +98,36 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.1, "Ложный сигнал пробоя");
         add(v, "microstructure_scalp", 0.1, "Нестабильная микроструктура");
         add(v, "vol_expansion",        0.3, "Волатильность уже высока");
+        add(v, "ema_pullback",         0.2, "Exhaustion — pullback рискован");
+        add(v, "rsi_divergence",       0.7, "Дивергенция на exhaustion — хорошо");
+        add(v, "vwap_reversion",       0.6, "VWAP reversion после спайка — хорошо");
+        add(v, "volume_profile",       0.5, "Объёмные уровни после спайка");
     }
-    // LiquidityVacuum (5)
+    // LiquidityVacuum (5) — для микро-кэпов это нормальное состояние
     {
         auto& v = cfg.table[5];
-        add(v, "momentum",             0.05, "Вакуум ликвидности — торговля опасна");
-        add(v, "mean_reversion",       0.05, "Вакуум ликвидности — торговля опасна");
-        add(v, "breakout",             0.05, "Вакуум ликвидности — торговля опасна");
-        add(v, "microstructure_scalp", 0.0,  "Вакуум ликвидности — скальпинг невозможен");
-        add(v, "vol_expansion",        0.05, "Вакуум ликвидности — торговля опасна");
+        add(v, "momentum",             0.35, "Вакуум ликвидности — осторожная торговля");
+        add(v, "mean_reversion",       0.30, "Вакуум ликвидности — mean reversion возможен");
+        add(v, "breakout",             0.30, "Вакуум ликвидности — пробои с осторожностью");
+        add(v, "microstructure_scalp", 0.10, "Вакуум ликвидности — скальпинг ограниченно");
+        add(v, "vol_expansion",        0.25, "Вакуум ликвидности — волатильность присутствует");
+        add(v, "ema_pullback",         0.30, "Вакуум ликвидности — pullback возможен");
+        add(v, "rsi_divergence",       0.25, "Вакуум ликвидности — дивергенции надёжнее");
+        add(v, "vwap_reversion",       0.25, "Вакуум ликвидности — VWAP актуален");
+        add(v, "volume_profile",       0.25, "Вакуум ликвидности — объёмные уровни работают");
     }
-    // ToxicMicrostructure (6)
+    // ToxicMicrostructure (6) — для микро-кэпов "токсичность" обычна
     {
         auto& v = cfg.table[6];
-        add(v, "momentum",             0.1, "Токсичный поток искажает сигналы");
-        add(v, "mean_reversion",       0.1, "Токсичная микроструктура");
-        add(v, "breakout",             0.1, "Манипулятивные пробои");
-        add(v, "microstructure_scalp", 0.0, "Микроструктура токсична — скальпинг запрещён");
-        add(v, "vol_expansion",        0.2, "Возможна повышенная волатильность");
+        add(v, "momentum",             0.30, "Токсичная микроструктура — momentum с осторожностью");
+        add(v, "mean_reversion",       0.30, "Токсичная микроструктура — mean reversion возможен");
+        add(v, "breakout",             0.25, "Токсичная микроструктура — пробои с осторожностью");
+        add(v, "microstructure_scalp", 0.10, "Токсичная микроструктура — скальпинг ограничен");
+        add(v, "vol_expansion",        0.30, "Токсичная микроструктура — волатильность есть");
+        add(v, "ema_pullback",         0.25, "Токсичная микроструктура — pullback возможен");
+        add(v, "rsi_divergence",       0.25, "Дивергенции в токсичном режиме — проверять");
+        add(v, "vwap_reversion",       0.20, "VWAP reversion — осторожно");
+        add(v, "volume_profile",       0.20, "Объёмные уровни — c поправкой");
     }
     // PostShockStabilization (7)
     {
@@ -109,6 +137,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.2, "Повторный шок маловероятен");
         add(v, "microstructure_scalp", 0.4, "Микроструктура стабилизируется");
         add(v, "vol_expansion",        0.4, "Волатильность снижается");
+        add(v, "ema_pullback",         0.4, "Pullback после шока — приемлемо");
+        add(v, "rsi_divergence",       0.5, "Дивергенции после шока — средне");
+        add(v, "vwap_reversion",       0.5, "VWAP reversion после шока — средне");
+        add(v, "volume_profile",       0.5, "Объёмные уровни актуальны");
     }
     // Unknown (8)
     {
@@ -118,6 +150,10 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "breakout",             0.3, "Состояние неизвестно — пониженный вес");
         add(v, "microstructure_scalp", 0.3, "Состояние неизвестно — пониженный вес");
         add(v, "vol_expansion",        0.3, "Состояние неизвестно — пониженный вес");
+        add(v, "ema_pullback",         0.3, "Состояние неизвестно — пониженный вес");
+        add(v, "rsi_divergence",       0.3, "Состояние неизвестно — пониженный вес");
+        add(v, "vwap_reversion",       0.3, "Состояние неизвестно — пониженный вес");
+        add(v, "volume_profile",       0.3, "Состояние неизвестно — пониженный вес");
     }
 
     return cfg;
@@ -304,7 +340,15 @@ WorldModelSnapshot RuleBasedWorldModelEngine::update(const features::FeatureSnap
     explanation.data_quality_score = assess_data_quality(snapshot);
     explanation.summary = generate_summary(explanation, fragility, confidence);
 
-    // 6. Собираем снимок
+    // 6. Обновляем dwell ПЕРЕД созданием снимка, чтобы snapshot
+    //    содержал актуальное значение (исправление off-by-1).
+    if (confirmed == previous || previous == WorldState::Unknown) {
+        ++ctx.dwell_ticks;
+    } else {
+        ctx.dwell_ticks = 1;
+    }
+
+    // 7. Собираем снимок
     WorldModelSnapshot result;
     // v1 поля
     result.state = confirmed;
@@ -323,20 +367,13 @@ WorldModelSnapshot RuleBasedWorldModelEngine::update(const features::FeatureSnap
     result.model_version = config_.model_version;
     result.dwell_ticks = ctx.dwell_ticks;
 
-    // 7. Обновляем историю
+    // 8. Обновляем историю
     HistoryEntry entry;
     entry.state = confirmed;
     entry.fragility = fragility.value;
     entry.confidence = confidence;
     entry.timestamp = now;
     ctx.push_history(entry, config_.history.max_entries);
-
-    // 8. Обновляем dwell
-    if (confirmed == previous || previous == WorldState::Unknown) {
-        ++ctx.dwell_ticks;
-    } else {
-        ctx.dwell_ticks = 1;
-    }
 
     // 9. Сохраняем снимок
     ctx.confirmed_snapshot = result;
@@ -1035,20 +1072,22 @@ std::vector<StrategySuitability> RuleBasedWorldModelEngine::compute_suitability(
         suit.signal_suitability = entry.suitability;
 
         // Execution suitability: штраф при плохом исполнении
+        // Для micro-cap: спреды 50-150 bps — норма, штрафуем мягко
         suit.execution_suitability = 1.0;
-        if (snap.microstructure.spread_valid && snap.microstructure.spread_bps > 30.0) {
-            suit.execution_suitability = std::max(0.2, 1.0 - (snap.microstructure.spread_bps - 30.0) / 100.0);
+        if (snap.microstructure.spread_valid && snap.microstructure.spread_bps > 50.0) {
+            suit.execution_suitability = std::max(0.5, 1.0 - (snap.microstructure.spread_bps - 50.0) / 200.0);
         }
-        if (snap.execution_context.slippage_valid && snap.execution_context.estimated_slippage_bps > 10.0) {
-            suit.execution_suitability *= std::max(0.3, 1.0 - snap.execution_context.estimated_slippage_bps / 50.0);
+        if (snap.execution_context.slippage_valid && snap.execution_context.estimated_slippage_bps > 20.0) {
+            suit.execution_suitability *= std::max(0.5, 1.0 - snap.execution_context.estimated_slippage_bps / 100.0);
         }
 
         // Risk suitability: штраф при опасных состояниях
+        // Для микро-кэпов эти состояния — норма, не блокируем полностью
         suit.risk_suitability = 1.0;
         if (state == WorldState::LiquidityVacuum || state == WorldState::ToxicMicrostructure) {
-            suit.risk_suitability = 0.1;
+            suit.risk_suitability = 0.6;
         } else if (state == WorldState::ExhaustionSpike) {
-            suit.risk_suitability = 0.3;
+            suit.risk_suitability = 0.5;
         }
 
         // Feedback adjustment: blend с исторической производительностью

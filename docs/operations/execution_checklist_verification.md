@@ -26,7 +26,7 @@
 - [x] Ubuntu 24.04 LTS — основная платформа
 - [x] Debug и Release профили
 - [x] Sanitizer профили (поддержка ASan/UBSan/TSan через CMAKE_BUILD_TYPE)
-- [~] Поддержка clang++ — не тестировалась (GCC 13.3 primary)
+- [~] Поддержка clang++ — не тестировалась (GCC 14 primary)
 - [x] C++20/23 стандарт
 - [x] Catch2 v3 для тестирования
 

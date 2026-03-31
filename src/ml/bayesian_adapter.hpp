@@ -52,6 +52,8 @@ struct BayesianConfig {
     int64_t stale_threshold_ns{10'000'000'000LL}; ///< Порог stale (10 секунд)
     double observation_variance{1.0};   ///< Дисперсия наблюдения для conj update
     double min_posterior_variance{1e-4};///< Пол дисперсии posterior
+    double precision_decay{0.995};     ///< Экспоненциальный decay precision (1.0 = без decay)
+    double max_precision{1000.0};      ///< Верхний предел precision (предотвращает остановку обучения)
 };
 
 /// Байесовский онлайн-адаптер параметров стратегий.

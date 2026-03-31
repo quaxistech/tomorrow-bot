@@ -212,8 +212,11 @@ RuleBasedOpportunityCost::determine_action(
         return {OpportunityAction::Execute, OpportunityReason::StrongEdgeAvailable};
     }
 
-    // Правило 9: Хороший conviction перевешивает высокую экспозицию
-    if (conviction >= config_.high_exposure_min_conviction) {
+    // Правило 9: Хороший conviction перевешивает высокую экспозицию,
+    // но ТОЛЬКО если net edge положительный (правила 1-4 не сработали).
+    // Это гарантирует, что высокий conviction не override'ит отрицательный ожидаемый доход.
+    if (conviction >= config_.high_exposure_min_conviction &&
+        score.net_expected_bps > 0.0) {
         return {OpportunityAction::Execute, OpportunityReason::HighConvictionOverride};
     }
 

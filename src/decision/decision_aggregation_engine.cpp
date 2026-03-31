@@ -233,10 +233,18 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
         // Time decay: стахнувшие сигналы теряют conviction
         double aged_conviction = intent.conviction;
-        if (advanced_.enable_time_decay && intent.generated_at.get() > 0) {
-            int64_t signal_age_ns = record.decided_at.get() - intent.generated_at.get();
-            double decay = compute_time_decay(signal_age_ns);
-            aged_conviction = intent.conviction * decay;
+        if (advanced_.enable_time_decay) {
+            if (intent.generated_at.get() > 0) {
+                int64_t signal_age_ns = record.decided_at.get() - intent.generated_at.get();
+                double decay = compute_time_decay(signal_age_ns);
+                aged_conviction = intent.conviction * decay;
+            } else {
+                // Стратегия не установила generated_at — лог для диагностики.
+                // Сигнал обрабатывается как свежий, но это признак ошибки в стратегии.
+                logger_->warn("Decision", "TradeIntent без generated_at — time decay пропущен",
+                    {{"strategy", intent.strategy_id.get()},
+                     {"symbol", intent.symbol.get()}});
+            }
         }
         contrib.aged_conviction = aged_conviction;
 
@@ -469,7 +477,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
 
         case DR::WeakUptrend:
         case DR::WeakDowntrend:
-            return advanced_.regime_trending_factor * 1.05; // slightly stricter
+            return advanced_.regime_trending_factor; // same as strong trend for micro-cap
 
         case DR::MeanReversion:
             return advanced_.regime_mean_reversion_factor;
@@ -478,7 +486,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
             return advanced_.regime_volatile_factor;
 
         case DR::LowVolCompression:
-            return 1.15; // compressed → breakout imminent, be cautious
+            return 1.0; // micro-cap: compression is normal, don't inflate
 
         case DR::LiquidityStress:
         case DR::SpreadInstability:
@@ -486,7 +494,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
             return advanced_.regime_stress_factor;
 
         case DR::AnomalyEvent:
-            return 1.50; // anomaly → very cautious
+            return 1.0; // anomaly — micro-cap markets are naturally noisy, don't inflate
 
         case DR::Chop:
             return advanced_.regime_choppy_factor;

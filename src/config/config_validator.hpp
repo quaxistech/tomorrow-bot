@@ -18,11 +18,17 @@ namespace tb::config {
 struct ValidationResult {
     bool valid{true};
     std::vector<std::string> errors;    ///< Список ошибок валидации
+    std::vector<std::string> warnings;  ///< Список предупреждений (не блокируют запуск)
 
     /// Добавляет ошибку и помечает результат как невалидный
     void add_error(std::string msg) {
         valid = false;
         errors.push_back(std::move(msg));
+    }
+
+    /// Добавляет предупреждение (не блокирует запуск)
+    void add_warning(std::string msg) {
+        warnings.push_back(std::move(msg));
     }
 };
 
@@ -43,6 +49,9 @@ public:
      * @return Ok(void) если валидна, Err(ConfigValidationFailed) иначе
      */
     [[nodiscard]] VoidResult validate(const AppConfig& cfg) const;
+
+    /// Returns the full ValidationResult for detailed error reporting
+    [[nodiscard]] ValidationResult validate_detailed(const AppConfig& cfg) const;
 
 private:
     /// Валидация настроек биржи
@@ -71,6 +80,9 @@ private:
 
     /// Валидация настроек исполнительной альфы
     void validate_execution_alpha(const ExecutionAlphaConfig& cfg, ValidationResult& result) const;
+
+    /// Валидация настроек фьючерсной торговли
+    void validate_futures(const FuturesConfig& cfg, ValidationResult& result) const;
 
     /// Межкомпонентная валидация (совместимость настроек)
     void validate_cross(const AppConfig& cfg, ValidationResult& result) const;

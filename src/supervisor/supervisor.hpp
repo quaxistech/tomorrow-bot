@@ -109,6 +109,9 @@ public:
     void register_subsystem(std::string name, std::function<bool()> start_fn,
                             std::function<void()> stop_fn);
 
+    /// Удалить подсистему (при горячей замене pipeline)
+    void unregister_subsystem(const std::string& name);
+
     /// Получить количество зарегистрированных подсистем
     [[nodiscard]] size_t subsystem_count() const noexcept;
 

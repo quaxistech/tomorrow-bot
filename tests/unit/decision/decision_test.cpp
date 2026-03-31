@@ -23,7 +23,8 @@ using namespace tb::uncertainty;
 
 namespace {
 
-TradeIntent make_intent(const std::string& id, Side side, double conviction) {
+TradeIntent make_intent(const std::string& id, Side side, double conviction,
+                        int64_t generated_at_ns = 1'000'000'000LL) {
     TradeIntent intent;
     intent.strategy_id = StrategyId(id);
     intent.strategy_version = StrategyVersion(1);
@@ -31,7 +32,7 @@ TradeIntent make_intent(const std::string& id, Side side, double conviction) {
     intent.side = side;
     intent.conviction = conviction;
     intent.signal_name = "test_signal";
-    intent.generated_at = Timestamp(1000000);
+    intent.generated_at = Timestamp(generated_at_ns);
     return intent;
 }
 
@@ -103,6 +104,11 @@ TEST_CASE("Decision: один интент одобрен → trade_approved", "
         make_world(),
         make_low_uncertainty());
 
+    // Debug output
+    INFO("rationale=" << record.rationale);
+    INFO("rejection=" << to_string(record.rejection_reason));
+    INFO("conviction=" << record.final_conviction);
+    INFO("threshold=" << record.effective_threshold);
     REQUIRE(record.trade_approved);
     REQUIRE(record.final_intent.has_value());
     REQUIRE(record.final_intent->side == Side::Buy);
@@ -259,7 +265,7 @@ RegimeSnapshot make_regime_with(DetailedRegime dr, double confidence = 0.8) {
 
 TEST_CASE("Decision: time decay снижает conviction устаревших сигналов", "[decision][advanced]") {
     auto logger = std::make_shared<TestLogger>();
-    auto clk = std::make_shared<TestClock>(); // now = 1_000_000 ns
+    auto clk = std::make_shared<TestClock>(); // now = 1'000'000'000 ns (1 секунда)
 
     AdvancedDecisionConfig adv;
     adv.enable_time_decay = true;
@@ -267,12 +273,11 @@ TEST_CASE("Decision: time decay снижает conviction устаревших �
     CommitteeDecisionEngine engine(logger, clk, 0.55, 0.65, adv);
 
     // Свежий сигнал (generated_at = now)
-    auto fresh = make_intent("momentum", Side::Buy, 0.80);
-    fresh.generated_at = Timestamp(1000000); // same as clock
+    auto fresh = make_intent("momentum", Side::Buy, 0.80, clk->current_time);
 
-    // Устаревший сигнал (generated_at 1ms ago → 2 halflifes)
-    auto stale = make_intent("momentum_stale", Side::Buy, 0.80);
-    stale.generated_at = Timestamp(1); // ~1ms ago at halflife 0.5ms → significant decay
+    // Устаревший сигнал (generated_at 1ms ago → 2 halflifes при halflife=0.5ms)
+    auto stale = make_intent("momentum_stale", Side::Buy, 0.80,
+                             clk->current_time - 1'000'000LL);
 
     auto allocation_fresh = make_allocation({{"momentum", 0.7}});
     auto allocation_stale = make_allocation({{"momentum_stale", 0.7}});

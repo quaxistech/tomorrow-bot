@@ -127,7 +127,7 @@ CorrelationResult CorrelationMonitor::evaluate() const {
     }
 
     CorrelationResult result;
-    result.component_status = status();
+    result.component_status = status_impl();
     double total_corr = 0.0;
     size_t valid_count = 0;
     const int64_t ts = clock::steady_now_ns();
@@ -230,6 +230,11 @@ bool CorrelationMonitor::has_correlation_break() const {
 }
 
 MlComponentStatus CorrelationMonitor::status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_impl();
+}
+
+MlComponentStatus CorrelationMonitor::status_impl() const {
     MlComponentStatus s;
     s.samples_processed = static_cast<int>(total_ticks_);
     s.last_update_ns = last_primary_tick_ns_;

@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <cstdio>
+#include <iostream>
 
 namespace tb::config {
 
@@ -70,10 +71,17 @@ YamlConfigLoader::parse_kv_line(std::string_view line) {
     }
     std::string key   = trim(line.substr(0, colon_pos));
     std::string value = trim(line.substr(colon_pos + 1));
-    // Удаляем комментарии
-    auto comment = value.find('#');
-    if (comment != std::string::npos) {
-        value = trim(value.substr(0, comment));
+    // Удаляем комментарии (пропускаем # внутри кавычек)
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        char c = value[i];
+        if (c == '\'' && !in_double_quote) in_single_quote = !in_single_quote;
+        else if (c == '"' && !in_single_quote) in_double_quote = !in_double_quote;
+        else if (c == '#' && !in_single_quote && !in_double_quote) {
+            value = trim(value.substr(0, i));
+            break;
+        }
     }
     return {key, unquote(value)};
 }
@@ -289,6 +297,78 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.pair_selection.blacklist = parse_list(
         get_value(kv, "pair_selection.blacklist", ""));
 
+    // Расширенные настройки pair_selection
+    auto max_cand_str = get_value(kv, "pair_selection.max_candidates_for_candles", "30");
+    try { cfg.pair_selection.max_candidates_for_candles = std::stoi(max_cand_str); }
+    catch (...) { cfg.pair_selection.max_candidates_for_candles = 30; }
+    auto candle_conc_str = get_value(kv, "pair_selection.candle_fetch_concurrency", "5");
+    try { cfg.pair_selection.candle_fetch_concurrency = std::stoi(candle_conc_str); }
+    catch (...) { cfg.pair_selection.candle_fetch_concurrency = 5; }
+    auto candle_hist_str = get_value(kv, "pair_selection.candle_history_hours", "48");
+    try { cfg.pair_selection.candle_history_hours = std::stoi(candle_hist_str); }
+    catch (...) { cfg.pair_selection.candle_history_hours = 48; }
+    auto scan_to_str = get_value(kv, "pair_selection.scan_timeout_ms", "60000");
+    try { cfg.pair_selection.scan_timeout_ms = std::stoi(scan_to_str); }
+    catch (...) { cfg.pair_selection.scan_timeout_ms = 60000; }
+    auto api_retry_str = get_value(kv, "pair_selection.api_retry_max", "3");
+    try { cfg.pair_selection.api_retry_max = std::stoi(api_retry_str); }
+    catch (...) { cfg.pair_selection.api_retry_max = 3; }
+    auto api_retry_delay_str = get_value(kv, "pair_selection.api_retry_base_delay_ms", "200");
+    try { cfg.pair_selection.api_retry_base_delay_ms = std::stoi(api_retry_delay_str); }
+    catch (...) { cfg.pair_selection.api_retry_base_delay_ms = 200; }
+    auto cb_thr_str = get_value(kv, "pair_selection.circuit_breaker_threshold", "5");
+    try { cfg.pair_selection.circuit_breaker_threshold = std::stoi(cb_thr_str); }
+    catch (...) { cfg.pair_selection.circuit_breaker_threshold = 5; }
+    auto cb_reset_str = get_value(kv, "pair_selection.circuit_breaker_reset_ms", "300000");
+    try { cfg.pair_selection.circuit_breaker_reset_ms = std::stoi(cb_reset_str); }
+    catch (...) { cfg.pair_selection.circuit_breaker_reset_ms = 300000; }
+    cfg.pair_selection.max_correlation_in_basket = parse_double(
+        get_value(kv, "pair_selection.max_correlation_in_basket", "0.85"), 0.85, "pair_selection.max_correlation_in_basket");
+    auto mpp_str = get_value(kv, "pair_selection.max_pairs_per_sector", "2");
+    try { cfg.pair_selection.max_pairs_per_sector = std::stoi(mpp_str); }
+    catch (...) { cfg.pair_selection.max_pairs_per_sector = 2; }
+    cfg.pair_selection.min_liquidity_depth_usdt = parse_double(
+        get_value(kv, "pair_selection.min_liquidity_depth_usdt", "50000"), 50000.0, "pair_selection.min_liquidity_depth_usdt");
+    auto div_str = get_value(kv, "pair_selection.enable_diversification", "true");
+    cfg.pair_selection.enable_diversification = (div_str != "false" && div_str != "0");
+    auto persist_scan_str = get_value(kv, "pair_selection.persist_scan_results", "true");
+    cfg.pair_selection.persist_scan_results = (persist_scan_str != "false" && persist_scan_str != "0");
+
+    // ScorerConfig (вложенный в pair_selection)
+    auto& sc = cfg.pair_selection.scorer;
+    sc.version = get_value(kv, "pair_selection.scorer_version", "v4");
+    sc.momentum_max = parse_double(get_value(kv, "pair_selection.scorer_momentum_max", "40.0"), 40.0, "pair_selection.scorer_momentum_max");
+    sc.trend_max = parse_double(get_value(kv, "pair_selection.scorer_trend_max", "25.0"), 25.0, "pair_selection.scorer_trend_max");
+    sc.tradability_max = parse_double(get_value(kv, "pair_selection.scorer_tradability_max", "25.0"), 25.0, "pair_selection.scorer_tradability_max");
+    sc.quality_max = parse_double(get_value(kv, "pair_selection.scorer_quality_max", "10.0"), 10.0, "pair_selection.scorer_quality_max");
+    sc.momentum_log_multiplier = parse_double(get_value(kv, "pair_selection.scorer_momentum_log_multiplier", "14.5"), 14.5, "pair_selection.scorer_momentum_log_multiplier");
+    sc.acceleration_log_multiplier = parse_double(get_value(kv, "pair_selection.scorer_acceleration_log_multiplier", "14.0"), 14.0, "pair_selection.scorer_acceleration_log_multiplier");
+    sc.fresh_start_multiplier = parse_double(get_value(kv, "pair_selection.scorer_fresh_start_multiplier", "2.5"), 2.5, "pair_selection.scorer_fresh_start_multiplier");
+    sc.fresh_start_roc_24h_cap = parse_double(get_value(kv, "pair_selection.scorer_fresh_start_roc_24h_cap", "10.0"), 10.0, "pair_selection.scorer_fresh_start_roc_24h_cap");
+    sc.fresh_start_roc_4h_min = parse_double(get_value(kv, "pair_selection.scorer_fresh_start_roc_4h_min", "0.5"), 0.5, "pair_selection.scorer_fresh_start_roc_4h_min");
+    sc.adx_weak_threshold = parse_double(get_value(kv, "pair_selection.scorer_adx_weak_threshold", "15.0"), 15.0, "pair_selection.scorer_adx_weak_threshold");
+    sc.adx_moderate_threshold = parse_double(get_value(kv, "pair_selection.scorer_adx_moderate_threshold", "25.0"), 25.0, "pair_selection.scorer_adx_moderate_threshold");
+    sc.adx_strong_threshold = parse_double(get_value(kv, "pair_selection.scorer_adx_strong_threshold", "50.0"), 50.0, "pair_selection.scorer_adx_strong_threshold");
+    sc.bullish_ratio_min = parse_double(get_value(kv, "pair_selection.scorer_bullish_ratio_min", "0.50"), 0.50, "pair_selection.scorer_bullish_ratio_min");
+    sc.roc_normalization_factor = parse_double(get_value(kv, "pair_selection.scorer_roc_normalization_factor", "5.0"), 5.0, "pair_selection.scorer_roc_normalization_factor");
+    sc.volume_tier_excellent = parse_double(get_value(kv, "pair_selection.scorer_volume_tier_excellent", "5000000"), 5'000'000.0, "pair_selection.scorer_volume_tier_excellent");
+    sc.volume_tier_good = parse_double(get_value(kv, "pair_selection.scorer_volume_tier_good", "1000000"), 1'000'000.0, "pair_selection.scorer_volume_tier_good");
+    sc.volume_tier_acceptable = parse_double(get_value(kv, "pair_selection.scorer_volume_tier_acceptable", "500000"), 500'000.0, "pair_selection.scorer_volume_tier_acceptable");
+    sc.volume_tier_minimal = parse_double(get_value(kv, "pair_selection.scorer_volume_tier_minimal", "100000"), 100'000.0, "pair_selection.scorer_volume_tier_minimal");
+    sc.spread_decay_constant = parse_double(get_value(kv, "pair_selection.scorer_spread_decay_constant", "15.0"), 15.0, "pair_selection.scorer_spread_decay_constant");
+    sc.volatility_low_threshold = parse_double(get_value(kv, "pair_selection.scorer_volatility_low_threshold", "0.5"), 0.5, "pair_selection.scorer_volatility_low_threshold");
+    sc.volatility_high_threshold = parse_double(get_value(kv, "pair_selection.scorer_volatility_high_threshold", "20.0"), 20.0, "pair_selection.scorer_volatility_high_threshold");
+    sc.filter_min_change_24h = parse_double(get_value(kv, "pair_selection.scorer_filter_min_change_24h", "-1.0"), -1.0, "pair_selection.scorer_filter_min_change_24h");
+    sc.filter_max_change_24h = parse_double(get_value(kv, "pair_selection.scorer_filter_max_change_24h", "20.0"), 20.0, "pair_selection.scorer_filter_max_change_24h");
+    sc.filter_exhausted_pump_24h = parse_double(get_value(kv, "pair_selection.scorer_filter_exhausted_pump_24h", "10.0"), 10.0, "pair_selection.scorer_filter_exhausted_pump_24h");
+    sc.filter_exhausted_pump_ratio = parse_double(get_value(kv, "pair_selection.scorer_filter_exhausted_pump_ratio", "0.25"), 0.25, "pair_selection.scorer_filter_exhausted_pump_ratio");
+    sc.stagnation_threshold = parse_double(get_value(kv, "pair_selection.scorer_stagnation_threshold", "1.0"), 1.0, "pair_selection.scorer_stagnation_threshold");
+    sc.stagnation_penalty = parse_double(get_value(kv, "pair_selection.scorer_stagnation_penalty", "0.3"), 0.3, "pair_selection.scorer_stagnation_penalty");
+    sc.steady_gainer_min = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_min", "2.0"), 2.0, "pair_selection.scorer_steady_gainer_min");
+    sc.steady_gainer_max = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_max", "10.0"), 10.0, "pair_selection.scorer_steady_gainer_max");
+    sc.steady_gainer_bonus = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_bonus", "8.0"), 8.0, "pair_selection.scorer_steady_gainer_bonus");
+    sc.negative_change_penalty = parse_double(get_value(kv, "pair_selection.scorer_negative_change_penalty", "0.5"), 0.5, "pair_selection.scorer_negative_change_penalty");
+
     // Секция adversarial_defense
     auto adv_enabled_str = get_value(kv, "adversarial_defense.enabled", "true");
     cfg.adversarial_defense.enabled = (adv_enabled_str != "false" && adv_enabled_str != "0");
@@ -477,6 +557,10 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "decision.enable_portfolio_awareness", "true") != "false");
     cfg.decision.drawdown_boost_scale = parse_double(
         get_value(kv, "decision.drawdown_boost_scale", "0.10"), 0.10, "decision.drawdown_boost_scale");
+    cfg.decision.drawdown_max_boost = parse_double(
+        get_value(kv, "decision.drawdown_max_boost", "0.25"), 0.25, "decision.drawdown_max_boost");
+    cfg.decision.consecutive_loss_boost = parse_double(
+        get_value(kv, "decision.consecutive_loss_boost", "0.03"), 0.03, "decision.consecutive_loss_boost");
     cfg.decision.enable_execution_cost_modeling = (
         get_value(kv, "decision.enable_execution_cost_modeling", "true") != "false");
     cfg.decision.max_acceptable_cost_bps = parse_double(
@@ -491,6 +575,10 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "trading_params.atr_stop_multiplier", "2.0"), 2.0, "trading_params.atr_stop_multiplier");
     cfg.trading_params.max_loss_per_trade_pct = parse_double(
         get_value(kv, "trading_params.max_loss_per_trade_pct", "1.0"), 1.0, "trading_params.max_loss_per_trade_pct");
+    cfg.trading_params.price_stop_loss_pct = parse_double(
+        get_value(kv, "trading_params.price_stop_loss_pct", "3.0"), 3.0, "trading_params.price_stop_loss_pct");
+    cfg.trading_params.min_risk_reward_ratio = parse_double(
+        get_value(kv, "trading_params.min_risk_reward_ratio", "1.5"), 1.5, "trading_params.min_risk_reward_ratio");
     cfg.trading_params.breakeven_atr_threshold = parse_double(
         get_value(kv, "trading_params.breakeven_atr_threshold", "1.5"), 1.5, "trading_params.breakeven_atr_threshold");
     cfg.trading_params.partial_tp_atr_threshold = parse_double(
@@ -501,6 +589,8 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "trading_params.max_hold_loss_minutes", "15"), 15, "trading_params.max_hold_loss_minutes"));
     cfg.trading_params.max_hold_absolute_minutes = static_cast<int>(parse_double(
         get_value(kv, "trading_params.max_hold_absolute_minutes", "60"), 60, "trading_params.max_hold_absolute_minutes"));
+    cfg.trading_params.min_hold_minutes = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.min_hold_minutes", "30"), 30, "trading_params.min_hold_minutes"));
     cfg.trading_params.order_cooldown_seconds = static_cast<int>(parse_double(
         get_value(kv, "trading_params.order_cooldown_seconds", "10"), 10, "trading_params.order_cooldown_seconds"));
     cfg.trading_params.stop_loss_cooldown_seconds = static_cast<int>(parse_double(
@@ -649,6 +739,68 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.regime.confidence.first_classification_stability = parse_double(
         get_value(kv, "regime.stability_first_classification", "0.5"), 0.5, "regime.stability_first_classification");
 
+    // ── Секция futures ───────────────────────────────────────────────────
+    {
+        auto& f = cfg.futures;
+        auto futures_enabled_str = get_value(kv, "futures.enabled", "false");
+        f.enabled = (futures_enabled_str == "true" || futures_enabled_str == "1");
+
+        f.product_type = get_value(kv, "futures.product_type", f.product_type);
+        f.margin_coin  = get_value(kv, "futures.margin_coin", f.margin_coin);
+        f.margin_mode  = get_value(kv, "futures.margin_mode", f.margin_mode);
+
+        f.default_leverage = static_cast<int>(parse_double(
+            get_value(kv, "futures.default_leverage", std::to_string(f.default_leverage)),
+            static_cast<double>(f.default_leverage), "futures.default_leverage"));
+        f.max_leverage = static_cast<int>(parse_double(
+            get_value(kv, "futures.max_leverage", std::to_string(f.max_leverage)),
+            static_cast<double>(f.max_leverage), "futures.max_leverage"));
+        f.min_leverage = static_cast<int>(parse_double(
+            get_value(kv, "futures.min_leverage", std::to_string(f.min_leverage)),
+            static_cast<double>(f.min_leverage), "futures.min_leverage"));
+
+        // Leverage по режиму рынка
+        f.leverage_trending = static_cast<int>(parse_double(
+            get_value(kv, "futures.leverage_trending", std::to_string(f.leverage_trending)),
+            static_cast<double>(f.leverage_trending), "futures.leverage_trending"));
+        f.leverage_ranging = static_cast<int>(parse_double(
+            get_value(kv, "futures.leverage_ranging", std::to_string(f.leverage_ranging)),
+            static_cast<double>(f.leverage_ranging), "futures.leverage_ranging"));
+        f.leverage_volatile = static_cast<int>(parse_double(
+            get_value(kv, "futures.leverage_volatile", std::to_string(f.leverage_volatile)),
+            static_cast<double>(f.leverage_volatile), "futures.leverage_volatile"));
+        f.leverage_stress = static_cast<int>(parse_double(
+            get_value(kv, "futures.leverage_stress", std::to_string(f.leverage_stress)),
+            static_cast<double>(f.leverage_stress), "futures.leverage_stress"));
+
+        // Защита от ликвидации
+        f.liquidation_buffer_pct = parse_double(
+            get_value(kv, "futures.liquidation_buffer_pct", std::to_string(f.liquidation_buffer_pct)),
+            f.liquidation_buffer_pct, "futures.liquidation_buffer_pct");
+        f.max_leverage_drawdown_scale = parse_double(
+            get_value(kv, "futures.max_leverage_drawdown_scale", std::to_string(f.max_leverage_drawdown_scale)),
+            f.max_leverage_drawdown_scale, "futures.max_leverage_drawdown_scale");
+
+        // Фандинг
+        f.funding_rate_threshold = parse_double(
+            get_value(kv, "futures.funding_rate_threshold", std::to_string(f.funding_rate_threshold)),
+            f.funding_rate_threshold, "futures.funding_rate_threshold");
+        f.funding_rate_penalty = parse_double(
+            get_value(kv, "futures.funding_rate_penalty", std::to_string(f.funding_rate_penalty)),
+            f.funding_rate_penalty, "futures.funding_rate_penalty");
+
+        // Maintenance margin rate
+        f.maintenance_margin_rate = parse_double(
+            get_value(kv, "futures.maintenance_margin_rate", std::to_string(f.maintenance_margin_rate)),
+            f.maintenance_margin_rate, "futures.maintenance_margin_rate");
+
+        // Propagate futures mode to pair_selection so PairScanner uses futures endpoints
+        if (f.enabled) {
+            cfg.pair_selection.futures_enabled = true;
+            cfg.pair_selection.product_type = f.product_type;
+        }
+    }
+
     // ── Секция shadow ────────────────────────────────────────────────────
     {
         auto& s = cfg.shadow;
@@ -695,8 +847,14 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
 
     // Валидация
     ConfigValidator validator;
-    auto validation = validator.validate(cfg);
-    if (!validation) {
+    auto vr = validator.validate_detailed(cfg);
+    if (!vr.valid) {
+        for (const auto& e : vr.errors) {
+            std::cerr << "[CONFIG ERROR] " << e << "\n";
+        }
+        for (const auto& w : vr.warnings) {
+            std::cerr << "[CONFIG WARN]  " << w << "\n";
+        }
         return Err<AppConfig>(TbError::ConfigValidationFailed);
     }
 

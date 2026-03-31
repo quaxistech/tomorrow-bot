@@ -106,8 +106,20 @@ using CorrelationId   = StrongType<std::string,  CorrelationIdTag>;
 
 /// Направление ордера
 enum class Side {
-    Buy,    ///< Покупка (длинная позиция)
-    Sell    ///< Продажа (короткая позиция)
+    Buy,    ///< Покупка (open long / close short)
+    Sell    ///< Продажа (open short / close long)
+};
+
+/// Сторона позиции (для фьючерсов: различие long/short)
+enum class PositionSide {
+    Long,   ///< Длинная позиция
+    Short   ///< Короткая позиция
+};
+
+/// Действие с позицией на фьючерсах
+enum class TradeSide {
+    Open,   ///< Открытие позиции
+    Close   ///< Закрытие позиции
 };
 
 /// Тип ордера

@@ -12,7 +12,7 @@
 ### Операционная система
 
 - Ubuntu 24.04 LTS (рекомендуется)
-- GCC 13.3+ с поддержкой C++23
+- GCC 14+ с поддержкой C++23
 
 ### Зависимости
 
@@ -30,16 +30,16 @@ sudo apt update && sudo apt install -y \
 cd ~/projects/tomorrow-bot
 
 # Debug-сборка (рекомендуется для начала)
-mkdir -p build-check && cd build-check
+mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug
 cmake --build . -j$(nproc)
 
-# Прогон тестов — ВСЕ 203 должны пройти
+# Прогон тестов — ВСЕ 614 должны пройти
 ctest --output-on-failure -j8
 
 # Release-сборка (для длительной работы)
 cd ~/projects/tomorrow-bot
-mkdir -p build-release && cd build-release
+mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 ctest --output-on-failure -j8
@@ -81,20 +81,28 @@ chmod 600 .env
 ```yaml
 trading:
   mode: production
-  initial_capital: 10.0        # Сумма на счёте (USDT)
+  initial_capital: 4.58        # Сумма на счёте (USDT)
+
+futures:
+  enabled: true
+  default_leverage: 20         # Кредитное плечо
+  margin_mode: isolated        # Изолированная маржа
 
 risk:
-  max_position_notional: 10.0  # Макс. размер позиции
-  max_daily_loss_pct: 50.0     # Макс. дневной убыток (%)
-  max_drawdown_pct: 50.0       # Макс. просадка (%)
+  max_position_notional: 400.0 # Макс. notional (с учётом leverage)
+  max_daily_loss_pct: 10.0     # Макс. дневной убыток (%)
+  max_drawdown_pct: 10.0       # Макс. просадка (%)
   kill_switch_enabled: true     # ОБЯЗАТЕЛЬНО для production
+
+decision:
+  min_conviction_threshold: 0.45 # Порог убеждённости
 ```
 
 ---
 
 ## 5. Предпродакшен чеклист
 
-- [ ] Все 203 теста проходят (`ctest` без ошибок)
+- [ ] Все 614 тестов проходят (`ctest` без ошибок)
 - [ ] API-ключи Bitget установлены в `.env`
 - [ ] Конфигурация `configs/production.yaml` проверена
 - [ ] Лимиты риска настроены под ваш капитал
@@ -113,17 +121,17 @@ risk:
 cd ~/projects/tomorrow-bot
 
 # Бумажная торговля (проверка)
-./build-check/src/app/tomorrow-bot -c configs/paper.yaml
+./build/src/app/tomorrow-bot -c configs/paper.yaml
 
 # Реальная торговля
-./build-check/src/app/tomorrow-bot -c configs/production.yaml
+./build/src/app/tomorrow-bot -c configs/production.yaml
 ```
 
 ### Фоновый запуск (nohup)
 
 ```bash
 cd ~/projects/tomorrow-bot
-nohup ./build-check/src/app/tomorrow-bot -c configs/production.yaml \
+nohup ./build/src/app/tomorrow-bot -c configs/production.yaml \
     >> logs/production.log 2>&1 &
 echo $! > logs/tomorrow-bot.pid
 ```
@@ -213,6 +221,6 @@ Risk Engine блокирует ордера (stale feed guard).
 cat .env
 
 # Проверьте что ключи валидны через curl
-curl -s https://api.bitget.com/api/v2/spot/account/assets \
+curl -s https://api.bitget.com/api/v2/mix/account/accounts \
   -H "ACCESS-KEY: $BITGET_API_KEY" | head -100
 ```

@@ -2,16 +2,30 @@
 
 namespace tb::execution {
 
+// ---------- static helper ----------
+
+Timestamp OrderFSM::wall_clock_now() noexcept {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return Timestamp{ns};
+}
+
+// ---------- ctor ----------
+
 OrderFSM::OrderFSM(OrderId order_id)
     : order_id_(std::move(order_id))
-    , created_at_ms_(0)
-    , last_transition_ms_(0)
+    , created_at_ns_(wall_clock_now().get())
+    , last_transition_tp_(std::chrono::steady_clock::now())
 {
 }
+
+// ---------- state queries ----------
 
 OrderState OrderFSM::current_state() const {
     return state_;
 }
+
+// ---------- transitions ----------
 
 bool OrderFSM::transition(OrderState new_state, const std::string& reason,
                            Timestamp now) {
@@ -19,7 +33,10 @@ bool OrderFSM::transition(OrderState new_state, const std::string& reason,
         return false;
     }
 
-    int64_t now_ms = now.get() / 1'000'000; // нс → мс (0 если не передано)
+    // Если вызывающая сторона не передала метку времени — подставить wall-clock
+    if (now == Timestamp(0)) {
+        now = wall_clock_now();
+    }
 
     history_.push_back(OrderTransition{
         .from = state_,
@@ -29,7 +46,7 @@ bool OrderFSM::transition(OrderState new_state, const std::string& reason,
     });
 
     state_ = new_state;
-    last_transition_ms_ = now_ms;
+    last_transition_tp_ = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -49,7 +66,10 @@ bool OrderFSM::is_active() const {
 
 void OrderFSM::force_transition(OrderState new_state, const std::string& reason,
                                  Timestamp now) {
-    int64_t now_ms = now.get() / 1'000'000;
+    // Если вызывающая сторона не передала метку времени — подставить wall-clock
+    if (now == Timestamp(0)) {
+        now = wall_clock_now();
+    }
 
     history_.push_back(OrderTransition{
         .from = state_,
@@ -59,22 +79,25 @@ void OrderFSM::force_transition(OrderState new_state, const std::string& reason,
     });
 
     state_ = new_state;
-    last_transition_ms_ = now_ms;
+    last_transition_tp_ = std::chrono::steady_clock::now();
 }
+
+// ---------- time accessors ----------
 
 Timestamp OrderFSM::last_transition_time() const {
     if (history_.empty()) {
-        return Timestamp(created_at_ms_);
+        return Timestamp(created_at_ns_);
     }
     return history_.back().occurred_at;
 }
 
 Timestamp OrderFSM::created_at() const {
-    return Timestamp(created_at_ms_);
+    return Timestamp(created_at_ns_);
 }
 
-int64_t OrderFSM::time_in_current_state_ms(int64_t now_ms) const {
-    return now_ms - last_transition_ms_;
+int64_t OrderFSM::time_in_current_state_ms() const {
+    auto elapsed = std::chrono::steady_clock::now() - last_transition_tp_;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 }
 
 } // namespace tb::execution

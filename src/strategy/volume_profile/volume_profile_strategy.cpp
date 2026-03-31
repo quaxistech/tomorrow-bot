@@ -37,11 +37,23 @@ std::optional<TradeIntent> VolumeProfileStrategy::evaluate(const StrategyContext
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(last_price) || !std::isfinite(tech.rsi_14) ||
+        !std::isfinite(tech.vp_poc) || !std::isfinite(tech.vp_value_area_high) ||
+        !std::isfinite(tech.vp_value_area_low)) {
+        return std::nullopt;
+    }
+
     double poc = tech.vp_poc;
     double va_high = tech.vp_value_area_high;
     double va_low = tech.vp_value_area_low;
 
     if (poc <= 0.0 || va_high <= 0.0 || va_low <= 0.0) {
+        return std::nullopt;
+    }
+
+    // VA ordering validation: va_low < poc < va_high
+    if (va_high <= va_low || poc <= va_low || poc >= va_high) {
         return std::nullopt;
     }
 
@@ -69,6 +81,17 @@ std::optional<TradeIntent> VolumeProfileStrategy::evaluate(const StrategyContext
     bool below_poc = (dist_to_poc < 0.0 && std::abs(dist_to_poc) < cfg_.poc_proximity_pct);
 
     if ((near_va_low || below_poc) && tech.rsi_14 < cfg_.rsi_confirm_buy) {
+        // EMA trend filter: подавляем BUY в сильном нисходящем тренде без подтверждения разворота
+        if (tech.ema_valid && tech.adx_valid) {
+            bool strong_downtrend = (tech.ema_20 < tech.ema_50) && (tech.adx > cfg_.adx_max * 0.75);
+            if (strong_downtrend) {
+                bool macd_reversal = tech.macd_valid && tech.macd_histogram > 0.0;
+                if (!macd_reversal) {
+                    return std::nullopt;
+                }
+            }
+        }
+
         intent.side = Side::Buy;
         intent.signal_intent = SignalIntent::LongEntry;
         intent.signal_name = near_va_low ? "vp_va_low_bounce" : "vp_poc_reversion";
@@ -133,10 +156,28 @@ std::optional<TradeIntent> VolumeProfileStrategy::evaluate(const StrategyContext
     bool above_poc = (dist_to_poc > 0.0 && dist_to_poc > cfg_.poc_proximity_pct);
 
     if ((near_va_high || above_poc) && tech.rsi_14 > cfg_.rsi_confirm_sell) {
+        // EMA trend filter: подавляем SELL в сильном восходящем тренде без подтверждения разворота
+        if (tech.ema_valid && tech.adx_valid) {
+            bool strong_uptrend = (tech.ema_20 > tech.ema_50) && (tech.adx > cfg_.adx_max * 0.75);
+            if (strong_uptrend) {
+                bool macd_reversal = tech.macd_valid && tech.macd_histogram < 0.0;
+                if (!macd_reversal) {
+                    return std::nullopt;
+                }
+            }
+        }
+
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = near_va_high ? "vp_va_high_rejection_short" : "vp_above_poc_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = near_va_high ? "vp_va_high_rejection" : "vp_above_poc_exit";
+        }
         intent.exit_reason = ExitReason::RangeTopExit;
-        intent.signal_name = near_va_high ? "vp_va_high_rejection" : "vp_above_poc_exit";
         intent.reason_codes = {};
 
         double poc_score = 0.0;

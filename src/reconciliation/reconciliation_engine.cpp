@@ -319,7 +319,7 @@ std::optional<MismatchRecord> ReconciliationEngine::reconcile_single_order(
 // Геттеры
 // ============================================================
 
-const ReconciliationResult& ReconciliationEngine::last_result() const {
+ReconciliationResult ReconciliationEngine::last_result() const {
     std::lock_guard lock(mutex_);
     return last_result_;
 }
@@ -631,13 +631,18 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_balance(
 // ============================================================
 
 bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
+    // NOTE: This function flags mismatches with a recommended ResolutionAction
+    // but does NOT execute the action itself (e.g., does not cancel orders on the
+    // exchange).  IExchangeQueryService is read-only by design.  The pipeline or
+    // operator is responsible for acting on the flagged resolution.
     switch (mismatch.type) {
         case MismatchType::StateMismatch:
             if (config_.auto_resolve_state_mismatches) {
                 mismatch.resolved_by = ResolutionAction::SyncFromExchange;
                 mismatch.resolved = true;
                 logger_->info("Reconciliation",
-                    "Авторазрешение: синхронизация состояния с биржи",
+                    "Авторазрешение: помечено для синхронизации состояния с биржи "
+                    "(действие выполнит pipeline)",
                     {{"order_id", mismatch.order_id.get()},
                      {"symbol", mismatch.symbol.get()}});
                 return true;
@@ -653,7 +658,8 @@ bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
                 mismatch.resolved_by = ResolutionAction::SyncFromExchange;
                 mismatch.resolved = true;
                 logger_->info("Reconciliation",
-                    "Авторазрешение: синхронизация qty с биржи",
+                    "Авторазрешение: помечено для синхронизации qty с биржи "
+                    "(действие выполнит pipeline)",
                     {{"order_id", mismatch.order_id.get()},
                      {"symbol", mismatch.symbol.get()}});
                 return true;
@@ -665,8 +671,11 @@ bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
             if (config_.auto_cancel_orphan_orders) {
                 mismatch.resolved_by = ResolutionAction::CancelOnExchange;
                 mismatch.resolved = true;
+                // IExchangeQueryService is read-only; actual cancellation is
+                // delegated to the pipeline/operator via the CancelOnExchange flag.
                 logger_->info("Reconciliation",
-                    "Авторазрешение: отмена orphan-ордера на бирже",
+                    "Авторазрешение: orphan-ордер помечен для отмены на бирже "
+                    "(действие выполнит pipeline/оператор)",
                     {{"order_id", mismatch.order_id.get()},
                      {"symbol", mismatch.symbol.get()}});
                 return true;
@@ -678,11 +687,12 @@ bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
             return false;
 
         case MismatchType::OrderExistsOnlyLocally:
-            // Обновить локальное состояние — ордер, вероятно, уже исполнен/отменён
+            // Ордер, вероятно, уже исполнен/отменён на бирже — помечаем для обновления
             mismatch.resolved_by = ResolutionAction::UpdateLocalState;
             mismatch.resolved = true;
             logger_->info("Reconciliation",
-                "Авторазрешение: обновление локального состояния (ордер отсутствует на бирже)",
+                "Авторазрешение: помечено для обновления локального состояния "
+                "(ордер отсутствует на бирже, действие выполнит pipeline)",
                 {{"order_id", mismatch.order_id.get()}});
             return true;
 
@@ -691,7 +701,8 @@ bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
                 mismatch.resolved_by = ResolutionAction::CloseOnExchange;
                 mismatch.resolved = true;
                 logger_->info("Reconciliation",
-                    "Авторазрешение: закрытие orphan-позиции на бирже",
+                    "Авторазрешение: orphan-позиция помечена для закрытия на бирже "
+                    "(действие выполнит pipeline/оператор)",
                     {{"symbol", mismatch.symbol.get()}});
                 return true;
             }
@@ -705,7 +716,8 @@ bool ReconciliationEngine::try_auto_resolve(MismatchRecord& mismatch) {
             mismatch.resolved_by = ResolutionAction::UpdateLocalState;
             mismatch.resolved = true;
             logger_->info("Reconciliation",
-                "Авторазрешение: обновление локального состояния (позиция отсутствует на бирже)",
+                "Авторазрешение: помечено для обновления локального состояния "
+                "(позиция отсутствует на бирже, действие выполнит pipeline)",
                 {{"symbol", mismatch.symbol.get()}});
             return true;
 

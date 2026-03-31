@@ -16,9 +16,15 @@ namespace tb::supervisor {
 std::atomic<Supervisor*> Supervisor::instance_{nullptr};
 
 void Supervisor::signal_handler(int sig) {
+    // ASYNC-SIGNAL-SAFE: только atomic store, без вызовов logger/malloc/mutex.
+    // request_shutdown() содержит логирование — вызывать из обработчика сигнала нельзя.
     Supervisor* sv = instance_.load(std::memory_order_acquire);
     if (sv != nullptr) {
-        sv->request_shutdown();
+        int expected = static_cast<int>(SystemState::Running);
+        int degraded = static_cast<int>(SystemState::Degraded);
+        int shutting = static_cast<int>(SystemState::ShuttingDown);
+        sv->state_.compare_exchange_strong(expected, shutting, std::memory_order_acq_rel) ||
+            sv->state_.compare_exchange_strong(degraded, shutting, std::memory_order_acq_rel);
     }
 }
 
@@ -271,6 +277,15 @@ void Supervisor::register_subsystem(std::string name, std::function<bool()> star
         .started = false
     });
     logger_->debug("supervisor", "Подсистема зарегистрирована: " + subsystems_.back().name);
+}
+
+void Supervisor::unregister_subsystem(const std::string& name) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    subsystems_.erase(
+        std::remove_if(subsystems_.begin(), subsystems_.end(),
+            [&name](const SubsystemEntry& e) { return e.name == name; }),
+        subsystems_.end());
+    logger_->debug("supervisor", "Подсистема удалена: " + name);
 }
 
 size_t Supervisor::subsystem_count() const noexcept {

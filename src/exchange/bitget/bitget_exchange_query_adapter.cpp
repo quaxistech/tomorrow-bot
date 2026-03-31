@@ -241,8 +241,16 @@ BitgetExchangeQueryAdapter::get_order_status(
             return Err<reconciliation::ExchangeOrderInfo>(TbError::ExchangeConnectionFailed);
         }
 
-        // data — объект (не массив) для одного ордера
-        const auto& data = root.at("data").as_object();
+        // data — массив (Bitget v2 API всегда возвращает массив)
+        const auto& data_arr = root.at("data").as_array();
+        if (data_arr.empty()) {
+            if (logger_) {
+                logger_->warn("reconciliation", "Пустой ответ orderInfo",
+                    {{"order_id", order_id.get()}});
+            }
+            return Err<reconciliation::ExchangeOrderInfo>(TbError::ReconciliationFailed);
+        }
+        const auto& data = data_arr[0].as_object();
         return parse_order(data);
 
     } catch (const std::exception& ex) {

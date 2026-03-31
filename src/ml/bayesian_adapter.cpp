@@ -191,11 +191,15 @@ void BayesianAdapter::update_posterior(
         param.max_value
     );
 
-    const double prior_precision = std::max(param.posterior_precision, numeric::kEpsilon);
+    // Exponential forgetting: decay precision before update to prevent learning freeze
+    const double decayed_precision = std::min(
+        param.posterior_precision * config_.precision_decay,
+        config_.max_precision);
+    const double prior_precision = std::max(decayed_precision, numeric::kEpsilon);
     const double obs_precision = numeric::safe_div(
         1.0, std::max(config_.observation_variance, numeric::kEpsilon), 1.0);
 
-    const double new_precision = prior_precision + obs_precision;
+    const double new_precision = std::min(prior_precision + obs_precision, config_.max_precision);
     const double weighted_mean = (prior_precision * param.posterior_mean + obs_precision * observation);
     const double new_mean = numeric::safe_div(weighted_mean, new_precision, param.posterior_mean);
     const double new_variance = std::max(

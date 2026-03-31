@@ -78,7 +78,8 @@ void CircuitBreaker::record_failure() {
     const auto current = static_cast<CircuitState>(state_.load(std::memory_order_acquire));
 
     if (current == CircuitState::HalfOpen) {
-        // Из HalfOpen сразу в Open
+        // Из HalfOpen сразу в Open — инкремент consecutive_failures_ для корректного счётчика
+        consecutive_failures_.fetch_add(1, std::memory_order_acq_rel);
         state_.store(static_cast<int>(CircuitState::Open), std::memory_order_release);
         return;
     }

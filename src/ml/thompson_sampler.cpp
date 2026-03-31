@@ -103,7 +103,7 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
                 arm.alpha += 1.0 + config_.magnitude_bonus * mag;
                 arm.consecutive_losses = 0;
             } else {
-                arm.beta += 1.0;
+                arm.beta += 1.0 + config_.magnitude_bonus * mag;
                 arm.consecutive_losses++;
             }
 

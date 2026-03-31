@@ -32,6 +32,7 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_execution_alpha
     tb_opportunity_cost
     tb_risk
+    tb_leverage
     tb_execution
     tb_exchange_bitget
     tb_alpha_decay

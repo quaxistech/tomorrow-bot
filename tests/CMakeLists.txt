@@ -53,6 +53,7 @@ add_subdirectory(unit/operator_control)
 add_subdirectory(unit/supervisor)
 add_subdirectory(unit/pair_scanner)
 add_subdirectory(unit/scenario_integration)
+add_subdirectory(unit/leverage)
 
 # Интеграционные тесты
 add_subdirectory(integration)

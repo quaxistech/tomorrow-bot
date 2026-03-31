@@ -70,8 +70,11 @@ Result<uint64_t> WalWriter::write_intent(
     const StrategyId& strategy_id,
     const CorrelationId& correlation_id)
 {
-    const uint64_t seq = ++wal_sequence_;
     const auto now = clock_->now();
+
+    std::lock_guard lock(mutex_);
+
+    const uint64_t seq = ++wal_sequence_;
 
     WalEntry entry{
         .wal_sequence = seq,
@@ -87,7 +90,8 @@ Result<uint64_t> WalWriter::write_intent(
 
     const auto wrapped = wrap_wal_json(seq, type, false, payload_json);
 
-    // Запись в журнал (синхронно, до изменения in-memory state)
+    // Запись в журнал под mutex, чтобы гарантировать порядок записей
+    // совпадает с порядком WAL sequence.
     auto result = journal_->append(
         journal_type_for(type),
         wrapped,
@@ -100,10 +104,7 @@ Result<uint64_t> WalWriter::write_intent(
         return std::unexpected(TbError::WalWriteFailed);
     }
 
-    {
-        std::lock_guard lock(mutex_);
-        pending_entries_.emplace(seq, std::move(entry));
-    }
+    pending_entries_.emplace(seq, std::move(entry));
 
     metrics_->counter("wal_writes_total")->increment();
 

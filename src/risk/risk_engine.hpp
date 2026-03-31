@@ -204,8 +204,9 @@ private:
     void check_trade_interval(const strategy::TradeIntent& intent,
                               RiskDecision& decision);
 
-    /// Проверка 23: Масштабирование лимитов по режиму (модифицирует decision)
-    void check_regime_scaled_limits(RiskDecision& decision) const;
+    /// Проверка 23: Масштабирование лимитов по режиму — снижение approved_quantity при стрессовом/чоп режиме
+    void check_regime_scaled_limits(const portfolio_allocator::SizingResult& sizing,
+                                    RiskDecision& decision) const;
 
     /// Проверка 24: Лимиты неопределённости — ужесточение max_notional при High/Extreme
     void check_uncertainty_limits(const uncertainty::UncertaintySnapshot& uncertainty,
@@ -242,7 +243,7 @@ private:
     std::deque<int64_t> trade_close_timestamps_;                           ///< Для отслеживания оборачиваемости
     std::unordered_map<std::string, int64_t> last_trade_per_symbol_;       ///< Для интервалов между сделками
     regime::DetailedRegime current_regime_{regime::DetailedRegime::Undefined};
-    double regime_scale_factor_{1.0};                                       ///< Кэшированный множитель режима
+    std::atomic<double> regime_scale_factor_{1.0};                          ///< Кэшированный множитель режима (atomic для thread-safety)
 
     mutable std::mutex mutex_;
 };

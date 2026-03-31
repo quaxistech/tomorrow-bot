@@ -34,6 +34,13 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(tech.ema_20) || !std::isfinite(tech.ema_50) ||
+        !std::isfinite(tech.rsi_14) || !std::isfinite(tech.adx) ||
+        !std::isfinite(tech.momentum_5) || !std::isfinite(tech.momentum_20)) {
+        return std::nullopt;
+    }
+
     // ADX ≥ 20: relaxed from Wilder's 25; many systems use 20 as trend boundary
     // (Kaufman "Trading Systems & Methods" 6th ed. recommends 20 for faster markets)
     if (tech.adx < cfg_.adx_min) {
@@ -106,8 +113,17 @@ std::optional<TradeIntent> MomentumStrategy::evaluate(const StrategyContext& con
     // SELL: EMA20 < EMA50 + RSI > 25 + momentum_5 negative + accelerating down
     if (tech.ema_20 < tech.ema_50 && tech.rsi_14 > cfg_.rsi_oversold && tech.momentum_5 < -cfg_.momentum_threshold) {
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
-        intent.signal_name = "momentum_sell_v2";
+
+        // Фьючерсы: открываем Short. Спот: закрываем Long.
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "momentum_short_v2";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "momentum_sell_v2";
+        }
         intent.reason_codes = {"trend_aligned", "adx_confirmed"};
 
         double adx_factor = std::min(1.0, (tech.adx - cfg_.adx_min) / 30.0);

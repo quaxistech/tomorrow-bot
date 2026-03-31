@@ -38,6 +38,12 @@ std::optional<TradeIntent> VwapReversionStrategy::evaluate(const StrategyContext
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(last_price) || !std::isfinite(tech.rsi_14) ||
+        !std::isfinite(micro.trade_vwap)) {
+        return std::nullopt;
+    }
+
     double vwap = micro.trade_vwap;
     if (vwap <= 0.0) {
         return std::nullopt;
@@ -64,6 +70,17 @@ std::optional<TradeIntent> VwapReversionStrategy::evaluate(const StrategyContext
     intent.generated_at = clock_->now();
 
     // === BUY: цена ниже VWAP (перепродана относительно fair value) ===
+    // EMA trend filter: подавляем BUY в сильном нисходящем тренде без подтверждения разворота
+    if (deviation < 0.0 && tech.ema_valid && tech.adx_valid) {
+        bool strong_downtrend = (tech.ema_20 < tech.ema_50) && (tech.adx > cfg_.adx_max * 0.75);
+        if (strong_downtrend) {
+            bool macd_reversal = tech.macd_valid && tech.macd_histogram > 0.0;
+            if (!macd_reversal) {
+                return std::nullopt;
+            }
+        }
+    }
+
     if (deviation < 0.0 && tech.rsi_14 < cfg_.rsi_buy_max) {
         intent.side = Side::Buy;
         intent.signal_intent = SignalIntent::LongEntry;
@@ -109,11 +126,29 @@ std::optional<TradeIntent> VwapReversionStrategy::evaluate(const StrategyContext
     }
 
     // === SELL (LongExit): цена выше VWAP (перекуплена) ===
+    // EMA trend filter: подавляем SELL в сильном восходящем тренде без подтверждения разворота
+    if (deviation > 0.0 && tech.ema_valid && tech.adx_valid) {
+        bool strong_uptrend = (tech.ema_20 > tech.ema_50) && (tech.adx > cfg_.adx_max * 0.75);
+        if (strong_uptrend) {
+            bool macd_reversal = tech.macd_valid && tech.macd_histogram < 0.0;
+            if (!macd_reversal) {
+                return std::nullopt;
+            }
+        }
+    }
+
     if (deviation > 0.0 && tech.rsi_14 > cfg_.rsi_sell_min) {
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "vwap_reversion_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "vwap_reversion_exit";
+        }
         intent.exit_reason = ExitReason::TakeProfit;
-        intent.signal_name = "vwap_reversion_exit";
         intent.reason_codes = {"price_above_vwap", "rsi_overbought_zone"};
 
         double dev_score = std::min(1.0, abs_deviation / cfg_.deviation_max_pct);

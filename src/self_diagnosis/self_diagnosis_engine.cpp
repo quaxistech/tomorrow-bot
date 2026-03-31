@@ -21,6 +21,7 @@
 #include "persistence/event_journal.hpp"
 #include "persistence/persistence_types.hpp"
 #include <sstream>
+#include <stdexcept>
 
 namespace tb::self_diagnosis {
 
@@ -38,6 +39,12 @@ SelfDiagnosisEngine::SelfDiagnosisEngine(
     , metrics_(std::move(metrics))
     , journal_(std::move(journal))
 {
+    if (!logger_) {
+        throw std::invalid_argument("SelfDiagnosisEngine: logger не может быть null");
+    }
+    if (!clock_) {
+        throw std::invalid_argument("SelfDiagnosisEngine: clock не может быть null");
+    }
     if (metrics_) {
         counter_diagnostics_total_ = metrics_->counter("tb_diag_records_total", {});
         gauge_severity_level_ = metrics_->gauge("tb_diag_max_severity", {});

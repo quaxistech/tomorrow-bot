@@ -161,7 +161,11 @@ int main(int argc, const char* argv[]) {
                     *api_key_res, *api_secret_res, *passphrase_res,
                     logger, config.exchange.timeout_ms);
 
-                auto resp = auth_rest->get("/api/v2/spot/account/assets");
+                // Use spot for spot mode, futures for futures mode
+                std::string balance_endpoint = config.futures.enabled
+                    ? "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
+                    : "/api/v2/spot/account/assets";
+                auto resp = auth_rest->get(balance_endpoint);
                 if (resp.status_code == 200) {
                     auto root = boost::json::parse(resp.body);
                     auto& data = root.as_object()["data"].as_array();
@@ -169,7 +173,15 @@ int main(int argc, const char* argv[]) {
 
                     for (auto& asset : data) {
                         auto& obj = asset.as_object();
-                        std::string coin(obj["coin"].as_string());
+                        // Futures uses "marginCoin", spot uses "coin"
+                        std::string coin;
+                        if (obj.contains("marginCoin")) {
+                            coin = std::string(obj["marginCoin"].as_string());
+                        } else if (obj.contains("coin")) {
+                            coin = std::string(obj["coin"].as_string());
+                        } else {
+                            continue;
+                        }
                         double avail = std::stod(std::string(obj["available"].as_string()));
                         if (coin == "USDT" || avail <= 0.0) continue;
 
@@ -401,7 +413,10 @@ int main(int argc, const char* argv[]) {
                 }
                 logger->warn("main", "Горячая замена пар: [" + old_str + "] → [" + new_str + "]");
 
-                // 1. Останавливаем старые pipeline
+                // 1. Останавливаем старые pipeline и удаляем из supervisor
+                for (const auto& sym : active_symbols) {
+                    supervisor.unregister_subsystem("pipeline_" + sym);
+                }
                 for (auto& p : pipelines) {
                     p->stop();
                 }
@@ -434,7 +449,13 @@ int main(int argc, const char* argv[]) {
                     }
                     pipeline->set_num_pipelines(static_cast<int>(active_symbols.size()));
                     pipeline->start();
-                    pipelines.push_back(std::move(pipeline));
+                    pipelines.push_back(pipeline);
+
+                    // Регистрируем в supervisor для мониторинга жизненного цикла
+                    std::string subsystem_name = "pipeline_" + sym;
+                    supervisor.register_subsystem(subsystem_name,
+                        [pipeline]() { return pipeline->start(); },
+                        [pipeline]() { pipeline->stop(); });
 
                     logger->info("main", "Новый pipeline создан для " + sym,
                         {{"index", std::to_string(i + 1)},

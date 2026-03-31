@@ -45,6 +45,7 @@
 #include "governance/governance_audit_layer.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
+#include "exchange/bitget/bitget_futures_order_submitter.hpp"
 #include "alpha_decay/alpha_decay_monitor.hpp"
 #include "champion_challenger/champion_challenger_engine.hpp"
 #include "ai/ai_advisory_engine.hpp"
@@ -63,6 +64,8 @@
 #include "pipeline/order_watchdog.hpp"
 #include "reconciliation/reconciliation_engine.hpp"
 #include "exchange/bitget/bitget_exchange_query_adapter.hpp"
+#include "leverage/leverage_engine.hpp"
+#include "exchange/bitget/bitget_futures_query_adapter.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -169,6 +172,10 @@ private:
     std::shared_ptr<execution_alpha::IExecutionAlphaEngine> execution_alpha_;
     std::shared_ptr<opportunity_cost::IOpportunityCostEngine> opportunity_cost_engine_;
     std::shared_ptr<risk::IRiskEngine> risk_engine_;
+
+    /// Адаптивный движок управления кредитным плечом (USDT-M фьючерсы)
+    std::shared_ptr<leverage::LeverageEngine> leverage_engine_;
+
     std::shared_ptr<execution::ExecutionEngine> execution_engine_;
 
     /// Smart TWAP — разбиение крупных ордеров на адаптивные слайсы
@@ -221,6 +228,9 @@ private:
     /// Время последней торговой активности (ордер, non-veto сигнал)
     std::atomic<int64_t> last_activity_ns_{0};
 
+    /// Время последнего принятого тика (для backlog detection)
+    int64_t last_tick_ingress_ns_{0};
+
     /// Время последнего отправленного ордера (для cooldown между сделками)
     int64_t last_order_time_ns_{0};
 
@@ -242,6 +252,9 @@ private:
 
     /// Ссылка на BitgetOrderSubmitter для настройки precision (nullptr в paper mode)
     std::shared_ptr<exchange::bitget::BitgetOrderSubmitter> bitget_submitter_;
+
+    /// Ссылка на BitgetFuturesOrderSubmitter (для USDT-M фьючерсов, nullptr если futures.enabled=false)
+    std::shared_ptr<exchange::bitget::BitgetFuturesOrderSubmitter> futures_submitter_;
 
     /// Правила инструмента для текущего символа (из exchange info)
     ExchangeSymbolRules exchange_rules_;
@@ -267,6 +280,9 @@ private:
     std::shared_ptr<reconciliation::ReconciliationEngine> reconciliation_engine_;
     /// Адаптер Bitget REST → IExchangeQueryService
     std::shared_ptr<exchange::bitget::BitgetExchangeQueryAdapter> exchange_query_adapter_;
+    /// Адаптер Bitget REST для фьючерсов (nullptr если futures.enabled=false)
+    std::shared_ptr<exchange::bitget::BitgetFuturesQueryAdapter> futures_query_adapter_;
+
     /// Timestamp последней reconciliation в runtime
     int64_t last_reconciliation_ns_{0};
     /// Интервал runtime reconciliation: 60 секунд
@@ -373,7 +389,7 @@ private:
     /// Максимальная цена с момента входа в позицию (для trailing stop BUY)
     double highest_price_since_entry_{0.0};
     /// Минимальная цена с момента входа (для trailing stop SELL)
-    double lowest_price_since_entry_{0.0};
+    double lowest_price_since_entry_{1e18};
     /// Текущий уровень стоп-лосса (динамически обновляется)
     double current_stop_level_{0.0};
     /// Стоп был перенесён в breakeven (вход + комиссия)
@@ -401,6 +417,8 @@ private:
 
     /// Стратегия, которая открыла текущую позицию (для record_trade_outcome)
     StrategyId current_position_strategy_{""};
+    /// Сторона текущей позиции (Long/Short) — для корректного закрытия на фьючерсах
+    PositionSide current_position_side_{PositionSide::Long};
     /// Conviction при открытии текущей позиции
     double current_position_conviction_{0.0};
     /// Thompson action при открытии текущей позиции (для корректной записи reward)
@@ -438,6 +456,14 @@ private:
         {StrategyId("momentum"),  StrategyId("mean_reversion")},
         {StrategyId("breakout"),  StrategyId("vol_expansion")}
     };
+
+    // ==================== Futures Management ====================
+    /// Текущий funding rate для активного символа (обновляется периодически)
+    double current_funding_rate_{0.0};
+    /// Timestamp последнего обновления funding rate
+    int64_t last_funding_rate_update_ns_{0};
+    /// Интервал обновления funding rate: 5 минут (300 секунд)
+    static constexpr int64_t kFundingRateUpdateIntervalNs = 300'000'000'000LL;
 
     /// Минимальный порог conviction для открытия новой позиции
     static constexpr double kDefaultConvictionThreshold = 0.3;

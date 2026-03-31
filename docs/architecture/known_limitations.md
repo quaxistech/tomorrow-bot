@@ -3,12 +3,13 @@
 ## Текущее состояние
 
 Tomorrow Bot — полностью рабочая production-grade торговая система:
-- **49+ модулей** реализованы без заглушек
-- **602 unit-тестов** проходят (100%)
-- **Реальная торговля** на Bitget через REST API
+- **49 модулей** реализованы без заглушек
+- **614 unit-тестов** проходят (100%)
+- **Реальная торговля** на Bitget USDT-M Futures через REST API v2
+- **Фьючерсный режим**: hedge mode, isolated margin, адаптивное плечо 5×–20×
 - **WebSocket**: ~1000+ сообщений в минуту
 - **Graceful shutdown** по SIGTERM/SIGINT
-- **Автоматический выбор пар** через PairScanner v5 (parallel, retry, diversification, 24ч ротация)
+- **Автоматический выбор пар** через PairScanner v5, ротация каждые 12ч
 - **Мультитаймфреймный анализ**: 200 × 1h свечей (8+ дней) для HTF тренда
 - **Тренд-фильтрация**: стратегии не торгуют против HTF тренда
 - **6 ML-модулей**: entropy filter, fingerprinting, cascade detection, correlation, bayesian, thompson
@@ -29,12 +30,12 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - **Market Readiness Gate**: блокировка торговли до готовности всех индикаторов
 - **HTF Trend Filter**: блокировка сигналов против тренда на старшем ТФ
 - **Тренд-защита стратегий**: MeanReversion и MicrostructureScalp не торгуют против EMA тренда
-- **Conviction threshold 0.35**: повышенный порог уверенности для входа (динамический)
+- **Conviction threshold 0.45**: повышенный порог уверенности для входа (динамический)
 - **Bitget WebSocket**: Подключение, подписки (ticker, trade, books, candle1m, candle5m), reconnect
 - **Bitget REST API**: Отправка market/limit/post-only ордеров, отмена, HMAC-SHA256 подпись
 - **9 торговых стратегий**: Momentum, MeanReversion, Breakout, VolatilityExpansion, MicrostructureScalp, EmaPullback, RsiDivergence, VwapReversion, VolumeProfile
 - **Typed Strategy Configs**: Все пороги стратегий конфигурируемы через типизированные структуры
-- **Spot Signal Semantics**: SignalIntent (LongEntry/LongExit/Reduce/Hold), ExitReason attribution
+- **Spot Signal Semantics**: SignalIntent (LongEntry/LongExit/ShortEntry/ShortExit/Reduce/Hold), ExitReason attribution
 - **27-проверочный Risk Engine**: Kill switch, daily loss, drawdown, exposure, stale feed, spread, liquidity, global limits, spot SELL guard и др.
 - **Order FSM**: 10 состояний (New → PendingAck → Open → PartiallyFilled → Filled/Cancelled/Rejected/Expired)
 - **Портфель**: Позиции, realized/unrealized PnL, exposure, concentration
@@ -155,9 +156,10 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 
 ## Ограничения ⚠️
 
-### Persistence — только в памяти
-- Текущий адаптер `MemoryStorageAdapter` — данные теряются при перезапуске.
-- Интерфейс `IStorageAdapter` готов для файлового/БД-адаптера.
+### Persistence — PostgreSQL + память
+- PostgreSQL адаптер реализован и используется для alpha decay, WAL, journal.
+- `MemoryStorageAdapter` используется как fallback при отсутствии `POSTGRES_URL`.
+- Интерфейс `IStorageAdapter` позволяет добавить другие бэкенды.
 
 ### Приватный WebSocket канал
 - Статусы ордеров (fill events) не отслеживаются через приватный WS-канал.
@@ -165,11 +167,9 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 - Для limit-ордеров — polling через REST API не реализован.
 
 ### Один торговый символ одновременно
-- Бот автоматически выбирает лучшую пару через PairScanner v5 (с диверсификацией корзины).
-- Скоринг учитывает корреляции, секторную концентрацию и ликвидность.
-- Но торгует только одной парой одновременно (не портфель из N пар).
-- Архитектура поддерживает multi-symbol pipeline, но требует доработки.
-- Ротация пар происходит каждые 24 часа.
+- Бот автоматически выбирает лучшую пару через PairScanner v5.
+- Торгует только одной парой одновременно.
+- Ротация пар происходит каждые 12 часов.
 
 ### AI Advisory
 - Интерфейс определён, реализация возвращает нейтральную рекомендацию.
@@ -193,7 +193,8 @@ Tomorrow Bot — полностью рабочая production-grade торгов
 | ✅ Готово | Chandelier Exit | Адаптивный trailing stop (1.5×–3×ATR) |
 | ✅ Готово | Volatility Targeting | Динамический сайзинг (Kelly × regime_mult) |
 | ✅ Готово | Advanced Indicators | CUSUM, VPIN, Volume Profile, Time-of-Day Alpha |
-| 🔴 Высокий | Файловая персистентность | SQLite или JSON-файловый адаптер для IStorageAdapter |
+| � Готово | Фьючерсная торговля | USDT-M Futures, hedge mode, isolated margin, adaptive leverage |
+| 🟢 Готово | PostgreSQL персистентность | PostgreSQL adapter для journal, snapshots, WAL |
 | 🔴 Высокий | Приватный WS-канал | Fill events через `wss://ws.bitget.com/v2/ws/private` |
 | 🟡 Средний | Multi-symbol pipeline | Одновременная торговля top-N парами (параллельные pipelines) |
 | 🟡 Средний | Backtest mode | Воспроизведение исторических данных через ReplayEngine |

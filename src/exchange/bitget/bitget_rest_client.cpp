@@ -12,8 +12,10 @@
 #include <boost/beast/ssl.hpp>
 
 #include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace tb::exchange::bitget {
 
@@ -68,6 +70,45 @@ BitgetRestClient::BitgetRestClient(
 
 BitgetRestClient::~BitgetRestClient() = default;
 
+void BitgetRestClient::wait_for_rate_limit() {
+    std::unique_lock<std::mutex> lock(rate_mutex_);
+
+    auto now = std::chrono::steady_clock::now();
+    double elapsed_sec = std::chrono::duration<double>(now - last_refill_).count();
+
+    // Пополняем токены пропорционально прошедшему времени
+    tokens_ = std::min(kMaxTokens, tokens_ + elapsed_sec * kRefillRate);
+    last_refill_ = now;
+
+    if (tokens_ >= 1.0) {
+        // Токен доступен — потребляем и продолжаем
+        tokens_ -= 1.0;
+        return;
+    }
+
+    // Нет токенов — вычисляем время ожидания до появления 1 токена
+    double wait_sec = (1.0 - tokens_) / kRefillRate;
+    auto wait_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration<double>(wait_sec));
+
+    logger_->debug(kComp, "Rate limit: ожидание токена",
+        {{"wait_ms", std::to_string(wait_duration.count())}});
+
+    // Освобождаем мьютекс на время ожидания, чтобы не блокировать другие потоки
+    lock.unlock();
+    std::this_thread::sleep_for(wait_duration);
+    lock.lock();
+
+    // После ожидания пересчитываем токены
+    now = std::chrono::steady_clock::now();
+    elapsed_sec = std::chrono::duration<double>(now - last_refill_).count();
+    tokens_ = std::min(kMaxTokens, tokens_ + elapsed_sec * kRefillRate);
+    last_refill_ = now;
+
+    // Потребляем токен (гарантированно >= 1.0 после ожидания)
+    tokens_ = std::max(0.0, tokens_ - 1.0);
+}
+
 RestResponse BitgetRestClient::get(const std::string& path,
                                     const std::string& query_params) {
     // Для GET: подписываем path + query_params, тело пустое
@@ -91,6 +132,9 @@ RestResponse BitgetRestClient::del(const std::string& path,
 RestResponse BitgetRestClient::execute(const std::string& method,
                                         const std::string& path,
                                         const std::string& body) {
+    // Rate limit: ждём доступный токен перед отправкой запроса
+    wait_for_rate_limit();
+
     RestResponse response;
 
     try {

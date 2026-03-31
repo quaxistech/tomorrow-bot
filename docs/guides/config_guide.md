@@ -23,7 +23,7 @@
 ```yaml
 trading:
   mode: paper               # paper | shadow | testnet | production
-  initial_capital: 10.0     # Начальный капитал (USDT)
+  initial_capital: 4.58     # Начальный капитал (USDT)
 ```
 
 ### exchange
@@ -66,37 +66,42 @@ health:
 ### risk
 ```yaml
 risk:
-  max_position_notional: 10.0   # Макс. размер позиции (USDT)
-  max_daily_loss_pct: 50.0      # Макс. дневной убыток (% от капитала)
-  max_drawdown_pct: 50.0        # Макс. просадка (% от капитала)
+  max_position_notional: 400.0  # Макс. размер позиции (USDT), с учётом leverage
+  max_daily_loss_pct: 10.0      # Макс. дневной убыток (% от капитала)
+  max_drawdown_pct: 10.0        # Макс. просадка (% от капитала)
   kill_switch_enabled: true     # ОБЯЗАТЕЛЕН в production!
 ```
 
-### pair_selection (новое)
+### pair_selection
 ```yaml
 pair_selection:
-  mode: "auto"                # auto | manual | hybrid
-  top_n: 5                    # Кол-во лучших пар для анализа
-  min_volume_usd: 500000      # Минимальный суточный объём (USDT)
-  max_spread_bps: 50          # Максимальный спред (базисные пункты)
-  rotation_hours: 24          # Период ротации пар (часы)
-  whitelist: ""               # Ручной список пар (для manual/hybrid)
-  blacklist: ""               # Исключённые пары
+  mode: "auto"                # auto | manual
+  top_n: 1                    # Кол-во лучших пар для торговли
+  min_volume_usdt: 50000000   # Минимальный суточный объём (USDT)
+  max_spread_bps: 15          # Максимальный спред (базисные пункты)
+  rotation_interval_hours: 12 # Период ротации пар (часы)
+  symbols: "SOLUSDT"          # Default fallback + приоритет
+  blacklist: "USDCUSDT,DAIUSDT,TUSDUSDT,USDPUSDT,FDUSDUSDT,EURCUSDT,PYUSDUSDT,BGBUSDT,TRADOORUSDT"
 ```
 
-**Режимы выбора пар:**
-
-| Режим | Описание |
-|-------|----------|
-| `auto` | Полностью автоматический: сканирует все пары, ранжирует по скорингу |
-| `manual` | Торгует только парами из `whitelist` |
-| `hybrid` | Автоматический скоринг + пары из `whitelist` всегда включены |
-
-**Алгоритм скоринга (режим `auto`):**
-- 40% — объём 24ч (нормализованный)
-- 30% — волатильность (оптимальная для краткосрочной торговли)
-- 20% — ATR (абсолютный диапазон движения)
-- 10% — ликвидность (глубина стакана)
+### futures (USDT-M)
+```yaml
+futures:
+  enabled: true
+  product_type: "USDT-FUTURES"
+  margin_coin: "USDT"
+  margin_mode: "isolated"        # isolated | crossed
+  default_leverage: 20           # Кредитное плечо по умолчанию
+  max_leverage: 20               # Максимальное плечо
+  min_leverage: 15               # Минимальное плечо
+  leverage_trending: 20          # Плечо в тренде
+  leverage_ranging: 15           # Плечо в диапазоне
+  leverage_volatile: 10          # Плечо при волатильности
+  leverage_stress: 5             # Плечо при стрессе
+  liquidation_buffer_pct: 3.0    # Буфер до ликвидации (%)
+  funding_rate_threshold: 0.05   # Порог funding rate
+  maintenance_margin_rate: 0.004 # Ставка поддерживающей маржи
+```
 
 ### trailing_stop (новое — Chandelier Exit)
 ```yaml
@@ -238,7 +243,7 @@ ml:
 ### decision (новое — профессиональный модуль решений)
 ```yaml
 decision:
-  min_conviction_threshold: 0.28    # Базовый порог conviction (до множителей)
+  min_conviction_threshold: 0.45    # Базовый порог conviction
   conflict_dominance_threshold: 0.60 # Порог доминирования при конфликте BUY/SELL
 
   # Режимно-адаптивный порог conviction

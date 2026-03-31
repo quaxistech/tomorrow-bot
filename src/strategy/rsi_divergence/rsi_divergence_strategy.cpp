@@ -36,6 +36,11 @@ std::optional<TradeIntent> RsiDivergenceStrategy::evaluate(const StrategyContext
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(last_price) || !std::isfinite(tech.rsi_14)) {
+        return std::nullopt;
+    }
+
     // Обновляем буфер
     std::lock_guard lock(history_mutex_);
     history_.push_back({last_price, tech.rsi_14});
@@ -58,8 +63,8 @@ std::optional<TradeIntent> RsiDivergenceStrategy::evaluate(const StrategyContext
     std::size_t half = history_.size() / 2;
 
     // Находим экстремумы в первой и второй половине окна
-    double first_min_price = current.price, first_min_rsi = current.rsi;
-    double first_max_price = 0.0, first_max_rsi = 0.0;
+    double first_min_price = history_[0].price, first_min_rsi = history_[0].rsi;
+    double first_max_price = history_[0].price, first_max_rsi = history_[0].rsi;
     for (std::size_t i = 0; i < half; ++i) {
         if (history_[i].price < first_min_price) {
             first_min_price = history_[i].price;
@@ -141,9 +146,16 @@ std::optional<TradeIntent> RsiDivergenceStrategy::evaluate(const StrategyContext
 
     if (price_new_high && rsi_lower_high && rsi_overbought) {
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "bearish_rsi_divergence_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "bearish_rsi_divergence";
+        }
         intent.exit_reason = ExitReason::SignalDecay;
-        intent.signal_name = "bearish_rsi_divergence";
         intent.reason_codes = {"price_new_high", "rsi_lower_high", "rsi_overbought"};
 
         double div_strength = std::min(1.0, (first_max_rsi - second_max_rsi) / 15.0);

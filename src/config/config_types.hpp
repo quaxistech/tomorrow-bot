@@ -144,6 +144,10 @@ struct PairSelectionConfig {
     std::vector<std::string> manual_symbols;     ///< Символы для ручного режима
     std::vector<std::string> blacklist;          ///< Символы, запрещённые для торговли
 
+    // --- Тип рынка (spot / futures) ---
+    bool futures_enabled{false};                 ///< true = сканировать USDT-M Futures пары
+    std::string product_type{"USDT-FUTURES"};    ///< Тип продукта для фьючерсов
+
     // --- Расширенные настройки сканера (professional-grade) ---
     int max_candidates_for_candles{30};          ///< Макс. кандидатов для загрузки свечей
     int candle_fetch_concurrency{5};             ///< Параллельных загрузок свечей
@@ -248,6 +252,8 @@ struct DecisionConfig {
     double ensemble_max_bonus{0.20};              ///< Макс. бонус от ансамбля
     bool enable_portfolio_awareness{true};        ///< Учёт просадки/серии убытков в пороге
     double drawdown_boost_scale{0.10};            ///< +10% к порогу за каждые 5% просадки
+    double drawdown_max_boost{0.25};               ///< Макс. повышение порога от просадки
+    double consecutive_loss_boost{0.03};            ///< +3% к порогу за каждую убыточную серию
     bool enable_execution_cost_modeling{true};     ///< Пенальти conviction за spread/slippage
     double max_acceptable_cost_bps{80.0};          ///< Вето если execution cost > N bps
     bool enable_time_skew_detection{true};        ///< Детекция рассинхронизации состояний
@@ -264,6 +270,7 @@ struct TradingParamsConfig {
     double partial_tp_fraction{0.5};            ///< Доля позиции для частичного TP (0.5 = 50%)
     int max_hold_loss_minutes{15};              ///< Макс. удержание убыточной позиции (минуты)
     int max_hold_absolute_minutes{60};          ///< Макс. удержание любой позиции (минуты)
+    int min_hold_minutes{30};                   ///< Мин. удержание позиции до стратегического закрытия (минуты)
     int order_cooldown_seconds{10};             ///< Кулдаун между ордерами (секунды)
     int stop_loss_cooldown_seconds{300};        ///< Кулдаун после стоп-лосса (секунды)
 };
@@ -336,6 +343,38 @@ struct OpportunityCostConfig {
     double drawdown_penalty_scale{0.5};        ///< Множитель: +X к порогу за каждые 5% просадки
 };
 
+// ─── Фьючерсная торговля ──────────────────────────────────────────────────────
+
+/// Конфигурация фьючерсной торговли (USDT-M)
+struct FuturesConfig {
+    bool enabled{false};                       ///< Включить фьючерсный режим
+    std::string product_type{"USDT-FUTURES"};  ///< Тип продукта Bitget
+    std::string margin_coin{"USDT"};           ///< Маржинальная монета
+    std::string margin_mode{"isolated"};       ///< Режим маржи: isolated / crossed
+
+    // Кредитное плечо
+    int default_leverage{5};                   ///< Базовое плечо по умолчанию
+    int max_leverage{20};                      ///< Максимально допустимое плечо
+    int min_leverage{1};                       ///< Минимальное допустимое плечо (floor)
+
+    // Адаптивное плечо по режиму рынка
+    int leverage_trending{10};                 ///< Плечо в тренде
+    int leverage_ranging{5};                   ///< Плечо в боковике
+    int leverage_volatile{3};                  ///< Плечо при высокой волатильности
+    int leverage_stress{1};                    ///< Плечо при стрессе
+
+    // Защита от ликвидации
+    double liquidation_buffer_pct{5.0};        ///< Мин. буфер до ликвидации (%)
+    double max_leverage_drawdown_scale{0.5};   ///< Снижение плеча: ×0.5 за каждые 10% drawdown
+
+    // Фандинг
+    double funding_rate_threshold{0.03};       ///< Порог фандинга для предупреждения (3%)
+    double funding_rate_penalty{0.5};          ///< Пенальти к плечу при высоком фандинге
+
+    // Maintenance margin (Bitget default for small positions)
+    double maintenance_margin_rate{0.004};     ///< Maintenance margin rate (0.4%)
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
     ExchangeConfig       exchange;         ///< Настройки биржи
@@ -352,6 +391,7 @@ struct AppConfig {
     ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
     OpportunityCostConfig opportunity_cost; ///< Настройки модуля opportunity cost
     RegimeConfig         regime;           ///< Настройки классификатора рыночных режимов
+    FuturesConfig        futures;          ///< Настройки фьючерсной торговли
     shadow::ShadowConfig shadow;           ///< Настройки shadow trading подсистемы
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };

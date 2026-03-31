@@ -30,7 +30,9 @@ IdempotencyManager::IdempotencyManager(
 std::string IdempotencyManager::generate_client_order_id(
     const Symbol& symbol, const Side& side, const StrategyId& strategy_id)
 {
-    const uint64_t seq = sequence_.fetch_add(1, std::memory_order_relaxed);
+    // Thread-safe: atomic fetch_add guarantees a unique seq per call.
+    // acq_rel ensures the seq is visible before downstream reads (mark_sent, is_duplicate).
+    const uint64_t seq = sequence_.fetch_add(1, std::memory_order_acq_rel);
     const int64_t ts = now_ms();
 
     // Формат: {prefix}_{strategy}_{symbol}_{side}_{timestamp_ms}_{seq}

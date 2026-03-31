@@ -43,7 +43,10 @@ double window_stddev(const std::deque<TradeOutcome>& t,
         double d = field_fn(t[i]) - mean;
         v += d * d;
     }
-    return std::sqrt(v / static_cast<double>(n - 1));
+    double variance = v / static_cast<double>(n - 1);
+    // Guard: floating-point rounding может дать отрицательное значение
+    if (variance < 0.0) return 0.0;
+    return std::sqrt(variance);
 }
 
 /// Сериализовать TradeOutcome в JSON строку

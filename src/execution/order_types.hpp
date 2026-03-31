@@ -55,6 +55,8 @@ struct OrderRecord {
     OrderId exchange_order_id{OrderId("")};   ///< ID ордера на бирже
     Symbol symbol{Symbol("")};
     Side side{Side::Buy};
+    PositionSide position_side{PositionSide::Long};  ///< Сторона позиции (Long/Short) для фьючерсов
+    TradeSide trade_side{TradeSide::Open};            ///< Открытие/закрытие (для фьючерсов)
     OrderType order_type{OrderType::Limit};
     TimeInForce tif{TimeInForce::GoodTillCancel};
     Price price{Price(0.0)};
@@ -101,6 +103,7 @@ struct OrderSubmitResult {
     OrderId order_id{OrderId("")};
     OrderId exchange_order_id{OrderId("")};
     std::string error_message;
+    Quantity submitted_quantity{Quantity(0.0)};  ///< Фактическое кол-во после floor (отправлено на биржу)
 };
 
 /// Преобразование состояния ордера в строку

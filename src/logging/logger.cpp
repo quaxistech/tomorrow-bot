@@ -142,9 +142,9 @@ void ConsoleLogger::log(LogEvent event) {
 
     // Error и выше -> stderr
     if (log_level_value(event.level) >= log_level_value(LogLevel::Error)) {
-        std::cerr << formatted << "\n";
+        std::cerr << formatted << std::endl;
     } else {
-        std::cout << formatted << "\n";
+        std::cout << formatted << std::endl;
     }
 }
 

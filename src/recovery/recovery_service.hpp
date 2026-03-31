@@ -49,11 +49,13 @@ public:
     [[nodiscard]] RecoveryStatus status() const;
 
 private:
-    /// Загрузить позиции с биржи и сравнить с портфелем
-    std::vector<RecoveredPosition> sync_positions_from_exchange();
+    /// Загрузить позиции с биржи и сравнить с портфелем.
+    /// Возвращает также кэшированные балансы для повторного использования.
+    std::vector<RecoveredPosition> sync_positions_from_exchange(
+        std::vector<reconciliation::ExchangePositionInfo>& out_balances);
 
-    /// Загрузить баланс с биржи
-    double sync_balance_from_exchange();
+    /// Извлечь USDT баланс из уже полученных балансов (без повторного API-вызова)
+    double extract_usdt_balance(const std::vector<reconciliation::ExchangePositionInfo>& balances);
 
     /// Восстановить из последнего снимка состояния
     bool restore_from_snapshot();

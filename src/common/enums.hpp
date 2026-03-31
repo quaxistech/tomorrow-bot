@@ -28,6 +28,22 @@ namespace tb {
     return "unknown";
 }
 
+[[nodiscard]] constexpr std::string_view to_string(PositionSide v) noexcept {
+    switch (v) {
+        case PositionSide::Long:  return "long";
+        case PositionSide::Short: return "short";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::string_view to_string(TradeSide v) noexcept {
+    switch (v) {
+        case TradeSide::Open:  return "open";
+        case TradeSide::Close: return "close";
+    }
+    return "unknown";
+}
+
 [[nodiscard]] constexpr std::string_view to_string(OrderType v) noexcept {
     switch (v) {
         case OrderType::Limit:       return "limit";
@@ -117,6 +133,18 @@ namespace tb {
 [[nodiscard]] inline std::optional<Side> side_from_string(std::string_view s) noexcept {
     if (s == "buy")  return Side::Buy;
     if (s == "sell") return Side::Sell;
+    return std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<PositionSide> position_side_from_string(std::string_view s) noexcept {
+    if (s == "long")  return PositionSide::Long;
+    if (s == "short") return PositionSide::Short;
+    return std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<TradeSide> trade_side_from_string(std::string_view s) noexcept {
+    if (s == "open")  return TradeSide::Open;
+    if (s == "close") return TradeSide::Close;
     return std::nullopt;
 }
 

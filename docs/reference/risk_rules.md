@@ -46,7 +46,7 @@
 | 24 | `UNCERTAINTY_LIMITS` | Uncertainty превышает порог | 0.8 | Denied |
 | 25 | `UNCERTAINTY_COOLDOWN` | Uncertainty cooldown активен | 60 сек | Throttled |
 | 26 | `GLOBAL_POSITION_LIMITS` | Глобальные лимиты позиций (v0.4, Supervisor) | max_positions | Denied |
-| 27 | `SPOT_SELL_WITHOUT_POSITION` | SELL без открытой long-позиции (v0.5) | has_position | Denied |
+| 27 | `SELL_WITHOUT_POSITION` | SELL/SHORT_EXIT без открытой позиции (v1.0) | has_position | Denied |
 
 ## Intra-Trade мониторинг
 
@@ -213,6 +213,27 @@ risk:
   min_trade_interval_sec: 30.0
   max_adverse_excursion_pct: 3.0
   max_realized_daily_loss_pct: 1.5
+  utc_cutoff_hour: -1
+```
+
+### Пример конфигурации (production.yaml)
+
+```yaml
+risk:
+  max_position_notional: 400.0   # С учётом leverage 20×
+  max_daily_loss_pct: 10.0
+  max_drawdown_pct: 10.0
+  kill_switch_enabled: true
+  max_leverage: 25.0             # Потолок плеча
+  max_strategy_daily_loss_pct: 5.0
+  max_strategy_exposure_pct: 60.0
+  max_symbol_concentration_pct: 100.0  # Один символ (top_n=1)
+  max_same_direction_positions: 5
+  regime_aware_limits_enabled: true
+  max_trades_per_hour: 12
+  min_trade_interval_sec: 15.0
+  max_adverse_excursion_pct: 5.0
+  max_realized_daily_loss_pct: 5.0
   utc_cutoff_hour: -1
 ```
 

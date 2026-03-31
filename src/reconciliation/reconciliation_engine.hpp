@@ -71,8 +71,8 @@ public:
     std::optional<MismatchRecord> reconcile_single_order(
         const execution::OrderRecord& local_order);
 
-    /// Получить последний результат
-    [[nodiscard]] const ReconciliationResult& last_result() const;
+    /// Получить последний результат (копия — потокобезопасно)
+    [[nodiscard]] ReconciliationResult last_result() const;
 
     /// Получить конфигурацию
     [[nodiscard]] const ReconciliationConfig& config() const;

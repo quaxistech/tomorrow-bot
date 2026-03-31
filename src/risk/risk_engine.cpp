@@ -1,9 +1,11 @@
 #include "risk/risk_engine.hpp"
+#include "strategy/strategy_types.hpp"
 #include "uncertainty/uncertainty_types.hpp"
 #include "governance/governance_audit_layer.hpp"
 #include "order_book/order_book_types.hpp"
 #include "common/constants.hpp"
 #include "common/enums.hpp"
+#include "common/types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -109,7 +111,7 @@ RiskDecision ProductionRiskEngine::evaluate(
     check_trade_interval(intent, decision);
 
     // 23. Масштабирование лимитов по режиму
-    check_regime_scaled_limits(decision);
+    check_regime_scaled_limits(sizing, decision);
 
     // 24. Лимиты неопределённости
     check_uncertainty_limits(uncertainty, sizing, decision);
@@ -123,6 +125,23 @@ RiskDecision ProductionRiskEngine::evaluate(
     // 27. Spot-семантика: SELL без открытой позиции невозможен на спотовом рынке
     check_spot_sell_without_position(intent, portfolio, decision);
 
+    // 28. Финальная проверка: если ReduceSize уменьшил объём ниже биржевого минимума,
+    // ордер отклоняется — иначе биржа вернёт ошибку min_notional.
+    if (decision.verdict == RiskVerdict::ReduceSize &&
+        sizing.approved_quantity.get() > 0.0) {
+        double price_per_unit = sizing.approved_notional.get() / sizing.approved_quantity.get();
+        double reduced_notional = decision.approved_quantity.get() * price_per_unit;
+        if (reduced_notional < common::exchange_limits::kMinBitgetNotionalUsdt) {
+            decision.verdict = RiskVerdict::Denied;
+            decision.reasons.push_back(RiskReasonCode{
+                "REDUCE_BELOW_MIN_NOTIONAL",
+                "Уменьшенный объём " + std::to_string(reduced_notional) +
+                " USDT ниже минимума " + std::to_string(common::exchange_limits::kMinBitgetNotionalUsdt),
+                1.0
+            });
+        }
+    }
+
     // Рассчитать утилизацию рисков
     if (portfolio.total_capital > 0.0) {
         decision.risk_utilization_pct =
@@ -130,7 +149,7 @@ RiskDecision ProductionRiskEngine::evaluate(
     }
 
     // Записать масштабирующий фактор режима
-    decision.regime_scaling_factor = regime_scale_factor_;
+    decision.regime_scaling_factor = regime_scale_factor_.load(std::memory_order_acquire);
 
     // Сформировать итоговое описание
     std::ostringstream oss;
@@ -290,33 +309,35 @@ void ProductionRiskEngine::set_current_regime(regime::DetailedRegime regime) {
 
     // Вычислить масштабирующий фактор на основе режима
     if (!config_.regime_aware_limits_enabled) {
-        regime_scale_factor_ = 1.0;
+        regime_scale_factor_.store(1.0, std::memory_order_release);
         return;
     }
 
+    double scale = 1.0;
     switch (regime) {
         case regime::DetailedRegime::LiquidityStress:
         case regime::DetailedRegime::VolatilityExpansion:
         case regime::DetailedRegime::AnomalyEvent:
         case regime::DetailedRegime::ToxicFlow:
         case regime::DetailedRegime::SpreadInstability:
-            regime_scale_factor_ = config_.stress_regime_scale;
+            scale = config_.stress_regime_scale;
             break;
 
         case regime::DetailedRegime::StrongUptrend:
         case regime::DetailedRegime::StrongDowntrend:
-            regime_scale_factor_ = config_.trending_regime_scale;
+            scale = config_.trending_regime_scale;
             break;
 
         case regime::DetailedRegime::Chop:
         case regime::DetailedRegime::LowVolCompression:
-            regime_scale_factor_ = config_.chop_regime_scale;
+            scale = config_.chop_regime_scale;
             break;
 
         default:
-            regime_scale_factor_ = 1.0;
+            scale = 1.0;
             break;
     }
+    regime_scale_factor_.store(scale, std::memory_order_release);
 }
 
 RiskSnapshot ProductionRiskEngine::get_risk_snapshot() const {
@@ -325,7 +346,7 @@ RiskSnapshot ProductionRiskEngine::get_risk_snapshot() const {
     RiskSnapshot snap;
     snap.computed_at = clock_->now();
     snap.kill_switch_active = kill_switch_active_.load();
-    snap.regime_scaling_factor = regime_scale_factor_;
+    snap.regime_scaling_factor = regime_scale_factor_.load(std::memory_order_acquire);
 
     // Собираем бюджеты стратегий
     for (const auto& [key, budget] : strategy_budgets_) {
@@ -353,8 +374,11 @@ void ProductionRiskEngine::reset_daily() {
 // ========== Реализация 15 существующих проверок ==========
 
 void ProductionRiskEngine::check_kill_switch(RiskDecision& decision) const {
-    if (kill_switch_active_.load()) {
-        std::lock_guard lock(mutex_);
+    // mutex_ защищает чтение kill_switch_reason_ (std::string — не атомарный тип).
+    // kill_switch_active_ также читается здесь под защитой mutex для синхронности пары.
+    // is_kill_switch_active() использует lock-free atomic.load() без mutex для hot-path.
+    std::lock_guard lock(mutex_);
+    if (kill_switch_active_.load(std::memory_order_relaxed)) {
         decision.verdict = RiskVerdict::Denied;
         decision.kill_switch_active = true;
         decision.reasons.push_back({
@@ -449,10 +473,11 @@ void ProductionRiskEngine::check_max_notional(
             decision.verdict = RiskVerdict::ReduceSize;
         }
 
-        // Рассчитать уменьшенный объём
+        // Рассчитать уменьшенный объём — применяем ratio к текущему decision.approved_quantity
+        // (не к исходному sizing.approved_quantity) для корректного каскадного снижения.
         const double ratio = config_.max_position_notional / notional;
         decision.approved_quantity = Quantity(
-            sizing.approved_quantity.get() * ratio);
+            decision.approved_quantity.get() * ratio);
 
         decision.reasons.push_back({
             "MAX_NOTIONAL",
@@ -814,13 +839,40 @@ void ProductionRiskEngine::check_trade_interval(
     }
 }
 
-void ProductionRiskEngine::check_regime_scaled_limits(RiskDecision& decision) const {
-    if (!config_.regime_aware_limits_enabled) return;
-    if (regime_scale_factor_ >= 1.0) return; // Масштабирование не ужесточает — пропускаем
+void ProductionRiskEngine::check_regime_scaled_limits(
+    const portfolio_allocator::SizingResult& sizing,
+    RiskDecision& decision) const
+{
+    const double scale = regime_scale_factor_.load(std::memory_order_acquire);
+    decision.regime_scaling_factor = scale;
 
-    // Если режим стрессовый (scale < 1.0) и утилизация рисков высокая,
-    // добавляем предупреждение в decision
-    decision.regime_scaling_factor = regime_scale_factor_;
+    if (!config_.regime_aware_limits_enabled) return;
+    if (scale >= 1.0) return;  // Масштабирование не ужесточает — пропускаем
+
+    // При стрессовом/чоп режиме ужесточаем max_position_notional пропорционально scale.
+    // Пример: scale=0.5 (стресс) → допустимый номинал = max_position_notional * 0.5
+    const double scaled_max = config_.max_position_notional * scale;
+    const double notional = sizing.approved_notional.get();
+
+    if (notional <= scaled_max) return;  // Укладываемся — корректировок не нужно
+
+    if (decision.verdict == RiskVerdict::Approved) {
+        decision.verdict = RiskVerdict::ReduceSize;
+    }
+
+    // Снижаем approved_quantity пропорционально — применяем к текущему значению decision
+    // (а не к исходному sizing) для корректного каскадного снижения.
+    const double ratio = scaled_max / notional;
+    decision.approved_quantity = Quantity(decision.approved_quantity.get() * ratio);
+
+    decision.reasons.push_back({
+        "REGIME_SCALED_LIMIT",
+        "Режимной коэффициент scale=" + std::to_string(scale) +
+        " — номинал " + std::to_string(notional) +
+        " превышает скорректированный лимит " + std::to_string(scaled_max) +
+        ", размер уменьшен до " + std::to_string(decision.approved_quantity.get()),
+        0.7
+    });
 }
 
 // ========== Проверки неопределённости (24-26) ==========
@@ -888,8 +940,11 @@ void ProductionRiskEngine::check_uncertainty_execution_mode(
         return;
     }
 
-    // HaltNewEntries — запрещаем новые входы (BUY), но разрешаем закрытие (SELL)
-    if (intent.side == Side::Buy) {
+    // HaltNewEntries — запрещаем НОВЫЕ входы, но разрешаем закрытие/выход из позиций.
+    // Определяем "новый вход" по trade_side:
+    // - trade_side == Open → это новый вход (запрещаем)
+    // - trade_side == Close → это выход/закрытие (разрешаем)
+    if (intent.trade_side == TradeSide::Open) {
         decision.verdict = RiskVerdict::Denied;
         decision.reasons.push_back({
             "UNCERTAINTY_HALT",
@@ -904,23 +959,52 @@ void ProductionRiskEngine::check_spot_sell_without_position(
     const portfolio::PortfolioSnapshot& portfolio,
     RiskDecision& decision) const
 {
+    // Логика применима только если пытаемся SELL (Side::Sell)
     if (intent.side != Side::Sell) {
         return;
     }
-    // На спотовом рынке SELL возможен только если есть открытая long-позиция по символу
+
+    // На ФЬЮЧЕРСАХ (position_side == Short):
+    // - Открытие short (trade_side == Open): это допустимо (SELL для открытия short)
+    // - Закрытие short (trade_side == Close): это допустимо (SELL для close-short)
+    // В обоих случаях нет требования наличия позиции.
+    if (intent.position_side == PositionSide::Short) {
+        // Фьючерсная логика: short позиции не требуют pre-existing position
+        return;
+    }
+
+    // На СПОТ (position_side == Long) или по умолчанию:
+    // SELL возможен только если есть открытая long-позиция
     bool has_long_position = false;
+    double position_size = 0.0;
     for (const auto& pos : portfolio.positions) {
         if (pos.symbol == intent.symbol && pos.side == Side::Buy && pos.size.get() > 0.0) {
             has_long_position = true;
+            position_size = pos.size.get();
             break;
         }
     }
+
     if (!has_long_position) {
         decision.verdict = RiskVerdict::Denied;
         decision.reasons.push_back(RiskReasonCode{
-            "SPOT_SELL_NO_POSITION",
-            "Невозможно продать на спотовом рынке без открытой long-позиции",
+            "POSITION_NOT_FOUND",
+            "Невозможно закрыть позицию: нет открытой long-позиции для продажи",
             1.0
+        });
+        return;
+    }
+
+    // SELL quantity не должен превышать размер позиции (на споте нельзя идти в шорт)
+    if (decision.approved_quantity.get() > position_size) {
+        if (decision.verdict == RiskVerdict::Approved) {
+            decision.verdict = RiskVerdict::ReduceSize;
+        }
+        decision.approved_quantity = Quantity(position_size);
+        decision.reasons.push_back({
+            "INSUFFICIENT_POSITION_SIZE",
+            "SELL " + std::to_string(position_size) + " ограничен до размера позиции",
+            0.7
         });
     }
 }

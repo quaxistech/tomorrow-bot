@@ -23,6 +23,7 @@ struct GatewayConfig {
     exchange::bitget::WsClientConfig ws_config;
     std::vector<tb::Symbol> symbols;
     std::vector<std::string> intervals{"1m", "5m", "1h"};
+    std::string inst_type{"SPOT"};  ///< "SPOT" или "USDT-FUTURES"
     bool subscribe_tickers{true};
     bool subscribe_trades{true};
     bool subscribe_order_book{true};

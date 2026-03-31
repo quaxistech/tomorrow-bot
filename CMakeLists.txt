@@ -91,6 +91,7 @@ add_subdirectory(src/governance)
 add_subdirectory(src/operator_control)
 add_subdirectory(src/pair_scanner)
 add_subdirectory(src/ml)
+add_subdirectory(src/leverage)
 add_subdirectory(src/pipeline)
 add_subdirectory(src/app)
 

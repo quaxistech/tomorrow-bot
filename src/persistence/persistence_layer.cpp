@@ -23,7 +23,8 @@ SnapshotStore& PersistenceLayer::snapshots() {
 }
 
 VoidResult PersistenceLayer::flush() {
-    std::lock_guard lock(mutex_);
+    // No facade-level lock: EventJournal and SnapshotStore each have their own
+    // internal mutex, so concurrent flush() / append() / save() calls are safe.
     auto r1 = journal_.flush();
     if (!r1) return r1;
     return snapshots_.flush();

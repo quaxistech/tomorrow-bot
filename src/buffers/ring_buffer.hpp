@@ -29,9 +29,18 @@ public:
     }
 
     // Самый новый элемент
-    T& back() { return (*this)[count_ - 1]; }
-    const T& back() const { return (*this)[count_ - 1]; }
-    const T& front() const { return (*this)[0]; }
+    T& back() {
+        if (count_ == 0) throw std::out_of_range("RingBuffer::back() called on empty buffer");
+        return (*this)[count_ - 1];
+    }
+    const T& back() const {
+        if (count_ == 0) throw std::out_of_range("RingBuffer::back() called on empty buffer");
+        return (*this)[count_ - 1];
+    }
+    const T& front() const {
+        if (count_ == 0) throw std::out_of_range("RingBuffer::front() called on empty buffer");
+        return (*this)[0];
+    }
 
     std::size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0; }

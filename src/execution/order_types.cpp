@@ -44,6 +44,7 @@ bool is_valid_transition(OrderState from, OrderState to) {
                    to == OrderState::Rejected ||
                    to == OrderState::Filled ||
                    to == OrderState::PartiallyFilled ||
+                   to == OrderState::CancelPending ||
                    to == OrderState::Cancelled ||
                    to == OrderState::UnknownRecovery;
 

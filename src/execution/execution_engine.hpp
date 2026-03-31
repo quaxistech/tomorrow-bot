@@ -33,7 +33,7 @@ public:
 
     /// Запросить реальную цену исполнения market-ордера с биржи.
     /// Возвращает avg fill price > 0 при успехе, 0.0 при неудаче.
-    virtual Price query_order_fill_price(const OrderId& exchange_order_id) { (void)exchange_order_id; return Price(0.0); }
+    virtual Price query_order_fill_price(const OrderId& exchange_order_id, const Symbol& symbol) { (void)exchange_order_id; (void)symbol; return Price(0.0); }
 };
 
 /// Реализация для paper/shadow торговли — немедленно подтверждает ордера без отправки на биржу
@@ -43,7 +43,7 @@ public:
     bool cancel_order(const OrderId& order_id, const Symbol& symbol) override;
 
 private:
-    int next_exchange_id_{1};
+    std::atomic<int64_t> next_exchange_id_{1};
 };
 
 /// Движок исполнения ордеров
@@ -56,7 +56,7 @@ public:
                     std::shared_ptr<metrics::IMetricsRegistry> metrics);
 
     /// Отправить ордер на основе одобренного интента + risk decision
-    Result<OrderId> execute(const strategy::TradeIntent& intent,
+    [[nodiscard]] Result<OrderId> execute(const strategy::TradeIntent& intent,
                             const risk::RiskDecision& risk_decision,
                             const execution_alpha::ExecutionAlphaResult& exec_alpha,
                             const uncertainty::UncertaintySnapshot& uncertainty);
@@ -76,7 +76,7 @@ public:
     std::vector<OrderRecord> active_orders() const;
 
     /// Проверка дублирования (не отправлять одинаковый интент дважды)
-    bool is_duplicate(const strategy::TradeIntent& intent);
+    [[nodiscard]] bool is_duplicate(const strategy::TradeIntent& intent);
 
     /// Обработать fill event (partial или full)
     void on_fill_event(const FillEvent& fill);
@@ -93,6 +93,9 @@ public:
     /// Установить partial fill policy по умолчанию
     void set_default_fill_policy(PartialFillPolicy policy);
 
+    /// Установить leverage для фьючерсов (влияет на cash reservation)
+    void set_leverage(double leverage) { leverage_ = std::max(leverage, 1.0); }
+
     /// Удалить ордера в терминальных состояниях старше max_age_ns.
     /// Предотвращает утечку памяти на долгоработающем боте.
     /// @return Количество удалённых ордеров
@@ -107,6 +110,10 @@ private:
 
     /// Генерировать уникальный идентификатор ордера
     std::string generate_order_id();
+
+    /// Очистить записи из recent_intents_ старше window_ns наносекунд.
+    /// MUST be called under mutex_.
+    void cleanup_old_intents(int64_t now_ns);
 
     /// Обновить портфель при SELL fill: уменьшить позицию, рассчитать PnL, зафиксировать комиссию.
     /// Вызывается из execute(), on_order_update() и on_fill_event(). Не блокирует mutex.
@@ -128,6 +135,7 @@ private:
     mutable std::mutex mutex_;
     std::atomic<int> next_order_seq_{1};
     PartialFillPolicy default_fill_policy_{PartialFillPolicy::WaitForFull};
+    double leverage_{1.0};  ///< Leverage for futures margin calculation
 
     /// Набор order_id для которых fill уже применён к портфелю (идемпотентность)
     std::unordered_set<std::string> fill_applied_;

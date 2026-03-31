@@ -14,10 +14,15 @@ namespace tb::pair_scanner {
 
 static constexpr char kComp[] = "PairScanner";
 
-// Bitget API эндпоинты
-static constexpr char kSymbolsPath[]  = "/api/v2/spot/public/symbols";
-static constexpr char kTickersPath[]  = "/api/v2/spot/market/tickers";
-static constexpr char kCandlesPath[]  = "/api/v2/spot/market/candles";
+// Bitget API эндпоинты — Spot
+static constexpr char kSpotSymbolsPath[]  = "/api/v2/spot/public/symbols";
+static constexpr char kSpotTickersPath[]  = "/api/v2/spot/market/tickers";
+static constexpr char kSpotCandlesPath[]  = "/api/v2/spot/market/candles";
+
+// Bitget API эндпоинты — Futures (Mix v2)
+static constexpr char kFuturesSymbolsPath[] = "/api/v2/mix/market/contracts";
+static constexpr char kFuturesTickersPath[] = "/api/v2/mix/market/tickers";
+static constexpr char kFuturesCandlesPath[] = "/api/v2/mix/market/candles";
 
 /// Утилита для парсинга числовых полей Bitget API (приходят как строки)
 static double parse_double(const boost::json::value& v) {
@@ -440,7 +445,10 @@ std::vector<PairInfo> PairScanner::fetch_symbols(ScanContext& ctx) {
     std::vector<PairInfo> result;
 
     try {
-        auto resp = fetch_with_retry(kSymbolsPath, "", ctx, "symbols");
+        const char* symbols_path = config_.futures_enabled ? kFuturesSymbolsPath : kSpotSymbolsPath;
+        std::string query = config_.futures_enabled
+            ? ("productType=" + config_.product_type) : "";
+        auto resp = fetch_with_retry(symbols_path, query, ctx, "symbols");
         if (!resp.success) {
             logger_->error(kComp, "Ошибка загрузки символов: " + resp.error_message);
             return result;
@@ -461,21 +469,35 @@ std::vector<PairInfo> PairScanner::fetch_symbols(ScanContext& ctx) {
             PairInfo info;
             info.symbol = parse_string(o.at("symbol"));
             info.base_coin = parse_string(o.at("baseCoin"));
-            info.quote_coin = parse_string(o.at("quoteCoin"));
-            info.status = parse_string(o.at("status"));
+            // quoteCoin может отсутствовать в futures — fallback: marginCoin
+            if (o.contains("quoteCoin")) {
+                info.quote_coin = parse_string(o.at("quoteCoin"));
+            } else if (o.contains("marginCoin")) {
+                info.quote_coin = parse_string(o.at("marginCoin"));
+            }
+            // status vs symbolStatus (spot vs futures)
+            if (o.contains("status")) {
+                info.status = parse_string(o.at("status"));
+            } else if (o.contains("symbolStatus")) {
+                info.status = parse_string(o.at("symbolStatus"));
+            }
 
-            // Фильтруем: только USDT пары со статусом online
+            // Фильтруем: только USDT пары со статусом online/normal
             if (info.quote_coin != "USDT") continue;
-            if (info.status != "online") continue;
+            if (info.status != "online" && info.status != "normal") continue;
 
             if (o.contains("minTradeUSDT")) {
                 info.min_trade_amount = parse_double(o.at("minTradeUSDT"));
             }
             if (o.contains("pricePrecision")) {
                 info.price_precision = parse_double(o.at("pricePrecision"));
+            } else if (o.contains("pricePlace")) {
+                info.price_precision = parse_double(o.at("pricePlace"));
             }
             if (o.contains("quantityPrecision")) {
                 info.quantity_precision = parse_double(o.at("quantityPrecision"));
+            } else if (o.contains("volumePlace")) {
+                info.quantity_precision = parse_double(o.at("volumePlace"));
             }
 
             result.push_back(std::move(info));
@@ -493,7 +515,10 @@ std::vector<TickerData> PairScanner::fetch_tickers(ScanContext& ctx) {
     std::vector<TickerData> result;
 
     try {
-        auto resp = fetch_with_retry(kTickersPath, "", ctx, "tickers");
+        const char* tickers_path = config_.futures_enabled ? kFuturesTickersPath : kSpotTickersPath;
+        std::string tickers_query = config_.futures_enabled
+            ? ("productType=" + config_.product_type) : "";
+        auto resp = fetch_with_retry(tickers_path, tickers_query, ctx, "tickers");
         if (!resp.success) {
             logger_->error(kComp, "Ошибка загрузки тикеров: " + resp.error_message);
             return result;
@@ -549,8 +574,12 @@ std::vector<CandleData> PairScanner::fetch_candles(const std::string& symbol, in
     auto fetch_start = std::chrono::steady_clock::now();
 
     try {
-        std::string query = "symbol=" + symbol + "&granularity=1h&limit=" + std::to_string(limit);
-        auto resp = fetch_with_retry(kCandlesPath, query, ctx, "candles/" + symbol);
+        std::string query = "symbol=" + symbol + "&granularity=1H&limit=" + std::to_string(limit);
+        if (config_.futures_enabled) {
+            query += "&productType=" + config_.product_type;
+        }
+        const char* candles_path = config_.futures_enabled ? kFuturesCandlesPath : kSpotCandlesPath;
+        auto resp = fetch_with_retry(candles_path, query, ctx, "candles/" + symbol);
         if (!resp.success) {
             logger_->debug(kComp, "Ошибка загрузки свечей для " + symbol);
             return result;

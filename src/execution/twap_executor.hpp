@@ -83,9 +83,29 @@ public:
     /// Проверить завершён ли TWAP
     bool is_complete(const TwapOrder& twap_order) const;
 
-    /// Получить активный TWAP ордер (если есть)
-    std::optional<TwapOrder>& active_twap() { return active_twap_; }
-    const std::optional<TwapOrder>& active_twap() const { return active_twap_; }
+    /// Проверить наличие активного TWAP ордера (потокобезопасно)
+    bool has_active_twap() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_twap_.has_value();
+    }
+
+    /// Получить копию активного TWAP ордера (потокобезопасно)
+    std::optional<TwapOrder> get_active_twap() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_twap_;
+    }
+
+    /// Установить активный TWAP ордер (потокобезопасно)
+    void set_active_twap(TwapOrder order) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_twap_ = std::move(order);
+    }
+
+    /// Сбросить активный TWAP ордер (потокобезопасно)
+    void clear_active_twap() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_twap_.reset();
+    }
 
 private:
     /// Адаптивный интервал на основе текущего спреда и волатильности

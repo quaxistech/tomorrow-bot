@@ -53,8 +53,9 @@ constexpr int64_t kCooldownCleanupIntervalMs = 60'000;
 }
 
 /// Определить action по severity (общий паттерн для детекторов)
+/// Micro-cap: повышен порог VETO (0.93) — тонкие стаканы нормальны
 [[nodiscard]] DefenseAction severity_to_action(double severity) {
-    if (severity >= 0.85) return DefenseAction::VetoTrade;
+    if (severity >= 0.93) return DefenseAction::VetoTrade;
     if (severity >= 0.4)  return DefenseAction::RaiseThreshold;
     return DefenseAction::ReduceConfidence;
 }
@@ -709,7 +710,8 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_toxic_flow(
             (1.0 - config_.vpin_toxic_threshold));
     }
 
-    const double severity = std::max({ratio_severity, aggressive_flow_severity, vpin_severity});
+    // Cap ToxicFlow severity at 0.6 — micro-cap markets have natural flow imbalance
+    const double severity = std::min(0.6, std::max({ratio_severity, aggressive_flow_severity, vpin_severity}));
     if (severity <= 0.0) {
         return std::nullopt;
     }
@@ -1046,8 +1048,9 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_threat_escalatio
     if (mem.consecutive_threats < config_.threat_escalation_ticks) return std::nullopt;
 
     const int excess = mem.consecutive_threats - config_.threat_escalation_ticks;
-    const double severity = clamp01(
-        config_.threat_escalation_boost * static_cast<double>(excess + 1));
+    // Cap escalation severity at 0.5 — it's a supporting signal, not primary
+    const double severity = std::min(0.5,
+        clamp01(config_.threat_escalation_boost * static_cast<double>(excess + 1)));
 
     if (severity <= 0.0) return std::nullopt;
 

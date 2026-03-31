@@ -40,11 +40,9 @@ void AdvancedFeatureEngine::on_tick(double price) {
 void AdvancedFeatureEngine::on_trade(double price, double volume, bool is_buy) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Обновляем CUSUM по цене трейда
-    if (last_price_ > 0.0) {
-        double ret = (price - last_price_) / last_price_;
-        update_cusum(ret);
-    }
+    // NOTE: CUSUM is updated only in on_tick() to avoid double-counting.
+    // on_tick() always fires, so computing CUSUM here as well would
+    // double-count the same price move.
     last_price_ = price;
 
     update_vpin(volume, is_buy);
@@ -270,7 +268,7 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
     snapshot.technical.session_hour_utc = hour;
     size_t h = static_cast<size_t>(hour);
     snapshot.technical.tod_volatility_mult = tod_cfg_.vol_multipliers.at(h);
-    snapshot.technical.tod_volume_mult = tod_cfg_.alpha_scores.at(h);
+    snapshot.technical.tod_volume_mult = tod_cfg_.volume_multipliers.at(h);
     snapshot.technical.tod_alpha_score = tod_cfg_.alpha_scores.at(h);
     snapshot.technical.tod_valid = true;
 }

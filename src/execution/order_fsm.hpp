@@ -1,5 +1,6 @@
 #pragma once
 #include "execution/order_types.hpp"
+#include <chrono>
 #include <vector>
 
 namespace tb::execution {
@@ -13,7 +14,8 @@ public:
     [[nodiscard]] OrderState current_state() const;
 
     /// Попытка перехода в новое состояние.
-    /// @param now Текущее время (устанавливается в записи перехода)
+    /// @param now Текущее время (wall-clock наносекунды). Если Timestamp(0) —
+    ///            автоматически подставляется system_clock для записи перехода.
     /// Возвращает false если переход недопустим
     bool transition(OrderState new_state, const std::string& reason = "",
                     Timestamp now = Timestamp(0));
@@ -31,21 +33,25 @@ public:
     void force_transition(OrderState new_state, const std::string& reason,
                           Timestamp now = Timestamp(0));
 
-    /// Время последнего перехода
+    /// Время последнего перехода (wall-clock)
     [[nodiscard]] Timestamp last_transition_time() const;
 
-    /// Время создания FSM
+    /// Время создания FSM (wall-clock)
     [[nodiscard]] Timestamp created_at() const;
 
-    /// Время в текущем состоянии (ms)
-    [[nodiscard]] int64_t time_in_current_state_ms(int64_t now_ms) const;
+    /// Время в текущем состоянии (ms), вычисленное по steady_clock
+    [[nodiscard]] int64_t time_in_current_state_ms() const;
 
 private:
+    /// Получить wall-clock timestamp (наносекунды от Unix-эпохи)
+    static Timestamp wall_clock_now() noexcept;
+
     OrderId order_id_;
     OrderState state_{OrderState::New};
     std::vector<OrderTransition> history_;
-    int64_t created_at_ms_{0};
-    int64_t last_transition_ms_{0};
+    int64_t created_at_ns_{0};  ///< Wall-clock наносекунды от эпохи
+    /// Точка последнего перехода по монотонным часам (для elapsed time)
+    std::chrono::steady_clock::time_point last_transition_tp_;
 };
 
 } // namespace tb::execution

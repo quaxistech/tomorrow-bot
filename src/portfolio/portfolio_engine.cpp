@@ -24,17 +24,48 @@ void InMemoryPortfolioEngine::open_position(const Position& pos) {
     std::lock_guard lock(mutex_);
 
     auto key = pos.symbol.get();
-    positions_[key] = pos;
-    positions_[key].updated_at = clock_->now();
+    auto existing_it = positions_.find(key);
 
-    // Пересчитать нереализованную P&L
-    recalculate_position_pnl(positions_[key]);
+    if (existing_it != positions_.end() &&
+        existing_it->second.side == pos.side &&
+        existing_it->second.size.get() > 0.0) {
+        // Добавление к существующей позиции: средневзвешенная цена входа
+        auto& existing = existing_it->second;
+        double old_size = existing.size.get();
+        double new_size = pos.size.get();
+        double total_size = old_size + new_size;
 
-    logger_->info("Portfolio", "Открыта позиция",
-                  {{"symbol", pos.symbol.get()},
-                   {"side", pos.side == Side::Buy ? "Buy" : "Sell"},
-                   {"size", std::to_string(pos.size.get())},
-                   {"entry_price", std::to_string(pos.avg_entry_price.get())}});
+        if (total_size > 0.0) {
+            double weighted_price =
+                (old_size * existing.avg_entry_price.get() +
+                 new_size * pos.avg_entry_price.get()) / total_size;
+            existing.avg_entry_price = Price(weighted_price);
+            existing.size = Quantity(total_size);
+            existing.notional = NotionalValue(total_size * pos.current_price.get());
+            existing.current_price = pos.current_price;
+            existing.updated_at = clock_->now();
+            // strategy_id остаётся от первоначальной позиции
+        }
+
+        recalculate_position_pnl(existing);
+
+        logger_->info("Portfolio", "Позиция увеличена (add)",
+                      {{"symbol", pos.symbol.get()},
+                       {"added_size", std::to_string(new_size)},
+                       {"total_size", std::to_string(total_size)},
+                       {"avg_entry", std::to_string(existing.avg_entry_price.get())}});
+    } else {
+        // Новая позиция
+        positions_[key] = pos;
+        positions_[key].updated_at = clock_->now();
+        recalculate_position_pnl(positions_[key]);
+
+        logger_->info("Portfolio", "Открыта позиция",
+                      {{"symbol", pos.symbol.get()},
+                       {"side", pos.side == Side::Buy ? "Buy" : "Sell"},
+                       {"size", std::to_string(pos.size.get())},
+                       {"entry_price", std::to_string(pos.avg_entry_price.get())}});
+    }
 
     if (metrics_) {
         metrics_->gauge("portfolio_positions_count", {})->set(
@@ -295,15 +326,14 @@ PortfolioSnapshot InMemoryPortfolioEngine::snapshot() const {
         snap.pending_orders.push_back(info);
     }
 
-    // Доступный капитал: при отсутствии pending orders и fees — совпадает со старой формулой
-    // Старая формула: total_capital_ + realized_pnl_today - gross_exposure
-    // Новая формула: total_cash - reserved_for_orders - fees (когда нет pending/fees, total_cash = total_capital_ + realized_pnl_today)
-    snap.available_capital = cash_ledger_.available_cash - snap.exposure.gross_exposure;
+    // Доступный капитал: при leverage > 1 вычитаем margin (notional / leverage), а не full notional
+    double margin_used = snap.exposure.gross_exposure / leverage_;
+    snap.available_capital = cash_ledger_.available_cash - margin_used;
     snap.available_capital = std::max(snap.available_capital, 0.0);
 
     // Использование капитала (%)
     if (total_capital_ > common::finance::kMinValidPrice) {
-        snap.capital_utilization_pct = ((snap.exposure.gross_exposure + cash_ledger_.reserved_for_orders) /
+        snap.capital_utilization_pct = ((margin_used + cash_ledger_.reserved_for_orders) /
                                         total_capital_) * common::finance::kPercentScaler;
     }
 
@@ -370,6 +400,11 @@ void InMemoryPortfolioEngine::set_capital(double capital) {
                   {{"capital", std::to_string(capital)}});
 }
 
+void InMemoryPortfolioEngine::set_leverage(double leverage) {
+    std::lock_guard lock(mutex_);
+    leverage_ = std::max(1.0, leverage);
+}
+
 void InMemoryPortfolioEngine::recalculate_position_pnl(Position& pos) const {
     const double entry = pos.avg_entry_price.get();
     const double current = pos.current_price.get();
@@ -414,8 +449,11 @@ ExposureSummary InMemoryPortfolioEngine::compute_exposure() const {
 
     exp.gross_exposure = exp.long_exposure + exp.short_exposure;
     exp.net_exposure = exp.long_exposure - exp.short_exposure;
+    // Для фьючерсов: exposure_pct считается от margin (notional / leverage),
+    // а не от полного notional, чтобы корректно работать с CapitalExhausted.
+    double margin_exposure = exp.gross_exposure / leverage_;
     exp.exposure_pct = (total_capital_ > common::finance::kMinValidPrice)
-        ? (exp.gross_exposure / total_capital_) * common::finance::kPercentScaler
+        ? (margin_exposure / total_capital_) * common::finance::kPercentScaler
         : 0.0;
 
     return exp;
@@ -454,7 +492,9 @@ bool InMemoryPortfolioEngine::reserve_cash(
     std::lock_guard lock(mutex_);
 
     double total_required = notional + estimated_fee;
-    if (total_required > cash_ledger_.available_cash + common::finance::kFloatEpsilon) {
+    // Строгая проверка: available_cash должен покрывать total_required полностью.
+    // Без epsilon-допуска, чтобы гарантировать неотрицательность available_cash.
+    if (total_required > cash_ledger_.available_cash) {
         logger_->warn("Portfolio", "Недостаточно cash для резервирования",
                       {{"order_id", order_id.get()},
                        {"symbol", symbol.get()},

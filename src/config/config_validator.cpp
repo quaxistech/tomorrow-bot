@@ -19,14 +19,32 @@ VoidResult ConfigValidator::validate(const AppConfig& cfg) const {
     validate_trading_params(cfg.trading_params, result);
     validate_decision(cfg.decision, result);
     validate_execution_alpha(cfg.execution_alpha, result);
+    validate_futures(cfg.futures, result);
     validate_cross(cfg, result);
 
     if (!result.valid) {
-        // Ошибки можно получить отдельным методом, здесь просто возвращаем код ошибки
         return ErrVoid(TbError::ConfigValidationFailed);
     }
 
     return OkVoid();
+}
+
+ValidationResult ConfigValidator::validate_detailed(const AppConfig& cfg) const {
+    ValidationResult result;
+
+    validate_exchange(cfg.exchange, result);
+    validate_logging(cfg.logging, result);
+    validate_metrics(cfg.metrics, result);
+    validate_risk(cfg.risk, result);
+    validate_adversarial(cfg.adversarial_defense, result);
+    validate_opportunity_cost(cfg.opportunity_cost, result);
+    validate_trading_params(cfg.trading_params, result);
+    validate_decision(cfg.decision, result);
+    validate_execution_alpha(cfg.execution_alpha, result);
+    validate_futures(cfg.futures, result);
+    validate_cross(cfg, result);
+
+    return result;
 }
 
 void ConfigValidator::validate_exchange(const ExchangeConfig& cfg, ValidationResult& result) const {
@@ -332,8 +350,8 @@ void ConfigValidator::validate_trading_params(
     if (cfg.partial_tp_atr_threshold <= cfg.breakeven_atr_threshold) {
         result.add_error("trading_params.partial_tp_atr_threshold должен быть > breakeven_atr_threshold");
     }
-    if (cfg.partial_tp_fraction <= 0.0 || cfg.partial_tp_fraction >= 1.0) {
-        result.add_error("trading_params.partial_tp_fraction должен быть в диапазоне (0, 1)");
+    if (cfg.partial_tp_fraction <= 0.0 || cfg.partial_tp_fraction > 1.0) {
+        result.add_error("trading_params.partial_tp_fraction должен быть в диапазоне (0, 1]");
     }
     if (cfg.max_hold_loss_minutes < 1 || cfg.max_hold_loss_minutes > 1440) {
         result.add_error("trading_params.max_hold_loss_minutes должен быть в диапазоне [1, 1440]");
@@ -432,6 +450,17 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
     if (cfg.trading.mode == TradingMode::Production && !cfg.risk.kill_switch_enabled) {
         result.add_error("В production режиме risk.kill_switch_enabled обязателен");
     }
+    // В production adversarial defense обязателен
+    if (cfg.trading.mode == TradingMode::Production && !cfg.adversarial_defense.enabled) {
+        result.add_error("В production режиме adversarial_defense.enabled обязателен");
+    }
+    // В production futures должны быть сконфигурированы, если включены
+    if (cfg.trading.mode == TradingMode::Production && cfg.futures.enabled &&
+        cfg.futures.max_leverage > 20) {
+        result.add_warning(
+            std::format("futures.max_leverage ({}) > 20 в production — высокий риск ликвидации",
+                        cfg.futures.max_leverage));
+    }
     // В production лог уровень не должен быть trace/debug (производительность)
     if (cfg.trading.mode == TradingMode::Production &&
         (cfg.logging.level == "trace" || cfg.logging.level == "debug")) {
@@ -440,6 +469,18 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
     // Начальный капитал должен покрывать хотя бы один минимальный ордер
     if (cfg.trading.initial_capital <= 0.0) {
         result.add_error("trading.initial_capital должен быть > 0");
+    }
+    // Порт-коллизия: metrics и health не должны слушать на одном порту
+    if (cfg.metrics.enabled && cfg.health.enabled && cfg.metrics.port == cfg.health.port) {
+        result.add_error(
+            std::format("metrics.port ({}) и health.port ({}) не должны совпадать",
+                cfg.metrics.port, cfg.health.port));
+    }
+    // health.port должен быть в допустимом диапазоне
+    if (cfg.health.enabled && (cfg.health.port < 1024 || cfg.health.port > 65535)) {
+        result.add_error(
+            std::format("health.port {} вне допустимого диапазона [1024, 65535]",
+                cfg.health.port));
     }
     // max_loss_per_trade не должен превышать daily loss limit
     if (cfg.trading_params.max_loss_per_trade_pct > cfg.risk.max_daily_loss_pct) {
@@ -452,6 +493,97 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
         result.add_error(
             "execution_alpha.max_spread_bps_any не должен превышать "
             "adversarial_defense.spread_explosion_threshold_bps");
+    }
+}
+
+void ConfigValidator::validate_futures(const FuturesConfig& cfg, ValidationResult& result) const {
+    if (!cfg.enabled) return; // Если фьючерсы отключены — не валидируем
+
+    // product_type
+    if (cfg.product_type != "USDT-FUTURES" && cfg.product_type != "COIN-FUTURES" &&
+        cfg.product_type != "USDC-FUTURES") {
+        result.add_error(
+            std::format("futures.product_type '{}' неизвестен; "
+                        "допустимые: USDT-FUTURES, COIN-FUTURES, USDC-FUTURES",
+                        cfg.product_type));
+    }
+
+    // margin_mode
+    if (cfg.margin_mode != "isolated" && cfg.margin_mode != "crossed") {
+        result.add_error(
+            std::format("futures.margin_mode '{}' неизвестен; "
+                        "допустимые: isolated, crossed",
+                        cfg.margin_mode));
+    }
+
+    // margin_coin
+    if (cfg.margin_coin.empty()) {
+        result.add_error("futures.margin_coin не может быть пустым");
+    }
+
+    // Leverage: [1, 125]
+    if (cfg.default_leverage < 1 || cfg.default_leverage > 125) {
+        result.add_error(
+            std::format("futures.default_leverage {} вне допустимого диапазона [1, 125]",
+                        cfg.default_leverage));
+    }
+    if (cfg.max_leverage < 1 || cfg.max_leverage > 125) {
+        result.add_error(
+            std::format("futures.max_leverage {} вне допустимого диапазона [1, 125]",
+                        cfg.max_leverage));
+    }
+    if (cfg.default_leverage > cfg.max_leverage) {
+        result.add_error(
+            std::format("futures.default_leverage ({}) не может превышать max_leverage ({})",
+                        cfg.default_leverage, cfg.max_leverage));
+    }
+
+    // Leverage по режимам: [1, max_leverage]
+    auto check_regime_leverage = [&](int lev, const char* name) {
+        if (lev < 1 || lev > cfg.max_leverage) {
+            result.add_error(
+                std::format("futures.{} ({}) вне допустимого диапазона [1, {}]",
+                            name, lev, cfg.max_leverage));
+        }
+    };
+    check_regime_leverage(cfg.leverage_trending, "leverage_trending");
+    check_regime_leverage(cfg.leverage_ranging, "leverage_ranging");
+    check_regime_leverage(cfg.leverage_volatile, "leverage_volatile");
+    check_regime_leverage(cfg.leverage_stress, "leverage_stress");
+
+    // Liquidation buffer: (0, 50]
+    if (cfg.liquidation_buffer_pct <= 0.0 || cfg.liquidation_buffer_pct > 50.0) {
+        result.add_error(
+            std::format("futures.liquidation_buffer_pct {} вне допустимого диапазона (0, 50]",
+                        cfg.liquidation_buffer_pct));
+    }
+
+    // max_leverage_drawdown_scale: [0, 1]
+    if (cfg.max_leverage_drawdown_scale < 0.0 || cfg.max_leverage_drawdown_scale > 1.0) {
+        result.add_error(
+            std::format("futures.max_leverage_drawdown_scale {} вне допустимого диапазона [0, 1]",
+                        cfg.max_leverage_drawdown_scale));
+    }
+
+    // Funding rate threshold: [0, 1] (в относительных единицах)
+    if (cfg.funding_rate_threshold < 0.0 || cfg.funding_rate_threshold > 1.0) {
+        result.add_error(
+            std::format("futures.funding_rate_threshold {} вне допустимого диапазона [0, 1]",
+                        cfg.funding_rate_threshold));
+    }
+
+    // Funding rate penalty: [0, 1]
+    if (cfg.funding_rate_penalty < 0.0 || cfg.funding_rate_penalty > 1.0) {
+        result.add_error(
+            std::format("futures.funding_rate_penalty {} вне допустимого диапазона [0, 1]",
+                        cfg.funding_rate_penalty));
+    }
+
+    // Maintenance margin rate: (0, 0.1] (Bitget max 10%)
+    if (cfg.maintenance_margin_rate <= 0.0 || cfg.maintenance_margin_rate > 0.1) {
+        result.add_error(
+            std::format("futures.maintenance_margin_rate {} вне допустимого диапазона (0, 0.1]",
+                        cfg.maintenance_margin_rate));
     }
 }
 

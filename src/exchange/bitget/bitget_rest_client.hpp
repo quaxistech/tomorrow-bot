@@ -9,7 +9,9 @@
 
 #include "bitget_signing.hpp"
 #include "logging/logger.hpp"
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace tb::exchange::bitget {
@@ -55,6 +57,10 @@ private:
     RestResponse execute(const std::string& method, const std::string& path,
                          const std::string& body);
 
+    /// Token bucket rate limiter: блокирует до появления токена.
+    /// Bitget лимит: 10 запросов/сек.
+    void wait_for_rate_limit();
+
     std::string base_url_;
     std::string host_;      ///< Извлечённый хост (api.bitget.com)
     std::string port_;      ///< "443" для HTTPS
@@ -63,6 +69,13 @@ private:
     std::string passphrase_;
     std::shared_ptr<logging::ILogger> logger_;
     int timeout_ms_;
+
+    /// Token bucket rate limiter state
+    mutable std::mutex rate_mutex_;
+    static constexpr double kMaxTokens = 10.0;       ///< Макс. токенов (Bitget: 10 req/sec)
+    static constexpr double kRefillRate = 10.0;       ///< Токенов в секунду
+    double tokens_{kMaxTokens};                        ///< Текущее кол-во токенов
+    std::chrono::steady_clock::time_point last_refill_{std::chrono::steady_clock::now()};
 };
 
 } // namespace tb::exchange::bitget

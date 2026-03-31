@@ -509,10 +509,14 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
         case DetailedRegime::StrongUptrend:
         case DetailedRegime::StrongDowntrend:
             add("momentum",            true,  1.5, "Сильный тренд — momentum эффективен");
-            add("mean_reversion",      false, 0.0, "Сильный тренд — mean reversion отключён");
+            add("mean_reversion",      true,  0.15,"Сильный тренд — mean reversion пониженный");
             add("breakout",            true,  0.8, "Продолжение тренда возможно");
             add("microstructure_scalp",true,  0.6, "Скальпинг в направлении тренда");
             add("vol_expansion",       true,  0.7, "Волатильность может расти");
+            add("ema_pullback",        true,  1.3, "Pullback в сильном тренде — отлично");
+            add("rsi_divergence",      true,  0.4, "Дивергенции против тренда рискованны");
+            add("vwap_reversion",      true,  0.5, "VWAP reversion — осторожно в тренде");
+            add("volume_profile",      true,  0.6, "Объёмные уровни как поддержка");
             break;
         case DetailedRegime::WeakUptrend:
         case DetailedRegime::WeakDowntrend:
@@ -521,52 +525,79 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("breakout",            true,  0.6, "Пробой из слабого тренда");
             add("microstructure_scalp",true,  0.8, "Скальпинг допустим");
             add("vol_expansion",       true,  0.5, "Умеренная вероятность расширения");
+            add("ema_pullback",        true,  1.0, "Pullback в слабом тренде — хорошо");
+            add("rsi_divergence",      true,  0.7, "Дивергенции возможны");
+            add("vwap_reversion",      true,  0.7, "VWAP reversion допустим");
+            add("volume_profile",      true,  0.7, "Объёмные уровни актуальны");
             break;
         case DetailedRegime::MeanReversion:
-            add("momentum",            false, 0.0, "Разворот — momentum опасен");
+            add("momentum",            true,  0.2, "Разворот — momentum пониженный");
             add("mean_reversion",      true,  1.5, "Идеальный сценарий для mean reversion");
-            add("breakout",            false, 0.0, "Возврат — не пробой");
+            add("breakout",            true,  0.15,"Возврат — breakout маловероятен");
             add("microstructure_scalp",true,  0.7, "Скальпинг на возврате");
-            add("vol_expansion",       false, 0.0, "Сжатие волатильности ожидается");
+            add("vol_expansion",       true,  0.15,"Сжатие волатильности ожидается");
+            add("ema_pullback",        true,  0.5, "Pullback в reversion — средне");
+            add("rsi_divergence",      true,  1.2, "RSI дивергенция при развороте — отлично");
+            add("vwap_reversion",      true,  1.3, "VWAP reversion — отлично при развороте");
+            add("volume_profile",      true,  1.0, "Объёмные уровни при развороте");
             break;
         case DetailedRegime::VolatilityExpansion:
             add("momentum",            true,  0.7, "Направленная волатильность");
-            add("mean_reversion",      false, 0.0, "Волатильность — mean reversion опасен");
+            add("mean_reversion",      true,  0.15,"Волатильность — mean reversion рискован");
             add("breakout",            true,  1.2, "Расширение — хорошо для пробоев");
-            add("microstructure_scalp",false, 0.0, "Волатильный стакан — скальпинг отключён");
+            add("microstructure_scalp",true,  0.2, "Волатильный стакан — скальпинг осторожно");
             add("vol_expansion",       true,  1.5, "Идеальный сценарий");
+            add("ema_pullback",        true,  0.5, "Pullback при vol expansion — рискованно");
+            add("rsi_divergence",      true,  0.5, "Дивергенции при волатильности");
+            add("vwap_reversion",      true,  0.2, "VWAP менее актуален при vol expansion");
+            add("volume_profile",      true,  0.5, "Объёмные уровни как ориентир");
             break;
         case DetailedRegime::LowVolCompression:
-            add("momentum",            false, 0.0, "Нет импульса в сжатии");
+            add("momentum",            true,  0.2, "Слабый импульс в сжатии");
             add("mean_reversion",      true,  1.0, "Диапазонная торговля в сжатии");
             add("breakout",            true,  1.5, "Сжатие → ожидание пробоя");
             add("microstructure_scalp",true,  1.0, "Узкие спреды — хорошо для скальпинга");
             add("vol_expansion",       true,  1.2, "Подготовка к расширению");
+            add("ema_pullback",        true,  0.5, "Pullback в сжатии — средне");
+            add("rsi_divergence",      true,  0.8, "Дивергенции в сжатии — хорошо");
+            add("vwap_reversion",      true,  1.0, "VWAP reversion в диапазоне");
+            add("volume_profile",      true,  1.2, "POC/VA актуальны в сжатии");
             break;
         case DetailedRegime::LiquidityStress:
         case DetailedRegime::SpreadInstability:
         case DetailedRegime::ToxicFlow:
-            // Стрессовые режимы: большинство стратегий отключены,
-            // но mean_reversion оставляем с минимальным весом — рынок может отскочить.
-            add("momentum",            false, 0.0, "Стресс — momentum отключён");
-            add("mean_reversion",      true,  0.2, "Стресс — mean reversion возможен на отскоке");
-            add("breakout",            false, 0.0, "Стресс — breakout отключён");
-            add("microstructure_scalp",false, 0.0, "Стресс — скальпинг отключён");
-            add("vol_expansion",       false, 0.0, "Стресс — vol_expansion отключён");
+            // Стрессовые режимы: сильно пониженные веса, но ни одна не отключена полностью
+            add("momentum",            true,  0.15,"Стресс — momentum минимальный");
+            add("mean_reversion",      true,  0.3, "Стресс — mean reversion на отскоке");
+            add("breakout",            true,  0.1, "Стресс — breakout минимальный");
+            add("microstructure_scalp",true,  0.1, "Стресс — скальпинг минимальный");
+            add("vol_expansion",       true,  0.1, "Стресс — vol_expansion минимальный");
+            add("ema_pullback",        true,  0.1, "Стресс — pullback минимальный");
+            add("rsi_divergence",      true,  0.3, "Стресс — дивергенции для отскока");
+            add("vwap_reversion",      true,  0.25,"Стресс — VWAP reversion осторожно");
+            add("volume_profile",      true,  0.1, "Стресс — profiles пониженный");
             break;
         case DetailedRegime::AnomalyEvent:
-            add("momentum",            false, 0.0, "Аномалия — торговля приостановлена");
+            add("momentum",            true,  0.1, "Аномалия — momentum минимальный");
             add("mean_reversion",      true,  0.5, "Возврат после аномалии");
-            add("breakout",            false, 0.0, "Ложные пробои при аномалии");
-            add("microstructure_scalp",false, 0.0, "Микроструктура нестабильна");
-            add("vol_expansion",       false, 0.0, "Волатильность уже экстремальна");
+            add("breakout",            true,  0.1, "Ложные пробои при аномалии");
+            add("microstructure_scalp",true,  0.1, "Микроструктура нестабильна");
+            add("vol_expansion",       true,  0.1, "Волатильность уже экстремальна");
+            add("ema_pullback",        true,  0.1, "Аномалия — pullback минимальный");
+            add("rsi_divergence",      true,  0.5, "Дивергенция после аномалии — средне");
+            add("vwap_reversion",      true,  0.3, "VWAP reversion после аномалии");
+            add("volume_profile",      true,  0.1, "Profiles ненадёжны при аномалии");
             break;
         case DetailedRegime::Chop:
-            add("momentum",            false, 0.0, "Рубка — momentum неэффективен");
+            add("momentum",            true,  0.2, "Рубка — momentum пониженный");
             add("mean_reversion",      true,  1.2, "Рубка — mean reversion хорош");
-            add("breakout",            false, 0.0, "Ложные пробои в рубке");
+            add("breakout",            true,  0.15,"Ложные пробои в рубке");
             add("microstructure_scalp",true,  1.3, "Скальпинг на шуме");
-            add("vol_expansion",       false, 0.0, "Нет расширения волатильности");
+            add("vol_expansion",       true,  0.15,"Нет расширения волатильности");
+            add("ema_pullback",        true,  0.2, "Слабые pullback без тренда");
+            add("rsi_divergence",      true,  0.8, "RSI дивергенции в рубке — хорошо");
+            add("vwap_reversion",      true,  1.2, "VWAP reversion в рубке — отлично");
+            add("volume_profile",      true,  1.2, "POC/VA в боковике");
             break;
         case DetailedRegime::Undefined:
             add("momentum",            true,  0.5, "Режим не определён — пониженный вес");
@@ -574,6 +605,10 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("breakout",            true,  0.5, "Режим не определён — пониженный вес");
             add("microstructure_scalp",true,  0.5, "Режим не определён — пониженный вес");
             add("vol_expansion",       true,  0.5, "Режим не определён — пониженный вес");
+            add("ema_pullback",        true,  0.5, "Режим не определён — пониженный вес");
+            add("rsi_divergence",      true,  0.5, "Режим не определён — пониженный вес");
+            add("vwap_reversion",      true,  0.5, "Режим не определён — пониженный вес");
+            add("volume_profile",      true,  0.5, "Режим не определён — пониженный вес");
             break;
     }
 

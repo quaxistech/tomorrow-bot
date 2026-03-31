@@ -77,6 +77,10 @@ private:
                            const std::deque<double>& y,
                            size_t window) const;
 
+    /// Внутренняя реализация status() без блокировки мьютекса.
+    /// Вызывается из evaluate() (который уже держит mutex_) и из status().
+    MlComponentStatus status_impl() const;
+
     CorrelationConfig config_;
     std::shared_ptr<logging::ILogger> logger_;
 

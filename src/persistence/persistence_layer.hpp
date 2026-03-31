@@ -11,11 +11,14 @@
 #include "persistence/persistence_types.hpp"
 #include "common/result.hpp"
 #include <memory>
-#include <mutex>
 
 namespace tb::persistence {
 
 /// Фасад слоя персистентности
+///
+/// Thread safety: EventJournal and SnapshotStore are individually thread-safe
+/// (each has its own internal mutex).  Callers may use journal() and snapshots()
+/// concurrently without additional synchronisation at the facade level.
 class PersistenceLayer {
 public:
     /// Конструктор принимает адаптер хранилища и опциональную конфигурацию
@@ -24,9 +27,11 @@ public:
         PersistenceConfig config = {});
 
     /// Получить ссылку на журнал событий
+    /// @note EventJournal is internally thread-safe; no external locking needed
     [[nodiscard]] EventJournal& journal();
 
     /// Получить ссылку на хранилище снимков
+    /// @note SnapshotStore is internally thread-safe; no external locking needed
     [[nodiscard]] SnapshotStore& snapshots();
 
     /// Сбросить буферы журнала и снимков на диск
@@ -40,7 +45,6 @@ private:
     PersistenceConfig config_;
     EventJournal journal_;
     SnapshotStore snapshots_;
-    mutable std::mutex mutex_;
 };
 
 } // namespace tb::persistence

@@ -49,10 +49,10 @@ struct AdvancedDecisionConfig {
     // Regime-aware threshold scaling
     bool enable_regime_threshold_scaling{true};
     double regime_trending_factor{1.0};          ///< Множитель порога для trending
-    double regime_choppy_factor{1.25};           ///< Множитель для choppy/noise (+25%)
+    double regime_choppy_factor{0.95};           ///< Множитель для choppy/noise (-5%, micro-cap chop = норма)
     double regime_volatile_factor{0.90};         ///< Множитель для vol expansion (-10%)
-    double regime_stress_factor{1.40};           ///< Множитель для liquidity stress (+40%)
-    double regime_mean_reversion_factor{1.10};   ///< Множитель для mean reversion (+10%)
+    double regime_stress_factor{1.0};           ///< Множитель для liquidity stress (neutral, micro-cap)
+    double regime_mean_reversion_factor{1.0};    ///< Множитель для mean reversion (neutral)
 
     // Regime-aware dominance scaling
     bool enable_regime_dominance_scaling{true};

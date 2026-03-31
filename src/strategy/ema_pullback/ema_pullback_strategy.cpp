@@ -37,6 +37,18 @@ std::optional<TradeIntent> EmaPullbackStrategy::evaluate(const StrategyContext& 
         return std::nullopt;
     }
 
+    // NaN/Inf guard
+    if (!std::isfinite(last_price) || !std::isfinite(tech.ema_20) ||
+        !std::isfinite(tech.ema_50) || !std::isfinite(tech.rsi_14) ||
+        !std::isfinite(tech.atr_14)) {
+        return std::nullopt;
+    }
+
+    // Guard: ATR=0 при flat data → деление на ноль
+    if (tech.atr_14 <= 0.0) {
+        return std::nullopt;
+    }
+
     // Определяем направление тренда: EMA20 vs EMA50
     bool uptrend = tech.ema_20 > tech.ema_50;
     bool downtrend = tech.ema_20 < tech.ema_50;
@@ -127,8 +139,12 @@ std::optional<TradeIntent> EmaPullbackStrategy::evaluate(const StrategyContext& 
             return std::nullopt; // Цена ещё выше EMA20 — не закрываем
         }
 
-        // RSI должен быть ниже средней зоны
-        if (tech.rsi_14 > cfg_.rsi_buy_max) {
+        // RSI должен быть ниже средней зоны (используем sell-specific threshold)
+        if (tech.rsi_14 > cfg_.rsi_sell_max) {
+            return std::nullopt;
+        }
+        // RSI floor: не шортим при экстремальной перепроданности (отскок вероятен)
+        if (tech.rsi_14 < cfg_.rsi_sell_min) {
             return std::nullopt;
         }
 
@@ -138,9 +154,16 @@ std::optional<TradeIntent> EmaPullbackStrategy::evaluate(const StrategyContext& 
         }
 
         intent.side = Side::Sell;
-        intent.signal_intent = SignalIntent::LongExit;
+        if (context.futures_enabled) {
+            intent.signal_intent = SignalIntent::ShortEntry;
+            intent.position_side = PositionSide::Short;
+            intent.trade_side = TradeSide::Open;
+            intent.signal_name = "ema_pullback_short";
+        } else {
+            intent.signal_intent = SignalIntent::LongExit;
+            intent.signal_name = "ema_pullback_exit";
+        }
         intent.exit_reason = ExitReason::TrendFailure;
-        intent.signal_name = "ema_pullback_exit";
         intent.reason_codes = {"downtrend_confirmed", "price_below_emas"};
 
         double trend_strength = std::min(1.0, (tech.ema_50 - tech.ema_20) / tech.atr_14);

@@ -305,3 +305,26 @@ world_model:
     max_threshold_drift_pct: 20.0
     ema_alpha: 0.05
     evaluation_window: 500
+
+# ─── FUTURES TRADING (USDT-M) ──────────────────────────────────────────────
+futures:
+  enabled: true
+  product_type: "USDT-FUTURES"
+  margin_coin: "USDT"
+  margin_mode: "isolated"
+
+  default_leverage: 3
+  max_leverage: 10               # Shadow: консервативный (наблюдение без реальных ордеров)
+
+  leverage_trending: 5
+  leverage_ranging: 3
+  leverage_volatile: 2
+  leverage_stress: 1
+
+  liquidation_buffer_pct: 8.0
+  max_leverage_drawdown_scale: 0.5
+
+  funding_rate_threshold: 0.03
+  funding_rate_penalty: 0.5
+
+  maintenance_margin_rate: 0.004
