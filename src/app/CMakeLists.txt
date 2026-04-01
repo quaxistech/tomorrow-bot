@@ -13,18 +13,15 @@ target_include_directories(tomorrow-bot
 target_link_libraries(tomorrow-bot
     PRIVATE
         tb_pipeline
-        tb_pair_scanner
+        tb_scanner
         tb_exchange_bitget
         tb_common
         tb_config
         tb_security
         tb_logging
         tb_metrics
-        tb_health
         tb_clock
         tb_supervisor
-        tb_governance
-        tb_platform
         Threads::Threads
 )
 

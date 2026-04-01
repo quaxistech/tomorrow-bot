@@ -513,7 +513,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  1.5, "Сильный тренд — momentum эффективен");
             add("mean_reversion",      true,  0.15,"Сильный тренд — mean reversion пониженный");
             add("breakout",            true,  0.8, "Продолжение тренда возможно");
-            add("microstructure_scalp",true,  0.6, "Скальпинг в направлении тренда");
+            add("scalp_engine",true,  0.6, "Скальпинг в направлении тренда");
             add("vol_expansion",       true,  0.7, "Волатильность может расти");
             add("ema_pullback",        true,  1.3, "Pullback в сильном тренде — отлично");
             add("rsi_divergence",      true,  0.4, "Дивергенции против тренда рискованны");
@@ -525,7 +525,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.8, "Слабый тренд — momentum с пониженным весом");
             add("mean_reversion",      true,  0.5, "Слабый тренд — mean reversion возможен");
             add("breakout",            true,  0.6, "Пробой из слабого тренда");
-            add("microstructure_scalp",true,  0.8, "Скальпинг допустим");
+            add("scalp_engine",true,  0.8, "Скальпинг допустим");
             add("vol_expansion",       true,  0.5, "Умеренная вероятность расширения");
             add("ema_pullback",        true,  1.0, "Pullback в слабом тренде — хорошо");
             add("rsi_divergence",      true,  0.7, "Дивергенции возможны");
@@ -536,7 +536,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.2, "Разворот — momentum пониженный");
             add("mean_reversion",      true,  1.5, "Идеальный сценарий для mean reversion");
             add("breakout",            true,  0.15,"Возврат — breakout маловероятен");
-            add("microstructure_scalp",true,  0.7, "Скальпинг на возврате");
+            add("scalp_engine",true,  0.7, "Скальпинг на возврате");
             add("vol_expansion",       true,  0.15,"Сжатие волатильности ожидается");
             add("ema_pullback",        true,  0.5, "Pullback в reversion — средне");
             add("rsi_divergence",      true,  1.2, "RSI дивергенция при развороте — отлично");
@@ -547,7 +547,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.7, "Направленная волатильность");
             add("mean_reversion",      true,  0.15,"Волатильность — mean reversion рискован");
             add("breakout",            true,  1.2, "Расширение — хорошо для пробоев");
-            add("microstructure_scalp",true,  0.2, "Волатильный стакан — скальпинг осторожно");
+            add("scalp_engine",true,  0.2, "Волатильный стакан — скальпинг осторожно");
             add("vol_expansion",       true,  1.5, "Идеальный сценарий");
             add("ema_pullback",        true,  0.5, "Pullback при vol expansion — рискованно");
             add("rsi_divergence",      true,  0.5, "Дивергенции при волатильности");
@@ -558,7 +558,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.2, "Слабый импульс в сжатии");
             add("mean_reversion",      true,  1.0, "Диапазонная торговля в сжатии");
             add("breakout",            true,  1.5, "Сжатие → ожидание пробоя");
-            add("microstructure_scalp",true,  1.0, "Узкие спреды — хорошо для скальпинга");
+            add("scalp_engine",true,  1.0, "Узкие спреды — хорошо для скальпинга");
             add("vol_expansion",       true,  1.2, "Подготовка к расширению");
             add("ema_pullback",        true,  0.5, "Pullback в сжатии — средне");
             add("rsi_divergence",      true,  0.8, "Дивергенции в сжатии — хорошо");
@@ -572,7 +572,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.15,"Стресс — momentum минимальный");
             add("mean_reversion",      true,  0.3, "Стресс — mean reversion на отскоке");
             add("breakout",            true,  0.1, "Стресс — breakout минимальный");
-            add("microstructure_scalp",true,  0.1, "Стресс — скальпинг минимальный");
+            add("scalp_engine",true,  0.1, "Стресс — скальпинг минимальный");
             add("vol_expansion",       true,  0.1, "Стресс — vol_expansion минимальный");
             add("ema_pullback",        true,  0.1, "Стресс — pullback минимальный");
             add("rsi_divergence",      true,  0.3, "Стресс — дивергенции для отскока");
@@ -583,7 +583,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.1, "Аномалия — momentum минимальный");
             add("mean_reversion",      true,  0.5, "Возврат после аномалии");
             add("breakout",            true,  0.1, "Ложные пробои при аномалии");
-            add("microstructure_scalp",true,  0.1, "Микроструктура нестабильна");
+            add("scalp_engine",true,  0.1, "Микроструктура нестабильна");
             add("vol_expansion",       true,  0.1, "Волатильность уже экстремальна");
             add("ema_pullback",        true,  0.1, "Аномалия — pullback минимальный");
             add("rsi_divergence",      true,  0.5, "Дивергенция после аномалии — средне");
@@ -594,7 +594,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.2, "Рубка — momentum пониженный");
             add("mean_reversion",      true,  1.2, "Рубка — mean reversion хорош");
             add("breakout",            true,  0.15,"Ложные пробои в рубке");
-            add("microstructure_scalp",true,  1.3, "Скальпинг на шуме");
+            add("scalp_engine",true,  1.3, "Скальпинг на шуме");
             add("vol_expansion",       true,  0.15,"Нет расширения волатильности");
             add("ema_pullback",        true,  0.2, "Слабые pullback без тренда");
             add("rsi_divergence",      true,  0.8, "RSI дивергенции в рубке — хорошо");
@@ -605,7 +605,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
             add("momentum",            true,  0.5, "Режим не определён — пониженный вес");
             add("mean_reversion",      true,  0.5, "Режим не определён — пониженный вес");
             add("breakout",            true,  0.5, "Режим не определён — пониженный вес");
-            add("microstructure_scalp",true,  0.5, "Режим не определён — пониженный вес");
+            add("scalp_engine",true,  0.5, "Режим не определён — пониженный вес");
             add("vol_expansion",       true,  0.5, "Режим не определён — пониженный вес");
             add("ema_pullback",        true,  0.5, "Режим не определён — пониженный вес");
             add("rsi_divergence",      true,  0.5, "Режим не определён — пониженный вес");

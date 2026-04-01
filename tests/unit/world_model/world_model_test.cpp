@@ -295,7 +295,7 @@ TEST_CASE("WorldModel: suitability veto в опасных состояниях",
     REQUIRE(result.state == WorldState::LiquidityVacuum);
 
     for (const auto& s : result.strategy_suitability) {
-        if (s.strategy_id.get() == "microstructure_scalp") {
+        if (s.strategy_id.get() == "scalp_engine") {
             REQUIRE(s.vetoed);
             REQUIRE(s.suitability == 0.0);
         }

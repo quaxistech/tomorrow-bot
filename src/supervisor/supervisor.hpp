@@ -8,11 +8,9 @@
 #pragma once
 
 #include "common/types.hpp"
-#include "health/health_service.hpp"
 #include "logging/logger.hpp"
 #include "metrics/metrics_registry.hpp"
 #include "clock/clock.hpp"
-#include "governance/governance_audit_layer.hpp"
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -59,11 +57,9 @@ enum class SystemState {
 class Supervisor {
 public:
     Supervisor(
-        std::shared_ptr<health::IHealthService>   health,
         std::shared_ptr<logging::ILogger>         logger,
         std::shared_ptr<metrics::IMetricsRegistry> metrics,
-        std::shared_ptr<clock::IClock>             clock,
-        std::shared_ptr<governance::GovernanceAuditLayer> governance = nullptr
+        std::shared_ptr<clock::IClock>             clock
     );
 
     ~Supervisor();
@@ -174,11 +170,9 @@ public:
     void set_shutdown_timeout(std::chrono::seconds timeout);
 
 private:
-    std::shared_ptr<health::IHealthService>    health_;
     std::shared_ptr<logging::ILogger>          logger_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
     std::shared_ptr<clock::IClock>             clock_;
-    std::shared_ptr<governance::GovernanceAuditLayer> governance_;
 
     std::atomic<int>    state_;     ///< Атомарное состояние (int для atomic)
     std::string         degraded_reason_;   ///< Причина деградации

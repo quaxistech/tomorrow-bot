@@ -6,11 +6,9 @@
 #include "pipeline/trading_pipeline.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
-#include "normalizer/normalized_events.hpp"
 #include "common/enums.hpp"
 #include "common/constants.hpp"
 #include "persistence/postgres_storage_adapter.hpp"
-#include "shadow/shadow_mode_engine.hpp"
 #include <boost/json.hpp>
 #include <sstream>
 #include <iomanip>
@@ -49,8 +47,6 @@ TradingPipeline::TradingPipeline(
     std::shared_ptr<logging::ILogger> logger,
     std::shared_ptr<clock::IClock> clock,
     std::shared_ptr<metrics::IMetricsRegistry> metrics,
-    std::shared_ptr<health::IHealthService> health,
-    std::shared_ptr<governance::GovernanceAuditLayer> governance,
     const std::string& symbol)
     : config_(config)
     , symbol_(Symbol(symbol.empty() ? "BTCUSDT" : symbol))
@@ -58,8 +54,6 @@ TradingPipeline::TradingPipeline(
     , logger_(std::move(logger))
     , clock_(std::move(clock))
     , metrics_(std::move(metrics))
-    , health_(std::move(health))
-    , governance_(std::move(governance))
 {
     // 1. Индикаторы и признаки
     indicator_engine_ = std::make_shared<indicators::IndicatorEngine>(logger_);
@@ -78,23 +72,7 @@ TradingPipeline::TradingPipeline(
     // 4. Стратегии
     strategy_registry_ = std::make_shared<strategy::StrategyRegistry>();
     strategy_registry_->register_strategy(
-        std::make_shared<strategy::MomentumStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::MeanReversionStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::BreakoutStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::VolExpansionStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::MicrostructureScalpStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::EmaPullbackStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::RsiDivergenceStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::VwapReversionStrategy>(logger_, clock_));
-    strategy_registry_->register_strategy(
-        std::make_shared<strategy::VolumeProfileStrategy>(logger_, clock_));
+        std::make_shared<strategy::StrategyEngine>(logger_, clock_));
 
     // 5. Аллокация стратегий и решения
     strategy_allocator_ = std::make_shared<strategy_allocator::RegimeAwareAllocator>(logger_, clock_);
@@ -121,8 +99,6 @@ TradingPipeline::TradingPipeline(
         config_.decision.min_conviction_threshold,
         config_.decision.conflict_dominance_threshold,
         adv_decision);
-    adversarial_defense_ = std::make_shared<defense::AdversarialMarketDefense>(
-        defense::make_defense_config(config_.adversarial_defense));
 
     // Общий PostgreSQL storage — создаём один раз, передаём всем компонентам.
     // Если POSTGRES_URL не задан или подключение не удалось — nullptr (in-memory fallback).
@@ -139,53 +115,7 @@ TradingPipeline::TradingPipeline(
         }
     }
 
-    // 5.5. Монитор деградации альфы
-    alpha_decay_monitor_ = std::make_shared<alpha_decay::AlphaDecayMonitor>(
-        alpha_decay::DecayConfig{}, metrics_, shared_pg_storage);
-    alpha_decay_monitor_->restore_from_storage();
-
-    // 5.5b. Champion-Challenger A/B тестирование стратегий
-    {
-        champion_challenger::ChampionChallengerConfig cc_cfg;
-        cc_cfg.min_evaluation_trades = 30;
-        cc_cfg.promotion_threshold   = 0.20;
-        cc_cfg.rejection_threshold   = -0.10;
-        cc_cfg.min_hit_rate          = 0.40;
-        cc_cfg.max_drawdown_bps      = -600.0;
-        cc_cfg.min_regime_samples    = 3;
-
-        cc_engine_ = std::make_shared<champion_challenger::ChampionChallengerEngine>(
-            cc_cfg, logger_, metrics_, shared_pg_storage);
-
-        (void)cc_engine_->register_challenger(
-            StrategyId("momentum"),
-            StrategyId("mean_reversion"),
-            StrategyVersion(1));
-        (void)cc_engine_->register_challenger(
-            StrategyId("breakout"),
-            StrategyId("vol_expansion"),
-            StrategyVersion(1));
-
-        logger_->info("pipeline", "Champion-Challenger инициализирован",
-            {{"pairs", "momentum/mean_reversion, breakout/vol_expansion"}});
-    }
-
-    // 5.4b. Shadow trading подсистема
-    {
-        auto shadow_storage = (config_.shadow.persist_to_db) ? shared_pg_storage : nullptr;
-        shadow_engine_ = std::make_shared<shadow::ShadowModeEngine>(
-            config_.shadow, logger_, clock_, metrics_, governance_, shadow_storage);
-        logger_->info("pipeline", "Shadow подсистема инициализирована",
-            {{"enabled", config_.shadow.enabled ? "true" : "false"},
-             {"mode", config_.shadow.mode == shadow::ShadowMode::Observation ? "observation"
-                    : config_.shadow.mode == shadow::ShadowMode::Validation ? "validation" : "discovery"}});
-    }
-
-    // 5.5a. AI Advisory Engine
-    ai_advisory_ = std::make_shared<ai::LocalRuleBasedAdvisory>(
-        config_.ai_advisory, logger_, metrics_);
-
-    // 5.6. Продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
+    // 5.5. Продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
     advanced_features_ = std::make_shared<features::AdvancedFeatureEngine>(
         features::CusumConfig{}, features::VpinConfig{},
         features::VolumeProfileConfig{}, features::TimeOfDayConfig{},
@@ -225,11 +155,6 @@ TradingPipeline::TradingPipeline(
         atr_stop_param.max_value = 4.0;
         bayesian_adapter_->register_parameter("global", atr_stop_param);
     }
-
-    // 5.9. Self-Diagnosis Engine — мониторинг здоровья и диагностика системы
-    self_diagnosis_ = std::make_shared<self_diagnosis::SelfDiagnosisEngine>(
-        logger_, clock_, metrics_);
-    logger_->info("pipeline", "Self-Diagnosis Engine инициализирован");
 
     // 6. Портфель (капитал из конфигурации)
     portfolio_ = std::make_shared<portfolio::InMemoryPortfolioEngine>(
@@ -342,7 +267,7 @@ TradingPipeline::TradingPipeline(
         risk_cfg.max_symbol_concentration_pct = lev * 150.0; // Same for single-pair
     }
     risk_engine_ = std::make_shared<risk::ProductionRiskEngine>(
-        risk_cfg, logger_, clock_, metrics_, governance_);
+        risk_cfg, logger_, clock_, metrics_);
 
     // 9.5. Адаптивное управление кредитным плечом (USDT-M фьючерсы)
     // Инстанцируется ТОЛЬКО если указано futures.enabled в конфиге
@@ -426,7 +351,7 @@ TradingPipeline::TradingPipeline(
     }
 
     gateway_ = std::make_shared<market_data::MarketDataGateway>(
-        gw_cfg, feature_engine_, order_book_, health_, logger_, metrics_, clock_,
+        gw_cfg, feature_engine_, order_book_, logger_, metrics_, clock_,
         [this](features::FeatureSnapshot snap) { on_feature_snapshot(std::move(snap)); });
 
     logger_->info("pipeline", "Торговый pipeline создан",
@@ -1661,23 +1586,61 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             int64_t max_hold_abs = static_cast<int64_t>(config_.trading_params.max_hold_absolute_minutes)
                                  * 60LL * 1'000'000'000LL;
             int64_t hold_min = hold_duration / 60'000'000'000LL;
-            // Убыточная позиция > N мин → закрыть
-            if (pos.unrealized_pnl < 0.0 && hold_duration >= max_hold_loss) {
-                time_exit_triggered = true;
-                logger_->warn("pipeline", "TIME_EXIT: убыточная позиция по таймауту",
-                    {{"hold_min", std::to_string(hold_min)},
-                     {"max_hold_loss_min", std::to_string(config_.trading_params.max_hold_loss_minutes)},
-                     {"pnl", std::to_string(pos.unrealized_pnl)},
-                     {"symbol", symbol_.get()}});
+
+            // Smart extension: if momentum favors position, delay TIME_EXIT
+            bool momentum_favorable = false;
+            if (snapshot.technical.momentum_valid) {
+                bool is_long = (pos.side == Side::Buy);
+                if (config_.futures.enabled) {
+                    is_long = (current_position_side_ == PositionSide::Long);
+                }
+                momentum_favorable = is_long
+                    ? (snapshot.technical.momentum_5 > 0.001)
+                    : (snapshot.technical.momentum_5 < -0.001);
             }
-            // Любая позиция > M мин → закрыть
+
+            // Убыточная позиция > N мин → закрыть (only if loss > 0.3% of entry)
+            double loss_pct_of_entry = (entry > 0.0 && pos.size.get() > 0.0)
+                ? std::abs(pos.unrealized_pnl) / (entry * pos.size.get()) * 100.0
+                : 0.0;
+            if (pos.unrealized_pnl < 0.0 && loss_pct_of_entry > 0.3 && hold_duration >= max_hold_loss) {
+                // If momentum is favorable — extend by another 50% of max_hold_loss
+                if (momentum_favorable && hold_duration < max_hold_loss * 3 / 2) {
+                    if (tick_count_ % 200 == 0) {
+                        logger_->info("pipeline", "TIME_EXIT отложен — momentum благоприятный",
+                            {{"hold_min", std::to_string(hold_min)},
+                             {"momentum_5", std::to_string(snapshot.technical.momentum_5)},
+                             {"pnl", std::to_string(pos.unrealized_pnl)},
+                             {"symbol", symbol_.get()}});
+                    }
+                } else {
+                    time_exit_triggered = true;
+                    logger_->warn("pipeline", "TIME_EXIT: убыточная позиция по таймауту",
+                        {{"hold_min", std::to_string(hold_min)},
+                         {"max_hold_loss_min", std::to_string(config_.trading_params.max_hold_loss_minutes)},
+                         {"pnl", std::to_string(pos.unrealized_pnl)},
+                         {"loss_pct", std::to_string(loss_pct_of_entry)},
+                         {"symbol", symbol_.get()}});
+                }
+            }
+            // Абсолютный таймаут > M мин → закрыть (extend if profitable + momentum ok)
             if (!time_exit_triggered && hold_duration >= max_hold_abs) {
-                time_exit_triggered = true;
-                logger_->warn("pipeline", "TIME_EXIT: абсолютный таймаут позиции",
-                    {{"hold_min", std::to_string(hold_min)},
-                     {"max_hold_abs_min", std::to_string(config_.trading_params.max_hold_absolute_minutes)},
-                     {"pnl", std::to_string(pos.unrealized_pnl)},
-                     {"symbol", symbol_.get()}});
+                if (pos.unrealized_pnl > 0.0 && momentum_favorable && hold_duration < max_hold_abs * 3 / 2) {
+                    if (tick_count_ % 200 == 0) {
+                        logger_->info("pipeline", "TIME_EXIT абсолютный отложен — прибыльная позиция + momentum",
+                            {{"hold_min", std::to_string(hold_min)},
+                             {"momentum_5", std::to_string(snapshot.technical.momentum_5)},
+                             {"pnl", std::to_string(pos.unrealized_pnl)},
+                             {"symbol", symbol_.get()}});
+                    }
+                } else {
+                    time_exit_triggered = true;
+                    logger_->warn("pipeline", "TIME_EXIT: абсолютный таймаут позиции",
+                        {{"hold_min", std::to_string(hold_min)},
+                         {"max_hold_abs_min", std::to_string(config_.trading_params.max_hold_absolute_minutes)},
+                         {"pnl", std::to_string(pos.unrealized_pnl)},
+                         {"symbol", symbol_.get()}});
+                }
             }
         }
 
@@ -1713,7 +1676,6 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 logger_->warn("pipeline", "Позиция не найдена на бирже — очистка фантомной позиции",
                     {{"symbol", symbol_.get()},
                      {"portfolio_size", std::to_string(pos.size.get())}});
-                record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
                 portfolio_->close_position(symbol_, pos.current_price, 0.0);
                 reset_trailing_state();
                 return true;
@@ -1730,7 +1692,6 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             logger_->info("pipeline", "Стоп-лосс: актив уже продан, очищаем позицию из портфеля",
                 {{"qty", std::to_string(actual_qty)},
                  {"symbol", symbol_.get()}});
-            record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
             portfolio_->close_position(symbol_, pos.current_price, pos.unrealized_pnl);
             reset_trailing_state();
             return true;
@@ -1862,9 +1823,8 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
 
             if (is_full_close) {
                 // Execution engine уже вызовет close_position при fill.
-                // Записываем данные для decay/fingerprint/thompson, но НЕ вызываем
+                // Записываем данные для fingerprint/thompson, но НЕ вызываем
                 // portfolio_->close_position() повторно — иначе PnL будет двойным.
-                record_trade_for_decay(current_position_strategy_, pos.unrealized_pnl, current_position_conviction_);
 
                 // Записываем результат fingerprint (стоп-лосс = негативный исход)
                 if (fingerprinter_ && last_entry_fingerprint_) {
@@ -1945,7 +1905,7 @@ bool TradingPipeline::start() {
 
     // Загрузка исторических свечей для прогрева индикаторов.
     // КРИТИЧНО: без этого SMA/RSI/ADX/EMA не имеют данных,
-    // и microstructure_scalp торгует вслепую.
+    // и scalp_engine торгует вслепую.
     bootstrap_historical_candles();
 
     gateway_->start();
@@ -1995,249 +1955,6 @@ bool TradingPipeline::is_idle(int64_t threshold_ns) const {
     if (last == 0) return false; // ещё не было ни одного тика
     int64_t now = clock_->now().get();
     return (now - last) > threshold_ns;
-}
-
-// ==================== Alpha Decay Feedback ====================
-
-void TradingPipeline::check_alpha_decay_feedback() {
-    // Не проверять чаще чем раз в 60 секунд
-    int64_t now_ns = clock_->now().get();
-    if (last_alpha_decay_check_ns_ > 0 &&
-        (now_ns - last_alpha_decay_check_ns_) < kAlphaDecayCheckIntervalNs) {
-        return;
-    }
-    last_alpha_decay_check_ns_ = now_ns;
-
-    auto reports = alpha_decay_monitor_->get_all_reports();
-
-    // Сбрасываем per-strategy множители перед пересчётом
-    alpha_decay_size_mult_per_strategy_.clear();
-    alpha_decay_threshold_adj_per_strategy_.clear();
-
-    for (const auto& report : reports) {
-        const std::string& sid = report.strategy_id.get();
-        auto rec = report.overall_recommendation;
-        double health = report.overall_health;
-
-        double size_mult  = 1.0;
-        double thresh_adj = 0.0;
-
-        switch (rec) {
-            case alpha_decay::DecayRecommendation::NoAction:
-                break;
-
-            case alpha_decay::DecayRecommendation::ReduceWeight:
-                size_mult = 0.7;
-                logger_->info("AlphaDecay", "Рекомендация: уменьшить вес стратегии",
-                    {{"strategy", sid}, {"health", std::to_string(health)}});
-                break;
-
-            case alpha_decay::DecayRecommendation::ReduceSize:
-                size_mult  = 0.5;
-                thresh_adj = 0.05;
-                logger_->warn("AlphaDecay", "Рекомендация: уменьшить размер позиций",
-                    {{"strategy", sid}, {"health", std::to_string(health)}});
-                break;
-
-            case alpha_decay::DecayRecommendation::RaiseThresholds:
-                thresh_adj = 0.10;
-                size_mult  = 0.5;
-                logger_->warn("AlphaDecay", "Рекомендация: поднять пороги входа",
-                    {{"strategy", sid}, {"health", std::to_string(health)}});
-                break;
-
-            case alpha_decay::DecayRecommendation::MoveToShadow:
-            case alpha_decay::DecayRecommendation::Disable:
-                size_mult  = 0.0;
-                thresh_adj = 1.0;
-                logger_->error("AlphaDecay", "КРИТИЧЕСКАЯ ДЕГРАДАЦИЯ — торговля заблокирована",
-                    {{"strategy", sid}, {"health", std::to_string(health)},
-                     {"recommendation", "DISABLE"}});
-                break;
-
-            case alpha_decay::DecayRecommendation::AlertOperator:
-                logger_->error("AlphaDecay", "ТРЕБУЕТСЯ ВНИМАНИЕ ОПЕРАТОРА",
-                    {{"strategy", sid}, {"health", std::to_string(health)}});
-                break;
-        }
-
-        alpha_decay_size_mult_per_strategy_[sid]  = size_mult;
-        alpha_decay_threshold_adj_per_strategy_[sid] = thresh_adj;
-    }
-
-    // Агрегируем в глобальные поля: min mult / max adj по всем стратегиям
-    alpha_decay_size_mult_    = 1.0;
-    alpha_decay_threshold_adj_ = 0.0;
-    for (const auto& [sid, mult] : alpha_decay_size_mult_per_strategy_) {
-        alpha_decay_size_mult_ = std::min(alpha_decay_size_mult_, mult);
-    }
-    for (const auto& [sid, adj] : alpha_decay_threshold_adj_per_strategy_) {
-        alpha_decay_threshold_adj_ = std::max(alpha_decay_threshold_adj_, adj);
-    }
-}
-
-void TradingPipeline::record_trade_for_decay(
-    const StrategyId& strategy_id, double pnl, double conviction)
-{
-    if (!alpha_decay_monitor_) return;
-
-    alpha_decay::TradeOutcome outcome;
-    double capital = portfolio_->snapshot().total_capital;
-    outcome.pnl_bps = (capital > 0.0) ? (pnl / capital * 10000.0) : 0.0;
-
-    // Fix: реальное проскальзывание из estimation на момент входа
-    outcome.slippage_bps = current_position_slippage_bps_;
-
-    // Fix: реальный MAE накопленный за время удержания позиции
-    outcome.max_adverse_excursion_bps = current_max_adverse_excursion_bps_;
-
-    outcome.conviction = conviction;
-    outcome.timestamp  = clock_->now();
-
-    // Fix: получаем актуальный режим рынка из движка режимов
-    outcome.regime = RegimeLabel::Unclear;
-    if (regime_engine_) {
-        auto regime_opt = regime_engine_->current_regime(symbol_);
-        if (regime_opt.has_value()) {
-            outcome.regime = regime_opt->label;
-        }
-    }
-
-    alpha_decay_monitor_->record_trade_outcome(strategy_id, outcome);
-
-    // Champion-Challenger: записываем net P&L (gross - fee - slippage) для честного сравнения
-    if (cc_engine_) {
-        // Реальные комиссии Bitget: maker=8bps, taker=10bps.
-        // Используем централизованные константы из common/constants.hpp.
-        double fee_bps = common::fees::kDefaultTakerFeePct * common::finance::kBasisPointsScaler; // default: taker (10 bps)
-        if (last_exec_alpha_.has_value()) {
-            using ES = execution_alpha::ExecutionStyle;
-            switch (last_exec_alpha_->recommended_style) {
-                case ES::Passive:
-                case ES::PostOnly:
-                    fee_bps = common::fees::kDefaultMakerFeePct * common::finance::kBasisPointsScaler; // maker: 8 bps
-                    break;
-                case ES::Aggressive:
-                    fee_bps = common::fees::kDefaultTakerFeePct * common::finance::kBasisPointsScaler; // taker: 10 bps
-                    break;
-                default:
-                    // Hybrid: среднее между maker и taker
-                    fee_bps = (common::fees::kDefaultMakerFeePct + common::fees::kDefaultTakerFeePct)
-                              / 2.0 * common::finance::kBasisPointsScaler; // 9 bps
-                    break;
-            }
-        }
-
-        champion_challenger::PnLBreakdown breakdown{
-            .gross_pnl_bps = outcome.pnl_bps,
-            .fee_bps       = fee_bps,
-            .slippage_bps  = current_position_slippage_bps_
-        };
-
-        const std::string regime_str = std::string{to_string(outcome.regime)};
-        const std::string sid        = std::string{strategy_id.get()};
-
-        // Маппинг champion↔challenger определён парами в cc_strategy_pairs_
-        for (const auto& [champ_id, chall_id] : cc_strategy_pairs_) {
-            if (sid == chall_id.get()) {
-                (void)cc_engine_->record_challenger_outcome(
-                    strategy_id, breakdown, regime_str, conviction);
-            } else if (sid == champ_id.get()) {
-                (void)cc_engine_->record_champion_outcome(
-                    strategy_id, breakdown, regime_str);
-            }
-        }
-        // microstructure_scalp — вне C/C пар, не записываем
-    }
-
-    logger_->debug("AlphaDecay", "Результат сделки записан",
-        {{"strategy",    std::string{strategy_id.get()}},
-         {"pnl_bps",     std::to_string(outcome.pnl_bps)},
-         {"slip_bps",    std::to_string(outcome.slippage_bps)},
-         {"mae_bps",     std::to_string(outcome.max_adverse_excursion_bps)},
-         {"regime",      std::string{to_string(outcome.regime)}},
-         {"conviction",  std::to_string(conviction)}});
-}
-
-void TradingPipeline::update_current_mae(double current_price, bool is_long) {
-    if (current_price <= 0.0) return;
-    // MAE в бп относительно цены входа
-    double entry = 0.0;
-    auto pos = portfolio_->get_position(symbol_);
-    if (pos.has_value() && pos->avg_entry_price.get() > 0.0) {
-        entry = pos->avg_entry_price.get();
-    }
-    if (entry <= 0.0) return;
-
-    double adverse_bps = 0.0;
-    if (is_long) {
-        // Для лонга: неблагоприятное движение = цена ниже входа
-        adverse_bps = (entry - current_price) / entry * 10000.0;
-    } else {
-        // Для шорта: неблагоприятное движение = цена выше входа
-        adverse_bps = (current_price - entry) / entry * 10000.0;
-    }
-    if (adverse_bps > current_max_adverse_excursion_bps_) {
-        current_max_adverse_excursion_bps_ = adverse_bps;
-    }
-}
-
-void TradingPipeline::check_champion_challenger_status() {
-    if (!cc_engine_) return;
-
-    const int64_t now_ns = clock_->now().get();
-    if (last_cc_check_ns_ > 0 &&
-        (now_ns - last_cc_check_ns_) < kCCCheckIntervalNs) return;
-    last_cc_check_ns_ = now_ns;
-
-    for (const auto& [champion, challenger] : cc_strategy_pairs_) {
-        auto report = cc_engine_->evaluate(champion);
-        if (!report) continue;
-
-        const auto champ_str = std::string{champion.get()};
-        const auto chall_str = std::string{challenger.get()};
-
-        if (cc_engine_->should_promote(challenger)) {
-            logger_->warn("CC", "Challenger promoted — деактивируем champion",
-                {{"champion",   champ_str},
-                 {"challenger", chall_str}});
-            auto result = cc_engine_->promote(challenger);
-            if (result) {
-                auto strat = strategy_registry_->get(champion);
-                if (strat) {
-                    strat->set_active(false);
-                    logger_->info("CC", "Champion деактивирован",
-                        {{"strategy", champ_str}});
-                }
-            }
-
-        } else if (cc_engine_->should_reject(challenger)) {
-            logger_->warn("CC", "Challenger rejected — деактивируем challenger",
-                {{"champion",   champ_str},
-                 {"challenger", chall_str}});
-            auto result = cc_engine_->reject(challenger);
-            if (result) {
-                auto strat = strategy_registry_->get(challenger);
-                if (strat) {
-                    strat->set_active(false);
-                    logger_->info("CC", "Challenger деактивирован",
-                        {{"strategy", chall_str}});
-                }
-            }
-        }
-
-        for (const auto& entry : report->challengers) {
-            const auto& cm = entry.challenger_metrics;
-            logger_->info("CC", "Сводка C/C",
-                {{"champion",      champ_str},
-                 {"challenger",    chall_str},
-                 {"chall_net_pnl", std::to_string(cm.net_pnl_bps)},
-                 {"chall_hitrate", std::to_string(cm.hit_rate())},
-                 {"chall_dd",      std::to_string(cm.max_drawdown_bps)},
-                 {"trades",        std::to_string(cm.decision_count)},
-                 {"status",        champion_challenger::to_string(entry.status)}});
-        }
-    }
 }
 
 // ==================== Основной торговый цикл ====================
@@ -2312,15 +2029,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (advanced_features_) {
             advanced_features_->on_tick(snapshot.mid_price.get());
         }
-
-        // Обновляем shadow price tracking на каждом тике
-        if (shadow_engine_ && shadow_engine_->is_enabled()) {
-            shadow_engine_->update_price_tracking(symbol_, Price(snapshot.mid_price), clock_->now());
-            // Периодическая очистка зависших записей
-            if (tick_count_ % 100 == 0) {
-                shadow_engine_->cleanup_stale_records(clock_->now());
-            }
-        }
     }
 
     // 0.adv. Заполняем продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
@@ -2392,33 +2100,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         return;
     }
 
-    // 0c.gov. Governance Gate — проверяем разрешение control plane на торговлю.
-    // Стоп-лоссы проверяются раньше (0a) и обходят governance — экстренное закрытие
-    // имеет приоритет. Governance блокирует только новые входы и обычные сигналы.
-    if (governance_) {
-        // Определяем ID стратегии для governance gate
-        // (используем первую зарегистрированную стратегию или пустой ID для глобальной проверки)
-        auto gate_result = governance_->evaluate_trading_gate(StrategyId(""));
-        if (!gate_result.trading_allowed) {
-            if (tick_count_ % 200 == 0) {
-                logger_->info("pipeline",
-                    "Governance gate заблокировал торговлю",
-                    {{"reason", gate_result.denial_reason},
-                     {"halt_mode", governance::to_string(gate_result.current_halt)},
-                     {"incident", governance::to_string(gate_result.current_incident)},
-                     {"symbol", symbol_.get()}});
-            }
-            return;
-        }
-    }
+    // 0c.gov. — removed (governance module deleted)
 
-    // 0d. Alpha Decay: периодическая проверка деградации стратегий
-    check_alpha_decay_feedback();
-    check_champion_challenger_status();
-
-    // 0d.diag. Self-Diagnosis: moved after world/regime/uncertainty computation (see below)
-
-    // 0e. Периодическое обновление HTF индикаторов (каждый час или экстренно)
+    // 0d. Периодическое обновление HTF индикаторов (каждый час или экстренно)
     maybe_update_htf(snapshot);
 
     // 0g. Фильтр энтропии: блокируем торговлю при зашумлённом рынке
@@ -2547,27 +2231,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         print_status(snapshot, world, regime);
     }
 
-    // 4a. Self-Diagnosis: периодическая диагностика состояния системы
-    if (self_diagnosis_ && tick_count_ % 500 == 0) {
-        auto port_snap = portfolio_->snapshot();
-        double exposure_pct = port_snap.exposure.exposure_pct;
-        double drawdown_pct = port_snap.pnl.current_drawdown_pct;
-        bool kill_active = risk_engine_ && risk_engine_->is_kill_switch_active();
-
-        std::string w_str = std::string(to_string(world.label));
-        std::string r_str = std::string(to_string(regime.label));
-        std::string u_str = std::string(to_string(uncertainty.level));
-
-        auto diag = self_diagnosis_->diagnose_system_state(
-            w_str, r_str, u_str, exposure_pct, drawdown_pct, kill_active);
-
-        if (diag.severity >= self_diagnosis::DiagnosticSeverity::Warning) {
-            logger_->warn("pipeline", "Диагностика: " + diag.human_summary,
-                {{"severity", self_diagnosis::to_string(diag.severity)},
-                 {"action", self_diagnosis::to_string(diag.recommended_action)}});
-        }
-    }
-
     // 5. Высокая неопределённость — торговля приостановлена
     if (uncertainty.recommended_action == uncertainty::UncertaintyAction::NoTrade) {
         if (tick_count_ % 200 == 0) {
@@ -2576,71 +2239,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                  {"size_mult", std::to_string(uncertainty.size_multiplier)}});
         }
         return;
-    }
-
-    adversarial::DefenseAssessment adversarial_assessment;
-    if (adversarial_defense_) {
-        adversarial_assessment = adversarial_defense_->assess(
-            defense::build_market_condition(snapshot));
-
-        // Критичные действия (VetoTrade/Cooldown) логируем КАЖДЫЙ тик
-        const bool is_critical = (adversarial_assessment.overall_action == adversarial::DefenseAction::VetoTrade ||
-                                  adversarial_assessment.overall_action == adversarial::DefenseAction::Cooldown);
-
-        if (adversarial_assessment.overall_action != adversarial::DefenseAction::NoAction &&
-            (is_critical || tick_count_ % 100 == 0)) {
-            // Собираем все типы угроз
-            std::string threat_types;
-            for (const auto& t : adversarial_assessment.threats) {
-                if (!threat_types.empty()) threat_types += ",";
-                threat_types += adversarial::to_string(t.type);
-            }
-            const std::string top_reason = adversarial_assessment.threats.empty()
-                ? ""
-                : adversarial_assessment.threats.front().reason;
-
-            logger_->warn("adversarial", "Defense active",
-                {{"symbol", symbol_.get()},
-                 {"action", adversarial::to_string(adversarial_assessment.overall_action)},
-                 {"severity", std::to_string(adversarial_assessment.compound_severity)},
-                 {"regime", adversarial::to_string(adversarial_assessment.regime)},
-                 {"threats", threat_types},
-                 {"threat_count", std::to_string(adversarial_assessment.threats.size())},
-                 {"safe", adversarial_assessment.is_safe ? "true" : "false"},
-                 {"hysteresis", adversarial_assessment.hysteresis_active ? "on" : "off"},
-                 {"recovery", adversarial_assessment.in_recovery ? "yes" : "no"},
-                 {"conf_mult", std::to_string(adversarial_assessment.confidence_multiplier)},
-                 {"thr_mult", std::to_string(adversarial_assessment.threshold_multiplier)},
-                 {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)},
-                 {"reason", top_reason}});
-        }
-
-        // Периодическая диагностика adversarial defense (каждые 500 тиков)
-        if (tick_count_ % 500 == 0) {
-            auto diag = adversarial_defense_->get_diagnostics(symbol_, snapshot.computed_at);
-            auto cal = adversarial_defense_->get_calibration_metrics();
-            logger_->info("adversarial", "Диагностика adversarial defense",
-                {{"symbol", symbol_.get()},
-                 {"regime", adversarial::to_string(diag.regime)},
-                 {"baseline_warm", diag.baseline_warm ? "true" : "false"},
-                 {"baseline_samples", std::to_string(diag.baseline_samples)},
-                 {"spread_ema", std::to_string(diag.spread_ema)},
-                 {"depth_ema", std::to_string(diag.depth_ema)},
-                 {"hysteresis", diag.hysteresis_active ? "on" : "off"},
-                 {"corr_spread_depth", std::to_string(diag.spread_depth_correlation)},
-                 {"corr_spread_flow", std::to_string(diag.spread_flow_correlation)},
-                 {"fast_spread", std::to_string(diag.fast_spread_ema)},
-                 {"slow_spread", std::to_string(diag.slow_spread_ema)},
-                 {"total_assessments", std::to_string(cal.total_assessments)},
-                 {"veto_rate", std::to_string(cal.veto_rate)},
-                 {"veto_count", std::to_string(cal.veto_count)},
-                 {"avg_severity", std::to_string(cal.avg_compound_severity)}});
-        }
-
-        if (!portfolio_->has_position(symbol_) &&
-            adversarial_assessment.overall_action == adversarial::DefenseAction::VetoTrade) {
-            return;
-        }
     }
 
     // 6. Аллокация стратегий по текущему режиму
@@ -2683,6 +2281,25 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         ctx.uncertainty_size_multiplier = uncertainty.size_multiplier;
         ctx.uncertainty_threshold_multiplier = uncertainty.threshold_multiplier;
         ctx.futures_enabled = config_.futures.enabled;
+
+        // Strategy Engine: передаём позицию и системное состояние
+        ctx.position.has_position = has_long_position || has_short_position;
+        if (ctx.position.has_position) {
+            auto port_snap = portfolio_->snapshot();
+            for (const auto& pos : port_snap.positions) {
+                if (pos.symbol.get() == symbol_.get()) {
+                    ctx.position.side = pos.side;
+                    ctx.position.position_side = (pos.side == Side::Buy) ? PositionSide::Long : PositionSide::Short;
+                    ctx.position.size = pos.size.get();
+                    ctx.position.avg_entry_price = pos.avg_entry_price.get();
+                    ctx.position.unrealized_pnl = pos.unrealized_pnl;
+                    ctx.position.entry_time_ns = position_entry_time_ns_;
+                    break;
+                }
+            }
+        }
+        ctx.data_fresh = snapshot.execution_context.is_feed_fresh;
+        ctx.exchange_ok = true; // при отключении WebSocket pipeline не вызывается
 
         auto intent = strat->evaluate(ctx);
         if (intent.has_value()) {
@@ -2727,34 +2344,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     if (intents.empty()) return;
 
-    // 7.5. AI Advisory: оценка рыночных условий
-    std::optional<ai::AIAdvisoryResult> ai_result;
-    if (ai_advisory_ && ai_advisory_->is_available()) {
-        ai_result = ai_advisory_->get_advisories(snapshot);
-
-        if (ai_result && !ai_result->empty()) {
-            // Логируем всегда при наличии advisory (не только каждые 100 тиков)
-            auto state_str = ai::to_string(ai_result->advisory_state);
-            if (ai_result->advisory_state != ai::AdvisoryState::Clear) {
-                logger_->warn("pipeline", "AI Advisory: активное предупреждение",
-                    {{"state", state_str},
-                     {"advisories", std::to_string(ai_result->count())},
-                     {"ensemble_count", std::to_string(ai_result->ensemble_count)},
-                     {"total_adj", std::to_string(ai_result->total_confidence_adjustment)},
-                     {"max_severity", std::to_string(ai_result->max_severity)},
-                     {"size_mult", std::to_string(ai_result->advisory_size_multiplier)},
-                     {"has_veto", ai_result->has_veto ? "true" : "false"}});
-            } else if (tick_count_ % 100 == 0) {
-                logger_->debug("pipeline", "AI Advisory: состояние clear",
-                    {{"advisories", std::to_string(ai_result->count())},
-                     {"max_severity", std::to_string(ai_result->max_severity)}});
-            }
-        }
-    }
-
     // 8. Агрегация решений комитетом (с portfolio/features context)
     auto decision = decision_engine_->aggregate(
-        symbol_, intents, allocation, regime, world, uncertainty, ai_result,
+        symbol_, intents, allocation, regime, world, uncertainty,
         portfolio_->snapshot(), snapshot);
 
     if (!decision.trade_approved || !decision.final_intent.has_value()) {
@@ -2764,18 +2356,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                  {"trade_approved", decision.trade_approved ? "true" : "false"},
                  {"has_intent", decision.final_intent.has_value() ? "true" : "false"},
                  {"rationale", decision.rationale}});
-        }
-
-        // Self-Diagnosis: объясняем отказ (каждые 200 тиков, чтобы не спамить)
-        if (self_diagnosis_ && tick_count_ % 200 == 0) {
-            std::string w_str = std::string(to_string(world.label));
-            std::string r_str = std::string(to_string(regime.label));
-            std::string u_str = std::string(to_string(uncertainty.level));
-            risk::RiskDecision empty_risk;
-            empty_risk.verdict = risk::RiskVerdict::Denied;
-            empty_risk.summary = "Комитет не одобрил сигнал: " + decision.rationale;
-            (void)self_diagnosis_->explain_denial(
-                decision, empty_risk, w_str, r_str, u_str);
         }
         return;
     }
@@ -2818,36 +2398,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         ml_snapshot_.bayesian_status = bayesian_adapter_->status();
     }
 
-    // 8b. Alpha Decay: проверка порога conviction с учётом деградации per-strategy
+    // 8b. Проверка порога conviction
     {
-        // Берём per-strategy adj для текущей стратегии (или глобальный как fallback)
-        double strategy_thresh_adj = alpha_decay_threshold_adj_;
-        {
-            const auto& sid = intent.strategy_id.get();
-            auto it = alpha_decay_threshold_adj_per_strategy_.find(sid);
-            if (it != alpha_decay_threshold_adj_per_strategy_.end()) {
-                strategy_thresh_adj = it->second;
-            }
-        }
         double effective_threshold = config_.decision.min_conviction_threshold
-                                   + strategy_thresh_adj
                                    + bayesian_conviction_adj;
-
-        if (adversarial_defense_) {
-            // ИСПРАВЛЕНИЕ: Не caps threshold_multiplier — доверяем adversarial defense.
-            // Система уже откалибрована для micro-cap (veto порог 0.93, soft actions).
-            // Старый cap к 1.1x игнорировал защиту: thr_mult=2.5 → 1.1 (бесполезно).
-            effective_threshold = effective_threshold * adversarial_assessment.threshold_multiplier;
-
-            // Regime-aware: в токсичных условиях слегка ужесточаем
-            // Примечание: micro-cap монеты часто показывают "Toxic" из-за
-            // aggressive_flow=1.0, что нормально для low-liquidity активов
-            if (adversarial_assessment.regime == adversarial::MarketRegime::Toxic) {
-                effective_threshold += 0.01;
-            } else if (adversarial_assessment.regime == adversarial::MarketRegime::LowLiquidity) {
-                effective_threshold += 0.01;
-            }
-        }
 
         // Абсолютный потолок — conviction шкала [0, 1]
         effective_threshold = std::min(effective_threshold, 0.90);
@@ -2878,21 +2432,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             if (tick_count_ % 200 == 0) {
                 logger_->warn("pipeline", "RSI EXTREME: SELL заблокирован (RSI<8)",
                     {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
-                     {"strategy", intent.strategy_id.get()},
-                     {"symbol", symbol_.get()}});
-            }
-            return;
-        }
-
-        // Adversarial hard veto: ТОЛЬКО при severity >= 0.96 (экстремально токсичные условия)
-        if (adversarial_defense_ &&
-            adversarial_assessment.regime == adversarial::MarketRegime::Toxic &&
-            adversarial_assessment.compound_severity >= 0.96) {
-            if (tick_count_ % 200 == 0) {
-                logger_->warn("pipeline",
-                    "ADVERSARIAL VETO: заблокировано в экстремально токсичном режиме",
-                    {{"severity", std::to_string(adversarial_assessment.compound_severity)},
-                     {"conviction", std::to_string(intent.conviction)},
                      {"strategy", intent.strategy_id.get()},
                      {"symbol", symbol_.get()}});
             }
@@ -2932,16 +2471,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             (intent.side == Side::Sell && htf_trend_direction_ == -1)) {
             reward_distance *= 1.3;
         }
-        // ADX-based adjustment: reward зависит от типа стратегии
+        // ADX-based adjustment: low ADX = ranging = less directional edge
         if (snapshot.technical.adx_valid && snapshot.technical.adx < 20.0) {
-            // Mean reversion и VWAP reversion ВЫИГРЫВАЮТ от low ADX (ranging)
-            auto sid = intent.strategy_id.get();
-            if (sid == "mean_reversion" || sid == "vwap_reversion" ||
-                sid == "volume_profile" || sid == "rsi_divergence") {
-                reward_distance *= 1.10; // +10% в ranging — MR edge сильнее
-            } else {
-                reward_distance *= 0.85; // Тренд-стратегии: мягкий штраф
-            }
+            reward_distance *= 0.90; // Mild penalty in ranging for scalping
         }
         
         double rr_ratio = (risk_distance > 0.0) ? (reward_distance / risk_distance) : 0.0;
@@ -2996,6 +2528,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         if (thompson_action == ml::EntryAction::Skip) {
             // Пропускаем сигнал полностью
+            consecutive_wait1_count_ = 0;
             if (tick_count_ % 200 == 0) {
                 logger_->debug("pipeline",
                     "Thompson Sampling: сигнал пропущен",
@@ -3005,6 +2538,22 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         if (wait > 0) {
+            // Track consecutive waits for rotation trigger
+            ++consecutive_wait1_count_;
+            if (consecutive_wait1_count_ >= kMaxConsecutiveWait1) {
+                // Thompson repeatedly says Wait — market uncertain for this pair.
+                // Force pipeline idle so main.cpp rotation thread picks a new pair.
+                last_activity_ns_.store(0, std::memory_order_relaxed);
+                logger_->warn("pipeline",
+                    "Thompson Wait1 спам: " + std::to_string(consecutive_wait1_count_) +
+                    "× подряд — pipeline помечен как idle для ротации пары",
+                    {{"consecutive_wait1", std::to_string(consecutive_wait1_count_)},
+                     {"threshold", std::to_string(kMaxConsecutiveWait1)},
+                     {"symbol", symbol_.get()}});
+                consecutive_wait1_count_ = 0;
+                return;
+            }
+
             // Откладываем вход на N тиков
             PendingEntry pe;
             pe.intent = intent;
@@ -3019,6 +2568,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             return;
         }
         // EnterNow — продолжаем немедленно
+        consecutive_wait1_count_ = 0;
     }
     ml_snapshot_.compute_aggregates();
 
@@ -3270,19 +2820,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         intent.snapshot_mid_price = snapshot.mid_price;
     }
 
-    if (adversarial_defense_ && !is_closing_position &&
-        adversarial_assessment.overall_action == adversarial::DefenseAction::VetoTrade) {
-        logger_->warn("adversarial", "Вход заблокирован (VetoTrade)",
-            {{"symbol", symbol_.get()},
-             {"action", adversarial::to_string(adversarial_assessment.overall_action)},
-             {"severity", std::to_string(adversarial_assessment.compound_severity)},
-             {"regime", adversarial::to_string(adversarial_assessment.regime)},
-             {"hysteresis", adversarial_assessment.hysteresis_active ? "on" : "off"},
-             {"pct_severity", std::to_string(adversarial_assessment.percentile_severity)},
-             {"cooldown_ms", std::to_string(adversarial_assessment.cooldown_remaining_ms)}});
-        return;
-    }
-
     risk::RiskDecision risk_decision;
     risk_decision.decided_at = clock_->now();
 
@@ -3439,69 +2976,17 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 realized_vol_annual = snapshot.technical.volatility_20 * std::sqrt(525600.0);
             }
 
-            // Реальные win_rate/win_loss_ratio из alpha_decay_monitor (HitRate dimension)
+            // Реальные win_rate/win_loss_ratio (default values)
             double win_rate = 0.5;
             double win_loss_ratio = 1.5;
-            {
-                auto reports = alpha_decay_monitor_->get_all_reports();
-                if (!reports.empty()) {
-                    // Fix: извлекаем реальный HitRate из метрик alpha decay
-                    double sum_hit_rate = 0.0;
-                    int count = 0;
-                    for (const auto& r : reports) {
-                        for (const auto& m : r.metrics) {
-                            if (m.dimension == alpha_decay::DecayDimension::HitRate) {
-                                sum_hit_rate += m.current_value;
-                                ++count;
-                                break;
-                            }
-                        }
-                    }
-                    if (count > 0) {
-                        win_rate = std::clamp(sum_hit_rate / count, 0.3, 0.75);
-                    } else {
-                        // Fallback: health как прокси, пока нет достаточно данных
-                        double total_health = 0.0;
-                        for (const auto& r : reports) total_health += r.overall_health;
-                        double avg_health = total_health / static_cast<double>(reports.size());
-                        win_rate = 0.35 + avg_health * 0.20;
-                    }
-                    // win_loss_ratio из Expectancy / HitRate
-                    double sum_health = 0.0;
-                    for (const auto& r : reports) sum_health += r.overall_health;
-                    win_loss_ratio = 1.0 + (sum_health / reports.size()) * 0.5;
-                }
-            }
 
             portfolio_allocator_->set_market_context(
                 realized_vol_annual, regime.detailed, win_rate, win_loss_ratio);
         }
 
-        // Adversarial defense: confidence + recovery penalty
-        double adversarial_size_mult = 1.0;
-        if (adversarial_defense_) {
-            adversarial_size_mult = adversarial_assessment.confidence_multiplier;
-            // В режиме восстановления после шока — дополнительное ограничение размера
-            if (adversarial_assessment.in_recovery) {
-                adversarial_size_mult = std::min(adversarial_size_mult, 0.5);
-            }
-        }
-
-        // Combined size multiplier — per-strategy из alpha decay, floor at 0.60 для малых счетов
-        // advisory_size_multiplier: 1.0=clear, 0.5=caution, 0.0=veto (veto already blocked above)
-        double strategy_decay_mult = 1.0;
-        {
-            const auto& sid = intent.strategy_id.get();
-            auto it = alpha_decay_size_mult_per_strategy_.find(sid);
-            if (it != alpha_decay_size_mult_per_strategy_.end()) {
-                strategy_decay_mult = it->second;
-            }
-        }
+        // Combined size multiplier
         double combined_size_mult = uncertainty.size_multiplier *
-                strategy_decay_mult *
-                correlation_risk_mult *
-                adversarial_size_mult *
-                decision.advisory_size_multiplier;
+                correlation_risk_mult;
         if (config_.trading.initial_capital < 100.0) {
             combined_size_mult = std::max(combined_size_mult, 0.80);
         }
@@ -3523,23 +3008,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             logger_->warn("pipeline", "Сделка отклонена риск-движком",
                 {{"verdict", risk::to_string(risk_decision.verdict)},
                  {"reasons", std::to_string(risk_decision.reasons.size())}});
-
-            // Self-Diagnosis: объясняем отклонение риском
-            if (self_diagnosis_) {
-                std::string w_str = std::string(to_string(world.label));
-                std::string r_str = std::string(to_string(regime.label));
-                std::string u_str = std::string(to_string(uncertainty.level));
-                (void)self_diagnosis_->explain_denial(
-                    decision, risk_decision, w_str, r_str, u_str);
-            }
             return;
         }
     }
-
-    // Записываем в shadow подсистему
-    record_shadow_decision(intent,
-        risk_decision.verdict == risk::RiskVerdict::Approved ? "Approved" : "Denied",
-        risk_decision.verdict == risk::RiskVerdict::Approved);
 
     // 11a. Smart TWAP: разбиваем крупные ордера на слайсы.
     // Execution Alpha является основным арбитром: если он рекомендует нарезку
@@ -3574,7 +3045,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         lev_ctx.uncertainty = uncertainty.level;
         lev_ctx.atr_normalized = atr_normalized;
         lev_ctx.drawdown_pct = portfolio_->snapshot().pnl.current_drawdown_pct;
-        lev_ctx.adversarial_severity = adversarial_assessment.compound_severity;
+        lev_ctx.adversarial_severity = 0.0;  // adversarial module removed
         lev_ctx.conviction = intent.conviction;
         lev_ctx.funding_rate = current_funding_rate_;
         lev_ctx.position_side = intent.position_side;
@@ -3636,15 +3107,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
              {"symbol", symbol_.get()},
              {"conviction", std::to_string(intent.conviction)}});
 
-        // Self-Diagnosis: регистрируем успешное исполнение
-        if (self_diagnosis_) {
-            std::string w_str = std::string(to_string(world.label));
-            std::string r_str = std::string(to_string(regime.label));
-            std::string u_str = std::string(to_string(uncertainty.level));
-            (void)self_diagnosis_->explain_trade(
-                decision, risk_decision, w_str, r_str, u_str);
-        }
-
         // Инициализация trailing stop при открытии новой позиции
         // Фьючерсы: открытие = trade_side==Open (и Long, и Short)
         // Спот: открытие = side==Buy
@@ -3684,10 +3146,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             : (intent.side == Side::Sell && is_closing_position);
 
         if (is_position_close) {
-            record_trade_for_decay(current_position_strategy_,
-                closing_pnl,
-                current_position_conviction_);
-
             // Записываем результат fingerprint и байесовское наблюдение
             if (fingerprinter_ && last_entry_fingerprint_) {
                 double norm_pnl = (closing_pnl > 0) ? 1.0 : -1.0;
@@ -3727,13 +3185,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
              {"symbol", symbol_.get()},
              {"consecutive_rejections", std::to_string(consecutive_rejections_)},
              {"backoff_sec", std::to_string(backoff / 1'000'000'000LL)}});
-
-        // Self-Diagnosis: диагностика ошибки исполнения
-        if (self_diagnosis_) {
-            (void)self_diagnosis_->diagnose_execution_failure(
-                symbol_, intent.strategy_id, decision.correlation_id,
-                "Ордер отклонён биржей", consecutive_rejections_);
-        }
     }
 }
 
@@ -3787,32 +3238,26 @@ void TradingPipeline::print_status(
          {"positions", std::to_string(portfolio_->snapshot().exposure.open_positions_count)}});
 }
 
-void TradingPipeline::record_shadow_decision(
-    const strategy::TradeIntent& intent,
-    const std::string& risk_verdict,
-    bool would_have_been_live)
-{
-    if (!shadow_engine_ || !shadow_engine_->is_enabled()) return;
+void TradingPipeline::update_current_mae(double current_price, bool is_long) {
+    if (current_price <= 0.0) return;
+    // MAE в бп относительно цены входа
+    double entry = 0.0;
+    auto pos = portfolio_->get_position(symbol_);
+    if (pos.has_value() && pos->avg_entry_price.get() > 0.0) {
+        entry = pos->avg_entry_price.get();
+    }
+    if (entry <= 0.0) return;
 
-    shadow::ShadowDecision decision;
-    decision.correlation_id = intent.correlation_id;
-    decision.strategy_id = intent.strategy_id;
-    decision.symbol = intent.symbol;
-    decision.side = intent.side;
-    decision.signal_intent = (intent.side == Side::Buy)
-        ? shadow::SignalIntent::LongEntry
-        : shadow::SignalIntent::LongExit;
-    decision.quantity = intent.suggested_quantity;
-    decision.intended_price = intent.limit_price.value_or(Price(0.0));
-    decision.conviction = intent.conviction;
-    decision.decided_at = clock_->now();
-    decision.risk_verdict = risk_verdict;
-    decision.would_have_been_live = would_have_been_live;
-
-    auto result = shadow_engine_->record_decision(std::move(decision));
-    if (!result.has_value()) {
-        logger_->debug("pipeline", "Shadow decision not recorded",
-            {{"reason", "disabled or kill_switch"}});
+    double adverse_bps = 0.0;
+    if (is_long) {
+        // Для лонга: неблагоприятное движение = цена ниже входа
+        adverse_bps = (entry - current_price) / entry * 10000.0;
+    } else {
+        // Для шорта: неблагоприятное движение = цена выше входа
+        adverse_bps = (current_price - entry) / entry * 10000.0;
+    }
+    if (adverse_bps > current_max_adverse_excursion_bps_) {
+        current_max_adverse_excursion_bps_ = adverse_bps;
     }
 }
 

@@ -13,7 +13,7 @@
  */
 
 #include "bitget_rest_client.hpp"
-#include "execution/execution_engine.hpp"
+#include "execution/order_submitter.hpp"
 #include "common/exchange_rules.hpp"
 #include "config/config_types.hpp"
 #include <memory>

@@ -29,9 +29,6 @@ static AppConfig make_valid_config() {
     cfg.metrics.port    = 9090;
     cfg.metrics.path    = "/metrics";
 
-    cfg.health.enabled = true;
-    cfg.health.port    = 8080;
-
     cfg.risk.max_position_notional       = 1000.0;
     cfg.risk.max_daily_loss_pct          = 2.0;
     cfg.risk.max_drawdown_pct            = 5.0;

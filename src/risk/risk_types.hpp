@@ -5,131 +5,245 @@
 
 namespace tb::risk {
 
-/// Решение риск-движка
+// ═══════════════════════════════════════════════════════════════
+// Enums
+// ═══════════════════════════════════════════════════════════════
+
+/// Решение риск-движка (legacy-совместимый вердикт)
 enum class RiskVerdict {
-    Approved,       ///< Одобрено
-    Denied,         ///< Отклонено
-    ReduceSize,     ///< Одобрено с уменьшенным размером
-    Throttled       ///< Отложено (ограничение частоты)
+    Approved,
+    Denied,
+    ReduceSize,
+    Throttled
+};
+
+/// Расширенное действие риск-движка (policy-based)
+enum class RiskAction {
+    Allow,
+    AllowWithReducedSize,
+    Deny,
+    DenySymbolLock,
+    DenyStrategyLock,
+    DenyDayLock,
+    DenyAccountLock,
+    EmergencyHalt,
+    ForceReduce,
+    ForceLiquidate
 };
 
 /// Фаза оценки риска
 enum class RiskPhase {
-    PreTrade,      ///< Перед отправкой ордера
-    IntraTrade,    ///< Мониторинг открытой позиции
-    PostTrade      ///< После закрытия сделки
+    PreTrade,
+    IntraTrade,
+    PostTrade
 };
+
+/// Глобальный уровень состояния риска
+enum class RiskStateLevel {
+    Normal,
+    Degraded,
+    DayLock,
+    SymbolLock,
+    StrategyLock,
+    AccountLock,
+    EmergencyHalt
+};
+
+/// Тип блокировки
+enum class LockType {
+    SymbolLock,
+    StrategyLock,
+    DayLock,
+    AccountLock,
+    EmergencyHalt,
+    Cooldown
+};
+
+// ═══════════════════════════════════════════════════════════════
+// DTOs
+// ═══════════════════════════════════════════════════════════════
 
 /// Причина решения риск-движка
 struct RiskReasonCode {
-    std::string code;        ///< Код причины ("MAX_DAILY_LOSS", "STALE_FEED", ...)
-    std::string message;     ///< Человекочитаемое сообщение
-    double severity{0.0};    ///< Серьёзность [0=предупреждение, 1=абсолютный отказ]
+    std::string code;
+    std::string message;
+    double severity{0.0};    ///< [0=предупреждение, 1=абсолютный отказ]
 };
 
-/// Полное решение риск-движка
+/// Запись о блокировке
+struct LockRecord {
+    LockType type{LockType::Cooldown};
+    std::string target;      ///< Символ / стратегия / "" для аккаунта
+    std::string reason;
+    Timestamp activated_at{Timestamp(0)};
+    int64_t duration_ns{0};  ///< 0 = бессрочная
+};
+
+/// Полное решение риск-движка (расширенное policy-based)
 struct RiskDecision {
+    // === Legacy-совместимые поля ===
     RiskVerdict verdict{RiskVerdict::Denied};
-    std::vector<RiskReasonCode> reasons;
-    Quantity approved_quantity{Quantity(0.0)};   ///< Одобренный размер (может быть уменьшен)
-    double risk_utilization_pct{0.0};            ///< Текущая утилизация лимитов [0,1]
-    bool kill_switch_active{false};               ///< Аварийный выключатель активен?
+    Quantity approved_quantity{Quantity(0.0)};
+    double risk_utilization_pct{0.0};
+    bool kill_switch_active{false};
     Timestamp decided_at{Timestamp(0)};
     std::string summary;
-    RiskPhase phase{RiskPhase::PreTrade};                   ///< Фаза оценки
-    double regime_scaling_factor{1.0};                      ///< Текущий множитель лимитов по режиму
-    double strategy_budget_utilization_pct{0.0};            ///< Утилизация бюджета стратегии (%)
-    double symbol_concentration_pct{0.0};                   ///< Концентрация символа (%)
+    RiskPhase phase{RiskPhase::PreTrade};
+    double regime_scaling_factor{1.0};
+    double strategy_budget_utilization_pct{0.0};
+    double symbol_concentration_pct{0.0};
+
+    // === Расширенные поля (policy-based) ===
+    RiskAction action{RiskAction::Deny};
+    bool allowed{false};
+    Quantity original_size{Quantity(0.0)};
+    RiskStateLevel risk_state{RiskStateLevel::Normal};
+
+    std::vector<std::string> triggered_checks;
+    std::vector<std::string> warnings;
+    std::vector<std::string> hard_blocks;
+
+    // Структурированные причины
+    std::vector<RiskReasonCode> reasons;
+
+    // Аудит
+    double current_daily_pnl{0.0};
+    double current_drawdown_pct{0.0};
+    double current_gross_exposure{0.0};
+    int active_locks_count{0};
 };
 
-/// Бюджет риска одной стратегии (runtime state)
+/// Бюджет риска одной стратегии
 struct StrategyRiskBudget {
     StrategyId strategy_id{StrategyId("")};
-    double daily_loss{0.0};           ///< Реализованный убыток за день (USD)
-    double daily_loss_pct{0.0};       ///< То же в % от капитала
-    double current_exposure{0.0};     ///< Текущая экспозиция (USD)
-    int trades_today{0};              ///< Количество сделок за день
-    int consecutive_losses{0};        ///< Серия убытков подряд
+    double daily_loss{0.0};
+    double daily_loss_pct{0.0};
+    double current_exposure{0.0};
+    int trades_today{0};
+    int consecutive_losses{0};
     Timestamp last_trade_at{Timestamp(0)};
 };
 
-/// Снимок состояния риск-движка для observability
+/// Снимок состояния риск-движка
 struct RiskSnapshot {
-    double total_risk_utilization{0.0};      ///< Общая утилизация [0,1]
-    double daily_loss_pct{0.0};              ///< Текущий дневной убыток (%)
-    double current_drawdown_pct{0.0};        ///< Текущая просадка (%)
-    int open_positions{0};                    ///< Открытые позиции
-    double gross_exposure_pct{0.0};          ///< Валовая экспозиция (%)
+    double total_risk_utilization{0.0};
+    double daily_loss_pct{0.0};
+    double current_drawdown_pct{0.0};
+    int open_positions{0};
+    double gross_exposure_pct{0.0};
     bool kill_switch_active{false};
-    double regime_scaling_factor{1.0};        ///< Текущий множитель лимитов по режиму
-    int rules_triggered{0};                   ///< Кол-во сработавших правил (за последний evaluate)
-    std::vector<StrategyRiskBudget> strategy_budgets; ///< Бюджеты стратегий
+    double regime_scaling_factor{1.0};
+    int rules_triggered{0};
+    RiskStateLevel global_state{RiskStateLevel::Normal};
+    std::vector<StrategyRiskBudget> strategy_budgets;
+    std::vector<LockRecord> active_locks;
     Timestamp computed_at{Timestamp(0)};
 };
 
 /// Результат intra-trade мониторинга позиции
 struct IntraTradeAssessment {
     Symbol symbol{Symbol("")};
-    bool should_close{false};               ///< Рекомендация закрыть позицию
-    bool should_reduce{false};              ///< Рекомендация уменьшить позицию
-    double reduce_fraction{0.0};            ///< На сколько уменьшить [0,1]
+    bool should_close{false};
+    bool should_reduce{false};
+    double reduce_fraction{0.0};
     std::vector<RiskReasonCode> reasons;
     Timestamp assessed_at{Timestamp(0)};
 };
 
-/// Расширенная конфигурация рисков (поверх config::RiskConfig)
+/// Конфигурация лимитов риска (полная)
 struct ExtendedRiskConfig {
-    double max_position_notional{10000.0};    ///< Макс номинал одной позиции (USD)
-    double max_daily_loss_pct{2.0};           ///< Макс дневной убыток (% капитала)
-    double max_drawdown_pct{5.0};             ///< Макс просадка (% капитала)
-    double max_loss_per_trade_pct{1.0};       ///< Макс убыток на одну сделку (% капитала) [ТЗ]
-    int max_concurrent_positions{5};          ///< Макс одновременных позиций
-    double max_gross_exposure_pct{50.0};      ///< Макс валовая экспозиция (% капитала)
-    double max_leverage{3.0};                 ///< Макс плечо
-    double max_slippage_bps{30.0};            ///< Макс проскальзывание (бп)
-    int max_orders_per_minute{10};            ///< Макс ордеров в минуту
-    int max_consecutive_losses{5};            ///< Макс подряд убыточных сделок
-    double max_spread_bps{50.0};              ///< Макс спред для торговли (бп)
-    double min_liquidity_depth{100.0};        ///< Мин ликвидность (единицы актива)
-    int64_t max_feed_age_ns{5'000'000'000LL}; ///< Макс возраст данных (5 сек)
-    int utc_cutoff_hour{-1};                  ///< Час UTC для прекращения торговли (-1 = отключено)
+    // === Per-trade ===
+    double max_position_notional{10000.0};
+    double max_risk_per_trade_pct{2.0};
+    double max_risk_per_trade_abs{200.0};
+    double max_loss_per_trade_pct{1.0};
+    double max_leverage{3.0};
+    double max_slippage_bps{30.0};
+
+    // === Per-symbol ===
+    double max_position_notional_per_symbol{10000.0};
+    double max_daily_loss_per_symbol_abs{500.0};
+    double max_daily_loss_per_symbol_pct{3.0};
+    int max_consecutive_losses_per_symbol{3};
+    int64_t symbol_cooldown_after_stopouts_ns{120'000'000'000LL}; // 2 мин
+
+    // === Per-strategy ===
+    double max_strategy_daily_loss_pct{1.5};
+    double max_strategy_drawdown_pct{5.0};
+    double max_strategy_exposure_pct{30.0};
+    int max_positions_per_strategy{3};
+
+    // === Daily ===
+    double max_daily_loss_pct{2.0};
+    double max_daily_loss_abs{500.0};
+    double max_realized_daily_loss_pct{1.5};
+    int max_daily_stopouts{5};
+
+    // === Drawdown ===
+    double max_drawdown_pct{5.0};
+    double max_intraday_drawdown_pct{3.0};
+    double drawdown_hard_stop_pct{10.0};
+
+    // === Positions ===
+    int max_concurrent_positions{5};
+    int max_simultaneous_long_positions{3};
+    int max_simultaneous_short_positions{3};
+
+    // === Exposure ===
+    double max_gross_exposure_pct{50.0};
+    double max_net_directional_exposure_pct{30.0};
+    double max_symbol_concentration_pct{35.0};
+
+    // === Consecutive losses ===
+    int max_consecutive_losses{5};
+    int cooldown_after_n_losses{3};
+    int64_t loss_cooldown_ns{60'000'000'000LL};  // 60с
+    int halt_after_n_losses{8};
+
+    // === Market conditions ===
+    double max_spread_bps{50.0};
+    double min_liquidity_depth{100.0};
+    int64_t max_feed_age_ns{5'000'000'000LL};  // 5с
+
+    // === Rate limiting ===
+    int max_orders_per_minute{10};
+    int max_trades_per_hour{8};
+    int64_t min_trade_interval_ns{30'000'000'000LL}; // 30с
+
+    // === Regime-aware ===
+    bool regime_aware_limits_enabled{true};
+    double stress_regime_scale{0.5};
+    double trending_regime_scale{1.2};
+    double chop_regime_scale{0.7};
+
+    // === Intra-trade ===
+    double max_adverse_excursion_pct{3.0};
+    int64_t max_position_hold_ns{3'600'000'000'000LL}; // 1 час
+    int64_t post_loss_cooldown_ns{60'000'000'000LL};   // 60с
+
+    // === Kill switch ===
     bool kill_switch_enabled{true};
+    bool kill_switch_on_data_stale{true};
+    bool kill_switch_on_position_mismatch{true};
 
-    // === Per-strategy risk budgets ===
-    double max_strategy_daily_loss_pct{1.5};     ///< Макс дневной убыток одной стратегии (% капитала)
-    double max_strategy_exposure_pct{30.0};      ///< Макс экспозиция одной стратегии (% капитала)
+    // === Directional / same-direction ===
+    int max_same_direction_positions{3};
 
-    // === Per-symbol concentration ===
-    double max_symbol_concentration_pct{35.0};   ///< Макс доля капитала на один символ (%)
+    // === UTC cutoff ===
+    int utc_cutoff_hour{-1};
 
-    // === Correlated positions ===
-    int max_same_direction_positions{3};          ///< Макс позиций в одном направлении
-
-    // === Regime-aware dynamic limits ===
-    bool regime_aware_limits_enabled{true};       ///< Включить адаптацию лимитов по режиму
-    double stress_regime_scale{0.5};              ///< Множитель лимитов в стрессовых режимах
-    double trending_regime_scale{1.2};            ///< Множитель лимитов в трендовых режимах
-    double chop_regime_scale{0.7};                ///< Множитель лимитов в боковых режимах
-
-    // === Turnover / churn control ===
-    int max_trades_per_hour{8};                   ///< Макс закрытых сделок в час
-    int64_t min_trade_interval_ns{30'000'000'000LL}; ///< Мин интервал между сделками одного символа (30с)
-
-    // === Intra-trade monitoring ===
-    double max_adverse_excursion_pct{3.0};        ///< Макс неблагоприятное отклонение (% капитала)
-    int64_t max_position_hold_ns{3'600'000'000'000LL}; ///< Макс удержание позиции (1 час)
-
-    // === Post-trade cooldown ===
-    int64_t post_loss_cooldown_ns{60'000'000'000LL}; ///< Кулдаун после убыточной сделки (60с)
-
-    // === Realized vs unrealized split ===
-    double max_realized_daily_loss_pct{1.5};      ///< Макс реализованный дневной убыток (%)
+    // === Fail-safe ===
+    bool allow_reduce_only_in_halt{true};
 };
 
-/// Преобразование вердикта в строку
-std::string to_string(RiskVerdict verdict);
+// ═══════════════════════════════════════════════════════════════
+// to_string
+// ═══════════════════════════════════════════════════════════════
 
-/// Преобразование фазы риска в строку
+std::string to_string(RiskVerdict verdict);
 std::string to_string(RiskPhase phase);
+std::string to_string(RiskAction action);
+std::string to_string(RiskStateLevel level);
+std::string to_string(LockType type);
 
 } // namespace tb::risk

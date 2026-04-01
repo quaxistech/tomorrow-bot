@@ -1,741 +1,133 @@
-# Tomorrow Bot — Adaptive Futures Trading System
+# Tomorrow Bot
 
-Производственная адаптивная торговая система для фьючерсов USDT-M на бирже Bitget.
-Написана на C++23, развёртывается на Ubuntu 24.04.
+Адаптивная алгоритмическая торговая система для фьючерсов USDT-M на бирже Bitget.
+C++23, скальпинг-стратегия, полный цикл от сканирования пар до исполнения ордеров.
 
-**Версия**: 1.0.0 | **Статус**: Production | **Тесты**: 614 | **Модули**: 49 | **Код**: 52K+ строк
-
----
-
-## Обзор
-
-Tomorrow Bot — модульная система алгоритмической торговли полного цикла
-для фьючерсов USDT-M с адаптивным кредитным плечом (5×–20×):
-от автоматического выбора лучшей торговой пары и загрузки исторических данных,
-через анализ рынка на нескольких таймфреймах, до исполнения ордеров через REST API.
-Поддержка hedge mode, isolated margin, dynamic leverage.
-Акцент на безопасность, наблюдаемость, воспроизводимость и адаптивность.
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│   PairScanner (Bitget REST API) — выбор лучших торговых пар         │
-│     анализ объёма, спреда, волатильности → top-N пар                │
-│     ротация каждые 24 часа                                         │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│   Bootstrap: загрузка истории                                       │
-│     200 × 1m свечей (3+ часа) — прогрев индикаторов                │
-│     200 × 1h свечей (8+ дней) — HTF тренд-анализ                   │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│   Bitget WebSocket (wss://ws.bitget.com/v2/ws/public)               │
-│     ticker · trade · books · candle1m · candle5m                    │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           ▼
-    MarketDataGateway → Normalizer → FeatureEngine
-                                        │
-              ┌─────────────────────────┬┴──────────────────────┐
-              ▼                         ▼                       ▼
-        WorldModel              RegimeEngine           UncertaintyEngine
-              │                         │                       │
-              └──────────┬──────────────┘                       │
-                         ▼                                      │
-    AdvancedFeatureEngine (CUSUM, VPIN, VolumeProfile, ToD)     │
-                         │                                      │
-              StrategyAllocator ←────────────────────────────────┘
-                         │
-          ┌──────────────┼──────────────────────────────┐
-          ▼              ▼              ▼        ▼       ▼
-      Momentum    MeanReversion    Breakout   Scalp  VolExpansion
-          │              │              │        │       │
-          └──────────────┴──────┬───────┴────────┘       │
-                                ▼                        │
-              DecisionAggregationEngine ←────────────────┘
-                                │
-                       ┌────────┤
-                       ▼        ▼
-              HTF Trend Filter · Market Readiness Gate
-                       │
-                       ▼
-              ML Layer (Entropy Filter, Fingerprint, Cascade, Correlation)
-                       │
-                       ▼
-              Bayesian Adaptation · Thompson Sampling Entry Timing
-                       │
-                    ┌──┴────────┬───────────┐
-                    ▼           ▼           ▼
-            ExecutionAlpha  OpportunityCost  PortfolioAllocator
-                    │           │           │
-                    └───────────┴─────┬─────┘
-                                      ▼
-                        Chandelier Exit / Trailing Stop
-                                      │
-                                      ▼
-                        Volatility Targeting (сайзинг)
-                                      │
-                                      ▼
-                                RiskEngine (27 проверок)
-                                      │
-                                      ▼
-                    ExecutionEngine → TWAP Executor → Bitget REST API
-                                      │
-                                      ▼
-                        Alpha Decay Feedback → PortfolioEngine (PnL)
-```
-
-**49 модулей** · **9 стратегий** · **27 проверок риска** · **10 состояний FSM ордера** · **HTF тренд-фильтр** · **6 ML-модулей** · **Smart TWAP** · **Trailing Stop** · **USDT-M Futures** · **Adaptive Leverage 5×–20×**
+**v0.5.0** · **35 модулей** · **230 файлов** · **43 000+ строк** · **384 теста**
 
 ---
 
-## Требования
+## Архитектура
 
-| Компонент | Версия |
-|-----------|--------|
-| **Компилятор** | GCC 14+ (C++23) |
-| **CMake** | 3.25+ |
-| **Boost** | 1.82+ (system, json, thread) |
-| **OpenSSL** | 3.x |
-| **Catch2** | v3 (подтягивается через FetchContent) |
-| **ОС** | Ubuntu 24.04 LTS |
-
-### Установка зависимостей
-
-```bash
-sudo apt install -y \
-    build-essential cmake \
-    libboost-all-dev \
-    libssl-dev
+```
+┌──────────────┐
+│ ScannerEngine│ Bitget REST → top-N пар → ротация каждые 24ч
+└──────┬───────┘
+       │  для каждого символа создаётся TradingPipeline
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  TradingPipeline                                             │
+│                                                              │
+│  WebSocket → Normalizer → OrderBook → FeatureEngine          │
+│                                          │                   │
+│              ┌───────────────────────────┬┘                   │
+│              ▼                           ▼                    │
+│         WorldModel + RegimeEngine   UncertaintyEngine         │
+│              │            │              │                    │
+│              └─────┬──────┘              │                    │
+│                    ▼                     │                    │
+│           StrategyAllocator ◀────────────┘                   │
+│                    │                                         │
+│           StrategyEngine (4 скальп-сценария)                 │
+│                    │                                         │
+│           DecisionEngine (conviction + конфликты)            │
+│                    │                                         │
+│           ML Layer (6 компонентов)                           │
+│                    │                                         │
+│        ┌───────────┼────────────┐                            │
+│        ▼           ▼            ▼                            │
+│   ExecAlpha   OpportCost   PortfolioAllocator                │
+│        └───────────┼────────────┘                            │
+│                    ▼                                         │
+│           LeverageEngine (1×–20×)                            │
+│                    ▼                                         │
+│           RiskEngine (33 проверки)                           │
+│                    ▼                                         │
+│           ExecutionEngine → Bitget REST API                  │
+│                    ▼                                         │
+│           Reconciliation ◀──▶ Portfolio                      │
+└──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  Supervisor (жизненный цикл, сигналы, kill switch)
 ```
 
 ---
 
 ## Быстрый старт
 
+### Зависимости
+
+| Компонент | Версия |
+|-----------|--------|
+| GCC | 14+ (C++23) |
+| CMake | 3.25+ |
+| Ninja | любая |
+| Boost | 1.82+ (system, json, thread) |
+| OpenSSL | 3.x |
+| libpqxx + PostgreSQL | для персистенции |
+| Catch2 | v3 (FetchContent) |
+
+```bash
+# Ubuntu 24.04
+sudo apt install g++-14 cmake ninja-build \
+  libboost-all-dev libssl-dev libpqxx-dev \
+  postgresql-server-dev-all
+```
+
 ### Сборка
 
 ```bash
-# Debug-сборка
-mkdir build-check && cd build-check
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build . -j$(nproc)
+# Debug (с санитайзерами)
+./scripts/build_debug.sh
 
-# Release-сборка (с оптимизациями)
-mkdir build-release && cd build-release
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(nproc)
+# Release
+./scripts/build_release.sh
+
+# Или вручную
+cmake -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_COMPILER=g++-14 \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+ninja -C build -j$(nproc)
 ```
 
-### Тестирование
+### Тесты
 
 ```bash
-cd build
-ctest --output-on-failure -j8   # 614 тестов
-```
-
-### Конфигурация API-ключей
-
-Создайте файл `.env` в корне проекта:
-
-```bash
-BITGET_API_KEY=ваш_api_key
-BITGET_API_SECRET=ваш_secret_key
-BITGET_PASSPHRASE=ваш_passphrase
-```
-
-Бот автоматически загружает `.env` при запуске. Файл защищён `.gitignore`.
-
-### Настройка PostgreSQL (для Alpha Decay Persistence)
-
-Alpha Decay Monitor использует PostgreSQL для персистентности истории сделок и восстановления
-после перезапуска. Если `POSTGRES_URL` не задан — модуль работает только в памяти.
-
-```bash
-# Установка PostgreSQL (если не установлен)
-sudo apt install -y postgresql libpqxx-dev
-
-# Создание базы данных для бота
-sudo -u postgres psql -c "CREATE USER tbbot WITH PASSWORD 'your_password';"
-sudo -u postgres psql -c "CREATE DATABASE tomorrow_bot OWNER tbbot;"
-
-# Добавьте в .env:
-POSTGRES_URL=host=localhost dbname=tomorrow_bot user=tbbot password=your_password
-
-# Таблицы создаются автоматически при первом запуске:
-#   tb_journal   — append-only журнал сигналов и сделок
-#   tb_snapshots — снапшоты состояния стратегий
-```
-
-Схема таблиц (DDL создаётся автоматически):
-
-```sql
--- Журнал событий (индексирован по типу и strategy_id)
-CREATE TABLE IF NOT EXISTS tb_journal (
-    id          BIGSERIAL PRIMARY KEY,
-    ts_ns       BIGINT NOT NULL,
-    entry_type  INT NOT NULL,
-    strategy_id TEXT NOT NULL DEFAULT '',
-    symbol      TEXT NOT NULL DEFAULT '',
-    payload_json TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_tj_type_strat ON tb_journal(entry_type, strategy_id);
-CREATE INDEX IF NOT EXISTS idx_tj_ts ON tb_journal(ts_ns);
-
--- Снапшоты (последнее значение по ключу)
-CREATE TABLE IF NOT EXISTS tb_snapshots (
-    key         TEXT PRIMARY KEY,
-    ts_ns       BIGINT NOT NULL,
-    payload_json TEXT NOT NULL
-);
+cd build && ctest -j$(nproc) --output-on-failure
 ```
 
 ### Запуск
 
 ```bash
-# Все команды выполняются из корня проекта
+# Бумажная торговля
+./scripts/run_paper.sh
 
-# Бумажная торговля (симуляция, без реальных ордеров)
-./build-check/src/app/tomorrow-bot -c configs/paper.yaml
-
-# Реальная торговля (РЕАЛЬНЫЕ ДЕНЬГИ!)
-./build-check/src/app/tomorrow-bot -c configs/production.yaml
+# Или напрямую
+./build/src/app/tomorrow-bot --config configs/paper.yaml
 ```
 
-Остановка: `Ctrl+C` (graceful shutdown через SIGINT/SIGTERM).
+API-ключи Bitget — через файл `.env` в корне проекта:
+
+```env
+BITGET_API_KEY=...
+BITGET_API_SECRET=...
+BITGET_PASSPHRASE=...
+```
 
 ---
 
-## Режимы торговли
+## Режимы
 
 | Режим | Конфиг | Описание |
 |-------|--------|----------|
-| `paper` | `configs/paper.yaml` | Симуляция — ордера не отправляются на биржу |
-| `shadow` | `configs/shadow.yaml` | Теневые расчёты стратегий, сравнение с рынком |
-| `testnet` | `configs/testnet.yaml` | Тестовая сеть Bitget (sandbox API) |
-| `production` | `configs/production.yaml` | **Реальная торговля** через Bitget USDT-M Futures API v2 |
-
-### Ключевые параметры `production.yaml`
-
-| Параметр | Описание | Значение |
-|----------|----------|----------|
-| `trading.initial_capital` | Капитал на аккаунте (USDT) | `4.58` |
-| `futures.enabled` | Фьючерсный режим | `true` |
-| `futures.default_leverage` | Кредитное плечо по умолчанию | `20` |
-| `futures.margin_mode` | Режим маржи | `isolated` |
-| `decision.min_conviction_threshold` | Порог убеждённости для входа | `0.45` |
-| `risk.max_daily_loss_pct` | Макс. дневной убыток (%) | `10.0` |
-| `risk.kill_switch_enabled` | Аварийный выключатель | `true` |
-| `pair_selection.mode` | Автоматический выбор пар | `auto` |
-| `pair_selection.top_n` | Количество пар | `1` |
-| `pair_selection.rotation_interval_hours` | Ротация пар | `12` |
-
----
-
-## Архитектура
-
-### Модули (49+ подсистем)
-
-| Слой | Модули |
-|------|--------|
-| **Инфраструктура** | common, config, security (+ **production_guard**), logging, metrics, health, clock, supervisor (v2: **symbol lock registry, kill-switch broadcast, global position limits, shutdown timeout**), platform |
-| **Рыночные данные** | exchange/bitget (WS+REST, **Futures Order Submitter**, **Futures Query Adapter**), market_data, normalizer, order_book, buffers, indicators, features |
-| **Выбор пар** | pair_scanner (автоматический выбор лучших торговых пар, ротация каждые 12ч) |
-| **Продвинутые признаки** | advanced_features (CUSUM, VPIN, Volume Profile, Time-of-Day Alpha) |
-| **Интеллект** | world_model, regime, uncertainty (v2: 9 измерений, stateful, ML/portfolio-aware), strategy (×9), strategy_allocator, decision, ai |
-| **Кредитное плечо** | **leverage** (LeverageEngine: режимно-адаптивное, liquidation buffer, drawdown scaling, funding rate penalty) |
-| **ML/AI** | bayesian_adapter, entropy_filter, microstructure_fingerprint, liquidation_cascade, correlation_monitor, thompson_sampler |
-| **Исполнение** | execution_alpha, opportunity_cost, portfolio, portfolio_allocator, risk, execution (v2: **partial fill policy, fill events, order timeout, slippage tracking**), pipeline, twap_executor |
-| **Операционная надёжность** | **reconciliation** (startup order/position/balance reconciliation), **recovery** (snapshot + WAL journal restore, exchange sync), **resilience** (circuit breaker, retry executor, idempotency manager) |
-| **Аналитика** | persistence (+ **WAL writer**: write-ahead logging для crash recovery), replay, telemetry, alpha_decay, shadow (v2.0), champion_challenger |
-| **Защита** | adversarial_defense (v4: 14 детекторов), synthetic_scenarios, self_diagnosis (v2), governance (runtime control plane), operator_control |
-
-### Продвинутые технологии v0.3
-
-#### Уровень 1 — Управление рисками
-
-| Технология | Описание |
-|-----------|----------|
-| **Chandelier Exit / Trailing Stop** | Адаптивный trailing stop: 3×ATR (сильный тренд ADX>30), 2.5× (умеренный), 1.5× (choppy). Breakeven при +1.5×ATR прибыли. Partial TP 50% при +2×ATR. Стоп только подтягивается, никогда не откатывается |
-| **Volatility Targeting** | Динамический сайзинг: size = target_vol / realized_vol × Kelly × regime_mult. 13 режимов с множителями 0.1–1.0. Kelly fraction = 0.25 (консервативно) |
-| **Alpha Decay Feedback** | Профессиональный мониторинг деградации по 7 измерениям: Expectancy, HitRate, SlippageAdjusted, ExecutionQuality, RegimeConditioned, ConfidenceReliability (Brier score), AdverseExcursion (MAE). Per-strategy множители размера/порогов. Гистерезис (stable_count≥2). Экспорт метрик в Prometheus. Персистентность истории в PostgreSQL. Рекомендации: ReduceWeight(×0.7), ReduceSize(×0.5, +0.05 threshold), RaiseThresholds(+0.10), Disable(×0.0). Проверка каждые 60с |
-| **HTF Real-Time Update** | Пересчёт HTF индикаторов каждый час через REST + экстренное обновление при движении > 3×ATR |
-
-#### Уровень 2 — Продвинутые индикаторы
-
-| Технология | Описание |
-|-----------|----------|
-| **CUSUM** | Two-sided cumulative sum для раннего обнаружения смены режима. Drift 0.5σ, threshold 4σ. Sample stddev (Bessel's correction). Без look-ahead bias |
-| **VPIN** | Volume-Synchronized Probability of Informed Trading. Volume buckets, порог токсичности 0.7. 10-trade calibration для надёжности |
-| **Volume Profile** | POC (Point of Control) + Value Area (70%). 50 ценовых уровней, 5000 трейдов lookback. Пересчёт каждые 100 трейдов |
-| **Smart TWAP** | Адаптивное разбиение крупных ордеров на 3-10 слайсов. Интервал адаптируется к спреду и VPIN. Front-loading 1.2× |
-| **Time-of-Day Alpha** | 24-часовой UTC профиль: множители волатильности и альфа-скоры по сессиям (азиатская, европейская, американская). +0.05 к порогу в тихие часы |
-
-#### Уровень 3 — Uncertainty Engine v2
-
-| Технология | Описание |
-|-----------|----------|
-| **Uncertainty Engine v2** | 9-мерная оценка неопределённости: regime, signal, data quality, execution, portfolio, ML, correlation, transition, operational. Stateful модель с EMA-сглаживанием, гистерезисом, shock memory, cooldown. Интеграция в risk engine (3 uncertainty-aware проверки), execution alpha и execution engine. ML-aware: потребляет signal quality, cascade probability, correlation breaks. Нелинейная агрегация с regime-specific amplifiers и tail stress. Production observability: top drivers, execution mode recommendations, диагностика. [Подробнее →](docs/architecture/uncertainty_engine.md) |
-
-#### Уровень 4 — ML/AI
-
-| Технология | Описание |
-|-----------|----------|
-| **Bayesian Online Adaptation** | Normal-Normal conjugate prior для онлайн обновления параметров стратегий. Regime-conditioned (70% вес текущего режима). Thompson Sampling exploration (10%) |
-| **Entropy Filter** | Shannon entropy на 4 каналах (returns, volume, spread, flow). Блокирует торговлю при entropy > 0.85 (шум). Результат кешируется |
-| **Microstructure Fingerprinting** | 5D fingerprint (spread, imbalance, flow, volatility, depth) × 5 buckets = 3125 patterns. Knowledge base с win_rate. Блокирует вход при edge < -0.1 |
-| **Liquidation Cascade Prediction** | Детектор каскадных ликвидаций: velocity 40%, volume spike 30%, depth thinning 30%. Порог 0.6 |
-| **Correlation Monitor** | Pearson correlation (short 20 / long 100 window) с BTC и ETH. Decorrelation → risk_mult 0.5 |
-| **RL Entry Timing (Thompson Sampling)** | 5-arm Beta bandit (EnterNow, Wait1/2/3, Skip). Exponential decay 0.995 для non-stationarity |
-
-### PairScanner v5 — профессиональный выбор торговых пар
-
-Модуль `pair_scanner` — production-grade сервис формирования торгового universe для фьючерсной торговли:
-
-| Компонент | Описание |
-|-----------|----------|
-| **Scoring v4** | Acceleration-based: Momentum(40) + Trend(25) + Tradability(25) + Quality(10) |
-| **Hard Filters** | 24ч change < -1% (отброс), > 20% (over-extended), exhausted pump detection |
-| **Parallel Fetch** | Bounded concurrency загрузка свечей (5 параллельных запросов) |
-| **Retry + Circuit Breaker** | Exponential backoff с jitter, circuit breaker (5 ошибок → блокировка) |
-| **Data Validation** | Bid/ask, хронология свечей, полнота данных, аномалии |
-| **Diversification** | Корреляция Пирсона, секторная концентрация, минимальная ликвидность |
-| **Observability** | Metrics (scan_duration, failures, turnover), health reporting, audit trail |
-| **Persistence** | Audit trail через IStorageAdapter, воспроизводимость по scan_id |
-
-**Режимы**: `auto` (автоматический скоринг) · `manual` (ручной список)
-**Ротация**: каждые 12 часов (конфигурируемо)
-**Результат**: top-N пар (по умолчанию 1) с полным score breakdown и data quality flags
-**Тесты**: 55 unit tests, 129 assertions
-
-### HTF Trend Filter — мультитаймфреймный анализ
-
-Система загружает 200 часовых свечей (8+ дней) и вычисляет тренд на старшем таймфрейме:
-
-| Индикатор | Применение |
-|-----------|------------|
-| **EMA 20/50** (1h) | Направление тренда: EMA20 > EMA50 → бычий, иначе → медвежий |
-| **RSI 14** (1h) | Перепроданность/перекупленность на HTF |
-| **MACD** (12/26/9, 1h) | Моментум, сигнал разворота |
-| **ADX 14** (1h) | Сила тренда: > 20 = направленный, < 20 = боковик |
-
-**Правила фильтрации**:
-- BUY заблокирован при сильном даунтренде (HTF trend = -1, сила > 0.4) без подтверждения разворота
-- SELL заблокирован при сильном аптренде (HTF trend = +1, сила > 0.4) без подтверждения разворота
-- Разворот подтверждается: MACD histogram меняет знак + RSI выходит из экстремальной зоны
-
-### Market Readiness Gate
-
-Бот **не торгует** до выполнения всех условий:
-1. ✅ HTF индикаторы загружены и валидны
-2. ✅ Минимум 200 тиков получено (прогрев ~3-5 минут)
-3. ✅ RSI не в экстремальной зоне (15-85 на HTF)
-4. ✅ Нет сильного даунтренда без признаков разворота
-
-### Торговые стратегии
-
-| Стратегия | Тип | Режим рынка | Защита |
-|-----------|-----|-------------|--------|
-| **Momentum** | Трендследящая | Trend | ADX > 25, EMA crossover, volatility-scaled thresholds |
-| **Mean Reversion** | Возврат к среднему | Ranging | Требует разворот MACD, не покупает в даунтренде |
-| **Breakout** | Пробой уровней | Volatile | BB compression → expansion, volume confirmation |
-| **Microstructure Scalp** | Микроструктурная | Любой (низкий спред) | Не торгует против EMA-тренда, VPIN gating |
-| **Volatility Expansion** | Расширение волатильности | Volatile | Нейтральный RSI (40-60), consistent ATR windows |
-| **EMA Pullback** | Откат к тренду | Trending | Вход после отката к EMA20 в направлении тренда, ADX confirm |
-| **RSI Divergence** | Дивергенция | Ranging/Volatile | Бычья/медвежья дивергенция RSI vs цена, MACD confirm |
-| **VWAP Reversion** | Возврат к VWAP | Ranging | Отклонение от trade VWAP, volume + book imbalance confirm |
-| **Volume Profile** | Профиль объёма | Ranging | Сделки от POC/VA уровней, BB + momentum confirmation |
-
-Все стратегии поддерживают:
-- **Typed config** — конфигурируемые пороги (не хардкод)
-- **SignalIntent** — явная семантика (LongEntry/LongExit/ShortEntry/ShortExit/ReducePosition/Hold)
-- **ExitReason** — причина выхода для аналитики (TakeProfit, TrendFailure, RangeTopExit, etc.)
-- **Futures-aware** — стратегии генерируют шорт-сигналы при `futures_enabled: true`
-
-**Conviction threshold**: 0.45 (взвешенная оценка стратегии должна превысить порог)
-
-### Фьючерсный режим (USDT-M)
-
-Tomorrow Bot работает в режиме USDT-M Futures на Bitget с поддержкой:
-
-| Компонент | Описание |
-|-----------|----------|
-| **Hedge Mode** | Независимые long/short позиции одновременно |
-| **Isolated Margin** | Маржа изолирована per-position |
-| **Adaptive Leverage** | 5×–20× динамически по режиму рынка (trending: 20×, ranging: 15×, volatile: 10×, stress: 5×) |
-| **LeverageEngine** | Режимно-адаптивное плечо, liquidation buffer 3%, drawdown scaling |
-| **Liquidation Protection** | Буфер 3% до ликвидации, автоснижение плеча при просадке |
-| **Funding Rate Awareness** | Штраф при funding rate > 0.05%, снижение размера позиции |
-| **FuturesSubmitter** | REST API для Bitget Mix v2 (place/cancel orders, set leverage/margin) |
-| **FuturesQueryAdapter** | Запрос позиций, балансов, ордеров через Futures API |
-
-### Система защиты от убыточных входов
-
-```
-┌─────────────────────────────────────────────┐
-│ 1. Market Readiness Gate                     │
-│    HTF валидность + прогрев + RSI норма      │
-├─────────────────────────────────────────────┤
-│ 2. Governance Gate (runtime control plane)   │
-│    Kill switch · HaltMode · IncidentState    │
-│    Strategy lifecycle · Safe mode             │
-├─────────────────────────────────────────────┤
-│ 3. Entropy Filter (ML quality gate)          │
-│    Shannon entropy < 0.85 на 4 каналах       │
-├─────────────────────────────────────────────┤
-│ 4. Стратегия (Mean Reversion / Scalp / ...)  │
-│    Тренд-фильтр EMA20/50 + MACD reversal    │
-├─────────────────────────────────────────────┤
-│ 5. Fingerprint Check                         │
-│    Микроструктурный паттерн edge > -0.1      │
-├─────────────────────────────────────────────┤
-│ 6. Cascade Check (аварийная блокировка)      │
-│    Ликвидационный каскад score < 0.6         │
-├─────────────────────────────────────────────┤
-│ 7. Correlation Risk Adjustment               │
-│    Decorrelation с BTC/ETH → risk_mult 0.5   │
-├─────────────────────────────────────────────┤
-│ 8. Bayesian Adaptation + Thompson Sampling   │
-│    Онлайн обновление параметров + entry timing│
-├─────────────────────────────────────────────┤
-│ 9. Decision Engine (conviction > dynamic)    │
-│    Порог = base 0.35 + alpha_decay + tod_adj │
-├─────────────────────────────────────────────┤
-│ 10. HTF Trend Filter (финальный барьер)      │
-│    BUY блокирован в даунтренде HTF           │
-│    SELL блокирован в аптренде HTF            │
-├─────────────────────────────────────────────┤
-│ 11. Volatility Targeting (сайзинг)           │
-│    size = target_vol / realized_vol × Kelly   │
-├─────────────────────────────────────────────┤
-│ 12. Risk Engine (27 проверок)                │
-│    ATR-стоп, макс. убыток, kill switch       │
-├─────────────────────────────────────────────┤
-│ 13. Chandelier Exit / Trailing Stop          │
-│    Адаптивный ATR-стоп (1.5×–3×)             │
-├─────────────────────────────────────────────┤
-│ 14. Smart TWAP (исполнение крупных ордеров)  │
-│    3-10 слайсов, адаптивный интервал         │
-├─────────────────────────────────────────────┤
-│ 15. Alpha Decay Feedback                     │
-│    Деградация → ReduceWeight/Disable         │
-├─────────────────────────────────────────────┤
-│ 16. Adversarial Defense v4                   │
-│    14 детекторов, percentile scoring,        │
-│    correlation matrix, multi-TF baselines,   │
-│    hysteresis, regime-aware порог, audit log  │
-└─────────────────────────────────────────────┘
-```
-
-### Risk Engine — 27 проверок
-
-1. Kill switch
-2. Max daily loss
-3. Max drawdown
-4. Max concurrent positions
-5. Max notional exposure
-6. Max leverage
-7. Max slippage
-8. Max order rate
-9. Max consecutive losses
-10. Stale feed guard
-11. Invalid order book guard
-12. Spread threshold
-13. Liquidity threshold
-14. Max loss per trade
-15. UTC cut-off
-16. Strategy budget
-17. Symbol concentration
-18. Same-direction positions
-19. Turnover rate
-20. Realized daily loss
-21. Trade interval per symbol
-22. Regime-scaled limits
-23. Uncertainty limits
-24. Uncertainty cooldown
-25. Uncertainty execution mode
-26. **Global position limits** (v0.4: через Supervisor coordination)
-27. **Spot SELL without position** (v0.5: запрет продажи без открытой long-позиции в спот-режиме)
-
-### Фьючерсная торговля v1.0
-
-#### Полная поддержка USDT-M Futures
-
-- **Bitget Futures Order Submitter**: отправка ордеров через Mix API v2 (`/api/v2/mix/order/place-order`)
-- **Bitget Futures Query Adapter**: запросы позиций (`/api/v2/mix/position/all-position`), балансов (`/api/v2/mix/account/accounts`), ордеров
-- **Hedge Mode**: `hold_mode: hedge_mode` — независимые long/short позиции
-- **Isolated Margin**: маржа изолирована per-position для ограничения риска
-- **Dynamic Leverage**: LeverageEngine выбирает плечо 5×–20× по режиму рынка, просадке и funding rate
-- **Leverage Sync**: pipeline синхронизирует leverage между биржей и execution engine при каждой смене
-- **Correlation ID**: уникальный `strategy_id-tick_count` для дедупликации ордеров
-- **Position Recovery**: восстановление открытых позиций с биржи при рестарте
-- **Partial TP / Trailing Stop**: частичное закрытие 50% при +1.5×ATR, trailing stop для остатка
-
-### Production Hardening v0.5
-
-#### Критические исправления торговой логики
-
-- **Partial close**: исправлена модель позиции — `reduce_position()` корректно уменьшает размер, а не удаляет позицию целиком при частичном закрытии (TP 50%)
-- **Adversarial defense**: `LiquidityVacuum` и `ToxicFlow` детекторы теперь корректно возвращают `VetoTrade` при высокой severity (≥ 0.85)
-- **ProductionGuard**: подключен в bootstrap flow — production-режим требует явного подтверждения
-- **Market readiness**: переделан из одноразовой защёлки в runtime-переоцениваемый gate
-
-#### Дедупликация и консистентность
-
-- Извлечены `apply_sell_fill_to_portfolio()` / `apply_buy_fill_to_portfolio()` — три копии SELL/BUY логики → одна реализация
-- Добавлена валидация конфигурации: `trading_params` (9 полей), `decision` (8 полей), `execution_alpha` (14 полей)
-- Кросс-валидация: `max_loss_per_trade ≤ daily_loss`, `initial_capital > 0`, согласованность spread-порогов
-- Устранены silent `catch(...)` в critical path (main, pipeline, config_loader)
-
-#### Тесты
-
-- 614 тестов (было 559): +6 regression на reduce_position, +31 config validator, +3 spot-semantic risk, +3 risk regression, +12 futures/leverage
-
-### v1.0 — Futures Production Release
-
-#### Фьючерсная торговля
-
-- **FuturesOrderSubmitter**: полная реализация Bitget Mix API v2 — place/cancel orders, set leverage, set margin mode, set hold mode
-- **FuturesQueryAdapter**: запрос позиций, балансов, ордеров с биржи
-- **LeverageEngine**: режимно-адаптивное кредитное плечо (trending: 20×, ranging: 15×, volatile: 10×, stress: 5×), liquidation buffer, drawdown scaling, funding rate penalty
-- **Pipeline futures integration**: автоматическая настройка hedge mode, isolated margin, leverage при запуске
-- **Position recovery**: восстановление open positions с биржи при рестарте
-- **Leverage sync fix**: pipeline синхронизирует leverage между exchange и execution engine
-
-#### Исправления execution
-
-- **Correlation ID generation**: все 9 стратегий получают уникальный `strategy_id-tick_count` (было: пустой → ложные дубликаты)
-- **Duplicate detection logging**: добавлен WARN лог при отклонении дублирующих intents (было: silent failure)
-- **Exec alpha visibility**: блокировки exec_alpha логируются на WARN уровне (было: DEBUG, невидимы в production)
-- **Dynamic leverage in execution**: execution engine получает актуальное плечо от pipeline (было: stale default)
-
-#### Оптимизация стратегий (v11)
-
-- ADX пороги: microstructure_scalp 45→20, ema_pullback 40→25
-- Base conviction: 0.48–0.50 (стратегии генерируют сигналы уверенно)
-- Counter-trend conviction multiplier: 0.65→1.00 (нет штрафа)
-- Pipeline: удалены 20+ BUY-штрафов. Остались только: RSI>92 hard block, RSI<8 SELL block, adversarial severity≥0.96 veto
-- Risk engine: max_gross_exposure и max_leverage вычисляются динамически из futures.default_leverage
-
-### Production Hardening v0.4
-
-#### Reconciliation Engine
-
-При каждом рестарте система выполняет трёхступенчатую сверку:
-1. **Ордера**: загрузка активных ордеров с биржи → сопоставление с внутренним состоянием → обнаружение и разрешение расхождений
-2. **Позиции**: сверка открытых позиций с балансами на бирже → восстановление или закрытие «сирот»
-3. **Баланс**: проверка USDT-баланса с допуском ±0.5%
-
-Классификация расхождений: `OrderExistsOnlyOnExchange`, `StateMismatch`, `QuantityMismatch`, `PositionExistsOnlyLocally`, `BalanceMismatch`. Автоматическое разрешение с лимитом безопасности (max 10 auto-resolutions per run).
-
-#### Recovery Service
-
-Восстановление состояния после crash/restart:
-1. **Snapshot restore**: загрузка последнего снимка портфеля из PostgreSQL
-2. **WAL replay**: воспроизведение журнала событий после снимка
-3. **Exchange sync**: синхронизация позиций и баланса с биржей
-
-#### WAL (Write-Ahead Logging)
-
-Каждое критическое действие (отправка ордера, открытие/закрытие позиции) сначала записывается в WAL, затем выполняется. При crash незавершённые записи обнаруживаются и обрабатываются. Паттерн: `write_intent → execute → commit/rollback`.
-
-#### Resilience Layer
-
-| Компонент | Описание |
-|-----------|----------|
-| **CircuitBreaker** | Lock-free circuit breaker: Closed → Open (после N отказов) → HalfOpen (после timeout) → Closed (при success). Per-endpoint изоляция |
-| **RetryExecutor** | Экспоненциальный backoff с jitter: `min(base × 2^n + random, max_delay)`. Классификация ошибок: Transient (retry), RateLimit (retry с увеличенным delay), Permanent (fail), AuthFailure (kill switch) |
-| **IdempotencyManager** | Генерация стабильных `ClientOrderId` (`{prefix}_{strategy}_{symbol}_{side}_{ts}_{seq}`). Дедупликация в скользящем окне 5 минут |
-
-#### Supervisor v2 — Global Coordination
-
-| Функция | Описание |
-|---------|----------|
-| **Symbol Lock Registry** | Эксклюзивный лок на символ для предотвращения race condition между pipeline |
-| **Kill Switch Broadcast** | Мгновенное уведомление всех pipeline при активации kill switch через callback registry |
-| **Global Position Limits** | Атомарная проверка глобальных лимитов перед открытием позиции |
-| **Shutdown Timeout** | Контролируемое завершение с таймаутом (default: 30с), force-continue при превышении |
-
-#### Execution Engine v2
-
-| Улучшение | Описание |
-|-----------|----------|
-| **Partial Fill Policy** | `WaitForFull` / `CancelRemaining` / `AllowPartial` — явная политика на каждый ордер |
-| **Fill Event Tracking** | Каждый fill event записывается отдельно с ценой, объёмом, комиссией. Weighted average price |
-| **Order Timeout** | Автоматическая отмена ордеров в состоянии Open дольше threshold (configurable) |
-| **Slippage Tracking** | `realized_slippage = avg_fill_price - expected_fill_price` для post-trade аналитики |
-
-#### Production Guard
-
-Защита от случайного запуска в production:
-- Paper/Shadow/Testnet — всегда разрешены
-- Production — требует `TOMORROW_BOT_PRODUCTION_CONFIRM` env variable
-- Детекция production API URL (отсутствие «testnet» в base URL)
-- Верификация конфигурационного хэша
-
-### Governance Control Plane
-
-Governance — централизованный runtime control plane системы. Каждый торговый тик проходит
-через governance gate перед стратегиями. Все изменения состояния записываются в durable audit trail.
-
-#### Архитектура
-
-```
-                    AppBootstrap
-                        │
-                        ▼
-              GovernanceAuditLayer ─────────── EventJournal (durable)
-                   │    │    │
-          ┌────────┤    │    ├────────┐
-          ▼        ▼    ▼    ▼        ▼
-    Supervisor  Pipeline  RiskEngine  OperatorControl
-                   │
-              Governance Gate
-         (kill switch / halt mode /
-          incident / strategy lifecycle)
-                   │
-                   ▼
-           ... trading continues ...
-```
-
-#### Governance Gate — 6-уровневая проверка
-
-| # | Проверка | Описание |
-|---|----------|----------|
-| 1 | Kill Switch | Полная блокировка торговли |
-| 2 | Halt Mode | `HardHalt` · `CloseOnly` · `ReduceOnly` · `NoNewEntries` · `None` |
-| 3 | Incident State | `Halted` → блокировка; `Restricted` → close-only; `Degraded` → no new entries |
-| 4 | Safe Mode | Только reduce/close при активном safe mode |
-| 5 | Strategy Enabled | Стратегия должна быть enabled в реестре |
-| 6 | Strategy Lifecycle | Только `Live` и `Shadow` разрешены для торговли |
-
-#### Halt Modes
-
-| Режим | Описание |
-|-------|----------|
-| `None` | Нет ограничений |
-| `NoNewEntries` | Запрет новых позиций, закрытие разрешено |
-| `ReduceOnly` | Только уменьшение позиций |
-| `CloseOnly` | Только закрытие позиций |
-| `HardHalt` | Полная остановка торговли |
-
-#### Incident State Machine
-
-```
-Normal ←→ Degraded → Restricted → Halted
-  ↑                                  │
-  └───────── Recovering ←────────────┘
-```
-
-| Состояние | Описание | Торговля |
-|-----------|----------|----------|
-| `Normal` | Нормальная работа | Полная |
-| `Degraded` | Частичные сбои | Только close/reduce |
-| `Restricted` | Серьёзные проблемы | Close-only |
-| `Halted` | Полная остановка | Заблокирована |
-| `Recovering` | Восстановление | Заблокирована |
-
-#### Strategy Lifecycle
-
-```
-Registered → Shadow → Candidate → Live → Draining → Disabled → Retired
-```
-
-| Состояние | Описание | Торговля |
-|-----------|----------|----------|
-| `Registered` | Зарегистрирована, не запущена | Нет |
-| `Shadow` | Теневой режим (наблюдение) | Да (shadow) |
-| `Candidate` | Кандидат на promotion | Нет |
-| `Live` | Боевой режим | Да |
-| `Draining` | Закрытие позиций | Нет |
-| `Disabled` | Выключена | Нет |
-| `Retired` | Окончательно выведена | Нет |
-
-#### Единый Kill Switch
-
-Risk Engine делегирует kill switch в governance (единый source of truth).
-При активации risk engine или оператором — kill switch фиксируется
-в governance, записывается в durable audit, обновляются метрики и health.
-
-#### Durable Audit Trail
-
-23 типа аудиторских событий записываются в:
-- **In-memory ring buffer** (10 000 записей) — для быстрого доступа
-- **EventJournal** (PostgreSQL) — для forensic analysis и восстановления
-
-Каждая запись содержит: `audit_id`, `type`, `timestamp`, `actor`, `target`,
-`details`, `config_hash`, `subsystem`, `severity`, `previous_state`, `new_state`.
-
-#### Метрики Governance (Prometheus)
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `governance_kill_switch_active` | Gauge | 1 = active, 0 = inactive |
-| `governance_safe_mode_active` | Gauge | 1 = active, 0 = inactive |
-| `governance_halt_mode` | Gauge | 0-4 (None → HardHalt) |
-| `governance_incident_state` | Gauge | 0-4 (Normal → Recovering) |
-| `governance_strategies_total` | Gauge | Количество зарегистрированных стратегий |
-| `governance_audit_events_total` | Counter | Общее число аудиторских событий |
-
-### Self-Diagnosis Engine v2
-
-Модуль самодиагностики превращён из локального explain-модуля в production subsystem, интегрированную в торговый pipeline.
-
-#### Архитектура
-
-```
-TradingPipeline
-  ├─ decision denied    → explain_denial()
-  ├─ risk denied        → explain_denial()
-  ├─ order executed     → explain_trade()
-  ├─ order failed       → diagnose_execution_failure()
-  └─ periodic (500 tick)→ diagnose_system_state()
-
-SelfDiagnosisEngine
-  ├─ 12 типов DiagnosticType
-  ├─ 4 уровня DiagnosticSeverity (Info → Fatal)
-  ├─ 7 CorrectiveAction (Observe → HaltSystem)
-  ├─ Event-sourced: каждая запись → EventJournal
-  ├─ Scorecards: агрегация по стратегиям
-  └─ Метрики Prometheus: tb_diag_records_total, tb_diag_max_severity
-```
-
-#### Типы диагностических событий
-
-| Тип | Описание |
-|-----|----------|
-| `TradeTaken` | Объяснение совершённой сделки |
-| `TradeDenied` | Объяснение отказа от сделки |
-| `SystemState` | Диагностика состояния системы |
-| `DegradedState` | Деградированное состояние |
-| `ExecutionFailure` | Ошибка исполнения ордера |
-| `MarketDataDegradation` | Деградация рыночных данных |
-| `ExchangeConnectivityIncident` | Инцидент подключения к бирже |
-| `StrategySuppression` | Подавление стратегии (alpha decay) |
-| `PortfolioConstraint` | Ограничение портфеля |
-| `ReconciliationMismatch` | Расхождение при сверке с биржей |
-| `RecoveryAction` | Действие восстановления |
-| `StrategyHealth` | Здоровье стратегии |
-
-#### Корректирующие действия
-
-| Действие | Описание | Автоматический триггер |
-|----------|----------|------------------------|
-| `Observe` | Только наблюдать | TradeTaken, StrategyHealth |
-| `SlowDown` | Увеличить интервалы | Единичные execution failures |
-| `ReduceSize` | Уменьшить размер позиций | DegradedState, PortfolioConstraint |
-| `StopEntries` | Запретить новые входы | Множественные execution failures |
-| `ForceReconcile` | Принудительная сверка | ReconciliationMismatch |
-| `HaltSymbol` | Остановить торговлю символом | MarketDataDegradation (critical) |
-| `HaltSystem` | Остановить всю торговлю | ExchangeConnectivity (critical) |
-
-#### Strategy Scorecards
-
-Агрегированная статистика по каждой стратегии:
-- `trades_taken` / `trades_denied` / `execution_failures` / `suppressions`
-- `denial_rate` — доля отклонённых сигналов
-- `avg_conviction` — средняя убеждённость сигналов
-- Сброс при дневной ротации (`reset_scorecards()`)
+| Paper | `configs/paper.yaml` | Симуляция, ордера не отправляются |
+| Testnet | `configs/testnet.yaml` | Тестовая сеть Bitget |
+| Shadow | `configs/shadow.yaml` | Теневые расчёты без исполнения |
+| Production | `configs/production.yaml` | Реальная торговля |
+
+Production-режим требует переменную окружения `TOMORROW_BOT_PRODUCTION_CONFIRM`.
 
 ---
 
@@ -743,170 +135,81 @@ SelfDiagnosisEngine
 
 ```
 tomorrow-bot/
-├── CMakeLists.txt              # Корневой CMake
-├── README.md                   # Этот файл
-├── .env                        # API-ключи (не в VCS)
-├── cmake/                      # CMake-модули (Sanitizers, CompilerWarnings)
-├── configs/                    # Конфигурации по режимам
-│   ├── paper.yaml
-│   ├── shadow.yaml
-│   ├── testnet.yaml
-│   └── production.yaml
-├── deploy/                     # Артефакты развёртывания
-│   ├── systemd/                # tomorrow-bot.service
-│   └── env/                    # Шаблоны .env
-├── docs/                       # Документация
-│   ├── architecture/           # Архитектура, потоки данных, FSM
-│   ├── guides/                 # Руководства для разработчиков
-│   ├── operations/             # Развёртывание, runbooks
-│   ├── reference/              # Справка: риск-правила, телеметрия
-│   ├── research/               # Схемы feature snapshot
-│   └── runbooks/               # Инцидент-менеджмент
-├── logs/                       # Логи runtime (не в VCS)
-├── scripts/                    # Build/run скрипты
-├── src/                        # Исходный код (49 модулей, ~52K строк)
-│   ├── app/                    # Точка входа, bootstrap, PairScanner интеграция
-│   ├── common/                 # StrongType, Result, Error, перечисления
-│   ├── config/                 # Загрузка YAML, валидация, хеширование
-│   ├── security/               # EnvSecretProvider, маскирование, ProductionGuard
+├── src/                        # 35 модулей
+│   ├── app/                    # Точка входа, bootstrap
+│   ├── common/                 # Типы, Result, ошибки
+│   ├── config/                 # Загрузка YAML, валидация
+│   ├── security/               # EnvSecretProvider, маскирование
 │   ├── logging/                # Структурированный JSON-логгер
-│   ├── metrics/                # Prometheus-совместимые метрики
-│   ├── health/                 # Health-check подсистем
-│   ├── clock/                  # Абстракция времени (SystemClock / TestClock)
-│   ├── supervisor/             # Жизненный цикл, SIGTERM/SIGINT, symbol locks, kill-switch broadcast
-│   ├── platform/               # Информация о хосте/ОС
-│   ├── exchange/bitget/        # WS + REST + OrderSubmitter + **FuturesSubmitter** + **FuturesQueryAdapter**
-│   ├── normalizer/             # Нормализация сырых данных Bitget
-│   ├── market_data/            # Шлюз рыночных данных
+│   ├── metrics/                # Prometheus-метрики
+│   ├── clock/                  # IClock (system / test)
+│   ├── supervisor/             # Жизненный цикл, сигналы, symbol locks
+│   ├── exchange/bitget/        # REST + WS + Futures submitter
+│   ├── normalizer/             # Нормализация данных Bitget
+│   ├── market_data/            # WebSocket-шлюз
 │   ├── order_book/             # Локальный L2-стакан
-│   ├── buffers/                # Lock-free кольцевые буферы
-│   ├── indicators/             # 12 встроенных индикаторов (SMA, EMA, RSI, MACD, BB, ATR, ADX, OBV, VWAP, Rolling VWAP, ROC, Z-Score)
-│   ├── features/               # FeatureEngine + AdvancedFeatures (CUSUM, VPIN, VolumeProfile, ToD)
-│   ├── pair_scanner/           # PairScanner v5: scoring, parallel fetch, retry, diversification
-│   ├── world_model/            # 9 состояний мира, fragility, tendency
-│   ├── regime/                 # 13 режимов рынка, confidence, stability
-│   ├── uncertainty/            # Uncertainty Engine v2: 9 измерений, stateful
-│   ├── strategy/               # 9 стратегий с тренд-фильтрацией, futures-aware
-│   ├── strategy_allocator/     # Аллокация по режимам и world suitability
-│   ├── decision/               # Комитетное голосование, вето, conviction (порог 0.45)
-│   ├── ai/                     # AI Advisory Engine v2
-│   ├── ml/                     # 6 ML-модулей
-│   │   ├── bayesian_adapter    # Bayesian Online Adaptation
-│   │   ├── entropy_filter      # Shannon entropy quality gate
-│   │   ├── microstructure_fingerprint  # 5D fingerprint, 3125 паттернов
-│   │   ├── liquidation_cascade # Детектор каскадных ликвидаций
-│   │   ├── correlation_monitor # Pearson correlation с BTC/ETH
-│   │   └── thompson_sampler    # 5-arm Beta bandit, RL entry timing
-│   ├── leverage/               # **LeverageEngine**: адаптивное плечо 5×–20×
-│   ├── execution_alpha/        # Passive/Aggressive/Hybrid execution
+│   ├── buffers/                # Кольцевые буферы
+│   ├── indicators/             # RSI, EMA, MACD, ATR, ADX, BB, OBV, VWAP...
+│   ├── features/               # FeatureEngine + AdvancedFeatures
+│   ├── world_model/            # 9 состояний мира
+│   ├── regime/                 # 13 режимов рынка
+│   ├── uncertainty/            # 9-мерная неопределённость
+│   ├── strategy/               # Скальпинг (4 сценария)
+│   ├── strategy_allocator/     # Аллокация весов по режимам
+│   ├── decision/               # Комитетное голосование
+│   ├── ml/                     # 6 ML-компонентов
+│   ├── leverage/               # Адаптивное плечо 1×–20×
+│   ├── execution_alpha/        # Passive/Aggressive/Hybrid
 │   ├── opportunity_cost/       # Ранжирование кандидатов
-│   ├── portfolio/              # Позиции, PnL, exposure, cash ledger
-│   ├── portfolio_allocator/    # Иерархическая аллокация
-│   ├── risk/                   # 27 проверок, kill switch
-│   ├── execution/              # FSM (10 состояний), Paper/Bitget/Futures submitter, TWAP
-│   ├── pipeline/               # TradingPipeline + HTF + Market Readiness + Futures
-│   ├── reconciliation/         # Startup order/position/balance reconciliation
-│   ├── recovery/               # Snapshot restore + WAL replay + exchange sync
-│   ├── resilience/             # Circuit breaker + retry executor + idempotency
-│   ├── persistence/            # EventJournal + SnapshotStore + WalWriter (PostgreSQL)
-│   ├── replay/                 # ReplayEngine + BacktestEngine
-│   ├── telemetry/              # Decision envelope телеметрия
-│   ├── alpha_decay/            # Мониторинг деградации (7 измерений)
-│   ├── shadow/                 # Shadow v2.0: виртуальное исполнение
-│   ├── champion_challenger/    # A/B тестирование стратегий
-│   ├── self_diagnosis/         # Самодиагностика v2: 12 типов, scorecards
-│   ├── adversarial_defense/    # 14 детекторов, v4
-│   ├── defense/                # Дополнительные механизмы защиты
-│   ├── governance/             # Runtime control plane, audit trail
-│   ├── operator_control/       # 11 команд оператора
-│   └── synthetic_scenarios/    # 9 стресс-сценариев
-├── tests/                      # 614 тестов (unit + integration + scenario)
-│   ├── unit/                   # Модульные тесты (вкл. reconciliation, recovery, resilience, persistence, security)
+│   ├── portfolio/              # Позиции, PnL, exposure
+│   ├── portfolio_allocator/    # Иерархический сайзинг
+│   ├── risk/                   # 33 policy-проверки
+│   ├── execution/              # FSM ордеров, TWAP
+│   ├── scanner/                # Выбор торговых пар
+│   ├── reconciliation/         # Сверка с биржей
+│   ├── recovery/               # Snapshot + WAL restore
+│   ├── resilience/             # Circuit breaker, retry, idempotency
+│   └── persistence/            # PostgreSQL (journal, snapshots)
+├── tests/                      # 384 теста (Catch2 v3)
+│   ├── unit/                   # 27 модулей юнит-тестов
 │   ├── integration/            # Интеграционные тесты
-│   ├── mocks/                  # Моки (exchange, persistence)
+│   ├── common/                 # Тестовые моки
 │   └── data/                   # Тестовые данные
-└── tools/                      # Утилиты (replay_inspector, telemetry_viewer)
+├── configs/                    # YAML-конфигурации
+├── scripts/                    # Скрипты сборки и запуска
+├── deploy/                     # systemd, env-шаблоны
+├── tools/                      # config_validator, log_summarizer,
+│                               # replay_inspector, telemetry_viewer
+└── docs/                       # Документация
 ```
-
----
-
-## Наблюдаемость
-
-| Канал | Формат | Назначение |
-|-------|--------|------------|
-| **Логи** | Структурированный JSON | `stdout` или файл (`logs/`) |
-| **Метрики** | Prometheus | `http://localhost:9090/metrics` |
-| **Health** | JSON | `http://localhost:8080/health` |
-| **Телеметрия** | Decision envelope | Полная трассировка каждого решения |
-
----
-
-## Безопасность
-
-- API-ключи загружаются из `.env` через `EnvSecretProvider`
-- Секреты маскируются в логах (`[REDACTED]`)
-- **Production Guard**: запуск в production требует env `TOMORROW_BOT_PRODUCTION_CONFIRM` + детекция production API URL
-- Production требует `kill_switch_enabled: true`
-- Governance control plane — единый kill switch, halt modes, durable audit trail
-- **Kill Switch Broadcast**: мгновенное уведомление всех pipeline через callback registry
-- **Symbol Lock Registry**: предотвращение race condition между параллельными pipeline
-- 27 независимых проверок риск-движка перед каждым ордером
-- **Idempotent Order Submission**: стабильный ClientOrderId + дедупликация
-- **Write-Ahead Logging**: критические действия записываются ДО выполнения
-- **Reconciliation**: автоматическая сверка ордеров/позиций/баланса при рестарте
-- Chandelier Exit / Trailing Stop — адаптивный стоп (1.5×–3×ATR)
-- Adversarial Defense v4 — 14 детекторов рыночных угроз с автоматической калибровкой
-- Entropy Filter — блокировка торговли при высоком шуме (entropy > 0.85)
-- Liquidation Cascade Detector — аварийная блокировка при каскадных ликвидациях
-- Correlation Monitor — снижение риска при decorrelation с BTC/ETH
-- Order FSM исключает дублирование и некорректные переходы
-- **Circuit Breaker + Retry Executor**: защита от каскадных отказов с экспоненциальным backoff
-- Graceful shutdown по SIGTERM/SIGINT с **таймаутом** и сохранением состояния
-- Systemd service с `PrivateTmp`, `ProtectSystem=strict`, `NoNewPrivileges`
 
 ---
 
 ## Документация
 
-| Раздел | Описание |
-|--------|----------|
-| **Архитектура** | |
-| [Архитектурный обзор](docs/architecture/overview.md) | Модули, слои, принципы |
-| [Потоки данных](docs/architecture/data_flow.md) | WebSocket → PairScanner → HTF → Pipeline |
-| [Потоки решений](docs/architecture/decision_flow.md) | Strategy → HTF Filter → Execution |
-| [Потоки исполнения](docs/architecture/execution_flow.md) | ExecutionAlpha → Allocator → Risk → Execution |
-| [Стадии pipeline](docs/architecture/pipeline_stages.md) | 11 стадий, SLA-бюджеты, watchdog |
-| [FSM ордеров](docs/architecture/order_fsm.md) | 10 состояний, переходы |
-| [World Model](docs/architecture/world_model_design.md) | 9 состояний, fragility, confidence |
-| [Uncertainty Engine](docs/architecture/uncertainty_engine.md) | 9-мерная неопределённость v2 |
-| [Adversarial Defense](docs/architecture/adversarial_defense_design.md) | 14 детекторов, percentile, hysteresis |
-| [Production Hardening](docs/architecture/production_hardening.md) | Reconciliation, Recovery, Resilience, WAL |
-| [Alpha Decay](docs/architecture/alpha_decay_design.md) | 7 метрик деградации |
-| [Self-Diagnosis](docs/architecture/self_diagnosis_overview.md) | Объяснение торговых решений |
-| [Replay/Backtest](docs/architecture/replay_architecture.md) | 4 режима, fill simulation, метрики |
-| [Persistence](docs/architecture/persistence_architecture.md) | EventJournal, Snapshot, IStorageAdapter |
-| [Взаимодействие модулей](docs/architecture/module_interactions.md) | Граф зависимостей, Paper ↔ Production |
-| [Известные ограничения](docs/architecture/known_limitations.md) | Текущий статус, roadmap |
-| **Руководства** | |
-| [Конфигурация](docs/guides/config_guide.md) | Параметры YAML, pair_selection |
-| [Расширение стратегий](docs/guides/strategy_extension_guide.md) | Как добавить стратегию |
-| [Shadow Mode v2.0](docs/guides/shadow_mode_guide.md) | Виртуальное исполнение, P&L, алерты |
-| [Champion-Challenger](docs/guides/champion_challenger_guide.md) | A/B тестирование стратегий |
-| [Сценарное моделирование](docs/guides/scenario_simulation_guide.md) | 9 стресс-сценариев |
-| [Operator Control](docs/guides/operator_control_guide.md) | 11 команд оператора |
-| [Governance & Audit](docs/guides/governance_audit_guide.md) | Governance gate, audit trail, halt modes |
-| **Эксплуатация** | |
-| [Развёртывание](docs/operations/production_deployment_guide.md) | Production setup, systemd |
-| [Operations runbook](docs/operations/operations_runbook.md) | Повседневная эксплуатация |
-| [Execution checklist](docs/operations/execution_checklist_verification.md) | Верификация готовности к запуску |
-| [Exchange degradation](docs/operations/exchange_degradation_runbook.md) | Деградация биржи |
-| [Stale feed](docs/operations/stale_feed_runbook.md) | Протухшие данные |
-| [Kill Switch](docs/runbooks/kill_switch_runbook.md) | Аварийная остановка |
-| [Incident Response](docs/runbooks/incident_response.md) | Инцидент-менеджмент |
-| **Справочники** | |
-| [Правила риска](docs/reference/risk_rules.md) | 27 проверок Risk Engine |
-| [Схема телеметрии](docs/reference/telemetry_schema.md) | Decision envelope |
-| [Feature Snapshot](docs/research/feature_snapshot_schema.md) | Схема feature-снимков |
+| Документ | Описание |
+|----------|----------|
+| [Архитектура](docs/architecture.md) | Модули, потоки данных, компоненты |
+| [Торговый конвейер](docs/pipeline.md) | Этапы обработки тика |
+| [Конфигурация](docs/config.md) | Параметры YAML |
+| [Риск-менеджмент](docs/risk.md) | 33 проверки Risk Engine |
+| [Эксплуатация](docs/operations.md) | Развёртывание, мониторинг |
+| [Разработка](docs/development.md) | Сборка, тесты, добавление модулей |
+
+---
+
+## Ключевые характеристики
+
+- **Bitget USDT-M Futures** — hedge mode, isolated margin
+- **Скальпинг** — 4 сценария (momentum, retest, pullback, rejection), state machine
+- **Адаптивное плечо** — 1×–20× (режим, волатильность, просадка, фандинг)
+- **ScannerEngine** — автоматический top-N пар, ротация, trap-детекция
+- **33 проверки риска** — kill switch, лимиты просадки, cooldown, regime-scaled
+- **6 ML-компонентов** — Bayesian, Thompson, entropy, fingerprint, cascade, correlation
+- **Reconciliation** — автоматическая сверка портфеля с биржей при рестарте
+- **Recovery** — snapshot + WAL replay + exchange sync
+- **Resilience** — circuit breaker, retry с backoff, idempotency
+- **Метрики** — Prometheus-совместимый экспортёр
 
 ---
 

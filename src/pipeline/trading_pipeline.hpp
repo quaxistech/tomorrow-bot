@@ -17,18 +17,9 @@
 #include "regime/regime_engine.hpp"
 #include "uncertainty/uncertainty_engine.hpp"
 #include "strategy/strategy_registry.hpp"
-#include "strategy/momentum/momentum_strategy.hpp"
-#include "strategy/mean_reversion/mean_reversion_strategy.hpp"
-#include "strategy/breakout/breakout_strategy.hpp"
-#include "strategy/vol_expansion/vol_expansion_strategy.hpp"
-#include "strategy/microstructure_scalp/microstructure_scalp_strategy.hpp"
-#include "strategy/ema_pullback/ema_pullback_strategy.hpp"
-#include "strategy/rsi_divergence/rsi_divergence_strategy.hpp"
-#include "strategy/vwap_reversion/vwap_reversion_strategy.hpp"
-#include "strategy/volume_profile/volume_profile_strategy.hpp"
+#include "strategy/strategy_engine.hpp"
 #include "strategy_allocator/strategy_allocator.hpp"
 #include "decision/decision_aggregation_engine.hpp"
-#include "defense/adversarial_market_defense.hpp"
 #include "portfolio_allocator/portfolio_allocator.hpp"
 #include "portfolio/portfolio_engine.hpp"
 #include "execution_alpha/execution_alpha_engine.hpp"
@@ -41,14 +32,9 @@
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
-#include "health/health_service.hpp"
-#include "governance/governance_audit_layer.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_order_submitter.hpp"
 #include "exchange/bitget/bitget_futures_order_submitter.hpp"
-#include "alpha_decay/alpha_decay_monitor.hpp"
-#include "champion_challenger/champion_challenger_engine.hpp"
-#include "ai/ai_advisory_engine.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
 #include "ml/microstructure_fingerprint.hpp"
@@ -56,8 +42,6 @@
 #include "ml/correlation_monitor.hpp"
 #include "ml/thompson_sampler.hpp"
 #include "ml/ml_signal_types.hpp"
-#include "self_diagnosis/self_diagnosis_engine.hpp"
-#include "shadow/shadow_mode_engine.hpp"
 #include "pipeline/pipeline_tick_context.hpp"
 #include "pipeline/pipeline_stage_result.hpp"
 #include "pipeline/pipeline_latency_tracker.hpp"
@@ -85,8 +69,6 @@ public:
         std::shared_ptr<logging::ILogger> logger,
         std::shared_ptr<clock::IClock> clock,
         std::shared_ptr<metrics::IMetricsRegistry> metrics,
-        std::shared_ptr<health::IHealthService> health,
-        std::shared_ptr<governance::GovernanceAuditLayer> governance = nullptr,
         const std::string& symbol = ""
     );
 
@@ -141,10 +123,6 @@ private:
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
-    std::shared_ptr<health::IHealthService> health_;
-
-    /// Governance control plane — runtime gate для торговли
-    std::shared_ptr<governance::GovernanceAuditLayer> governance_;
 
     // Рыночные данные
     std::shared_ptr<indicators::IndicatorEngine> indicator_engine_;
@@ -161,10 +139,6 @@ private:
     std::shared_ptr<strategy::StrategyRegistry> strategy_registry_;
     std::shared_ptr<strategy_allocator::IStrategyAllocator> strategy_allocator_;
     std::shared_ptr<decision::IDecisionAggregationEngine> decision_engine_;
-    std::shared_ptr<defense::AdversarialMarketDefense> adversarial_defense_;
-
-    /// AI Advisory движок — правиловый/ML анализ рыночных условий
-    std::shared_ptr<ai::IAIAdvisoryEngine> ai_advisory_;
 
     // Исполнение
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
@@ -180,12 +154,6 @@ private:
 
     /// Smart TWAP — разбиение крупных ордеров на адаптивные слайсы
     std::shared_ptr<execution::SmartTwapExecutor> twap_executor_;
-
-    /// Мониторинг деградации альфа-сигнала стратегий
-    std::shared_ptr<alpha_decay::AlphaDecayMonitor> alpha_decay_monitor_;
-
-    /// Champion-Challenger A/B тестирование стратегий
-    std::shared_ptr<champion_challenger::ChampionChallengerEngine> cc_engine_;
 
     /// Продвинутый движок features (CUSUM, VPIN, Volume Profile, Time-of-Day)
     std::shared_ptr<features::AdvancedFeatureEngine> advanced_features_;
@@ -215,11 +183,10 @@ private:
     };
     std::optional<PendingEntry> pending_entry_;
 
-    /// Движок самодиагностики — мониторинг здоровья, scorecards, corrective actions
-    std::shared_ptr<self_diagnosis::SelfDiagnosisEngine> self_diagnosis_;
-
-    /// Shadow trading подсистема — виртуальное исполнение без реальных ордеров
-    std::shared_ptr<shadow::ShadowModeEngine> shadow_engine_;
+    /// Consecutive Wait1 actions from Thompson Sampling (triggers rotation when too many)
+    int consecutive_wait1_count_{0};
+    /// Threshold: if Thompson selects Wait1 this many times, force pipeline idle for rotation
+    static constexpr int kMaxConsecutiveWait1 = 50;
 
     std::atomic<bool> running_{false};
     std::mutex pipeline_mutex_;
@@ -430,32 +397,8 @@ private:
     /// Max Adverse Excursion текущей позиции (бп, нарастающий итог)
     double current_max_adverse_excursion_bps_{0.0};
 
-    /// Множители размера по стратегиям (per-strategy, не глобальный)
-    std::unordered_map<std::string, double> alpha_decay_size_mult_per_strategy_;
-    /// Добавки к порогу conviction по стратегиям
-    std::unordered_map<std::string, double> alpha_decay_threshold_adj_per_strategy_;
-
-    /// Глобальный множитель: минимум по всем стратегиям (для combined_size_mult)
-    double alpha_decay_size_mult_{1.0};
-    /// Глобальная добавка к порогу conviction (максимум по всем стратегиям)
-    double alpha_decay_threshold_adj_{0.0};
-
-    /// Timestamp последней проверки alpha decay (не проверять каждый тик)
-    int64_t last_alpha_decay_check_ns_{0};
-    /// Интервал проверки alpha decay (каждые 60 секунд)
-    static constexpr int64_t kAlphaDecayCheckIntervalNs = 60'000'000'000LL;
-
     /// Последний результат execution alpha — нужен для C/C fee estimation при закрытии позиции
     std::optional<execution_alpha::ExecutionAlphaResult> last_exec_alpha_;
-    /// Интервал периодической проверки C/C статуса (каждые 5 минут)
-    static constexpr int64_t kCCCheckIntervalNs = 300'000'000'000LL;
-    int64_t last_cc_check_ns_{0};
-
-    /// Пары champion↔challenger стратегий (конфигурируемые, без hardcode)
-    std::vector<std::pair<StrategyId, StrategyId>> cc_strategy_pairs_ = {
-        {StrategyId("momentum"),  StrategyId("mean_reversion")},
-        {StrategyId("breakout"),  StrategyId("vol_expansion")}
-    };
 
     // ==================== Futures Management ====================
     /// Текущий funding rate для активного символа (обновляется периодически)
@@ -468,19 +411,8 @@ private:
     /// Минимальный порог conviction для открытия новой позиции
     static constexpr double kDefaultConvictionThreshold = 0.3;
 
-    /// Записать текущее решение в shadow-подсистему
-    void record_shadow_decision(const strategy::TradeIntent& intent,
-                                const std::string& risk_verdict,
-                                bool would_have_been_live);
-
-    /// Проверить alpha decay для всех стратегий и обновить множители
-    void check_alpha_decay_feedback();
-    /// Записать результат закрытой сделки в alpha decay monitor и champion_challenger
-    void record_trade_for_decay(const StrategyId& strategy_id, double pnl, double conviction);
     /// Обновить MAE для текущей позиции на текущем тике
     void update_current_mae(double current_price, bool is_long);
-    /// Периодически проверять C/C рекомендации и логировать статус
-    void check_champion_challenger_status();
 
     /// Проверить свежесть котировки (Phase 1)
     FreshnessResult check_quote_freshness(const features::FeatureSnapshot& snapshot) const;

@@ -9,16 +9,13 @@
 #pragma once
 
 #include "common/types.hpp"
-#include "ai/ai_advisory_types.hpp"
 #include "regime/regime_config.hpp"
-#include "shadow/shadow_types.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
 
 namespace tb::config {
 
-using ai::AIAdvisoryConfig;
 using regime::RegimeConfig;
 
 /// Настройки подключения к бирже
@@ -44,12 +41,6 @@ struct MetricsConfig {
     bool        enabled{true};          ///< Включён ли сервер метрик
     int         port{9090};             ///< Порт HTTP сервера метрик
     std::string path{"/metrics"};       ///< Путь для scrape эндпоинта
-};
-
-/// Настройки сервиса проверки здоровья
-struct HealthConfig {
-    bool enabled{true};                 ///< Включён ли HTTP сервер здоровья
-    int  port{8080};                    ///< Порт HTTP сервера
 };
 
 /// Настройки риск-менеджера
@@ -132,6 +123,9 @@ struct ScorerConfig {
     double steady_gainer_max{10.0};
     double steady_gainer_bonus{8.0};
     double negative_change_penalty{0.5};
+
+    // --- Futures bidirectional mode ---
+    bool futures_mode{false};                    ///< true = score absolute trend strength (both long & short)
 };
 
 /// Настройки системы выбора торговых пар
@@ -163,78 +157,6 @@ struct PairSelectionConfig {
     bool enable_diversification{true};           ///< Включить диверсификацию корзины
     bool persist_scan_results{true};             ///< Сохранять результаты в persistence
     ScorerConfig scorer;                         ///< Конфигурация scorer-а (вложенный)
-};
-
-/// Runtime-настройки защиты от враждебных рыночных условий
-struct AdversarialDefenseConfig {
-    bool enabled{true};
-    bool fail_closed_on_invalid_data{true};
-    bool auto_cooldown_on_veto{true};
-    double auto_cooldown_severity{0.85};
-    double spread_explosion_threshold_bps{100.0};
-    double spread_normal_bps{20.0};
-    double min_liquidity_depth{50.0};
-    double book_imbalance_threshold{0.8};
-    double book_instability_threshold{0.7};
-    double toxic_flow_ratio_threshold{1.8};
-    double aggressive_flow_threshold{0.8};
-    double vpin_toxic_threshold{0.7};
-    int64_t cooldown_duration_ms{30000};
-    int64_t post_shock_cooldown_ms{60000};
-    int64_t max_market_data_age_ns{2'000'000'000LL};
-    double max_confidence_reduction{0.8};
-    double max_threshold_expansion{2.0};
-
-    // --- Compound threat & recovery ---
-    double compound_threat_factor{0.5};
-    double cooldown_severity_scale{1.5};
-    int64_t recovery_duration_ms{10000};
-    double recovery_confidence_floor{0.6};
-
-    // --- Spread velocity ---
-    double spread_velocity_threshold_bps_per_sec{50.0};
-
-    // --- Adaptive baseline ---
-    double baseline_alpha{0.01};
-    int64_t baseline_warmup_ticks{200};
-    double z_score_spread_threshold{3.0};
-    double z_score_depth_threshold{3.0};
-    double z_score_ratio_threshold{3.0};
-    int64_t baseline_stale_reset_ms{300'000LL};
-
-    // --- Threat memory ---
-    double threat_memory_alpha{0.15};
-    double threat_memory_residual_factor{0.3};
-    int threat_escalation_ticks{5};
-    double threat_escalation_boost{0.1};
-
-    // --- Depth asymmetry ---
-    double depth_asymmetry_threshold{0.3};
-
-    // --- Cross-signal amplification ---
-    double cross_signal_amplification{0.3};
-
-    // --- v4: Percentile scoring ---
-    int percentile_window_size{500};
-    double percentile_severity_threshold{0.95};
-
-    // --- v4: Correlation matrix ---
-    double correlation_alpha{0.02};
-    double correlation_breakdown_threshold{0.4};
-
-    // --- v4: Time-weighted EMA & Multi-timeframe ---
-    double baseline_halflife_fast_ms{30'000.0};
-    double baseline_halflife_medium_ms{300'000.0};
-    double baseline_halflife_slow_ms{1'800'000.0};
-    double timeframe_divergence_threshold{2.5};
-
-    // --- v4: Hysteresis ---
-    double hysteresis_enter_severity{0.5};
-    double hysteresis_exit_severity{0.25};
-    double hysteresis_confidence_penalty{0.15};
-
-    // --- v4: Event sourcing ---
-    int64_t audit_log_max_size{10'000};
 };
 
 /// Настройки движка принятия решений (conviction, конфликт-разрешение, advanced features)
@@ -380,19 +302,15 @@ struct AppConfig {
     ExchangeConfig       exchange;         ///< Настройки биржи
     LoggingConfig        logging;          ///< Настройки логирования
     MetricsConfig        metrics;          ///< Настройки метрик
-    HealthConfig         health;           ///< Настройки проверки здоровья
     RiskConfig           risk;             ///< Настройки риск-менеджера
     TradingModeConfig    trading;          ///< Настройки режима торговли
     PairSelectionConfig  pair_selection;   ///< Настройки выбора торговых пар
-    AdversarialDefenseConfig adversarial_defense; ///< Защита от враждебных market conditions
-    AIAdvisoryConfig     ai_advisory;      ///< AI Advisory — правиловый/ML анализ
     DecisionConfig       decision;         ///< Настройки движка принятия решений
     TradingParamsConfig  trading_params;   ///< Настройки управления позицией
     ExecutionAlphaConfig execution_alpha;  ///< Настройки модуля исполнительной альфы
     OpportunityCostConfig opportunity_cost; ///< Настройки модуля opportunity cost
     RegimeConfig         regime;           ///< Настройки классификатора рыночных режимов
     FuturesConfig        futures;          ///< Настройки фьючерсной торговли
-    shadow::ShadowConfig shadow;           ///< Настройки shadow trading подсистемы
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

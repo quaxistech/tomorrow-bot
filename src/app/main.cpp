@@ -6,7 +6,7 @@
  * 1. Парсинг аргументов командной строки
  * 2. Загрузка и валидация конфигурации
  * 3. Инициализация компонентов
- * 4. Сканирование торговых пар (PairScanner)
+ * 4. Сканирование торговых пар (ScannerEngine)
  * 5. Создание pipeline для каждого выбранного символа
  * 6. Создание и запуск супервизора
  * 7. Запуск ротации пар (каждые 24ч)
@@ -14,10 +14,9 @@
  * 9. Корректное завершение работы
  */
 #include "app_bootstrap.hpp"
-#include "platform/platform_info.hpp"
 #include "supervisor/supervisor.hpp"
 #include "pipeline/trading_pipeline.hpp"
-#include "pair_scanner/pair_scanner.hpp"
+#include "scanner/scanner_engine.hpp"
 #include "common/exchange_rules.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "security/secret_provider.hpp"
@@ -113,33 +112,49 @@ int main(int argc, const char* argv[]) {
     auto& config  = comp.config;
 
     // ---- 3. Вывод баннера запуска ----
-    auto platform = tb::platform::get_platform_info();
-    auto banner   = tb::platform::format_startup_banner(platform);
-    std::cout << banner;
-
     logger->info("main", "Запуск Tomorrow Bot",
         {{"config", args.config_path},
          {"mode",   std::string(tb::to_string(config.trading.mode))},
          {"config_hash", config.config_hash}});
 
-    // ---- 4. Сканирование торговых пар (PairScanner) ----
+    // ---- 4. Сканирование торговых пар (ScannerEngine v2) ----
     // Создаём REST-клиент для сканера (публичный, без аутентификации)
     auto scanner_rest_client = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
         config.exchange.endpoint_rest, "", "", "", logger, config.exchange.timeout_ms);
 
-    // Создаём PairScanner (v5: metrics, health, persistence)
-    auto pair_scanner = std::make_shared<tb::pair_scanner::PairScanner>(
-        config.pair_selection, scanner_rest_client, logger,
-        comp.metrics, comp.health, nullptr /* storage */);
+    // Создаём ScannerConfig из существующей конфигурации
+    tb::scanner::ScannerConfig scanner_cfg;
+    scanner_cfg.top_n = config.pair_selection.top_n;
+    scanner_cfg.blacklist = config.pair_selection.blacklist;
+    scanner_cfg.product_type = config.pair_selection.product_type;
+    scanner_cfg.rotation_interval_hours = config.pair_selection.rotation_interval_hours;
+    scanner_cfg.prefilter_min_volume_usdt = config.pair_selection.min_volume_usdt;
+    scanner_cfg.min_volume_usdt = config.pair_selection.min_volume_usdt;
+    scanner_cfg.max_spread_bps = config.pair_selection.max_spread_bps;
+    scanner_cfg.max_candidates_detailed = config.pair_selection.max_candidates_for_candles;
+    scanner_cfg.api_retry_max = config.pair_selection.api_retry_max;
+
+    // Создаём ScannerEngine (v2: features, traps, bias, ranking)
+    auto market_scanner = std::make_shared<tb::scanner::ScannerEngine>(
+        scanner_cfg, scanner_rest_client, logger, comp.metrics);
 
     // Выполняем первичное сканирование
-    logger->info("main", "Запуск сканирования торговых пар...");
-    auto scan_result = pair_scanner->scan();
+    logger->info("main", "Запуск сканирования торговых пар (ScannerEngine v2)...");
+    auto scanner_result = market_scanner->scan();
 
-    // Определяем символы для торговли (до top_n пар из конфига)
+    // Определяем символы для торговли
     std::vector<std::string> active_symbols;
-    if (!scan_result.selected.empty()) {
-        active_symbols = scan_result.selected;
+    auto new_symbols = scanner_result.selected_symbols();
+    if (!new_symbols.empty()) {
+        active_symbols = new_symbols;
+
+        // Логируем детали сканера
+        for (const auto& p : scanner_result.top_pairs) {
+            logger->info("main", "Scanner v2: " + p.symbol +
+                " | Score=" + std::to_string(p.score.total) +
+                " | Bias=" + std::string(tb::scanner::to_string(p.bias)) +
+                " | State=" + std::string(tb::scanner::to_string(p.trade_state)));
+        }
     } else {
         active_symbols.push_back("BTCUSDT");
         logger->warn("main", "Сканер не нашёл подходящих пар. Используется BTCUSDT по умолчанию");
@@ -255,25 +270,33 @@ int main(int argc, const char* argv[]) {
             {{"symbols", symbols_str}});
     }
 
-    // Собираем правила инструментов для cada выбранного символа из результатов сканирования
-    // (PairScanner уже загрузил quantityPrecision/pricePrecision/minTradeUSDT из exchange info)
+    // Собираем правила инструментов из результатов сканирования
     std::unordered_map<std::string, tb::ExchangeSymbolRules> symbol_rules;
-    for (const auto& ps : scan_result.ranked_pairs) {
+
+    // Из нового ScannerEngine (top_pairs + rejected содержат precision)
+    for (const auto& sa : scanner_result.top_pairs) {
         tb::ExchangeSymbolRules rules;
-        rules.symbol = tb::Symbol(ps.symbol);
-        rules.quantity_precision = ps.quantity_precision;
-        rules.price_precision = ps.price_precision;
-        rules.min_trade_usdt = ps.min_trade_usdt;
-        symbol_rules[ps.symbol] = rules;
+        rules.symbol = tb::Symbol(sa.symbol);
+        rules.quantity_precision = sa.quantity_precision;
+        rules.price_precision = sa.price_precision;
+        rules.min_trade_usdt = sa.min_trade_usdt;
+        symbol_rules[sa.symbol] = rules;
+    }
+    for (const auto& sa : scanner_result.rejected_pairs) {
+        if (symbol_rules.count(sa.symbol)) continue;
+        tb::ExchangeSymbolRules rules;
+        rules.symbol = tb::Symbol(sa.symbol);
+        rules.quantity_precision = sa.quantity_precision;
+        rules.price_precision = sa.price_precision;
+        rules.min_trade_usdt = sa.min_trade_usdt;
+        symbol_rules[sa.symbol] = rules;
     }
 
     // ---- 5. Создание и запуск супервизора ----
     tb::supervisor::Supervisor supervisor{
-        comp.health,
         comp.logger,
         comp.metrics,
-        comp.clock,
-        comp.governance
+        comp.clock
     };
 
     supervisor.install_signal_handlers();
@@ -286,8 +309,7 @@ int main(int argc, const char* argv[]) {
         const auto& sym = active_symbols[i];
 
         auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
-            config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, comp.health,
-            comp.governance, sym);
+            config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, sym);
 
         // Устанавливаем правила инструмента из данных сканирования
         auto rules_it = symbol_rules.find(sym);
@@ -312,14 +334,17 @@ int main(int argc, const char* argv[]) {
     }
 
     // ---- 5.6. Запуск ротации пар (каждые N часов) ----
-    pair_scanner->start_rotation([&logger](const std::vector<std::string>& new_symbols) {
+    // Ротация через новый ScannerEngine
+    market_scanner->start_rotation([&logger](const tb::scanner::ScannerResult& result) {
+        auto syms = result.selected_symbols();
         std::string symbols_str;
-        for (const auto& s : new_symbols) {
+        for (const auto& s : syms) {
             if (!symbols_str.empty()) symbols_str += ", ";
             symbols_str += s;
         }
-        logger->info("main", "Плановая ротация завершена. Лучшие пары: " + symbols_str,
-            {{"count", std::to_string(new_symbols.size())}});
+        logger->info("main", "Плановая ротация (ScannerEngine v2). Лучшие пары: " + symbols_str,
+            {{"count", std::to_string(syms.size())},
+             {"scan_duration_ms", std::to_string(result.scan_duration_ms)}});
     });
 
     try {
@@ -375,8 +400,11 @@ int main(int argc, const char* argv[]) {
                 {{"pipeline_count", std::to_string(pipelines.size())}});
 
             try {
-                auto rescan = pair_scanner->scan();
-                if (rescan.selected.empty()) {
+                // Используем новый ScannerEngine для ресканирования
+                auto rescan_v2 = market_scanner->scan();
+                auto rescan_syms = rescan_v2.selected_symbols();
+
+                if (rescan_syms.empty()) {
                     logger->warn("main", "Ресканирование не нашло подходящих пар");
                     last_rescan_ns = comp.clock->now().get();
                     continue;
@@ -384,11 +412,11 @@ int main(int argc, const char* argv[]) {
 
                 // Проверяем: новые символы отличаются от текущих?
                 bool symbols_changed = false;
-                if (rescan.selected.size() != active_symbols.size()) {
+                if (rescan_syms.size() != active_symbols.size()) {
                     symbols_changed = true;
                 } else {
-                    for (size_t i = 0; i < rescan.selected.size(); ++i) {
-                        if (rescan.selected[i] != active_symbols[i]) {
+                    for (size_t i = 0; i < rescan_syms.size(); ++i) {
+                        if (rescan_syms[i] != active_symbols[i]) {
                             symbols_changed = true;
                             break;
                         }
@@ -407,7 +435,7 @@ int main(int argc, const char* argv[]) {
                     if (!old_str.empty()) old_str += ", ";
                     old_str += s;
                 }
-                for (const auto& s : rescan.selected) {
+                for (const auto& s : rescan_syms) {
                     if (!new_str.empty()) new_str += ", ";
                     new_str += s;
                 }
@@ -424,24 +452,33 @@ int main(int argc, const char* argv[]) {
 
                 // 2. Обновляем правила инструментов из нового сканирования
                 symbol_rules.clear();
-                for (const auto& ps : rescan.ranked_pairs) {
+                for (const auto& sa : rescan_v2.top_pairs) {
                     tb::ExchangeSymbolRules rules;
-                    rules.symbol = tb::Symbol(ps.symbol);
-                    rules.quantity_precision = ps.quantity_precision;
-                    rules.price_precision = ps.price_precision;
-                    rules.min_trade_usdt = ps.min_trade_usdt;
-                    symbol_rules[ps.symbol] = rules;
+                    rules.symbol = tb::Symbol(sa.symbol);
+                    rules.quantity_precision = sa.quantity_precision;
+                    rules.price_precision = sa.price_precision;
+                    rules.min_trade_usdt = sa.min_trade_usdt;
+                    symbol_rules[sa.symbol] = rules;
+                }
+                for (const auto& sa : rescan_v2.rejected_pairs) {
+                    if (symbol_rules.count(sa.symbol)) continue;
+                    tb::ExchangeSymbolRules rules;
+                    rules.symbol = tb::Symbol(sa.symbol);
+                    rules.quantity_precision = sa.quantity_precision;
+                    rules.price_precision = sa.price_precision;
+                    rules.min_trade_usdt = sa.min_trade_usdt;
+                    symbol_rules[sa.symbol] = rules;
                 }
 
                 // 3. Обновляем список активных символов
-                active_symbols = rescan.selected;
+                active_symbols = rescan_syms;
 
                 // 4. Создаём и запускаем новые pipeline
                 for (size_t i = 0; i < active_symbols.size(); ++i) {
                     const auto& sym = active_symbols[i];
                     auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
                         config, comp.secret_provider, comp.logger, comp.clock,
-                        comp.metrics, comp.health, comp.governance, sym);
+                        comp.metrics, sym);
 
                     auto rules_it = symbol_rules.find(sym);
                     if (rules_it != symbol_rules.end()) {
@@ -492,7 +529,7 @@ int main(int argc, const char* argv[]) {
     if (idle_monitor_thread.joinable()) {
         idle_monitor_thread.join();
     }
-    pair_scanner->stop_rotation();
+    market_scanner->stop_rotation();
     // Останавливаем pipeline вручную (supervisor может не знать о горячих заменах)
     for (auto& p : pipelines) {
         p->stop();

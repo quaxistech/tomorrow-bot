@@ -371,7 +371,7 @@ TEST_CASE("Decision: portfolio drawdown → повышенный порог conv
     auto portfolio_ok = make_portfolio(0.0, 0);
     auto rec_ok = engine.aggregate(Symbol("BTCUSDT"), {intent}, allocation,
         make_regime(), make_world(), make_low_uncertainty(),
-        std::nullopt, portfolio_ok, std::nullopt);
+        portfolio_ok);
     REQUIRE(rec_ok.trade_approved);
 
     // С глубокой просадкой (8%) и серией потерь (5)
@@ -380,7 +380,7 @@ TEST_CASE("Decision: portfolio drawdown → повышенный порог conv
     auto portfolio_dd = make_portfolio(-8.0, 5);
     auto rec_dd = engine.aggregate(Symbol("BTCUSDT"), {intent}, allocation,
         make_regime(), make_world(), make_low_uncertainty(),
-        std::nullopt, portfolio_dd, std::nullopt);
+        portfolio_dd);
     REQUIRE_FALSE(rec_dd.trade_approved);
 }
 
@@ -406,13 +406,13 @@ TEST_CASE("Decision: execution cost penalty снижает conviction", "[decisi
     auto features_low = make_features(3.0, 2.0);
     auto rec_low = engine.aggregate(Symbol("BTCUSDT"), {intent}, allocation,
         make_regime(), make_world(), make_low_uncertainty(),
-        std::nullopt, std::nullopt, features_low);
+        std::nullopt, features_low);
 
     // Высокие издержки
     auto features_high = make_features(40.0, 30.0);
     auto rec_high = engine.aggregate(Symbol("BTCUSDT"), {intent}, allocation,
         make_regime(), make_world(), make_low_uncertainty(),
-        std::nullopt, std::nullopt, features_high);
+        std::nullopt, features_high);
 
     // Высокие издержки → conviction ниже
     REQUIRE(rec_low.final_conviction > rec_high.final_conviction);
@@ -440,7 +440,7 @@ TEST_CASE("Decision: execution cost > max → veto", "[decision][advanced]") {
     auto features_expensive = make_features(50.0, 30.0);
     auto record = engine.aggregate(Symbol("BTCUSDT"), {intent}, allocation,
         make_regime(), make_world(), make_low_uncertainty(),
-        std::nullopt, std::nullopt, features_expensive);
+        std::nullopt, features_expensive);
 
     REQUIRE_FALSE(record.trade_approved);
     bool has_exec_veto = false;

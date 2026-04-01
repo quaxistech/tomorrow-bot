@@ -13,7 +13,6 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_logging
     tb_clock
     tb_metrics
-    tb_health
     tb_security
     tb_market_data
     tb_features
@@ -25,8 +24,6 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_strategy
     tb_strategy_allocator
     tb_decision
-    tb_ai
-    tb_adversarial_defense
     tb_portfolio_allocator
     tb_portfolio
     tb_execution_alpha
@@ -35,12 +32,7 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_leverage
     tb_execution
     tb_exchange_bitget
-    tb_alpha_decay
-    tb_champion_challenger
     tb_persistence
     tb_ml
-    tb_governance
-    tb_self_diagnosis
-    tb_shadow
     tb_reconciliation
 )

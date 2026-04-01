@@ -117,6 +117,15 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
             return std::nullopt;
         }
 
+        // Momentum guard: block BUY when local momentum is falling
+        if (tech.momentum_valid && tech.momentum_5 < cfg_.momentum_min_buy) {
+            logger_->debug("MicroScalp",
+                "BUY заблокирован — отрицательный momentum_5",
+                {{"momentum_5", std::to_string(tech.momentum_5)},
+                 {"threshold", std::to_string(cfg_.momentum_min_buy)}});
+            return std::nullopt;
+        }
+
         // Block BUY scalps in bear trend
         if (trend_bearish && cfg_.block_counter_trend) {
             logger_->debug("MicroScalp",
@@ -170,6 +179,15 @@ std::optional<TradeIntent> MicrostructureScalpStrategy::evaluate(const StrategyC
                 "SELL заблокирован — цена перепродана по BB",
                 {{"bb_pos", std::to_string(bb_pos)},
                  {"threshold", std::to_string(cfg_.bb_min_sell)}});
+            return std::nullopt;
+        }
+
+        // Momentum guard: block SELL when local momentum is rising
+        if (tech.momentum_valid && tech.momentum_5 > cfg_.momentum_max_sell) {
+            logger_->debug("MicroScalp",
+                "SELL заблокирован — положительный momentum_5",
+                {{"momentum_5", std::to_string(tech.momentum_5)},
+                 {"threshold", std::to_string(cfg_.momentum_max_sell)}});
             return std::nullopt;
         }
 

@@ -5,7 +5,6 @@
 #include "regime/regime_types.hpp"
 #include "world_model/world_model_types.hpp"
 #include "uncertainty/uncertainty_types.hpp"
-#include "ai/ai_advisory_types.hpp"
 #include "portfolio/portfolio_types.hpp"
 #include "features/feature_snapshot.hpp"
 #include "logging/logger.hpp"
@@ -31,7 +30,6 @@ public:
         const regime::RegimeSnapshot& regime,
         const world_model::WorldModelSnapshot& world,
         const uncertainty::UncertaintySnapshot& uncertainty,
-        const std::optional<ai::AIAdvisoryResult>& ai_advisory = std::nullopt,
         const std::optional<portfolio::PortfolioSnapshot>& portfolio = std::nullopt,
         const std::optional<features::FeatureSnapshot>& features = std::nullopt) = 0;
 };
@@ -53,7 +51,6 @@ public:
         const regime::RegimeSnapshot& regime,
         const world_model::WorldModelSnapshot& world,
         const uncertainty::UncertaintySnapshot& uncertainty,
-        const std::optional<ai::AIAdvisoryResult>& ai_advisory = std::nullopt,
         const std::optional<portfolio::PortfolioSnapshot>& portfolio = std::nullopt,
         const std::optional<features::FeatureSnapshot>& features = std::nullopt) override;
 

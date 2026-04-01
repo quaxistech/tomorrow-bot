@@ -11,7 +11,6 @@
 #include "world_model/world_model_engine.hpp"
 #include "regime/regime_engine.hpp"
 #include "uncertainty/uncertainty_engine.hpp"
-#include "defense/adversarial_market_defense.hpp"
 #include "ml/ml_signal_types.hpp"
 #include "strategy/strategy_types.hpp"
 #include "decision/decision_aggregation_engine.hpp"
@@ -88,15 +87,13 @@ struct PipelineTickContext {
     std::optional<regime::RegimeSnapshot> regime;
     /// Снимок неопределённости (Uncertainty Engine)
     std::optional<uncertainty::UncertaintySnapshot> uncertainty;
-    /// Оценка враждебности рыночных условий (Adversarial Defense)
-    std::optional<adversarial::DefenseAssessment> adversarial;
     /// Снимок ML-сигналов (энтропия, каскады, корреляции)
     std::optional<ml::MlSignalSnapshot> ml_signals;
 
     // ── Стратегические сигналы ───────────────────────────────────────────
     /// Сигналы всех стратегий до фильтрации
     std::vector<strategy::TradeIntent> raw_intents;
-    /// Сигналы после применения фильтров (allocator, adversarial veto)
+    /// Сигналы после применения фильтров
     std::vector<strategy::TradeIntent> filtered_intents;
 
     // ── Решение и исполнение ─────────────────────────────────────────────

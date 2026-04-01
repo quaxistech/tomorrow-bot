@@ -44,7 +44,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.9, "Устойчивый тренд — идеально для momentum");
         add(v, "mean_reversion",       0.2, "Тренд — не подходит для возврата к среднему");
         add(v, "breakout",             0.4, "Тренд уже установлен, пробой менее вероятен");
-        add(v, "microstructure_scalp", 0.5, "Стабильная микроструктура допускает скальпинг");
+        add(v, "scalp_engine", 0.5, "Стабильная микроструктура допускает скальпинг");
         add(v, "vol_expansion",        0.3, "Волатильность стабильна, расширение маловероятно");
         add(v, "ema_pullback",         0.9, "Устойчивый тренд — идеально для pullback");
         add(v, "rsi_divergence",       0.4, "Дивергенции в тренде — средняя пригодность");
@@ -57,7 +57,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.5, "Пробой может перерасти в тренд");
         add(v, "mean_reversion",       0.1, "Пробой — опасно торговать против");
         add(v, "breakout",             0.8, "Пробой — основной сценарий");
-        add(v, "microstructure_scalp", 0.3, "Хрупкая микроструктура");
+        add(v, "scalp_engine", 0.3, "Хрупкая микроструктура");
         add(v, "vol_expansion",        0.7, "Волатильность расширяется");
         add(v, "ema_pullback",         0.3, "Пробой — pullback маловероятен");
         add(v, "rsi_divergence",       0.5, "Дивергенции на пробое — средне");
@@ -70,7 +70,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.2, "Ещё нет направления");
         add(v, "mean_reversion",       0.6, "Можно торговать в диапазоне до пробоя");
         add(v, "breakout",             0.9, "Сжатие — лучший сетап для пробоя");
-        add(v, "microstructure_scalp", 0.6, "Узкие спреды в сжатии");
+        add(v, "scalp_engine", 0.6, "Узкие спреды в сжатии");
         add(v, "vol_expansion",        0.8, "Ожидание расширения волатильности");
         add(v, "ema_pullback",         0.4, "Сжатие — pullback возможен");
         add(v, "rsi_divergence",       0.5, "Дивергенции в сжатии — средне");
@@ -83,7 +83,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.1, "Нет тренда — momentum неэффективен");
         add(v, "mean_reversion",       0.7, "Боковик — хорошо для mean reversion");
         add(v, "breakout",             0.1, "Ложные пробои в боковике");
-        add(v, "microstructure_scalp", 0.8, "Стабильный стакан — хорошо для скальпинга");
+        add(v, "scalp_engine", 0.8, "Стабильный стакан — хорошо для скальпинга");
         add(v, "vol_expansion",        0.1, "Низкая волатильность, расширение маловероятно");
         add(v, "ema_pullback",         0.3, "Слабые pullback без тренда");
         add(v, "rsi_divergence",       0.6, "RSI дивергенции в боковике — хорошо");
@@ -96,7 +96,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.1, "Импульс истощён");
         add(v, "mean_reversion",       0.6, "Возврат после спайка вероятен");
         add(v, "breakout",             0.1, "Ложный сигнал пробоя");
-        add(v, "microstructure_scalp", 0.1, "Нестабильная микроструктура");
+        add(v, "scalp_engine", 0.1, "Нестабильная микроструктура");
         add(v, "vol_expansion",        0.3, "Волатильность уже высока");
         add(v, "ema_pullback",         0.2, "Exhaustion — pullback рискован");
         add(v, "rsi_divergence",       0.7, "Дивергенция на exhaustion — хорошо");
@@ -109,7 +109,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.35, "Вакуум ликвидности — осторожная торговля");
         add(v, "mean_reversion",       0.30, "Вакуум ликвидности — mean reversion возможен");
         add(v, "breakout",             0.30, "Вакуум ликвидности — пробои с осторожностью");
-        add(v, "microstructure_scalp", 0.10, "Вакуум ликвидности — скальпинг ограниченно");
+        add(v, "scalp_engine", 0.10, "Вакуум ликвидности — скальпинг ограниченно");
         add(v, "vol_expansion",        0.25, "Вакуум ликвидности — волатильность присутствует");
         add(v, "ema_pullback",         0.30, "Вакуум ликвидности — pullback возможен");
         add(v, "rsi_divergence",       0.25, "Вакуум ликвидности — дивергенции надёжнее");
@@ -122,7 +122,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.30, "Токсичная микроструктура — momentum с осторожностью");
         add(v, "mean_reversion",       0.30, "Токсичная микроструктура — mean reversion возможен");
         add(v, "breakout",             0.25, "Токсичная микроструктура — пробои с осторожностью");
-        add(v, "microstructure_scalp", 0.10, "Токсичная микроструктура — скальпинг ограничен");
+        add(v, "scalp_engine", 0.10, "Токсичная микроструктура — скальпинг ограничен");
         add(v, "vol_expansion",        0.30, "Токсичная микроструктура — волатильность есть");
         add(v, "ema_pullback",         0.25, "Токсичная микроструктура — pullback возможен");
         add(v, "rsi_divergence",       0.25, "Дивергенции в токсичном режиме — проверять");
@@ -135,7 +135,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.3, "Направление после шока неясно");
         add(v, "mean_reversion",       0.5, "Возврат к нормальным уровням");
         add(v, "breakout",             0.2, "Повторный шок маловероятен");
-        add(v, "microstructure_scalp", 0.4, "Микроструктура стабилизируется");
+        add(v, "scalp_engine", 0.4, "Микроструктура стабилизируется");
         add(v, "vol_expansion",        0.4, "Волатильность снижается");
         add(v, "ema_pullback",         0.4, "Pullback после шока — приемлемо");
         add(v, "rsi_divergence",       0.5, "Дивергенции после шока — средне");
@@ -148,7 +148,7 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "momentum",             0.3, "Состояние неизвестно — пониженный вес");
         add(v, "mean_reversion",       0.3, "Состояние неизвестно — пониженный вес");
         add(v, "breakout",             0.3, "Состояние неизвестно — пониженный вес");
-        add(v, "microstructure_scalp", 0.3, "Состояние неизвестно — пониженный вес");
+        add(v, "scalp_engine", 0.3, "Состояние неизвестно — пониженный вес");
         add(v, "vol_expansion",        0.3, "Состояние неизвестно — пониженный вес");
         add(v, "ema_pullback",         0.3, "Состояние неизвестно — пониженный вес");
         add(v, "rsi_divergence",       0.3, "Состояние неизвестно — пониженный вес");

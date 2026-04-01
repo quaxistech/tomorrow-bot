@@ -35,7 +35,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     const regime::RegimeSnapshot& regime,
     const world_model::WorldModelSnapshot& world,
     const uncertainty::UncertaintySnapshot& uncertainty,
-    const std::optional<ai::AIAdvisoryResult>& ai_advisory,
     const std::optional<portfolio::PortfolioSnapshot>& portfolio,
     const std::optional<features::FeatureSnapshot>& features) {
 
@@ -47,13 +46,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     record.world_state = world.label;
     record.uncertainty = uncertainty.level;
     record.uncertainty_score = uncertainty.aggregate_score;
-
-    // Запомнить portfolio context для аудита
-    if (portfolio.has_value()) {
-        record.portfolio_drawdown_pct = portfolio->pnl.current_drawdown_pct;
-        record.consecutive_losses = portfolio->pnl.consecutive_losses;
-        record.has_open_position = !portfolio->positions.empty();
-    }
 
     std::ostringstream rationale;
 
@@ -110,57 +102,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
                       {{"symbol", symbol.get()},
                        {"reason_code", to_string(record.rejection_reason)}});
         return record;
-    }
-
-    // ─── 1.5. AI Advisory processing ────────────────────────────────────────
-
-    if (ai_advisory.has_value() && !ai_advisory->empty()) {
-        record.ai_advisories = ai_advisory->advisories;
-        record.ai_confidence_adjustment = ai_advisory->total_confidence_adjustment;
-        record.ai_veto_recommended = ai_advisory->has_veto;
-        record.advisory_state = ai_advisory->advisory_state;
-        record.advisory_size_multiplier = ai_advisory->advisory_size_multiplier;
-
-        // Жёсткое вето — полный запрет торговли
-        if (ai_advisory->advisory_state == ai::AdvisoryState::Veto) {
-            VetoReason veto;
-            veto.source = "ai_advisory";
-            veto.reason = "AI Advisory: высокая серьёзность предупреждений (severity=" +
-                std::to_string(ai_advisory->max_severity) + ")";
-            veto.severity = ai_advisory->max_severity;
-            veto.reason_code = RejectionReason::AIAdvisoryVeto;
-            record.global_vetoes.push_back(veto);
-            rationale << "AI ВЕТО: " << ai_advisory->advisories.front().insight << ". ";
-
-            record.trade_approved = false;
-            record.rejection_reason = RejectionReason::AIAdvisoryVeto;
-            record.rationale = rationale.str();
-            for (const auto& intent : intents) {
-                StrategyContribution contrib;
-                contrib.strategy_id = intent.strategy_id;
-                contrib.intent = intent;
-                contrib.raw_conviction = intent.conviction;
-                contrib.was_vetoed = true;
-                contrib.veto_reasons = record.global_vetoes;
-                record.contributions.push_back(std::move(contrib));
-            }
-            logger_->warn("Decision", "AI Advisory вето",
-                {{"symbol", symbol.get()},
-                 {"severity", std::to_string(ai_advisory->max_severity)},
-                 {"advisories_count", std::to_string(ai_advisory->advisories.size())}});
-            return record;
-        }
-
-        // Режим осторожности — торговля разрешена с уменьшенным размером позиции
-        if (ai_advisory->advisory_state == ai::AdvisoryState::Caution) {
-            rationale << "AI CAUTION: size_mult=" << ai_advisory->advisory_size_multiplier
-                      << " severity=" << ai_advisory->max_severity << ". ";
-            logger_->info("Decision", "AI Advisory режим осторожности",
-                {{"symbol", symbol.get()},
-                 {"severity", std::to_string(ai_advisory->max_severity)},
-                 {"size_mult", std::to_string(ai_advisory->advisory_size_multiplier)},
-                 {"ensemble_count", std::to_string(ai_advisory->ensemble_count)}});
-        }
     }
 
     // ─── 2. Execution cost estimation ───────────────────────────────────────
@@ -363,15 +304,8 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     record.effective_threshold = threshold;
 
-    // ─── 7. AI Advisory conviction adjustment ───────────────────────────────
-
-    double ai_adj = 0.0;
-    if (ai_advisory.has_value()) {
-        ai_adj = ai_advisory->total_confidence_adjustment;
-    }
-
     // Используем aged conviction (после time decay + execution cost)
-    double base_conviction = best.regime_conviction + ai_adj;
+    double base_conviction = best.regime_conviction;
 
     // ─── 8. Ensemble conviction bonus ───────────────────────────────────────
 
@@ -403,9 +337,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         if (best.aged_conviction != best.intent->conviction) {
             rationale << " aged=" << best.aged_conviction;
         }
-        if (ai_adj != 0.0) {
-            rationale << " (AI adj=" << ai_adj << ")";
-        }
         if (ensemble.ensemble_bonus > 0.0) {
             rationale << " (ensemble+" << ensemble.ensemble_bonus << ")";
         }
@@ -435,9 +366,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
               << " conviction=" << best.intent->conviction;
     if (best.aged_conviction != best.intent->conviction) {
         rationale << " aged=" << best.aged_conviction;
-    }
-    if (ai_adj != 0.0) {
-        rationale << " (AI adj=" << ai_adj << ")";
     }
     if (ensemble.ensemble_bonus > 0.0) {
         rationale << " (ensemble+" << ensemble.ensemble_bonus

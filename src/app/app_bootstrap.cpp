@@ -5,7 +5,6 @@
 #include "app_bootstrap.hpp"
 #include "clock/wall_clock.hpp"
 #include "common/enums.hpp"
-#include "governance/governance_audit_layer.hpp"
 #include "security/production_guard.hpp"
 #include <filesystem>
 
@@ -59,26 +58,8 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
     // ---- 4. Метрики ----
     components.metrics = metrics::create_metrics_registry();
 
-    // ---- 5. Сервис здоровья ----
-    components.health = health::create_health_service();
-
-    // ---- 6. Часы ----
+    // ---- 5. Часы ----
     components.clock = clock::create_wall_clock();
-
-    // ---- 7. Governance control plane ----
-    components.governance = std::make_shared<governance::GovernanceAuditLayer>(
-        components.logger,
-        components.clock,
-        components.metrics,
-        components.health
-    );
-    components.governance->register_with_health();
-    components.governance->set_config_hash(ConfigHash(components.config.config_hash));
-    components.governance->set_trading_mode(components.config.trading.mode, "bootstrap");
-    components.governance->record_audit(
-        governance::AuditEventType::SystemStartup,
-        "bootstrap", "system",
-        "Инициализация завершена, режим: " + std::string(tb::to_string(components.config.trading.mode)));
 
     // ---- 8. Production Guard — запрет запуска в production без явного подтверждения ----
     if (components.config.trading.mode == TradingMode::Production ||
@@ -106,11 +87,6 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
                 "ProductionGuard: запуск запрещён — " + guard_result.reason);
             return Err<AppComponents>(TbError::ProductionGuardFailed);
         }
-
-        components.governance->record_audit(
-            governance::AuditEventType::SystemStartup,
-            "production_guard", "system",
-            "Production guard passed: " + guard_result.reason);
     }
 
     return Ok(std::move(components));

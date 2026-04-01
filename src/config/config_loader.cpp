@@ -9,7 +9,6 @@
 #include "config_hash.hpp"
 #include "config_validator.hpp"
 #include "common/enums.hpp"
-#include "shadow/shadow_types.hpp"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -198,17 +197,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     }
     cfg.metrics.path = get_value(kv, "metrics.path", "/metrics");
 
-    // Секция health
-    auto health_enabled_str = get_value(kv, "health.enabled", "true");
-    cfg.health.enabled = (health_enabled_str != "false" && health_enabled_str != "0");
-    auto health_port_str = get_value(kv, "health.port", "8080");
-    try {
-        cfg.health.port = std::stoi(health_port_str);
-    } catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать health.port (value='%s'), default=8080\n", health_port_str.c_str());
-        cfg.health.port = 8080;
-    }
-
     // Секция risk
     auto parse_double = [](const std::string& s, double def, const char* field_name = "") -> double {
         try { return std::stod(s); }
@@ -368,167 +356,8 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     sc.steady_gainer_max = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_max", "10.0"), 10.0, "pair_selection.scorer_steady_gainer_max");
     sc.steady_gainer_bonus = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_bonus", "8.0"), 8.0, "pair_selection.scorer_steady_gainer_bonus");
     sc.negative_change_penalty = parse_double(get_value(kv, "pair_selection.scorer_negative_change_penalty", "0.5"), 0.5, "pair_selection.scorer_negative_change_penalty");
-
-    // Секция adversarial_defense
-    auto adv_enabled_str = get_value(kv, "adversarial_defense.enabled", "true");
-    cfg.adversarial_defense.enabled = (adv_enabled_str != "false" && adv_enabled_str != "0");
-    auto adv_fail_closed_str = get_value(kv, "adversarial_defense.fail_closed_on_invalid_data", "true");
-    cfg.adversarial_defense.fail_closed_on_invalid_data =
-        (adv_fail_closed_str != "false" && adv_fail_closed_str != "0");
-    auto adv_auto_cd_str = get_value(kv, "adversarial_defense.auto_cooldown_on_veto", "true");
-    cfg.adversarial_defense.auto_cooldown_on_veto =
-        (adv_auto_cd_str != "false" && adv_auto_cd_str != "0");
-    cfg.adversarial_defense.auto_cooldown_severity = parse_double(
-        get_value(kv, "adversarial_defense.auto_cooldown_severity", "0.85"), 0.85, "adversarial_defense.auto_cooldown_severity");
-    cfg.adversarial_defense.spread_explosion_threshold_bps = parse_double(
-        get_value(kv, "adversarial_defense.spread_explosion_threshold_bps", "100.0"), 100.0, "adversarial_defense.spread_explosion_threshold_bps");
-    cfg.adversarial_defense.spread_normal_bps = parse_double(
-        get_value(kv, "adversarial_defense.spread_normal_bps", "20.0"), 20.0, "adversarial_defense.spread_normal_bps");
-    cfg.adversarial_defense.min_liquidity_depth = parse_double(
-        get_value(kv, "adversarial_defense.min_liquidity_depth", "50.0"), 50.0, "adversarial_defense.min_liquidity_depth");
-    cfg.adversarial_defense.book_imbalance_threshold = parse_double(
-        get_value(kv, "adversarial_defense.book_imbalance_threshold", "0.8"), 0.8, "adversarial_defense.book_imbalance_threshold");
-    cfg.adversarial_defense.book_instability_threshold = parse_double(
-        get_value(kv, "adversarial_defense.book_instability_threshold", "0.7"), 0.7, "adversarial_defense.book_instability_threshold");
-    cfg.adversarial_defense.toxic_flow_ratio_threshold = parse_double(
-        get_value(kv, "adversarial_defense.toxic_flow_ratio_threshold", "1.8"), 1.8, "adversarial_defense.toxic_flow_ratio_threshold");
-    cfg.adversarial_defense.aggressive_flow_threshold = parse_double(
-        get_value(kv, "adversarial_defense.aggressive_flow_threshold", "0.8"), 0.8, "adversarial_defense.aggressive_flow_threshold");
-    cfg.adversarial_defense.vpin_toxic_threshold = parse_double(
-        get_value(kv, "adversarial_defense.vpin_toxic_threshold", "0.7"), 0.7, "adversarial_defense.vpin_toxic_threshold");
-    cfg.adversarial_defense.cooldown_duration_ms = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.cooldown_duration_ms", "30000"), 30000.0, "adversarial_defense.cooldown_duration_ms"));
-    cfg.adversarial_defense.post_shock_cooldown_ms = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.post_shock_cooldown_ms", "60000"), 60000.0, "adversarial_defense.post_shock_cooldown_ms"));
-    cfg.adversarial_defense.max_market_data_age_ns = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.max_market_data_age_ns", "2000000000"), 2'000'000'000.0, "adversarial_defense.max_market_data_age_ns"));
-    cfg.adversarial_defense.max_confidence_reduction = parse_double(
-        get_value(kv, "adversarial_defense.max_confidence_reduction", "0.8"), 0.8, "adversarial_defense.max_confidence_reduction");
-    cfg.adversarial_defense.max_threshold_expansion = parse_double(
-        get_value(kv, "adversarial_defense.max_threshold_expansion", "2.0"), 2.0, "adversarial_defense.max_threshold_expansion");
-    cfg.adversarial_defense.compound_threat_factor = parse_double(
-        get_value(kv, "adversarial_defense.compound_threat_factor", "0.5"), 0.5, "adversarial_defense.compound_threat_factor");
-    cfg.adversarial_defense.cooldown_severity_scale = parse_double(
-        get_value(kv, "adversarial_defense.cooldown_severity_scale", "1.5"), 1.5, "adversarial_defense.cooldown_severity_scale");
-    cfg.adversarial_defense.recovery_duration_ms = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.recovery_duration_ms", "10000"), 10000.0, "adversarial_defense.recovery_duration_ms"));
-    cfg.adversarial_defense.recovery_confidence_floor = parse_double(
-        get_value(kv, "adversarial_defense.recovery_confidence_floor", "0.6"), 0.6, "adversarial_defense.recovery_confidence_floor");
-    cfg.adversarial_defense.spread_velocity_threshold_bps_per_sec = parse_double(
-        get_value(kv, "adversarial_defense.spread_velocity_threshold_bps_per_sec", "50.0"), 50.0, "adversarial_defense.spread_velocity_threshold_bps_per_sec");
-    // --- Adaptive baseline ---
-    cfg.adversarial_defense.baseline_alpha = parse_double(
-        get_value(kv, "adversarial_defense.baseline_alpha", "0.01"), 0.01, "adversarial_defense.baseline_alpha");
-    cfg.adversarial_defense.baseline_warmup_ticks = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.baseline_warmup_ticks", "200"), 200.0, "adversarial_defense.baseline_warmup_ticks"));
-    cfg.adversarial_defense.z_score_spread_threshold = parse_double(
-        get_value(kv, "adversarial_defense.z_score_spread_threshold", "3.0"), 3.0, "adversarial_defense.z_score_spread_threshold");
-    cfg.adversarial_defense.z_score_depth_threshold = parse_double(
-        get_value(kv, "adversarial_defense.z_score_depth_threshold", "3.0"), 3.0, "adversarial_defense.z_score_depth_threshold");
-    cfg.adversarial_defense.z_score_ratio_threshold = parse_double(
-        get_value(kv, "adversarial_defense.z_score_ratio_threshold", "3.0"), 3.0, "adversarial_defense.z_score_ratio_threshold");
-    cfg.adversarial_defense.baseline_stale_reset_ms = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.baseline_stale_reset_ms", "300000"), 300000.0, "adversarial_defense.baseline_stale_reset_ms"));
-    // --- Threat memory ---
-    cfg.adversarial_defense.threat_memory_alpha = parse_double(
-        get_value(kv, "adversarial_defense.threat_memory_alpha", "0.15"), 0.15, "adversarial_defense.threat_memory_alpha");
-    cfg.adversarial_defense.threat_memory_residual_factor = parse_double(
-        get_value(kv, "adversarial_defense.threat_memory_residual_factor", "0.3"), 0.3, "adversarial_defense.threat_memory_residual_factor");
-    cfg.adversarial_defense.threat_escalation_ticks = static_cast<int>(parse_double(
-        get_value(kv, "adversarial_defense.threat_escalation_ticks", "5"), 5.0, "adversarial_defense.threat_escalation_ticks"));
-    cfg.adversarial_defense.threat_escalation_boost = parse_double(
-        get_value(kv, "adversarial_defense.threat_escalation_boost", "0.1"), 0.1, "adversarial_defense.threat_escalation_boost");
-    // --- Depth asymmetry ---
-    cfg.adversarial_defense.depth_asymmetry_threshold = parse_double(
-        get_value(kv, "adversarial_defense.depth_asymmetry_threshold", "0.3"), 0.3, "adversarial_defense.depth_asymmetry_threshold");
-    // --- Cross-signal amplification ---
-    cfg.adversarial_defense.cross_signal_amplification = parse_double(
-        get_value(kv, "adversarial_defense.cross_signal_amplification", "0.3"), 0.3, "adversarial_defense.cross_signal_amplification");
-    // --- v4: Percentile scoring ---
-    cfg.adversarial_defense.percentile_window_size = static_cast<int>(parse_double(
-        get_value(kv, "adversarial_defense.percentile_window_size", "500"), 500.0, "adversarial_defense.percentile_window_size"));
-    cfg.adversarial_defense.percentile_severity_threshold = parse_double(
-        get_value(kv, "adversarial_defense.percentile_severity_threshold", "0.95"), 0.95, "adversarial_defense.percentile_severity_threshold");
-    // --- v4: Correlation matrix ---
-    cfg.adversarial_defense.correlation_alpha = parse_double(
-        get_value(kv, "adversarial_defense.correlation_alpha", "0.02"), 0.02, "adversarial_defense.correlation_alpha");
-    cfg.adversarial_defense.correlation_breakdown_threshold = parse_double(
-        get_value(kv, "adversarial_defense.correlation_breakdown_threshold", "0.4"), 0.4, "adversarial_defense.correlation_breakdown_threshold");
-    // --- v4: Multi-timeframe ---
-    cfg.adversarial_defense.baseline_halflife_fast_ms = parse_double(
-        get_value(kv, "adversarial_defense.baseline_halflife_fast_ms", "30000"), 30000.0, "adversarial_defense.baseline_halflife_fast_ms");
-    cfg.adversarial_defense.baseline_halflife_medium_ms = parse_double(
-        get_value(kv, "adversarial_defense.baseline_halflife_medium_ms", "300000"), 300000.0, "adversarial_defense.baseline_halflife_medium_ms");
-    cfg.adversarial_defense.baseline_halflife_slow_ms = parse_double(
-        get_value(kv, "adversarial_defense.baseline_halflife_slow_ms", "1800000"), 1800000.0, "adversarial_defense.baseline_halflife_slow_ms");
-    cfg.adversarial_defense.timeframe_divergence_threshold = parse_double(
-        get_value(kv, "adversarial_defense.timeframe_divergence_threshold", "2.5"), 2.5, "adversarial_defense.timeframe_divergence_threshold");
-    // --- v4: Hysteresis ---
-    cfg.adversarial_defense.hysteresis_enter_severity = parse_double(
-        get_value(kv, "adversarial_defense.hysteresis_enter_severity", "0.5"), 0.5, "adversarial_defense.hysteresis_enter_severity");
-    cfg.adversarial_defense.hysteresis_exit_severity = parse_double(
-        get_value(kv, "adversarial_defense.hysteresis_exit_severity", "0.25"), 0.25, "adversarial_defense.hysteresis_exit_severity");
-    cfg.adversarial_defense.hysteresis_confidence_penalty = parse_double(
-        get_value(kv, "adversarial_defense.hysteresis_confidence_penalty", "0.15"), 0.15, "adversarial_defense.hysteresis_confidence_penalty");
-    // --- v4: Event sourcing ---
-    cfg.adversarial_defense.audit_log_max_size = static_cast<int64_t>(parse_double(
-        get_value(kv, "adversarial_defense.audit_log_max_size", "10000"), 10000.0, "adversarial_defense.audit_log_max_size"));
-
-    // Секция ai_advisory
-    auto ai_enabled_str = get_value(kv, "ai_advisory.enabled", "false");
-    cfg.ai_advisory.enabled = (ai_enabled_str == "true" || ai_enabled_str == "1");
-    cfg.ai_advisory.timeout_ms = static_cast<int>(parse_double(
-        get_value(kv, "ai_advisory.timeout_ms", "2000"), 2000.0, "ai_advisory.timeout_ms"));
-    cfg.ai_advisory.max_confidence_adjustment = parse_double(
-        get_value(kv, "ai_advisory.max_confidence_adjustment", "0.5"), 0.5, "ai_advisory.max_confidence_adjustment");
-    cfg.ai_advisory.veto_severity_threshold = parse_double(
-        get_value(kv, "ai_advisory.veto_severity_threshold", "0.8"), 0.8, "ai_advisory.veto_severity_threshold");
-    cfg.ai_advisory.cooldown_ms = static_cast<int64_t>(parse_double(
-        get_value(kv, "ai_advisory.cooldown_ms", "5000"), 5000.0, "ai_advisory.cooldown_ms"));
-    // Detector thresholds
-    cfg.ai_advisory.thresholds.volatility_ratio_threshold = parse_double(
-        get_value(kv, "ai_advisory.volatility_ratio_threshold", "3.0"), 3.0, "ai_advisory.volatility_ratio_threshold");
-    cfg.ai_advisory.thresholds.volatility_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.volatility_confidence_adj", "-0.3"), -0.3, "ai_advisory.volatility_confidence_adj");
-    cfg.ai_advisory.thresholds.rsi_overbought = parse_double(
-        get_value(kv, "ai_advisory.rsi_overbought", "85.0"), 85.0, "ai_advisory.rsi_overbought");
-    cfg.ai_advisory.thresholds.rsi_oversold = parse_double(
-        get_value(kv, "ai_advisory.rsi_oversold", "15.0"), 15.0, "ai_advisory.rsi_oversold");
-    cfg.ai_advisory.thresholds.rsi_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.rsi_confidence_adj", "-0.15"), -0.15, "ai_advisory.rsi_confidence_adj");
-    cfg.ai_advisory.thresholds.spread_anomaly_bps = parse_double(
-        get_value(kv, "ai_advisory.spread_anomaly_bps", "50.0"), 50.0, "ai_advisory.spread_anomaly_bps");
-    cfg.ai_advisory.thresholds.spread_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.spread_confidence_adj", "-0.25"), -0.25, "ai_advisory.spread_confidence_adj");
-    cfg.ai_advisory.thresholds.liquidity_ratio_min = parse_double(
-        get_value(kv, "ai_advisory.liquidity_ratio_min", "0.3"), 0.3, "ai_advisory.liquidity_ratio_min");
-    cfg.ai_advisory.thresholds.liquidity_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.liquidity_confidence_adj", "-0.2"), -0.2, "ai_advisory.liquidity_confidence_adj");
-    cfg.ai_advisory.thresholds.vpin_toxic_threshold = parse_double(
-        get_value(kv, "ai_advisory.vpin_toxic_threshold", "0.7"), 0.7, "ai_advisory.vpin_toxic_threshold");
-    cfg.ai_advisory.thresholds.vpin_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.vpin_confidence_adj", "-0.25"), -0.25, "ai_advisory.vpin_confidence_adj");
-    cfg.ai_advisory.thresholds.book_imbalance_threshold = parse_double(
-        get_value(kv, "ai_advisory.book_imbalance_threshold", "0.7"), 0.7, "ai_advisory.book_imbalance_threshold");
-    cfg.ai_advisory.thresholds.book_imbalance_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.book_imbalance_confidence_adj", "-0.15"), -0.15, "ai_advisory.book_imbalance_confidence_adj");
-    cfg.ai_advisory.thresholds.book_instability_threshold = parse_double(
-        get_value(kv, "ai_advisory.book_instability_threshold", "0.7"), 0.7, "ai_advisory.book_instability_threshold");
-    cfg.ai_advisory.thresholds.book_instability_confidence_adj = parse_double(
-        get_value(kv, "ai_advisory.book_instability_confidence_adj", "-0.15"), -0.15, "ai_advisory.book_instability_confidence_adj");
-    // Hysteresis, ensemble escalation, caution mode
-    cfg.ai_advisory.caution_severity_threshold = parse_double(
-        get_value(kv, "ai_advisory.caution_severity_threshold", "0.55"), 0.55, "ai_advisory.caution_severity_threshold");
-    cfg.ai_advisory.hysteresis_clear_ticks = static_cast<int>(parse_double(
-        get_value(kv, "ai_advisory.hysteresis_clear_ticks", "3"), 3.0, "ai_advisory.hysteresis_clear_ticks"));
-    cfg.ai_advisory.ensemble_escalation_count = static_cast<int>(parse_double(
-        get_value(kv, "ai_advisory.ensemble_escalation_count", "3"), 3.0, "ai_advisory.ensemble_escalation_count"));
-    cfg.ai_advisory.ensemble_escalation_bonus = parse_double(
-        get_value(kv, "ai_advisory.ensemble_escalation_bonus", "0.15"), 0.15, "ai_advisory.ensemble_escalation_bonus");
-    cfg.ai_advisory.caution_size_multiplier = parse_double(
-        get_value(kv, "ai_advisory.caution_size_multiplier", "0.5"), 0.5, "ai_advisory.caution_size_multiplier");
-    cfg.ai_advisory.use_severity_weighted_adjustment = (
-        get_value(kv, "ai_advisory.use_severity_weighted_adjustment", "true") != "false");
+    auto scorer_futures_str = get_value(kv, "pair_selection.scorer_futures_mode", "false");
+    sc.futures_mode = (scorer_futures_str != "false" && scorer_futures_str != "0");
 
     // ============================================================
     // Decision Engine
@@ -799,50 +628,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
             cfg.pair_selection.futures_enabled = true;
             cfg.pair_selection.product_type = f.product_type;
         }
-    }
-
-    // ── Секция shadow ────────────────────────────────────────────────────
-    {
-        auto& s = cfg.shadow;
-        auto enabled_str = get_value(kv, "shadow.enabled", "false");
-        s.enabled = (enabled_str == "true" || enabled_str == "1");
-
-        auto mode_str = get_value(kv, "shadow.mode", "observation");
-        if (mode_str == "validation") s.mode = shadow::ShadowMode::Validation;
-        else if (mode_str == "discovery") s.mode = shadow::ShadowMode::Discovery;
-        else s.mode = shadow::ShadowMode::Observation;
-
-        auto policy_str = get_value(kv, "shadow.risk_policy", "mirror_live");
-        if (policy_str == "relaxed") s.risk_policy = shadow::ShadowRiskPolicy::Relaxed;
-        else if (policy_str == "unconstrained") s.risk_policy = shadow::ShadowRiskPolicy::Unconstrained;
-        else s.risk_policy = shadow::ShadowRiskPolicy::MirrorLive;
-
-        s.max_records_per_strategy = static_cast<int>(parse_double(
-            get_value(kv, "shadow.max_records_per_strategy", "1000"), 1000.0, "shadow.max_records_per_strategy"));
-        s.eval_window_short_ns = static_cast<int64_t>(parse_double(
-            get_value(kv, "shadow.eval_window_short_ms", "1000"), 1000.0, "shadow.eval_window_short_ms")) * 1000000LL;
-        s.eval_window_mid_ns = static_cast<int64_t>(parse_double(
-            get_value(kv, "shadow.eval_window_mid_ms", "5000"), 5000.0, "shadow.eval_window_mid_ms")) * 1000000LL;
-        s.eval_window_long_ns = static_cast<int64_t>(parse_double(
-            get_value(kv, "shadow.eval_window_long_ms", "30000"), 30000.0, "shadow.eval_window_long_ms")) * 1000000LL;
-        s.stale_record_timeout_ns = static_cast<int64_t>(parse_double(
-            get_value(kv, "shadow.stale_timeout_ms", "120000"), 120000.0, "shadow.stale_timeout_ms")) * 1000000LL;
-        s.taker_fee_pct = parse_double(
-            get_value(kv, "shadow.taker_fee_pct", std::to_string(s.taker_fee_pct)), s.taker_fee_pct, "shadow.taker_fee_pct");
-        s.maker_fee_pct = parse_double(
-            get_value(kv, "shadow.maker_fee_pct", std::to_string(s.maker_fee_pct)), s.maker_fee_pct, "shadow.maker_fee_pct");
-
-        auto persist_str = get_value(kv, "shadow.persist_to_db", "false");
-        s.persist_to_db = (persist_str == "true" || persist_str == "1");
-        auto respect_ks_str = get_value(kv, "shadow.respect_kill_switch", "true");
-        s.respect_kill_switch = (respect_ks_str != "false" && respect_ks_str != "0");
-
-        s.alert_pnl_divergence_bps = parse_double(
-            get_value(kv, "shadow.alert_pnl_divergence_bps", std::to_string(s.alert_pnl_divergence_bps)),
-            s.alert_pnl_divergence_bps, "shadow.alert_pnl_divergence_bps");
-        s.alert_hit_rate_divergence = parse_double(
-            get_value(kv, "shadow.alert_hit_rate_divergence", std::to_string(s.alert_hit_rate_divergence)),
-            s.alert_hit_rate_divergence, "shadow.alert_hit_rate_divergence");
     }
 
     // Валидация

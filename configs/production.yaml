@@ -62,16 +62,16 @@ decision:
 trading_params:
   atr_stop_multiplier: 1.0          # Tight stop: 1.0×ATR for scalping (fast in/out)
   max_loss_per_trade_pct: 1.5       # 1.5% max loss per trade
-  breakeven_atr_threshold: 1.0      # Breakeven after 1.0×ATR (need enough profit to cover fees)
-  partial_tp_atr_threshold: 1.5     # Take profit at 1.5×ATR (cover fees + profit)
+  breakeven_atr_threshold: 0.3      # Breakeven after 0.3×ATR (reachable on micro-caps)
+  partial_tp_atr_threshold: 0.5     # Take profit at 0.5×ATR (lock profit early)
   partial_tp_fraction: 0.50         # Close 50% at TP, let rest run with trail
   min_risk_reward_ratio: 0.40       # Low R:R — high WR scalping (90% WR × 0.4 R:R = +EV)
-  max_hold_loss_minutes: 10         # 10 min max for losing trades (mean reversion needs time)
-  max_hold_absolute_minutes: 20     # 20 min max any trade
+  max_hold_loss_minutes: 30         # 30 min emergency exit for losing trades
+  max_hold_absolute_minutes: 60     # 60 min max any trade
   order_cooldown_seconds: 30         # v11: 30 sec (скальпинг — быстрый вход/выход)
   stop_loss_cooldown_seconds: 60    # v11: 60 sec after stop loss
   min_hold_minutes: 1               # 1 min min hold
-  price_stop_loss_pct: 1.5          # Tight stop: 1.5% price move
+  price_stop_loss_pct: 3.0          # Safety net: 3% price move (wider for ATR-based exits)
 
 adversarial_defense:
   enabled: true                       # ОБЯЗАТЕЛЬНО в production
@@ -136,8 +136,14 @@ pair_selection:
   top_n: 1                         # ОДНА лучшая пара — концентрация капитала
   min_volume_usdt: 50000000        # $50M+ volume only (major pairs, reliable fills)
   max_spread_bps: 15               # Tight spread (scalping needs low cost)
-  rotation_interval_hours: 12      # Rotate every 12h to find best pair
+  rotation_interval_hours: 4       # Rotate every 4h — find fresh trends faster
   blacklist: "USDCUSDT,DAIUSDT,TUSDUSDT,USDPUSDT,FDUSDUSDT,EURCUSDT,PYUSDUSDT,BGBUSDT,TRADOORUSDT"
+  # Futures bidirectional scoring: bearish trends score equally (short = profit)
+  scorer_futures_mode: true
+  scorer_filter_min_change_24h: -20.0    # Allow coins dropping up to 20% (amazing for short)
+  scorer_negative_change_penalty: 1.0    # NO penalty for falling coins in futures
+  scorer_steady_gainer_min: 2.0          # 2-10% absolute movement = ideal
+  scorer_steady_gainer_max: 10.0
 
 ai_advisory:
   enabled: true                      # AI Advisory включён
@@ -341,30 +347,37 @@ world_model:
 
 # ─── FUTURES TRADING (USDT-M) ──────────────────────────────────────────────
 # Адаптивное управление кредитным плечом для фьючерсной торговли на Bitget
+# Научная основа: Kelly Criterion + ATR-нормализация + режим рынка
+# f* ≈ W - (1-W)/R; для WR=60%, R:R=1.0 → f*=0.20 → conservative leverage
 futures:
   enabled: true
   product_type: "USDT-FUTURES"
   margin_coin: "USDT"
   margin_mode: "isolated"        # isolated: risk isolated per position
 
-  # MAX LEVERAGE for scalping
-  default_leverage: 20           # Start at 20x — max amplification
-  max_leverage: 20               # Bitget max for USDT-M
-  min_leverage: 15               # Floor — never go below 15x for small account
+  # Adaptive leverage: engine computes optimal from regime × 6 multipliers
+  # Bitget supports 50-125x depending on symbol; engine auto-clamps per symbol
+  default_leverage: 10           # Starting point: moderate (engine adapts)
+  max_leverage: 50               # Upper bound — engine rarely reaches this
+  min_leverage: 1                # Floor at 1x — let engine decide freely
 
-  # Always use high leverage (scalping = small moves × big leverage)
-  leverage_trending: 20          # Trending: full leverage (ride the trend)
-  leverage_ranging: 15           # Ranging: still aggressive (mean reversion)
-  leverage_volatile: 10          # Volatile: reduce but still strong
-  leverage_stress: 5             # Stress: moderate (not zero)
+  # Kelly-inspired regime-based leverage (Wilder ADX classification)
+  # Trending (ADX>25): high Sharpe → higher leverage justified
+  # Ranging (ADX 15-25): mean-reversion, lower Sharpe → conservative
+  # Volatile (high ATR): wider stops → lower leverage for same risk
+  # Stress (ADX<15 + extreme RSI): avoid, minimal exposure
+  leverage_trending: 12          # Strong trend = reliable direction → 12x
+  leverage_ranging: 6            # Range-bound = noisy → 6x
+  leverage_volatile: 3           # High vol = wide stops → 3x
+  leverage_stress: 1             # Stress = survival mode → 1x
 
-  # Liquidation protection (tight with high leverage)
-  liquidation_buffer_pct: 3.0    # 3% buffer (with 20x = ~60% price move before liq)
-  max_leverage_drawdown_scale: 0.7  # Slower drawdown-based reduction
+  # Liquidation protection
+  liquidation_buffer_pct: 5.0    # 5% buffer (safe margin from liquidation)
+  max_leverage_drawdown_scale: 0.5  # Halve leverage per 10% drawdown (exponential)
 
   # Funding rate
-  funding_rate_threshold: 0.05   # Higher threshold (scalping = short hold = less funding impact)
-  funding_rate_penalty: 0.3      # Mild penalty
+  funding_rate_threshold: 0.03   # 3% funding = significant (reduce leverage)
+  funding_rate_penalty: 0.5      # 50% penalty per threshold excess
 
   # Maintenance Margin
   maintenance_margin_rate: 0.004 # 0.4% Bitget standard

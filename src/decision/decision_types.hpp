@@ -1,7 +1,6 @@
 #pragma once
 #include "common/types.hpp"
 #include "strategy/strategy_types.hpp"
-#include "ai/ai_advisory_types.hpp"
 #include "regime/regime_types.hpp"
 #include <string>
 #include <vector>
@@ -169,18 +168,6 @@ struct DecisionRecord {
     // Ансамбль
     EnsembleMetrics ensemble;                 ///< Метрики ансамблевого согласия
     ExecutionCostEstimate execution_cost;     ///< Оценка стоимости исполнения
-
-    // AI Advisory контекст
-    std::vector<ai::AIAdvisory> ai_advisories;           ///< AI рекомендации для аудита
-    double ai_confidence_adjustment{0.0};                 ///< Суммарная AI корректировка
-    bool ai_veto_recommended{false};                     ///< AI рекомендовал вето
-    ai::AdvisoryState advisory_state{ai::AdvisoryState::Clear}; ///< Состояние advisory с гистерезисом
-    double advisory_size_multiplier{1.0};                ///< Множитель размера (1.0=норма, 0.5=caution)
-
-    // Portfolio контекст (для аудита)
-    double portfolio_drawdown_pct{0.0};       ///< Просадка на момент решения
-    int consecutive_losses{0};                ///< Серия убытков на момент решения
-    bool has_open_position{false};            ///< Открыта ли позиция по символу
 
     // Вклады стратегий
     std::vector<StrategyContribution> contributions;

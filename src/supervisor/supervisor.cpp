@@ -33,16 +33,12 @@ void Supervisor::signal_handler(int sig) {
 // ============================================================
 
 Supervisor::Supervisor(
-    std::shared_ptr<health::IHealthService>    health,
     std::shared_ptr<logging::ILogger>          logger,
     std::shared_ptr<metrics::IMetricsRegistry> metrics,
-    std::shared_ptr<clock::IClock>             clock,
-    std::shared_ptr<governance::GovernanceAuditLayer> governance)
-    : health_(std::move(health))
-    , logger_(std::move(logger))
+    std::shared_ptr<clock::IClock>             clock)
+    : logger_(std::move(logger))
     , metrics_(std::move(metrics))
     , clock_(std::move(clock))
-    , governance_(std::move(governance))
     , state_(static_cast<int>(SystemState::Initializing))
 {
     instance_.store(this, std::memory_order_release);
@@ -74,39 +70,13 @@ void Supervisor::start() {
         return;
     }
 
-    // Регистрируем базовые подсистемы в health service
-    health_->register_subsystem("supervisor");
-    health_->register_subsystem("config");
-    health_->register_subsystem("logging");
-    health_->register_subsystem("metrics");
-    health_->register_subsystem("clock");
-
-    // Отмечаем инфраструктурные подсистемы как здоровые
-    health_->update_subsystem("supervisor", health::SubsystemState::Healthy, "Работает");
-    health_->update_subsystem("config",     health::SubsystemState::Healthy, "Конфигурация загружена");
-    health_->update_subsystem("logging",    health::SubsystemState::Healthy, "Логирование активно");
-    health_->update_subsystem("metrics",    health::SubsystemState::Healthy, "Метрики готовы");
-    health_->update_subsystem("clock",      health::SubsystemState::Healthy, "Часы синхронизированы");
-
-    // Governance: регистрируем подсистему и записываем SystemStartup
-    if (governance_) {
-        governance_->register_with_health();
-        governance_->record_audit(
-            governance::AuditEventType::SystemStartup,
-            "supervisor", "system",
-            "Супервизор запущен, подсистем: " + std::to_string(subsystems_.size()));
-    }
-
     // Запуск зарегистрированных подсистем в порядке регистрации
     for (auto& sub : subsystems_) {
         logger_->info("supervisor", "Запуск подсистемы: " + sub.name);
-        health_->register_subsystem(sub.name);
         if (sub.start_fn && sub.start_fn()) {
             sub.started = true;
-            health_->update_subsystem(sub.name, health::SubsystemState::Healthy, "Запущена");
             logger_->info("supervisor", "Подсистема запущена: " + sub.name);
         } else {
-            health_->update_subsystem(sub.name, health::SubsystemState::Failed, "Ошибка запуска");
             logger_->error("supervisor", "Не удалось запустить подсистему: " + sub.name);
             enter_degraded_mode("Ошибка запуска подсистемы: " + sub.name);
         }
@@ -147,14 +117,6 @@ void Supervisor::stop() {
     logger_->info("supervisor", "Завершение работы системы (таймаут: "
                   + std::to_string(shutdown_timeout_.count()) + "с)...");
 
-    // Governance: записываем SystemShutdown
-    if (governance_) {
-        governance_->record_audit(
-            governance::AuditEventType::SystemShutdown,
-            "supervisor", "system",
-            "Корректное завершение работы системы");
-    }
-
     const auto deadline = std::chrono::steady_clock::now() + shutdown_timeout_;
 
     // Остановка подсистем в обратном порядке регистрации с учётом таймаута
@@ -169,16 +131,13 @@ void Supervisor::stop() {
             try {
                 it->stop_fn();
                 it->started = false;
-                health_->update_subsystem(it->name, health::SubsystemState::Failed, "Остановлена");
             } catch (const std::exception& e) {
                 logger_->error("supervisor", "Ошибка при остановке подсистемы " + it->name + ": " + e.what());
             }
         }
     }
 
-    // Обновляем состояние супервизора
-    health_->update_subsystem("supervisor", health::SubsystemState::Failed, "Завершение работы");
-
+    // Обновляем состояние
     state_.store(static_cast<int>(SystemState::Stopped), std::memory_order_release);
     logger_->info("supervisor", "Система остановлена");
 }
@@ -194,12 +153,7 @@ SystemState Supervisor::current_state() const noexcept {
 bool Supervisor::validate_startup_dependencies() {
     bool valid = true;
 
-    if (!health_) {
-        logger_->error("supervisor", "Зависимость отсутствует: health service");
-        valid = false;
-    }
     if (!logger_) {
-        // Логгер отсутствует — вывести невозможно, но проверяем для полноты
         valid = false;
     }
     if (!metrics_) {
@@ -226,14 +180,7 @@ void Supervisor::enter_degraded_mode(const std::string& reason) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.store(static_cast<int>(SystemState::Degraded), std::memory_order_release);
     degraded_reason_ = reason;
-    health_->update_subsystem("supervisor", health::SubsystemState::Degraded, reason);
     logger_->warn("supervisor", "Вход в деградированный режим: " + reason);
-
-    // Governance: переводим инцидентное состояние в Degraded
-    if (governance_) {
-        governance_->transition_incident_state(
-            governance::IncidentState::Degraded, "supervisor", reason);
-    }
 }
 
 void Supervisor::exit_degraded_mode() {
@@ -243,14 +190,7 @@ void Supervisor::exit_degraded_mode() {
             static_cast<int>(SystemState::Running),
             std::memory_order_acq_rel)) {
         degraded_reason_.clear();
-        health_->update_subsystem("supervisor", health::SubsystemState::Healthy, "Работает");
         logger_->info("supervisor", "Выход из деградированного режима");
-
-        // Governance: возвращаем инцидентное состояние в Normal
-        if (governance_) {
-            governance_->transition_incident_state(
-                governance::IncidentState::Normal, "supervisor", "Выход из деградации");
-        }
     }
 }
 
@@ -370,14 +310,6 @@ void Supervisor::activate_global_kill_switch(const std::string& reason) {
             logger_->error("supervisor", "Ошибка в kill switch listener: " + std::string(e.what()));
         }
     }
-
-    // Governance audit
-    if (governance_) {
-        governance_->record_audit(
-            governance::AuditEventType::KillSwitchActivated,
-            "supervisor", "system",
-            "Kill switch активирован: " + reason);
-    }
 }
 
 void Supervisor::deactivate_global_kill_switch() {
@@ -392,14 +324,6 @@ void Supervisor::deactivate_global_kill_switch() {
     }
 
     logger_->info("supervisor", "Kill switch деактивирован");
-
-    // Governance audit
-    if (governance_) {
-        governance_->record_audit(
-            governance::AuditEventType::KillSwitchDeactivated,
-            "supervisor", "system",
-            "Kill switch деактивирован");
-    }
 }
 
 bool Supervisor::is_kill_switch_active() const noexcept {

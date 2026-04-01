@@ -4,7 +4,6 @@
 #include "order_book/order_book.hpp"
 #include "normalizer/normalizer.hpp"
 #include "exchange/bitget/bitget_ws_client.hpp"
-#include "health/health_service.hpp"
 #include "logging/logger.hpp"
 #include "metrics/metrics_registry.hpp"
 #include "clock/clock.hpp"
@@ -39,7 +38,6 @@ public:
         GatewayConfig config,
         std::shared_ptr<features::FeatureEngine> feature_engine,
         std::shared_ptr<order_book::LocalOrderBook> order_book,
-        std::shared_ptr<tb::health::IHealthService> health,
         std::shared_ptr<tb::logging::ILogger> logger,
         std::shared_ptr<tb::metrics::IMetricsRegistry> metrics,
         std::shared_ptr<tb::clock::IClock> clock,
@@ -66,7 +64,6 @@ private:
     GatewayConfig config_;
     std::shared_ptr<features::FeatureEngine> feature_engine_;
     std::shared_ptr<order_book::LocalOrderBook> order_book_;
-    std::shared_ptr<tb::health::IHealthService> health_;
     std::shared_ptr<tb::logging::ILogger> logger_;
     std::shared_ptr<tb::metrics::IMetricsRegistry> metrics_;
     std::shared_ptr<tb::clock::IClock> clock_;

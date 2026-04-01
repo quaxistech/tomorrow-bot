@@ -1,5 +1,4 @@
 #include "market_data_gateway.hpp"
-#include "health/readiness_state.hpp"
 #include <variant>
 
 namespace tb::market_data {
@@ -8,7 +7,6 @@ MarketDataGateway::MarketDataGateway(
     GatewayConfig config,
     std::shared_ptr<features::FeatureEngine> feature_engine,
     std::shared_ptr<order_book::LocalOrderBook> order_book,
-    std::shared_ptr<tb::health::IHealthService> health,
     std::shared_ptr<tb::logging::ILogger> logger,
     std::shared_ptr<tb::metrics::IMetricsRegistry> metrics,
     std::shared_ptr<tb::clock::IClock> clock,
@@ -16,7 +14,6 @@ MarketDataGateway::MarketDataGateway(
     : config_(std::move(config))
     , feature_engine_(std::move(feature_engine))
     , order_book_(std::move(order_book))
-    , health_(std::move(health))
     , logger_(std::move(logger))
     , metrics_(std::move(metrics))
     , clock_(std::move(clock))
@@ -38,9 +35,7 @@ MarketDataGateway::MarketDataGateway(
         logger_
     );
 
-    health_->register_subsystem("market_data");
-    health_->update_subsystem("market_data", tb::health::SubsystemState::Starting,
-                              "Инициализация шлюза рыночных данных");
+    logger_->info("MarketDataGateway", "Шлюз рыночных данных инициализирован");
 }
 
 MarketDataGateway::~MarketDataGateway() {
@@ -64,8 +59,6 @@ void MarketDataGateway::stop() {
     }
     logger_->info("MarketDataGateway", "Остановка шлюза рыночных данных");
     ws_client_->stop();
-    health_->update_subsystem("market_data", tb::health::SubsystemState::Unknown,
-                              "Шлюз остановлен");
 }
 
 bool MarketDataGateway::is_connected() const {
@@ -97,14 +90,8 @@ void MarketDataGateway::on_raw_message(exchange::bitget::RawWsMessage msg) {
 void MarketDataGateway::on_connection_changed(bool connected) {
     if (connected) {
         logger_->info("MarketDataGateway", "WebSocket подключён");
-        health_->update_subsystem("market_data", tb::health::SubsystemState::Healthy,
-                                  "WebSocket подключён");
-        // Повторная подписка не нужна: on_ws_handshake уже отправляет
-        // все сохранённые подписки из вектора subscriptions при каждом подключении
     } else {
         logger_->warn("MarketDataGateway", "WebSocket отключён, ожидаем переподключения");
-        health_->update_subsystem("market_data", tb::health::SubsystemState::Degraded,
-                                  "WebSocket отключён");
     }
 }
 

@@ -1,5 +1,0 @@
-# Модуль синтетических сценариев тестирования
-add_library(tb_synthetic_scenarios STATIC scenario_simulator.cpp)
-target_include_directories(tb_synthetic_scenarios PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(tb_synthetic_scenarios PUBLIC tb_common tb_adversarial_defense)
-target_compile_features(tb_synthetic_scenarios PUBLIC cxx_std_23)
