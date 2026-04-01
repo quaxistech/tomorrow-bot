@@ -205,6 +205,9 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
 }
 
 VoidResult WalWriter::write_checkpoint(const std::string& snapshot_json) {
+    // ИСПРАВЛЕНИЕ: Инкремент sequence должен быть под мьютексом для гарантии монотонности
+    std::lock_guard lock(mutex_);
+
     const uint64_t seq = ++wal_sequence_;
 
     const auto wrapped = wrap_wal_json(
