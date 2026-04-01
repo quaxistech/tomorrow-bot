@@ -56,7 +56,9 @@ struct StressThresholds {
     double rsi_extreme_low{15.0};
     double obv_norm_extreme{2.0};
     double aggressive_flow_toxic{0.75};
-    double spread_toxic_bps{15.0};
+    // ИСПРАВЛЕНИЕ: Micro-cap altcoins имеют спреды 50-150bps.
+    // 15bps слишком низкий порог — ложные срабатывания ToxicFlow.
+    double spread_toxic_bps{80.0};        ///< Макс спред для ToxicFlow детекции (micro-cap worst-case 150bps)
     double book_instability_threshold{0.6};
     double spread_stress_bps{30.0};
     double liquidity_ratio_stress{3.0};
