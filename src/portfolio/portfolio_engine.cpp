@@ -356,10 +356,13 @@ PortfolioSnapshot InMemoryPortfolioEngine::snapshot() const {
         snap.pending_orders.push_back(info);
     }
 
-    // Доступный капитал: при leverage > 1 вычитаем margin (notional / leverage), а не full notional
+    // Доступный капитал: используем уже пересчитанный available_cash из ledger
+    // ИСПРАВЛЕНИЕ: Не вычитаем margin_used повторно, т.к. available_cash уже
+    // уменьшен при reserve_cash() и отражает фактически доступные средства
+    snap.available_capital = cash_ledger_.available_cash;
+
+    // Margin используемый для расчета утилизации
     double margin_used = snap.exposure.gross_exposure / leverage_;
-    snap.available_capital = cash_ledger_.available_cash - margin_used;
-    snap.available_capital = std::max(snap.available_capital, 0.0);
 
     // Использование капитала (%)
     if (total_capital_ > common::finance::kMinValidPrice) {
