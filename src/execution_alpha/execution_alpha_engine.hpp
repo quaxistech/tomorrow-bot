@@ -28,8 +28,10 @@ class RuleBasedExecutionAlpha : public IExecutionAlphaEngine {
 public:
     struct Config {
         // ── Базовые пороги ──
-        double max_spread_bps_passive{15.0};     ///< Макс спред для пассивного исполнения
-        double max_spread_bps_any{50.0};          ///< Макс спред для любого исполнения
+        // ИСПРАВЛЕНИЕ: Micro-cap altcoins имеют спреды 50-150bps.
+        // Старые значения (15bps passive / 50bps any) блокировали микрокапы.
+        double max_spread_bps_passive{60.0};     ///< Макс спред для пассивного исполнения (micro-cap реалистично)
+        double max_spread_bps_any{150.0};        ///< Макс спред для любого исполнения (micro-cap worst-case)
         double adverse_selection_threshold{0.7};  ///< Порог токсичности для NoExecution
         double urgency_passive_threshold{0.5};    ///< Ниже → пассивно
         double urgency_aggressive_threshold{0.8}; ///< Выше → агрессивно

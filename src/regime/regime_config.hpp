@@ -30,7 +30,9 @@ struct TrendThresholds {
     double adx_strong{30.0};       ///< ADX above this = strong trend
     double adx_weak_min{18.0};     ///< ADX range for weak trend [min, max]
     double adx_weak_max{30.0};
-    double rsi_trend_bias{50.0};   ///< RSI above = bullish bias, below = bearish
+    // ИСПРАВЛЕНИЕ: RSI=50 нейтрален, не бычий. Для StrongUptrend/Downtrend
+    // требуется RSI >55 (bullish) или <45 (bearish).
+    double rsi_trend_bias{55.0};   ///< RSI above = bullish bias, below = bearish
 };
 
 /// Thresholds for mean-reversion detection
@@ -54,7 +56,9 @@ struct StressThresholds {
     double rsi_extreme_low{15.0};
     double obv_norm_extreme{2.0};
     double aggressive_flow_toxic{0.75};
-    double spread_toxic_bps{15.0};
+    // ИСПРАВЛЕНИЕ: Micro-cap altcoins имеют спреды 50-150bps.
+    // 15bps слишком низкий порог — ложные срабатывания ToxicFlow.
+    double spread_toxic_bps{80.0};        ///< Макс спред для ToxicFlow детекции (micro-cap worst-case 150bps)
     double book_instability_threshold{0.6};
     double spread_stress_bps{30.0};
     double liquidity_ratio_stress{3.0};

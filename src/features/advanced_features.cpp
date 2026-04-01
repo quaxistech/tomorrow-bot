@@ -96,6 +96,26 @@ void AdvancedFeatureEngine::update_cusum(double return_val) {
 // ==================== VPIN ====================
 
 void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
+    ++vpin_trade_count_;
+
+    // ИСПРАВЛЕНИЕ: Периодическая рекалибровка размера бакета каждые 1000 трейдов
+    // Это позволяет адаптироваться к изменениям ликвидности и волатильности рынка
+    if (vpin_trade_count_ % 1000 == 0 && bucket_target_volume_ > 0.0) {
+        // Пересчитываем bucket_target_volume на основе недавней истории
+        if (!vpin_buckets_.empty()) {
+            double recent_avg_volume = 0.0;
+            size_t count = std::min(size_t(10), vpin_buckets_.size());
+            for (size_t i = vpin_buckets_.size() - count; i < vpin_buckets_.size(); ++i) {
+                recent_avg_volume += vpin_buckets_[i].total_volume;
+            }
+            recent_avg_volume /= static_cast<double>(count);
+
+            // Обновляем target с сглаживанием (70% старое, 30% новое)
+            double new_target = recent_avg_volume;
+            bucket_target_volume_ = 0.7 * bucket_target_volume_ + 0.3 * new_target;
+        }
+    }
+
     // Bulk Volume Classification
     if (is_buy) {
         current_bucket_.buy_volume += volume;

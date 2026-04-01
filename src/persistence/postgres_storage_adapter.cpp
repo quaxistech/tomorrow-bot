@@ -125,7 +125,8 @@ VoidResult PostgresStorageAdapter::append_journal(const JournalEntry& entry) {
         reconnect_if_needed();
         pqxx::work txn(*conn_);
 
-        uint64_t seq = next_seq_++;
+        // ИСПРАВЛЕНИЕ: Инкремент next_seq_ ПОСЛЕ успешного коммита, не до
+        uint64_t seq = next_seq_;  // Читаем текущее значение
         txn.exec_params(
             R"sql(
             INSERT INTO tb_journal
@@ -142,6 +143,10 @@ VoidResult PostgresStorageAdapter::append_journal(const JournalEntry& entry) {
             entry.payload_json
         );
         txn.commit();
+
+        // Инкремент только после успешного коммита
+        next_seq_++;
+
         return OkVoid();
     } catch (const std::exception& e) {
         return ErrVoid(TbError::PersistenceError);

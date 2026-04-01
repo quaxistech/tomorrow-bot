@@ -2834,11 +2834,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                                    + bayesian_conviction_adj;
 
         if (adversarial_defense_) {
-            // Ограничиваем рост порога: макс. +20% от базы
-            // (adversarial на micro-cap всегда severity=1.0, thr_mult=2.5)
-            const double capped_mult = std::min(
-                adversarial_assessment.threshold_multiplier, 1.1);
-            effective_threshold = effective_threshold * capped_mult;
+            // ИСПРАВЛЕНИЕ: Не caps threshold_multiplier — доверяем adversarial defense.
+            // Система уже откалибрована для micro-cap (veto порог 0.93, soft actions).
+            // Старый cap к 1.1x игнорировал защиту: thr_mult=2.5 → 1.1 (бесполезно).
+            effective_threshold = effective_threshold * adversarial_assessment.threshold_multiplier;
 
             // Regime-aware: в токсичных условиях слегка ужесточаем
             // Примечание: micro-cap монеты часто показывают "Toxic" из-за

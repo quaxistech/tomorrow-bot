@@ -18,6 +18,7 @@
 #include "config/config_types.hpp"
 #include "common/types.hpp"
 #include "features/feature_snapshot.hpp"
+#include <mutex>
 #include <string>
 
 namespace tb::leverage {
@@ -144,6 +145,7 @@ private:
     [[nodiscard]] static double uncertainty_multiplier(UncertaintyLevel level);
 
     config::FuturesConfig config_;
+    mutable std::mutex mutex_;  ///< Защита config_ от гонок при hot reload
 };
 
 } // namespace tb::leverage

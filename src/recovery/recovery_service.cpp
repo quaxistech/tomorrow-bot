@@ -67,22 +67,40 @@ RecoveryResult RecoveryService::recover_on_startup() {
         logger_->warn(kComponent, "Снимок состояния не найден или повреждён");
         last_result_.messages.emplace_back("Snapshot restore failed or not found");
         ++last_result_.warnings;
+
+        // ИСПРАВЛЕНИЕ: Если нет снимка И это не первый запуск системы,
+        // это критическая ошибка - продолжать опасно
+        // Проверяем есть ли хоть какие-то записи в журнале
+        auto journal_check = persistence_->journal().query(
+            Timestamp(0), clock_->now(), std::nullopt);
+        if (journal_check.has_value() && !journal_check->empty()) {
+            // Есть история но нет снимка - критическая ошибка
+            logger_->error(kComponent,
+                "КРИТИЧЕСКАЯ ОШИБКА: найдены записи в журнале, но снимок недоступен");
+            last_result_.status = RecoveryStatus::Failed;
+            ++last_result_.errors;
+            return last_result_;
+        }
+        // Иначе это первый запуск - предупреждение, но продолжаем
     }
 
     // Шаг 2: воспроизведение журнала событий
+    bool journal_ok = false;
     if (snapshot_ok) {
         // Берём время последнего снимка для replay
         auto snap_result = persistence_->snapshots().load_latest(
             persistence::SnapshotType::Portfolio);
         if (snap_result.has_value()) {
-            bool journal_ok = replay_journal_after_snapshot(snap_result->created_at);
+            journal_ok = replay_journal_after_snapshot(snap_result->created_at);
             if (journal_ok) {
                 logger_->info(kComponent, "Журнал событий воспроизведён");
                 last_result_.messages.emplace_back("Journal replayed successfully");
             } else {
-                logger_->warn(kComponent, "Ошибки при воспроизведении журнала");
-                last_result_.messages.emplace_back("Journal replay had errors");
-                ++last_result_.warnings;
+                logger_->error(kComponent, "КРИТИЧЕСКАЯ ОШИБКА при воспроизведении журнала");
+                last_result_.messages.emplace_back("Journal replay FAILED");
+                ++last_result_.errors;
+                last_result_.status = RecoveryStatus::Failed;
+                return last_result_;
             }
         }
     }

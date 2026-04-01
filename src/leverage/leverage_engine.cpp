@@ -56,6 +56,9 @@ LeverageDecision LeverageEngine::compute_leverage(
     PositionSide position_side,
     double entry_price) const
 {
+    // ИСПРАВЛЕНИЕ: Защита от гонки с update_config()
+    std::lock_guard<std::mutex> lock(mutex_);
+
     LeverageDecision decision;
 
     // 1. Базовое плечо из режима рынка
@@ -178,6 +181,8 @@ bool LeverageEngine::is_liquidation_safe(
 // ==================== update_config ====================
 
 void LeverageEngine::update_config(const config::FuturesConfig& new_config) {
+    // ИСПРАВЛЕНИЕ: Защита от гонки с compute_leverage()
+    std::lock_guard<std::mutex> lock(mutex_);
     config_ = new_config;
 }
 

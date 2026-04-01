@@ -21,6 +21,11 @@ public:
     /// Обновить текущую цену по символу
     virtual void update_price(const Symbol& symbol, Price price) = 0;
 
+    /// Записать funding payment для позиции (для фьючерсов)
+    virtual void record_funding_payment(const Symbol& symbol, double funding_amount) {
+        (void)symbol; (void)funding_amount;
+    }
+
     /// Закрыть позицию полностью
     virtual void close_position(const Symbol& symbol, Price close_price, double realized_pnl) = 0;
 
@@ -101,6 +106,7 @@ public:
 
     void open_position(const Position& pos) override;
     void update_price(const Symbol& symbol, Price price) override;
+    void record_funding_payment(const Symbol& symbol, double funding_amount) override;
     void close_position(const Symbol& symbol, Price close_price, double realized_pnl) override;
     double reduce_position(const Symbol& symbol, Quantity sold_qty,
                            Price close_price, double realized_pnl) override;
