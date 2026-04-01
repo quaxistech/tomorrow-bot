@@ -333,12 +333,14 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
         if (downtrend) {
             check("EMA_cross", tech.ema_20 - tech.ema_50, 0.0, "<", true);
 
-            // StrongDowntrend: EMA20 < EMA50, ADX > adx_strong, RSI <= rsi_trend_bias
+            // StrongDowntrend: EMA20 < EMA50, ADX > adx_strong, RSI < (100 - rsi_trend_bias)
+            // ИСПРАВЛЕНИЕ: Используем симметричный порог для bearish (100 - 55 = 45)
             bool adx_strong = check("ADX", tech.adx, config_.trend.adx_strong, ">",
                                     tech.adx > config_.trend.adx_strong);
             if (adx_strong && tech.rsi_valid) {
-                bool rsi_bearish = check("RSI", tech.rsi_14, config_.trend.rsi_trend_bias, "<=",
-                                         tech.rsi_14 <= config_.trend.rsi_trend_bias);
+                double rsi_bearish_threshold = 100.0 - config_.trend.rsi_trend_bias;
+                bool rsi_bearish = check("RSI", tech.rsi_14, rsi_bearish_threshold, "<",
+                                         tech.rsi_14 < rsi_bearish_threshold);
                 if (rsi_bearish) {
                     return DetailedRegime::StrongDowntrend;
                 }

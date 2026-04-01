@@ -30,7 +30,9 @@ struct TrendThresholds {
     double adx_strong{30.0};       ///< ADX above this = strong trend
     double adx_weak_min{18.0};     ///< ADX range for weak trend [min, max]
     double adx_weak_max{30.0};
-    double rsi_trend_bias{50.0};   ///< RSI above = bullish bias, below = bearish
+    // ИСПРАВЛЕНИЕ: RSI=50 нейтрален, не бычий. Для StrongUptrend/Downtrend
+    // требуется RSI >55 (bullish) или <45 (bearish).
+    double rsi_trend_bias{55.0};   ///< RSI above = bullish bias, below = bearish
 };
 
 /// Thresholds for mean-reversion detection
