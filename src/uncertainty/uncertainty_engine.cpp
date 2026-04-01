@@ -676,7 +676,11 @@ CooldownRecommendation RuleBasedUncertaintyEngine::compute_cooldown(
         constexpr int64_t max_cooldown_ns = 60'000'000'000LL;
         double ratio = static_cast<double>(cd.remaining_ns) /
                        static_cast<double>(max_cooldown_ns);
-        cd.decay_factor    = 0.5 + 0.5 * std::clamp(ratio, 0.0, 1.0);
+        // ИСПРАВЛЕНИЕ: Инвертированная формула — чем больше осталось времени,
+        // тем сильнее должна быть редукция (decay_factor ближе к 0.5).
+        // При ratio=1.0 (только что активирован) → decay=0.5 (50% размера)
+        // При ratio=0.0 (истекает) → decay=1.0 (полный размер)
+        cd.decay_factor    = 0.5 + 0.5 * std::clamp(1.0 - ratio, 0.0, 1.0);
         cd.trigger_reason  = "Серия экстремальных оценок (≥3 подряд)";
     } else {
         cd.active       = false;
