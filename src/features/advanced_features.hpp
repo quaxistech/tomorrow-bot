@@ -107,6 +107,7 @@ private:
     double bucket_target_volume_{0.0};         ///< Целевой объём одного бакета
     double vpin_value_{0.0};                   ///< Текущее значение VPIN
     double vpin_ma_{0.0};                      ///< Скользящее среднее VPIN (EMA)
+    size_t vpin_trade_count_{0};               ///< Счётчик трейдов для периодической рекалибровки
 
     std::vector<double> volumes_calibration_; ///< Буфер объёмов для калибровки бакетов VPIN
 
