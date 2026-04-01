@@ -16,6 +16,7 @@ struct Position {
     NotionalValue notional{NotionalValue(0.0)}; ///< Номинальная стоимость
     double unrealized_pnl{0.0};              ///< Нереализованная прибыль/убыток (USD)
     double unrealized_pnl_pct{0.0};          ///< Нереализованная P&L в процентах
+    double accumulated_funding{0.0};         ///< Накопленные funding payments (USD) - для фьючерсов
     StrategyId strategy_id{StrategyId("")};  ///< Стратегия, открывшая позицию
     Timestamp opened_at{Timestamp(0)};
     Timestamp updated_at{Timestamp(0)};

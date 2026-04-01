@@ -115,6 +115,36 @@ void InMemoryPortfolioEngine::update_price(const Symbol& symbol, Price price) {
     }
 }
 
+void InMemoryPortfolioEngine::record_funding_payment(const Symbol& symbol, double funding_amount) {
+    std::lock_guard lock(mutex_);
+
+    auto it = positions_.find(symbol.get());
+    if (it == positions_.end()) {
+        // Нет позиции - игнорируем funding payment
+        return;
+    }
+
+    auto& pos = it->second;
+
+    // Добавляем funding payment к accumulated_funding
+    // Положительный funding_amount = мы платим (уменьшает P&L)
+    // Отрицательный funding_amount = нам платят (увеличивает P&L)
+    pos.accumulated_funding += funding_amount;
+
+    // Пересчитываем P&L с учетом нового funding
+    recalculate_position_pnl(pos);
+
+    logger_->debug("Portfolio", "Записан funding payment",
+                  {{"symbol", symbol.get()},
+                   {"funding_amount", std::to_string(funding_amount)},
+                   {"accumulated_funding", std::to_string(pos.accumulated_funding)},
+                   {"unrealized_pnl", std::to_string(pos.unrealized_pnl)}});
+
+    emit_event(PortfolioEventType::PositionUpdated, symbol,
+               funding_amount, cash_ledger_.available_cash,
+               "funding_payment=" + std::to_string(funding_amount));
+}
+
 void InMemoryPortfolioEngine::close_position(
     const Symbol& symbol, Price close_price, double realized_pnl)
 {
@@ -418,11 +448,16 @@ void InMemoryPortfolioEngine::recalculate_position_pnl(Position& pos) const {
 
     // Для длинной позиции: (current - entry) * size
     // Для короткой позиции: (entry - current) * size
+    double price_pnl = 0.0;
     if (pos.side == Side::Buy) {
-        pos.unrealized_pnl = (current - entry) * size;
+        price_pnl = (current - entry) * size;
     } else {
-        pos.unrealized_pnl = (entry - current) * size;
+        price_pnl = (entry - current) * size;
     }
+
+    // ИСПРАВЛЕНИЕ: Вычитаем накопленные funding payments для фьючерсов
+    // Funding payments уменьшают итоговую P&L позиции
+    pos.unrealized_pnl = price_pnl - pos.accumulated_funding;
 
     // Безопасный расчёт процента P&L с проверкой делителя
     const double entry_notional = entry * size;
