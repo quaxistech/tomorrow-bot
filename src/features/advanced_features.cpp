@@ -8,6 +8,92 @@
 #include <ctime>
 #include <numeric>
 
+namespace {
+
+constexpr size_t kVolumeProfileRecomputeStrideTrades = 500;
+
+struct VolumeProfileSnapshot {
+    double poc{0.0};
+    double value_area_high{0.0};
+    double value_area_low{0.0};
+    bool valid{false};
+};
+
+VolumeProfileSnapshot compute_volume_profile_snapshot(
+    const std::vector<std::pair<double, double>>& trade_history,
+    size_t num_levels,
+    double value_area_pct) {
+    VolumeProfileSnapshot snapshot;
+    if (trade_history.size() < 50 || num_levels == 0) {
+        return snapshot;
+    }
+
+    double min_price = 1e18;
+    double max_price = 0.0;
+    for (const auto& [price, _] : trade_history) {
+        min_price = std::min(min_price, price);
+        max_price = std::max(max_price, price);
+    }
+    if (max_price <= min_price) {
+        return snapshot;
+    }
+
+    const double level_width = (max_price - min_price) / static_cast<double>(num_levels);
+    if (level_width <= 0.0) {
+        return snapshot;
+    }
+
+    std::vector<double> histogram(num_levels, 0.0);
+    double total_volume = 0.0;
+    for (const auto& [price, volume] : trade_history) {
+        const size_t idx = std::min(
+            static_cast<size_t>((price - min_price) / level_width),
+            num_levels - 1);
+        histogram[idx] += volume;
+        total_volume += volume;
+    }
+    if (total_volume <= 0.0) {
+        return snapshot;
+    }
+
+    size_t poc_idx = 0;
+    double max_volume = 0.0;
+    for (size_t i = 0; i < num_levels; ++i) {
+        if (histogram[i] > max_volume) {
+            max_volume = histogram[i];
+            poc_idx = i;
+        }
+    }
+
+    double target = total_volume * value_area_pct;
+    double accumulated = histogram[poc_idx];
+    size_t low_idx = poc_idx;
+    size_t high_idx = poc_idx;
+    while (accumulated < target && (low_idx > 0 || high_idx < num_levels - 1)) {
+        const double add_low = (low_idx > 0) ? histogram[low_idx - 1] : 0.0;
+        const double add_high = (high_idx < num_levels - 1) ? histogram[high_idx + 1] : 0.0;
+
+        if (add_high >= add_low && high_idx < num_levels - 1) {
+            ++high_idx;
+            accumulated += histogram[high_idx];
+        } else if (low_idx > 0) {
+            --low_idx;
+            accumulated += histogram[low_idx];
+        } else {
+            ++high_idx;
+            accumulated += histogram[high_idx];
+        }
+    }
+
+    snapshot.poc = min_price + (static_cast<double>(poc_idx) + 0.5) * level_width;
+    snapshot.value_area_low = min_price + static_cast<double>(low_idx) * level_width;
+    snapshot.value_area_high = min_price + static_cast<double>(high_idx + 1) * level_width;
+    snapshot.valid = true;
+    return snapshot;
+}
+
+} // namespace
+
 namespace tb::features {
 
 // ==================== Конструктор ====================
@@ -17,12 +103,14 @@ AdvancedFeatureEngine::AdvancedFeatureEngine(
     VpinConfig vpin_cfg,
     VolumeProfileConfig vp_cfg,
     TimeOfDayConfig tod_cfg,
-    std::shared_ptr<logging::ILogger> logger)
+    std::shared_ptr<logging::ILogger> logger,
+    std::shared_ptr<clock::IClock> clock)
     : cusum_cfg_(std::move(cusum_cfg))
     , vpin_cfg_(std::move(vpin_cfg))
     , vp_cfg_(std::move(vp_cfg))
     , tod_cfg_(std::move(tod_cfg))
     , logger_(std::move(logger))
+    , clock_(std::move(clock))
 {}
 
 // ==================== Обработка тиков и трейдов ====================
@@ -38,15 +126,51 @@ void AdvancedFeatureEngine::on_tick(double price) {
 }
 
 void AdvancedFeatureEngine::on_trade(double price, double volume, bool is_buy) {
+    std::vector<std::pair<double, double>> trade_history_copy;
+    bool recompute_volume_profile = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // NOTE: CUSUM is updated only in on_tick() to avoid double-counting.
+        // on_tick() always fires, so computing CUSUM here as well would
+        // double-count the same price move.
+        last_price_ = price;
+
+        update_vpin(volume, is_buy);
+
+        trade_history_.push_back({price, volume});
+        if (trade_history_.size() > vp_cfg_.lookback_trades) {
+            trade_history_.pop_front();
+        }
+        vp_dirty_ = true;
+        ++vp_calc_counter_;
+
+        recompute_volume_profile = trade_history_.size() >= 50 &&
+            (vp_poc_ <= 0.0 || vp_calc_counter_ % kVolumeProfileRecomputeStrideTrades == 0);
+        if (recompute_volume_profile) {
+            trade_history_copy.reserve(trade_history_.size());
+            for (const auto& trade : trade_history_) {
+                trade_history_copy.emplace_back(trade.price, trade.volume);
+            }
+        }
+    }
+
+    if (!recompute_volume_profile) {
+        return;
+    }
+
+    const auto profile = compute_volume_profile_snapshot(
+        trade_history_copy, vp_cfg_.num_levels, vp_cfg_.value_area_pct);
+    if (!profile.valid) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
-
-    // NOTE: CUSUM is updated only in on_tick() to avoid double-counting.
-    // on_tick() always fires, so computing CUSUM here as well would
-    // double-count the same price move.
-    last_price_ = price;
-
-    update_vpin(volume, is_buy);
-    update_volume_profile(price, volume);
+    vp_poc_ = profile.poc;
+    vp_va_low_ = profile.value_area_low;
+    vp_va_high_ = profile.value_area_high;
+    vp_dirty_ = false;
 }
 
 // ==================== CUSUM ====================
@@ -62,7 +186,7 @@ void AdvancedFeatureEngine::update_cusum(double return_val) {
             sq_sum += (r - cusum_mean_) * (r - cusum_mean_);
         }
         cusum_sigma_ = std::sqrt(sq_sum / static_cast<double>(returns_buffer_.size() - 1));
-        if (cusum_sigma_ < 1e-10) cusum_sigma_ = 1e-10;
+        if (cusum_sigma_ < 1e-12) cusum_sigma_ = 1e-12;
 
         // Стандартизированный return на основе ПРЕДЫДУЩИХ данных
         double z = (return_val - cusum_mean_) / cusum_sigma_;
@@ -98,8 +222,10 @@ void AdvancedFeatureEngine::update_cusum(double return_val) {
 void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
     ++vpin_trade_count_;
 
-    // ИСПРАВЛЕНИЕ: Периодическая рекалибровка размера бакета каждые 1000 трейдов
-    // Это позволяет адаптироваться к изменениям ликвидности и волатильности рынка
+    // Периодическая рекалибровка размера бакета каждые 1000 трейдов.
+    // Адаптивная калибровка позволяет отслеживать изменения ликвидности рынка.
+    // Blend: 70% старое / 30% новое — эвристика для плавной адаптации
+    // без резких переключений (аналог EMA с α≈0.3).
     if (vpin_trade_count_ % 1000 == 0 && bucket_target_volume_ > 0.0) {
         // Пересчитываем bucket_target_volume на основе недавней истории
         if (!vpin_buckets_.empty()) {
@@ -137,13 +263,34 @@ void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
         bucket_target_volume_ = avg_vol * static_cast<double>(vpin_cfg_.bucket_size);
     }
 
-    // Заполняем бакет при достижении целевого объёма
-    if (bucket_target_volume_ > 0.0 && current_bucket_.total_volume >= bucket_target_volume_) {
-        vpin_buckets_.push_back(current_bucket_);
+    // Заполняем бакет при достижении целевого объёма.
+    // Carry-over: если трейд переполняет бакет, остаток переносится в следующий.
+    while (bucket_target_volume_ > 0.0 && current_bucket_.total_volume >= bucket_target_volume_) {
+        // Рассчитываем переполнение
+        const double overflow = current_bucket_.total_volume - bucket_target_volume_;
+
+        // Разделяем переполнение пропорционально buy/sell в текущем бакете
+        double buy_frac = (current_bucket_.total_volume > 0.0)
+            ? current_bucket_.buy_volume / current_bucket_.total_volume : 0.5;
+        double overflow_buy = overflow * buy_frac;
+        double overflow_sell = overflow - overflow_buy;
+
+        // Завершаем текущий бакет (без переполнения)
+        VolumeBucket completed = current_bucket_;
+        completed.buy_volume -= overflow_buy;
+        completed.sell_volume -= overflow_sell;
+        completed.total_volume = bucket_target_volume_;
+
+        vpin_buckets_.push_back(completed);
         if (vpin_buckets_.size() > vpin_cfg_.num_buckets) {
             vpin_buckets_.pop_front();
         }
+
+        // Новый бакет начинается с остатка
         current_bucket_ = {};
+        current_bucket_.buy_volume = overflow_buy;
+        current_bucket_.sell_volume = overflow_sell;
+        current_bucket_.total_volume = overflow;
 
         // Пересчёт VPIN при достаточном количестве бакетов
         if (vpin_buckets_.size() >= 10) {
@@ -155,8 +302,13 @@ void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
             }
             vpin_value_ = (sum_volume > 0.0) ? sum_abs_imbalance / sum_volume : 0.0;
 
-            // EMA VPIN для сглаживания (α = 0.1)
-            vpin_ma_ = 0.9 * vpin_ma_ + 0.1 * vpin_value_;
+            // EMA VPIN для сглаживания (α = 0.1, Easley et al., 2012)
+            // Инициализация: первое значение — без сглаживания
+            if (vpin_ma_ <= 0.0) {
+                vpin_ma_ = vpin_value_;
+            } else {
+                vpin_ma_ = 0.9 * vpin_ma_ + 0.1 * vpin_value_;
+            }
         }
     }
 }
@@ -277,13 +429,19 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
         snapshot.technical.vp_valid = true;
     }
 
-    // Time-of-Day
-    auto now = std::chrono::system_clock::now();
-    auto time_t_val = std::chrono::system_clock::to_time_t(now);
-    struct tm utc_tm{};
-    gmtime_r(&time_t_val, &utc_tm);
-    int hour = utc_tm.tm_hour;
-    if (hour < 0 || hour >= 24) return;  // Защита от невалидных значений
+    // Time-of-Day — используем инжектированные часы для детерминизма в replay/backtest
+    int64_t now_ns = 0;
+    if (clock_) {
+        now_ns = clock_->now().get();
+    } else {
+        now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    const int64_t ns_per_sec = 1'000'000'000LL;
+    const int64_t ns_per_hour = ns_per_sec * 3600LL;
+    const int64_t ns_per_day = ns_per_hour * 24LL;
+    int hour = static_cast<int>((now_ns % ns_per_day) / ns_per_hour);
+    if (hour < 0 || hour >= 24) return;
 
     snapshot.technical.session_hour_utc = hour;
     size_t h = static_cast<size_t>(hour);

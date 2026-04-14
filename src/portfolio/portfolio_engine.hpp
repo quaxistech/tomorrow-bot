@@ -29,16 +29,36 @@ public:
     /// Закрыть позицию полностью
     virtual void close_position(const Symbol& symbol, Price close_price, double realized_pnl) = 0;
 
+    /// Закрыть конкретную ногу (hedge mode)
+    virtual void close_position(const Symbol& symbol, PositionSide ps,
+                                Price close_price, double realized_pnl) {
+        (void)ps;
+        close_position(symbol, close_price, realized_pnl);
+    }
+
     /// Уменьшить позицию на заданное количество (partial close).
     /// Возвращает оставшийся размер позиции. При нулевом остатке позиция удаляется.
     virtual double reduce_position(const Symbol& symbol, Quantity sold_qty,
                                    Price close_price, double realized_pnl) = 0;
+
+    /// Уменьшить конкретную ногу (hedge mode)
+    virtual double reduce_position(const Symbol& symbol, PositionSide ps,
+                                   Quantity sold_qty, Price close_price, double realized_pnl) {
+        (void)ps;
+        return reduce_position(symbol, sold_qty, close_price, realized_pnl);
+    }
 
     /// Добавить реализованную прибыль/убыток
     virtual void add_realized_pnl(double amount) = 0;
 
     /// Получить позицию по символу
     virtual std::optional<Position> get_position(const Symbol& symbol) const = 0;
+
+    /// Получить позицию конкретной ноги (hedge mode)
+    virtual std::optional<Position> get_position(const Symbol& symbol, PositionSide ps) const {
+        (void)ps;
+        return get_position(symbol);
+    }
 
     /// Проверить наличие позиции
     virtual bool has_position(const Symbol& symbol) const = 0;
@@ -61,13 +81,13 @@ public:
     /// Установить кредитное плечо (для фьючерсов — корректирует exposure/available_capital)
     virtual void set_leverage(double leverage) { (void)leverage; }
 
-    // === Cash Reserve Management (Phase 1) ===
+    // === Cash Reserve Management (USDT-M Futures Margin) ===
 
-    /// Зарезервировать cash под BUY-ордер (вызывается перед отправкой на биржу)
+    /// Зарезервировать cash под открывающий ордер (вызывается перед отправкой на биржу)
     virtual bool reserve_cash(const OrderId& order_id, const Symbol& symbol,
-                              double notional, double estimated_fee,
+                              Side side, double notional, double estimated_fee,
                               const StrategyId& strategy_id = StrategyId("")) {
-        (void)order_id; (void)symbol; (void)notional; (void)estimated_fee; (void)strategy_id;
+        (void)order_id; (void)symbol; (void)side; (void)notional; (void)estimated_fee; (void)strategy_id;
         return true; // default: всегда разрешаем (backward compat)
     }
 
@@ -108,10 +128,15 @@ public:
     void update_price(const Symbol& symbol, Price price) override;
     void record_funding_payment(const Symbol& symbol, double funding_amount) override;
     void close_position(const Symbol& symbol, Price close_price, double realized_pnl) override;
+    void close_position(const Symbol& symbol, PositionSide ps,
+                        Price close_price, double realized_pnl) override;
     double reduce_position(const Symbol& symbol, Quantity sold_qty,
                            Price close_price, double realized_pnl) override;
+    double reduce_position(const Symbol& symbol, PositionSide ps,
+                           Quantity sold_qty, Price close_price, double realized_pnl) override;
     void add_realized_pnl(double amount) override;
     std::optional<Position> get_position(const Symbol& symbol) const override;
+    std::optional<Position> get_position(const Symbol& symbol, PositionSide ps) const override;
     bool has_position(const Symbol& symbol) const override;
     PortfolioSnapshot snapshot() const override;
     ExposureSummary exposure() const override;
@@ -122,7 +147,7 @@ public:
 
     // === Cash Reserve Management overrides ===
     bool reserve_cash(const OrderId& order_id, const Symbol& symbol,
-                      double notional, double estimated_fee,
+                      Side side, double notional, double estimated_fee,
                       const StrategyId& strategy_id = StrategyId("")) override;
     void release_cash(const OrderId& order_id) override;
     void record_fee(const Symbol& symbol, double fee_amount, const OrderId& order_id = OrderId("")) override;
@@ -146,9 +171,6 @@ private:
                     double balance_after, const std::string& details,
                     const OrderId& order_id = OrderId(""));
 
-    /// Пересчитать cash_ledger_ из текущего состояния
-    void recompute_cash_ledger();
-
     double total_capital_;
     double leverage_{1.0};
     double peak_equity_;
@@ -156,7 +178,7 @@ private:
     int trades_today_{0};
     int consecutive_losses_{0};
 
-    std::unordered_map<std::string, Position> positions_; ///< По symbol.get()
+    std::unordered_map<std::string, Position> positions_; ///< По make_pos_key(symbol, side) — "SYMBOL:long"/"SYMBOL:short"
     mutable std::mutex mutex_;
 
     std::shared_ptr<logging::ILogger> logger_;

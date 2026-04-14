@@ -15,7 +15,8 @@ namespace tb::clock {
  * @brief Абстрактный интерфейс часов
  * 
  * Возвращает текущее время в наносекундах от Unix-эпохи.
- * Реализации: WallClock (system_clock), MonotonicClock (steady_clock)
+ * Единственная продакшен-реализация: WallClock (system_clock).
+ * В тестах используется TestClock с управляемым временем.
  */
 class IClock {
 public:

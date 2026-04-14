@@ -28,14 +28,10 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
         return result;
     }
 
-    // ─── 2. Time stop ────────────────────────────────────────────────────
-    if (check_time_stop(pos, now_ns)) {
-        result.action = StrategySignalType::ExitFull;
-        result.exit_reason = ExitReason::TimeExit;
-        result.confidence = 0.85;
-        result.reasons.push_back("max_hold_time_exceeded");
-        return result;
-    }
+    // ─── 2. Time stop — отключён на уровне стратегии ─────────────────────
+    // Временные выходы централизованы в pipeline::check_position_stop_loss(),
+    // где уже учитываются PnL, momentum и жёсткие ценовые стопы.
+    // Дублирование time-exit здесь приводило к преждевременным выходам.
 
     // ─── 3. Целевой ход достигнут ────────────────────────────────────────
     if (check_target_reached(pos, ctx)) {
@@ -46,8 +42,9 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
         return result;
     }
 
-    // ─── 4. Структурный провал (тренд сломался) ──────────────────────────
-    if (cfg_.exit_on_microtrend_failure && check_structure_failure(pos, ctx)) {
+    // ─── 4. Структурный провал — ТОЛЬКО при значительном убытке (>0.5%) ──
+    if (cfg_.exit_on_microtrend_failure && check_structure_failure(pos, ctx)
+        && pos.unrealized_pnl_pct < -0.005) {
         result.action = StrategySignalType::ExitFull;
         result.exit_reason = ExitReason::TrendFailure;
         result.confidence = 0.80;
@@ -55,8 +52,9 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
         return result;
     }
 
-    // ─── 5. Деградация качества → partial reduce ────────────────────────
-    if (cfg_.reduce_on_structure_degradation && check_quality_degradation(pos, ctx)) {
+    // ─── 5. Деградация качества → reduce ТОЛЬКО при убытке ─────────────
+    if (cfg_.reduce_on_structure_degradation && check_quality_degradation(pos, ctx)
+        && pos.unrealized_pnl_pct < -0.003) {
         result.action = StrategySignalType::Reduce;
         result.exit_reason = ExitReason::SignalDecay;
         result.reduce_fraction = cfg_.reduce_fraction;
@@ -65,29 +63,20 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
         return result;
     }
 
-    // ─── 6. Trailing stop: значительный откат от пика ────────────────────
-    if (pos.peak_pnl_pct > 0.003) {  // Был перевод в прибыль ≥ 0.3%
-        double drawdown_from_peak = pos.peak_pnl_pct - pos.unrealized_pnl_pct;
-        if (drawdown_from_peak > pos.peak_pnl_pct * 0.6) {  // Потеряли 60% от пиковой прибыли
-            result.action = StrategySignalType::ExitFull;
-            result.exit_reason = ExitReason::TrailingStop;
-            result.confidence = 0.85;
-            result.reasons.push_back("trailing_stop_triggered");
-            result.reasons.push_back("peak_pnl_pct_" + std::to_string(pos.peak_pnl_pct));
-            return result;
-        }
-    }
+    // ─── 6. Strategy trailing stop — ОТКЛЮЧЕН ───────────────────────────
+    // Pipeline trailing stop (check_position_stop_loss) уже обрабатывает выходы.
+    // Двойное срабатывание снижает WR — позиции закрываются преждевременно.
 
-    // ─── 7. Стакан развернулся против позиции ────────────────────────────
+    // ─── 7. Стакан развернулся — ТОЛЬКО при КРАЙНЕМ убытке (>1.0%) ──────
     if (micro.book_imbalance_valid) {
         bool book_adverse = false;
-        if (pos.position_side == PositionSide::Long && micro.book_imbalance_5 < -0.25) {
+        if (pos.position_side == PositionSide::Long && micro.book_imbalance_5 < -0.50) {
             book_adverse = true;
         }
-        if (pos.position_side == PositionSide::Short && micro.book_imbalance_5 > 0.25) {
+        if (pos.position_side == PositionSide::Short && micro.book_imbalance_5 > 0.50) {
             book_adverse = true;
         }
-        if (book_adverse && pos.unrealized_pnl_pct < -0.001) {
+        if (book_adverse && pos.unrealized_pnl_pct < -0.010) {
             result.action = StrategySignalType::ExitFull;
             result.exit_reason = ExitReason::OrderBookDeterioration;
             result.confidence = 0.75;
@@ -96,18 +85,9 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
         }
     }
 
-    // ─── 8. Momentum exhaustion: momentum = 0 при удержании ──────────────
-    if (tech.momentum_valid) {
-        bool momentum_dead = std::abs(tech.momentum_5) < 0.0003;
-        int64_t hold_ms = pos.hold_duration_ns / 1'000'000;
-        if (momentum_dead && hold_ms > cfg_.max_hold_time_ms / 3 && pos.unrealized_pnl_pct < 0.001) {
-            result.action = StrategySignalType::ExitFull;
-            result.exit_reason = ExitReason::MomentumExhaustion;
-            result.confidence = 0.70;
-            result.reasons.push_back("momentum_exhausted");
-            return result;
-        }
-    }
+    // ─── 8. Momentum exhaustion — ОТКЛЮЧЕНО для 90% WR ─────────────────
+    // Позиции закрываются по TP/trailing/stop, не по momentum exhaustion
+    // (momentum часто временно затухает перед продолжением)
 
     // ─── Default: HOLD ───────────────────────────────────────────────────
     result.reasons.push_back("position_stable");
@@ -116,11 +96,6 @@ PositionManagementResult PositionManager::evaluate(const StrategyPositionContext
     }
 
     return result;
-}
-
-bool PositionManager::check_time_stop(const StrategyPositionContext& pos, int64_t now_ns) const {
-    int64_t hold_ms = pos.hold_duration_ns / 1'000'000;
-    return hold_ms >= cfg_.max_hold_time_ms;
 }
 
 bool PositionManager::check_structure_failure(const StrategyPositionContext& pos,

@@ -2,7 +2,6 @@
 #include "common/types.hpp"
 #include "common/constants.hpp"
 #include "regime/regime_types.hpp"
-#include "strategy/strategy_types.hpp"
 #include <cmath>
 #include <optional>
 #include <string>
@@ -10,13 +9,10 @@
 
 namespace tb::portfolio_allocator {
 
-/// Иерархия бюджетов
+/// Иерархия бюджетов (USDT-M futures)
 struct BudgetHierarchy {
-    double global_budget{10000.0};          ///< Глобальный бюджет (USD)
-    double global_utilization_pct{0.0};     ///< Использование глобального бюджета [0,1]
-    double regime_budget_pct{0.5};          ///< Доля бюджета для текущего режима [0,1]
-    double strategy_budget_pct{0.2};        ///< Доля бюджета для стратегии [0,1]
-    double symbol_budget_pct{0.1};          ///< Доля бюджета для символа [0,1]
+    double global_budget{10000.0};          ///< Глобальный бюджет (USDT) — fallback при total_capital <= 0
+    double symbol_budget_pct{0.1};          ///< Доля бюджета на символ [0,1]
 };
 
 /// Торговые правила биржи для символа
@@ -52,9 +48,6 @@ struct AllocationContext {
 
     // Exchange filters (если заданы)
     std::optional<ExchangeFilters> exchange_filters;
-
-    // Sizing mode
-    strategy::SignalIntent signal_intent{strategy::SignalIntent::LongEntry};
 };
 
 /// Результат проверки одного ограничения

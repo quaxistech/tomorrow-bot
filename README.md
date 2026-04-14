@@ -3,7 +3,7 @@
 Адаптивная алгоритмическая торговая система для фьючерсов USDT-M на бирже Bitget.
 C++23, скальпинг-стратегия, полный цикл от сканирования пар до исполнения ордеров.
 
-**v0.5.0** · **35 модулей** · **230 файлов** · **43 000+ строк** · **384 теста**
+**v0.5.0** · **35 модулей** · **222 файла** · **46 000+ строк** · **556 тестов**
 
 ---
 
@@ -101,11 +101,13 @@ cd build && ctest -j$(nproc) --output-on-failure
 ### Запуск
 
 ```bash
-# Бумажная торговля
-./scripts/run_paper.sh
+# Бумажная торговля (production.yaml с mode: paper)
+./build/src/app/tomorrow-bot --config configs/production.yaml
 
-# Или напрямую
-./build/src/app/tomorrow-bot --config configs/paper.yaml
+# Production (требует secrets и подтверждение)
+./run_prod.sh
+# или
+./scripts/run_production.sh
 ```
 
 API-ключи Bitget — через файл `.env` в корне проекта:
@@ -122,12 +124,13 @@ BITGET_PASSPHRASE=...
 
 | Режим | Конфиг | Описание |
 |-------|--------|----------|
-| Paper | `configs/paper.yaml` | Симуляция, ордера не отправляются |
-| Testnet | `configs/testnet.yaml` | Тестовая сеть Bitget |
-| Shadow | `configs/shadow.yaml` | Теневые расчёты без исполнения |
-| Production | `configs/production.yaml` | Реальная торговля |
+| Paper | `configs/production.yaml` (mode: paper) | Симуляция, ордера не отправляются |
+| Production | `configs/production.yaml` | Реальная торговля USDT-M фьючерсами |
 
-Production-режим требует переменную окружения `TOMORROW_BOT_PRODUCTION_CONFIRM`.
+Production-режим требует переменную окружения:
+```bash
+export TOMORROW_BOT_PRODUCTION_CONFIRM=I_UNDERSTAND_LIVE_TRADING
+```
 
 ---
 
@@ -170,7 +173,7 @@ tomorrow-bot/
 │   ├── recovery/               # Snapshot + WAL restore
 │   ├── resilience/             # Circuit breaker, retry, idempotency
 │   └── persistence/            # PostgreSQL (journal, snapshots)
-├── tests/                      # 384 теста (Catch2 v3)
+├── tests/                      # 556 тестов (Catch2 v3)
 │   ├── unit/                   # 27 модулей юнит-тестов
 │   ├── integration/            # Интеграционные тесты
 │   ├── common/                 # Тестовые моки
@@ -180,21 +183,15 @@ tomorrow-bot/
 ├── deploy/                     # systemd, env-шаблоны
 ├── tools/                      # config_validator, log_summarizer,
 │                               # replay_inspector, telemetry_viewer
-└── docs/                       # Документация
+└── audit.md                    # Аудит системы
 ```
 
 ---
 
 ## Документация
 
-| Документ | Описание |
-|----------|----------|
-| [Архитектура](docs/architecture.md) | Модули, потоки данных, компоненты |
-| [Торговый конвейер](docs/pipeline.md) | Этапы обработки тика |
-| [Конфигурация](docs/config.md) | Параметры YAML |
-| [Риск-менеджмент](docs/risk.md) | 33 проверки Risk Engine |
-| [Эксплуатация](docs/operations.md) | Развёртывание, мониторинг |
-| [Разработка](docs/development.md) | Сборка, тесты, добавление модулей |
+Основная документация содержится в `audit.md` и комментариях к коду.
+Конфигурация описана в `configs/production.yaml`.
 
 ---
 

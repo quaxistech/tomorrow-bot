@@ -5,7 +5,7 @@
 
 trading:
   mode: production
-  initial_capital: 4.58             # Фактический капитал ($4.58 USDT)
+  initial_capital: 9.80             # Фактический капитал ($9.80 USDT)
 
 exchange:
   endpoint_rest: "https://api.bitget.com"
@@ -25,148 +25,72 @@ metrics:
   port: 9090
   path: "/metrics"
 
-health:
-  enabled: true
-  port: 8080
-
 risk:
-  max_position_notional: 400.0     # $18 × 20x = $360 max notional + buffer
-  max_daily_loss_pct: 10.0         # Aggressive: 10% daily loss allowed
-  max_drawdown_pct: 10.0           # Max drawdown 10% (user requirement)
+  max_position_notional: 196.0     # $9.80 × 20x = $196 max leveraged capital
+  max_daily_loss_pct: 5.0          # 5% daily loss — conservative production limit
+  max_drawdown_pct: 8.0            # Max drawdown 8%
+  max_intraday_drawdown_pct: 5.0   # Intraday drawdown 5%
   kill_switch_enabled: true        # Safety net
-  # Ultra-aggressive risk for scalping
-  max_strategy_daily_loss_pct: 8.0        # Each strategy can lose up to 8%
-  max_strategy_exposure_pct: 95.0         # Near-full exposure per strategy
-  max_symbol_concentration_pct: 95.0      # All-in on one symbol OK
-  max_same_direction_positions: 1         # One position at a time (clean scalping)
-  regime_aware_limits_enabled: false      # Disable regime scaling — always trade
-  stress_regime_scale: 0.8               # Even in stress keep 80%
-  trending_regime_scale: 1.0             # No bonus needed
-  chop_regime_scale: 1.0                 # Trade in chop too (mean reversion)
-  max_trades_per_hour: 60                # Up to 60 trades/hour (1/min)
-  min_trade_interval_sec: 5.0            # 5 sec between trades (fast scalping)
+  max_strategy_daily_loss_pct: 4.0        # Each strategy can lose up to 4%
+  max_strategy_exposure_pct: 80.0         # 80% max exposure per strategy
+  max_symbol_concentration_pct: 50.0      # Max 50% per symbol with 3 pairs
+  max_same_direction_positions: 3         # One position per pair (3 pairs)
+  regime_aware_limits_enabled: true     # ENABLE: trade only in good regimes
+  stress_regime_scale: 0.30              # 30% in stress — enough for min notional on micro-account
+  trending_regime_scale: 1.0             # Full size in trends
+  chop_regime_scale: 0.50                # 50% in chop — reduces size but stays above $5 min notional
+  max_trades_per_hour: 12                # Max 12 trades/hour — quality > quantity
+  min_trade_interval_sec: 10.0           # 10 sec between trades — меньше fee drain
   max_adverse_excursion_pct: 5.0         # 5% adverse excursion w/ leverage
   max_realized_daily_loss_pct: 10.0      # Match daily loss limit
   utc_cutoff_hour: -1                    # Trade 24/7
 
-# === Decision engine: LOW thresholds = MORE trades ===
+# === Decision engine: HIGH thresholds = QUALITY trades only ===
 decision:
-  min_conviction_threshold: 0.45    # v11: стратегии дают 0.45-0.65, порог должен быть ниже
-  conflict_dominance_threshold: 0.45 # Less dominance needed
+  min_conviction_threshold: 0.68    # Строже: effective ~0.78-0.83 — только высококачественные входы
+  conflict_dominance_threshold: 0.60 # Higher dominance needed
   max_acceptable_cost_bps: 300       # Allow higher cost for speed
   drawdown_boost_scale: 0.01         # Minimal drawdown penalty
   drawdown_max_boost: 0.05           # Cap drawdown boost low
   consecutive_loss_boost: 0.005      # Tiny loss-series penalty
 
-# === Position management: PROFITABLE scalping ===
+# === Position management: HIGH WIN RATE scalping (90%+ target) ===
 trading_params:
-  atr_stop_multiplier: 1.0          # Tight stop: 1.0×ATR for scalping (fast in/out)
-  max_loss_per_trade_pct: 1.5       # 1.5% max loss per trade
-  breakeven_atr_threshold: 0.3      # Breakeven after 0.3×ATR (reachable on micro-caps)
-  partial_tp_atr_threshold: 0.5     # Take profit at 0.5×ATR (lock profit early)
-  partial_tp_fraction: 0.50         # Close 50% at TP, let rest run with trail
-  min_risk_reward_ratio: 0.40       # Low R:R — high WR scalping (90% WR × 0.4 R:R = +EV)
-  max_hold_loss_minutes: 30         # 30 min emergency exit for losing trades
-  max_hold_absolute_minutes: 60     # 60 min max any trade
-  order_cooldown_seconds: 30         # v11: 30 sec (скальпинг — быстрый вход/выход)
-  stop_loss_cooldown_seconds: 60    # v11: 60 sec after stop loss
+  atr_stop_multiplier: 2.0          # 2.0×ATR stop: R:R = 1.5/2.0 = 0.75 (tighter for micro)
+  max_loss_per_trade_pct: 2.5       # 2.5% max loss per trade — tighter для micro-счёта
+  breakeven_atr_threshold: 0.5      # Breakeven at 0.5×ATR — не слишком рано
+  partial_tp_atr_threshold: 1.5     # Take profit at 1.5×ATR — фиксируем прибыль быстрее
+  partial_tp_fraction: 0.70          # Close 70% at TP — keep runner for trend
+  min_risk_reward_ratio: 0.50       # Minimum R:R 0.5 — reject bad setups
+  max_hold_loss_minutes: 15         # 15 min emergency exit (дать больше времени)
+  max_hold_absolute_minutes: 60     # 60 min max (для больших движений)
+  order_cooldown_seconds: 30        # 30 sec between trades — меньше churning
+  stop_loss_cooldown_seconds: 300   # 300 sec (5 мин) after stop loss — без revenge trading
   min_hold_minutes: 1               # 1 min min hold
-  price_stop_loss_pct: 3.0          # Safety net: 3% price move (wider for ATR-based exits)
-
-adversarial_defense:
-  enabled: true                       # ОБЯЗАТЕЛЬНО в production
-  fail_closed_on_invalid_data: true   # Отклонять при невалидных данных
-  auto_cooldown_on_veto: true         # Автоматический кулдаун при вето
-  auto_cooldown_severity: 0.85        # Порог автокулдауна
-  spread_explosion_threshold_bps: 100  # Макс допустимый спред (bps) — выше execution_alpha.max_spread_bps_any
-  spread_normal_bps: 15               # Нормальный спред (bps)
-  min_liquidity_depth: 250            # Мин глубина стакана (USDT)
-  book_imbalance_threshold: 0.75      # Порог перекоса стакана
-  book_instability_threshold: 0.65    # Порог нестабильности стакана
-  toxic_flow_ratio_threshold: 1.8     # Порог токсичного потока
-  aggressive_flow_threshold: 0.8      # Порог агрессивных ордеров
-  vpin_toxic_threshold: 0.72          # VPIN порог токсичности
-  cooldown_duration_ms: 30000         # Кулдаун после угрозы (30 сек)
-  post_shock_cooldown_ms: 60000       # Кулдаун после шока (60 сек)
-  max_market_data_age_ns: 5000000000  # ОСЛАБЛЕНО: 5сек вместо 2сек
-  max_confidence_reduction: 0.30      # Макс снижение confidence — 30% (было 95%)
-  max_threshold_expansion: 0.5        # Макс расширение порога — 1.5x (было 4x)
-  compound_threat_factor: 0.30        # 70% вес на макс-угрозу, 30% на компаунд (было 95%)
-  cooldown_severity_scale: 1.0        # ОСЛАБЛЕНО: один на один без увеличения
-  recovery_duration_ms: 5000          # УСКОРЕНО: с 10000 на 5000
-  recovery_confidence_floor: 0.1      # ОСЛАБЛЕНО: с 0.6 на 0.1
-  spread_velocity_threshold_bps_per_sec: 200.0  # ОСЛАБЛЕНО: с 50 на 200
-  # Adaptive baseline
-  baseline_alpha: 0.05                # ОСЛАБЛЕНО: более быстрая адаптация
-  baseline_warmup_ticks: 50           # ОСЛАБЛЕНО: с 200 на 50 (быстрее начинаем)
-  z_score_spread_threshold: 5.0       # ОСЛАБЛЕНО: с 3.0 на 5.0 (5 сигм)
-  z_score_depth_threshold: 5.0        # ОСЛАБЛЕНО: с 3.0 на 5.0
-  z_score_ratio_threshold: 5.0        # ОСЛАБЛЕНО: с 3.0 на 5.0
-  baseline_stale_reset_ms: 600000     # ОСЛАБЛЕНО: с 300000 на 600000
-  # Threat memory
-  threat_memory_alpha: 0.05           # ОСЛАБЛЕНО: меньше памяти о угрозах
-  threat_memory_residual_factor: 0.1  # ОСЛАБЛЕНО: с 0.3 на 0.1
-  threat_escalation_ticks: 200        # ОСЛАБЛЕНО: с 50 на 200 (дольше до эскалации)
-  threat_escalation_boost: 0.001      # ОСЛАБЛЕНО: почти нет бонуса
-  # Depth asymmetry
-  depth_asymmetry_threshold: 0.5      # ОСЛАБЛЕНО: с 0.15 на 0.5
-  # Cross-signal amplification
-  cross_signal_amplification: 0.05    # ОСЛАБЛЕНО: с 0.3 на 0.05
-  # v4: Percentile scoring
-  percentile_window_size: 100         # ОСЛАБЛЕНО: с 500 на 100
-  percentile_severity_threshold: 0.99 # ОСЛАБЛЕНО: только 99-й персентиль
-  # v4: Correlation matrix
-  correlation_alpha: 0.05             # ОСЛАБЛЕНО: медленнее адаптация
-  correlation_breakdown_threshold: 0.1 # ОСЛАБЛЕНО: с 0.4 на 0.1 (почти никогда)
-  # v4: Multi-timeframe baselines
-  baseline_halflife_fast_ms: 60000    # ОСЛАБЛЕНО: с 30000 на 60000
-  baseline_halflife_medium_ms: 600000 # ОСЛАБЛЕНО: с 300000 на 600000
-  baseline_halflife_slow_ms: 3600000  # ОСЛАБЛЕНО: с 1800000 на 3600000
-  timeframe_divergence_threshold: 10.0 # ОСЛАБЛЕНО: с 4.0 на 10.0
-  # v4: Hysteresis (предотвращение chattering)
-  hysteresis_enter_severity: 0.95     # ОСЛАБЛЕНО: с 0.5 на 0.95
-  hysteresis_exit_severity: 0.90      # ОСЛАБЛЕНО: с 0.25 на 0.90
-  hysteresis_confidence_penalty: 0.01 # ОСЛАБЛЕНО: с 0.15 на 0.01
-  # v4: Event sourcing / audit log
-  audit_log_max_size: 10000
+  price_stop_loss_pct: 2.0          # Safety net: 2.0% price move = emergency exit (было 1.5%)
+  quick_profit_min_hold_seconds: 30  # 30 сек — фиксируем быструю прибыль (default 60)
+  quick_profit_fee_multiplier: 3.0   # 3× fees = порог quick exit (default 5.0)
+  # Hedge Recovery: открыть встречную позицию при глубоком убытке
+  hedge_recovery_enabled: true       # Включить хеджирование
+  hedge_trigger_loss_pct: 1.5        # Активировать при убытке > 1.5% капитала
+  hedge_min_hold_seconds: 30         # Не хеджировать первые 30 сек
+  hedge_max_hold_minutes: 5          # Максимум 5 мин на хедж
+  hedge_profit_close_fee_mult: 2.0   # Закрыть обе когда net PnL > 2× комиссий
 
 pair_selection:
-  mode: auto                       # v11: авто-ротация пар для поиска лучших условий
-  symbols: "SOLUSDT"               # Default fallback + приоритет SOL
-  top_n: 1                         # ОДНА лучшая пара — концентрация капитала
-  min_volume_usdt: 50000000        # $50M+ volume only (major pairs, reliable fills)
-  max_spread_bps: 15               # Tight spread (scalping needs low cost)
-  rotation_interval_hours: 4       # Rotate every 4h — find fresh trends faster
-  blacklist: "USDCUSDT,DAIUSDT,TUSDUSDT,USDPUSDT,FDUSDUSDT,EURCUSDT,PYUSDUSDT,BGBUSDT,TRADOORUSDT"
+  mode: auto                       # Auto: сканер выбирает лучшие пары и ротирует
+  symbols: ""                      # Пусто: сканер сам найдёт
+  top_n: 1                         # 1 пара — весь капитал на одну позицию (микро-счёт)
+  min_volume_usdt: 5000000         # $5M+ volume — покрывает ~50-80 пар (ранее $30M = только ~15)
+  max_spread_bps: 20               # 20bps max spread (стандарт для скальпинга, Cartea §4.3)
+  rotation_interval_hours: 2       # Ротация каждые 2ч — чаще ищет свежие тренды
+  blacklist: "BTCUSDT,ETHUSDT,XAGUSDT,XAUUSDT"     # BTC/ETH: too expensive; XAG/XAU: commodities, low vol = always compression
   # Futures bidirectional scoring: bearish trends score equally (short = profit)
   scorer_futures_mode: true
   scorer_filter_min_change_24h: -20.0    # Allow coins dropping up to 20% (amazing for short)
   scorer_negative_change_penalty: 1.0    # NO penalty for falling coins in futures
   scorer_steady_gainer_min: 2.0          # 2-10% absolute movement = ideal
   scorer_steady_gainer_max: 10.0
-
-ai_advisory:
-  enabled: true                      # AI Advisory включён
-  timeout_ms: 1000                   # Таймаут обработки (мс)
-  max_confidence_adjustment: 0.02    # Minimal: пусть AI почти не мешает
-  veto_severity_threshold: 0.99      # Вето ТОЛЬКО при экстремальных угрозах (0.99)
-  cooldown_ms: 10000                 # Кулдаун между advisory
-  # Пороги детекторов (ослаблены для micro-cap)
-  volatility_ratio_threshold: 3.5    # Micro-cap волатильность высокая — норма
-  rsi_overbought: 85.0              # Мемкоины часто RSI>80
-  rsi_oversold: 15.0                # Мемкоины часто RSI<20
-  spread_anomaly_bps: 80.0          # Широкий спред нормален
-  liquidity_ratio_min: 0.15         # Низкая ликвидность нормальна
-  vpin_toxic_threshold: 0.85        # VPIN высокий на thin markets
-  book_imbalance_threshold: 0.85    # Перекос стакана нормален
-  book_instability_threshold: 0.85  # Нестабильность стакана нормальна
-  # Hysteresis / ensemble / caution — настроено для micro-cap
-  caution_severity_threshold: 0.85   # Высокий порог — не блокировать нормальные сделки
-  hysteresis_clear_ticks: 4          # 4 чистых тика для сброса (консервативно)
-  ensemble_escalation_count: 3       # 3+ детектора → эскалация severity
-  ensemble_escalation_bonus: 0.12    # Небольшой бонус: не хотим лишних вето
-  caution_size_multiplier: 0.70      # Режим осторожности: 70% размера (не убивать позиции)
-  use_severity_weighted_adjustment: true
 
 # ── Execution Alpha: AGGRESSIVE execution for scalping ────────────────────────
 execution_alpha:
@@ -177,7 +101,7 @@ execution_alpha:
   urgency_aggressive_threshold: 0.5     # Lower bar for aggressive (more market orders)
   large_order_slice_threshold: 0.20     # Our orders are tiny
   # VPIN
-  vpin_toxic_threshold: 0.80            # Relaxed
+  vpin_toxic_threshold: 0.95            # XRP VPIN ranges 0.90-0.93 normally
   vpin_weight: 0.20                     # Less weight on VPIN
   # Order book imbalance
   imbalance_favorable_threshold: 0.15   # Lower bar
@@ -195,22 +119,28 @@ execution_alpha:
   postonly_urgency_max: 0.40
   postonly_adverse_max: 0.40
 
-# ── Opportunity Cost: Accept everything, trade fast ─────────────────────────
+# ── Opportunity Cost: USDT-M futures scalping gating ────────────────────────
+# Научные основания:
+#   - Almgren & Chriss 2001: edge > execution cost для положительного ожидания
+#   - Hull 2018: margin reserves, concentration limits для фьючерсов
+#   - Thorp 2006: drawdown scaling (half-Kelly approach)
+#   - Markowitz MPT: диверсификация по инструментам и стратегиям
 opportunity_cost:
-  min_net_expected_bps: 0.0              # Accept ANY edge
-  execute_min_net_bps: 0.0               # Execute on any edge
-  high_exposure_threshold: 0.99          # Allow full exposure
-  high_exposure_min_conviction: 0.25     # Low bar for high exposure
-  max_symbol_concentration: 1.0          # All-in on one symbol
-  max_strategy_concentration: 1.0        # All-in on one strategy
-  capital_exhaustion_threshold: 0.99     # Never block
-  weight_conviction: 0.40               # Conviction matters most
-  weight_net_edge: 0.30                 # Edge matters
-  weight_capital_efficiency: 0.15       # Less important
-  weight_urgency: 0.15                  # Less important
-  conviction_to_bps_scale: 200.0        # conviction 1.0 → 200 bps expected (leverage amplified)
-  upgrade_min_edge_advantage_bps: 2.0   # Very low bar for signal upgrade
-  drawdown_penalty_scale: 0.05          # Almost no drawdown penalty
+  min_net_expected_bps: 1.0              # > avg half-spread (~0.5 bps на BTCUSDT)
+  execute_min_net_bps: 3.0               # ~3× half-spread: cost-to-edge ratio 1:3
+  high_exposure_threshold: 0.70          # 70% margin util → 30% reserve для maintenance
+  high_exposure_min_conviction: 0.60     # Высокий порог при загрузке капитала
+  max_symbol_concentration: 1.00         # Single symbol mode: 100% on one pair
+  max_strategy_concentration: 1.00       # Single-strategy prod: no blocking
+  capital_exhaustion_threshold: 0.85     # 15% buffer для maintenance margin
+  weight_conviction: 0.35               # Главный драйвер composite score
+  weight_net_edge: 0.35                 # Чистый edge — второй драйвер
+  weight_capital_efficiency: 0.15       # Вторичный фактор
+  weight_urgency: 0.15                  # Вторичный фактор
+  conviction_to_bps_scale: 100.0        # conviction 1.0 → 100 bps (leveraged scalp returns)
+  upgrade_min_edge_advantage_bps: 5.0   # > 2× round-trip cost (~4 bps maker fees)
+  drawdown_penalty_scale: 0.30          # +0.30 к порогу за каждые 5% drawdown
+  consecutive_loss_penalty: 0.015       # +0.015 за каждый consecutive loss
 
 # ── Regime Classification ─────────────────────────────────────────────────────
 # Настройки классификатора рыночных режимов: пороги, гистерезис, политика
@@ -219,7 +149,7 @@ regime:
   trend_adx_strong: 30.0            # ADX выше этого = сильный тренд
   trend_adx_weak_min: 18.0          # Нижняя граница слабого тренда
   trend_adx_weak_max: 30.0          # Верхняя граница слабого тренда
-  trend_rsi_bias: 50.0              # RSI выше = бычий, ниже = медвежий
+  trend_rsi_bias: 55.0              # RSI выше 55 = бычий, ниже 45 = медвежий (Wilder 1978, C. Brown 1999)
 
   # Возврат к среднему
   mr_rsi_overbought: 70.0           # RSI порог перекупленности
@@ -228,19 +158,19 @@ regime:
 
   # Волатильность
   vol_bb_expansion: 0.06            # BB bandwidth для расширения волатильности
-  vol_bb_compression: 0.02          # BB bandwidth для сжатия
+  vol_bb_compression: 0.015          # BB bandwidth для сжатия (was 0.02 — less strict)
   vol_atr_expansion: 0.02           # Нормализованный ATR для расширения
-  vol_adx_compression_max: 20.0     # Макс ADX для компрессии
+  vol_adx_compression_max: 15.0     # Макс ADX для компрессии (was 20 — allow weak trends)
 
   # Стресс / аномалии
-  stress_rsi_extreme_high: 85.0     # RSI аномально высокий
-  stress_rsi_extreme_low: 15.0      # RSI аномально низкий
-  stress_obv_extreme: 2.0           # OBV нормализованный — аномалия
+  stress_rsi_extreme_high: 95.0     # RSI аномально высокий (крипто: 85-95 — нормальный тренд)
+  stress_rsi_extreme_low: 5.0       # RSI аномально низкий (крипто: 5-15 — нормальная коррекция)
+  stress_obv_extreme: 3.0           # OBV нормализованный — аномалия (2.0 слишком чувствительно)
   stress_aggressive_flow: 0.75      # Порог токсичного потока
   stress_spread_toxic_bps: 15.0     # Spread токсичности (bps)
   stress_book_instability: 0.6      # Нестабильность книги ордеров
   stress_spread_bps: 30.0           # Spread стресса (bps)
-  stress_liquidity_ratio: 3.0       # Коэффициент стресса ликвидности
+  stress_liquidity_ratio: 0.3       # Дисбаланс книги: ratio < 0.3 = перекос ≥ 3.3:1 (Cont et al. 2010)
 
   # Chop / боковик
   chop_adx_max: 18.0                # ADX ниже этого = Chop
@@ -248,13 +178,12 @@ regime:
   # Гистерезис / переходная политика
   transition_confirmation_ticks: 3  # Тиков для подтверждения смены режима
   transition_min_confidence: 0.55   # Мин confidence для смены
-  transition_inertia_alpha: 0.15    # EMA-сглаживание перехода
   transition_dwell_ticks: 5         # Мин тиков в режиме перед сменой
 
   # Уверенность / стабильность
   confidence_base: 0.5              # Базовая уверенность
   confidence_data_quality_weight: 0.2
-  confidence_max_indicators: 6
+  confidence_max_indicators: 12     # 12 реально используемых индикаторов
   confidence_anomaly: 0.9
   stability_same_regime: 0.9
   stability_first_classification: 0.5
@@ -263,7 +192,7 @@ regime:
 # Мировая модель: классификация состояний рынка, хрупкость, пригодность стратегий
 world_model:
   model_version: "2.0.0"
-  min_valid_indicators: 2
+  min_valid_indicators: 4
 
   # Пороги классификации состояний
   toxic_microstructure:
@@ -317,12 +246,10 @@ world_model:
     enabled: true
     confirmation_ticks: 2
     min_dwell_ticks: 3
-    min_confidence_to_switch: 0.55
 
   # История состояний
   history:
     max_entries: 200
-    transition_matrix_window: 100
     tendency_lookback: 5
 
   # Персистентность (blend base + empirical)
@@ -334,16 +261,12 @@ world_model:
   suitability:
     feedback_blend_weight: 0.3
     min_trades_for_feedback: 20
-    alpha_decay_weight: 0.2
     hard_veto_threshold: 0.01
 
   # Обратная связь (feedback loop)
   feedback:
     enabled: true
-    min_samples_per_state: 50
-    max_threshold_drift_pct: 20.0
     ema_alpha: 0.05
-    evaluation_window: 500
 
 # ─── FUTURES TRADING (USDT-M) ──────────────────────────────────────────────
 # Адаптивное управление кредитным плечом для фьючерсной торговли на Bitget
@@ -357,34 +280,85 @@ futures:
 
   # Adaptive leverage: engine computes optimal from regime × 6 multipliers
   # Bitget supports 50-125x depending on symbol; engine auto-clamps per symbol
-  default_leverage: 10           # Starting point: moderate (engine adapts)
-  max_leverage: 50               # Upper bound — engine rarely reaches this
-  min_leverage: 1                # Floor at 1x — let engine decide freely
+  default_leverage: 20           # 20x — максимум для микро-счёта ($1.85 × 20x = $37 notional)
+  max_leverage: 20               # Upper bound — capped for risk protection
+  min_leverage: 10               # Micro-account: $9.80 × 10x = $98 > $5 min notional
 
   # Kelly-inspired regime-based leverage (Wilder ADX classification)
   # Trending (ADX>25): high Sharpe → higher leverage justified
   # Ranging (ADX 15-25): mean-reversion, lower Sharpe → conservative
   # Volatile (high ATR): wider stops → lower leverage for same risk
-  # Stress (ADX<15 + extreme RSI): avoid, minimal exposure
-  leverage_trending: 12          # Strong trend = reliable direction → 12x
-  leverage_ranging: 6            # Range-bound = noisy → 6x
-  leverage_volatile: 3           # High vol = wide stops → 3x
-  leverage_stress: 1             # Stress = survival mode → 1x
+  leverage_trending: 20          # Strong trend = reliable direction → 20x (micro: $1.85×20 = $37)
+  leverage_ranging: 15            # Micro-account: need ≥15x for proper notional
+  leverage_volatile: 10           # High vol but micro-account: need $18+ notional for $5 min
 
   # Liquidation protection
   liquidation_buffer_pct: 5.0    # 5% buffer (safe margin from liquidation)
-  max_leverage_drawdown_scale: 0.5  # Halve leverage per 10% drawdown (exponential)
 
-  # Funding rate
-  funding_rate_threshold: 0.03   # 3% funding = significant (reduce leverage)
+  # Funding rate (Bitget 8-hour rate, decimal: 0.0001 = 0.01%)
+  # Threshold: 0.05% per 8h is elevated; at 20x leverage = 1% margin cost per 8h
+  funding_rate_threshold: 0.0005 # 0.05% per 8h — start reducing leverage
   funding_rate_penalty: 0.5      # 50% penalty per threshold excess
 
   # Maintenance Margin
   maintenance_margin_rate: 0.004 # 0.4% Bitget standard
 
-# ─── SHADOW TRADING (Paper mode simulation) ─────────────────────────────────
-# Виртуальная торговля без реальных ордеров — для тестирования стратегий
-shadow:
-  enabled: false                 # Отключено в production (только для testing)
-  track_all_strategies: true     # Отслеживать виртуальные результаты всех стратегий
-  enable_price_simulation: false # Не симулировать проскальзывание в виртуальном режиме
+  # === Leverage Engine (адаптивный движок плеча) ===
+  # Volatility breakpoints: откалиброваны для 1-min USDT-M candles
+  # Эмпирическая калибровка: BTC 1-min ATR/price ≈ 0.0005-0.003 (calm→elevated)
+  leverage_engine:
+    vol_low_atr: 0.001               # ≤ 0.1% ATR/price → mult=1.0 (calm)
+    vol_mid_atr: 0.003               # 0.3% → mult → 0.7 (moderate)
+    vol_high_atr: 0.008              # 0.8% → mult → 0.4 (significant)
+    vol_extreme_atr: 0.02            # 2.0% → mult → 0.2 (flash-crash)
+    vol_floor: 0.10                  # Минимальный множитель волатильности
+    conviction_min_mult: 0.40        # Множитель при нулевом conviction
+    conviction_breakpoint: 0.70      # Порог для бонуса conviction
+    conviction_max_mult: 1.30        # Макс бонус
+    drawdown_floor_mult: 0.10        # Минимум при макс drawdown
+    drawdown_halfpoint_pct: 10.0     # DD% при 50% снижении множителя
+    ema_alpha: 0.3                   # EMA скорость реакции (~5-tick lookback)
+    taker_fee_rate: 0.0006           # 0.06% Bitget futures taker
+    min_leverage_change_delta: 2     # Минимальное изменение для API call
+
+# ─── UNCERTAINTY ENGINE ─────────────────────────────────────────────────────
+# Модуль оценки неопределённости — управляет size, threshold, execution mode
+# Веса научно обоснованы для USDT-M futures scalping:
+#   Execution+Data: высокий приоритет (microstructure = profit margin)
+#   Regime: структурный фактор (Lopez de Prado classification)
+#   ML: ensemble quality (Lakshminarayanan 2017)
+uncertainty:
+  # Веса измерений (сумма = 1.0)
+  w_regime: 0.20
+  w_signal: 0.15
+  w_data_quality: 0.15
+  w_execution: 0.15
+  w_portfolio: 0.10
+  w_ml: 0.10
+  w_correlation: 0.05
+  w_transition: 0.05
+  w_operational: 0.05
+
+  # Пороги уровней (равные квартили [0,1])
+  threshold_low: 0.25            # Low → Moderate
+  threshold_moderate: 0.50       # Moderate → High
+  threshold_high: 0.75           # High → Extreme
+
+  # Гистерезис (асимметричный: понижение инерционнее повышения)
+  hysteresis_up: 0.03
+  hysteresis_down: 0.05
+
+  # EMA-сглаживание persistent score
+  ema_alpha: 0.15
+
+  # Лимиты size/threshold multiplier
+  size_floor: 0.10              # Минимум 10% от номинала
+  threshold_ceiling: 2.5        # Максимальный множитель порога
+
+  # Cooldown: серия Extreme оценок → пауза
+  consecutive_extreme_for_cooldown: 3
+  cooldown_duration_s: 60        # 60 секунд
+  consecutive_high_for_defensive: 3
+
+  # Liquidity: порог для штрафа за асимметрию стакана
+  liquidity_ratio_penalty_threshold: 0.5

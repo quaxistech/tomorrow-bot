@@ -40,7 +40,7 @@ class CommitteeDecisionEngine : public IDecisionAggregationEngine {
 public:
     CommitteeDecisionEngine(std::shared_ptr<logging::ILogger> logger,
                             std::shared_ptr<clock::IClock> clock,
-                            double conviction_threshold = 0.28,
+                            double conviction_threshold = 0.45,
                             double dominance_threshold = 0.60,
                             AdvancedDecisionConfig advanced = {});
 

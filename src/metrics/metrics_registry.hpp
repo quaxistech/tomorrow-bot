@@ -72,9 +72,15 @@ public:
 private:
     mutable std::mutex mutex_;
 
+    /// ИСПРАВЛЕНИЕ H8: ключ = name + serialized_tags (для корректного разделения label-серий)
     std::unordered_map<std::string, std::shared_ptr<ICounter>>   counters_;
     std::unordered_map<std::string, std::shared_ptr<IGauge>>     gauges_;
     std::unordered_map<std::string, std::shared_ptr<IHistogram>> histograms_;
+
+    /// Сериализовать tags в стабильный ключ: "name{k1=v1,k2=v2}" (сортировка по ключу)
+    static std::string make_key(const std::string& name, const MetricTags& tags);
+    /// Форматировать tags для Prometheus export: {k1="v1",k2="v2"}
+    static std::string format_labels(const MetricTags& tags);
 };
 
 /// Создаёт стандартный реестр метрик в памяти

@@ -66,7 +66,8 @@ private:
         std::string status;
         int quantity_precision{6};
         int price_precision{2};
-        double min_trade_usdt{1.0};
+        double min_trade_usdt{5.0};   ///< Bitget min notional (USDT)
+        double min_quantity{0.0};     ///< minTradeNum (base coin)
     };
 
     std::vector<SymbolInfo> fetch_symbols();

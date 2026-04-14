@@ -5,6 +5,7 @@
 #include "security/production_guard.hpp"
 #include <cstdlib>
 #include <format>
+#include <string_view>
 
 namespace tb::security {
 
@@ -15,6 +16,8 @@ ProductionGuard::ProductionGuard(std::shared_ptr<logging::ILogger> logger)
 ProductionGuardResult ProductionGuard::validate(
     TradingMode mode,
     const std::string& api_key,
+    const std::string& api_secret,
+    const std::string& api_passphrase,
     const std::string& api_base_url,
     const std::string& config_hash)
 {
@@ -24,25 +27,25 @@ ProductionGuardResult ProductionGuard::validate(
     result.env_confirmation_present = check_env_confirmation();
     result.config_hash = config_hash;
 
-    // Не-production режимы разрешены без дополнительных проверок
-    if (mode != TradingMode::Production) {
+    // Paper mode — пропускаем все проверки
+    if (mode == TradingMode::Paper) {
         result.allowed = true;
-        result.reason = "Режим не production — дополнительное подтверждение не требуется";
-        logger_->info("ProductionGuard", std::format(
-            "Запуск разрешён: режим не production, config_hash={}",
-            config_hash));
+        result.reason = "Paper режим — проверки production пропущены";
+        logger_->info("ProductionGuard",
+            "Запуск в PAPER режиме — реальные ордера не отправляются");
         return result;
     }
 
-    // Production режим — нужны все проверки
+    // Production — нужны все проверки
 
     // 1. Переменная окружения подтверждения
     if (!result.env_confirmation_present) {
         result.allowed = false;
         result.reason = "Production режим требует переменную окружения "
-                        "TOMORROW_BOT_PRODUCTION_CONFIRM";
+                        "TOMORROW_BOT_PRODUCTION_CONFIRM=I_UNDERSTAND_LIVE_TRADING";
         logger_->error("ProductionGuard",
-            "ЗАПРЕТ: переменная TOMORROW_BOT_PRODUCTION_CONFIRM не установлена");
+            "ЗАПРЕТ: переменная TOMORROW_BOT_PRODUCTION_CONFIRM не установлена "
+            "или содержит неверный токен");
         return result;
     }
 
@@ -56,12 +59,26 @@ ProductionGuardResult ProductionGuard::validate(
         return result;
     }
 
-    // 3. API ключ не должен быть пустым
+    // 3. Все три секрета обязательны для production
     if (api_key.empty()) {
         result.allowed = false;
-        result.reason = "Production режим требует непустой API ключ";
+        result.reason = "Production режим требует непустой BITGET_API_KEY";
         logger_->error("ProductionGuard",
             "ЗАПРЕТ: пустой API ключ в production режиме");
+        return result;
+    }
+    if (api_secret.empty()) {
+        result.allowed = false;
+        result.reason = "Production режим требует непустой BITGET_API_SECRET";
+        logger_->error("ProductionGuard",
+            "ЗАПРЕТ: пустой API secret в production режиме");
+        return result;
+    }
+    if (api_passphrase.empty()) {
+        result.allowed = false;
+        result.reason = "Production режим требует непустой BITGET_PASSPHRASE";
+        logger_->error("ProductionGuard",
+            "ЗАПРЕТ: пустая passphrase в production режиме");
         return result;
     }
 
@@ -76,7 +93,10 @@ ProductionGuardResult ProductionGuard::validate(
 }
 
 bool ProductionGuard::check_env_confirmation() {
-    return std::getenv("TOMORROW_BOT_PRODUCTION_CONFIRM") != nullptr;
+    const char* val = std::getenv("TOMORROW_BOT_PRODUCTION_CONFIRM");
+    if (val == nullptr) return false;
+    // Требуем точный токен — случайный auto-export не пройдёт
+    return std::string_view(val) == "I_UNDERSTAND_LIVE_TRADING";
 }
 
 bool ProductionGuard::is_production_api(const std::string& base_url) {

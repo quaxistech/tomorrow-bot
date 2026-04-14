@@ -9,14 +9,14 @@
 
 namespace tb::execution {
 
-/// Конфигурация Smart TWAP
+/// Конфигурация Smart TWAP (параметры по Almgren-Chriss 2000)
 struct TwapConfig {
     size_t min_slices{3};              ///< Минимум слайсов
     size_t max_slices{10};             ///< Максимум слайсов
-    int64_t base_interval_ms{500};     ///< Базовый интервал между слайсами (мс)
+    int64_t base_interval_ms{500};     ///< Базовый интервал между слайсами (мс), Cont 2017
     double spread_threshold_bps{20.0}; ///< Спред > порога → пассивные лимитки
     double urgency_aggressive{0.8};    ///< Urgency > порога → агрессивное исполнение
-    double participation_rate{0.1};    ///< Макс доля от рыночного объёма
+    double participation_rate{0.10};   ///< Макс 10% от рыночного объёма (Almgren-Chriss standard)
     double price_improvement_bps{2.0}; ///< Улучшение цены для лимиток (bps)
 };
 
@@ -37,6 +37,9 @@ struct TwapOrder {
     std::string twap_id;               ///< Уникальный ID TWAP
     Symbol symbol{""};                 ///< Торговый символ
     Side side{Side::Buy};              ///< Направление сделки
+    PositionSide position_side{PositionSide::Long}; ///< Сторона позиции (Long/Short)
+    TradeSide trade_side{TradeSide::Open};          ///< Открытие/закрытие
+    strategy::SignalIntent signal_intent{strategy::SignalIntent::LongEntry}; ///< Тип сигнала
     Quantity total_qty{0.0};           ///< Общий объём
     Quantity filled_qty{0.0};          ///< Заполненный объём
     double avg_fill_price{0.0};        ///< Средняя цена заполнения
@@ -107,6 +110,11 @@ public:
         active_twap_.reset();
     }
 
+    /// Установить per-symbol min notional (из exchange rules)
+    void set_min_notional_usdt(double value) {
+        min_notional_usdt_.store(value, std::memory_order_release);
+    }
+
 private:
     /// Адаптивный интервал на основе текущего спреда и волатильности
     int64_t compute_adaptive_interval(
@@ -120,6 +128,7 @@ private:
     TwapConfig config_;                    ///< Конфигурация TWAP
     std::shared_ptr<logging::ILogger> logger_; ///< Логгер
     std::optional<TwapOrder> active_twap_; ///< Активный TWAP ордер (если есть)
+    std::atomic<double> min_notional_usdt_{0.0}; ///< Per-symbol min notional
     mutable std::mutex mutex_;             ///< Мьютекс для потокобезопасности
 };
 

@@ -22,22 +22,15 @@ enum class BiasDirection { Long, Short, Neutral };
 /// Торговое состояние символа (§14)
 enum class TradeState { TradeAllowed, Neutral, DoNotTrade };
 
-/// Типы ловушек (§6.2)
+/// Типы ловушек — только реализованные MVP-детекторы (§6.2)
 enum class TrapType {
-    Spoofing,           // §6.2.1
-    Layering,           // §6.2.2
-    StopHunt,           // §6.2.3
-    FalseBreakout,      // §6.2.4
-    LiquidityVacuum,    // §6.2.5
-    MomentumTrap,       // §6.2.6
-    MeanReversionBait,  // §6.2.7
-    FakeSupport,        // §6.2.8
-    NoiseChop,          // §6.2.9
-    FundingCrowdTrap,   // §6.2.10
-    OpenInterestTrap,   // §6.2.11
-    ExhaustionSpike,    // §6.2.12
-    BookInstability,    // §6.2.13
-    AdverseSelection    // §6.2.14
+    Spoofing,           // §6.2.1 — крупные стенки / асимметрия стакана
+    StopHunt,           // §6.2.3 — свечи с длинными тенями (вынос стопов)
+    FalseBreakout,      // §6.2.4 — прокол уровня с возвратом в диапазон
+    MomentumTrap,       // §6.2.6 — импульс → разворот
+    NoiseChop,          // §6.2.9 — шумный бесцельный рынок
+    FundingCrowdTrap,   // §6.2.10 — экстремальный funding rate
+    BookInstability     // §6.2.13 — дырявый / тонкий стакан
 };
 
 /// Причина фильтрации пары (§7)
@@ -53,7 +46,9 @@ enum class FilterReason {
     LowVolatility,
     NotOnline,
     Blacklisted,
-    InvalidData
+    InvalidData,
+    PriceTooLow,
+    PoorTickEconomics
 };
 
 // ─── Market Data Types (§5.2) ─────────────────────────────────────────────────
@@ -95,14 +90,6 @@ struct CandleData {
     double volume{0.0};
 };
 
-/// Данные последних сделок
-struct TradeData {
-    double price{0.0};
-    double quantity{0.0};
-    bool is_buyer_maker{false};
-    int64_t timestamp_ms{0};
-};
-
 /// Полный снимок рыночных данных по одному символу (§5.2)
 struct MarketSnapshot {
     std::string symbol;
@@ -119,7 +106,7 @@ struct MarketSnapshot {
     double volume_24h{0.0};      // base asset
     double turnover_24h{0.0};    // quote (USDT)
     double funding_rate{0.0};
-    double open_interest{0.0};   // USDT
+    double open_interest{0.0};   // base coin (converted to USDT in features)
 
     // Order book
     OrderBookSnapshot orderbook;
@@ -127,13 +114,11 @@ struct MarketSnapshot {
     // Short-term candles
     std::vector<CandleData> candles;
 
-    // Recent trades
-    std::vector<TradeData> recent_trades;
-
     // Instrument info
     int quantity_precision{6};
     int price_precision{2};
-    double min_trade_usdt{1.0};
+    double min_trade_usdt{5.0};
+    double min_quantity{0.0};
     std::string status{"online"};
 
     int64_t collected_at_ms{0};
@@ -283,7 +268,8 @@ struct SymbolAnalysis {
     // Instrument info для downstream usage
     int quantity_precision{6};
     int price_precision{2};
-    double min_trade_usdt{1.0};
+    double min_trade_usdt{5.0};
+    double min_quantity{0.0};
 };
 
 /// Результат сканирования (§14)
@@ -326,20 +312,13 @@ inline const char* to_string(TradeState s) {
 
 inline const char* to_string(TrapType t) {
     switch (t) {
-        case TrapType::Spoofing:          return "spoofing";
-        case TrapType::Layering:          return "layering";
-        case TrapType::StopHunt:          return "stop_hunt";
-        case TrapType::FalseBreakout:     return "false_breakout";
-        case TrapType::LiquidityVacuum:   return "liquidity_vacuum";
-        case TrapType::MomentumTrap:      return "momentum_trap";
-        case TrapType::MeanReversionBait: return "mean_reversion_bait";
-        case TrapType::FakeSupport:       return "fake_support";
-        case TrapType::NoiseChop:         return "noise_chop";
-        case TrapType::FundingCrowdTrap:  return "funding_crowd_trap";
-        case TrapType::OpenInterestTrap:  return "oi_trap";
-        case TrapType::ExhaustionSpike:   return "exhaustion_spike";
-        case TrapType::BookInstability:   return "book_instability";
-        case TrapType::AdverseSelection:  return "adverse_selection";
+        case TrapType::Spoofing:         return "spoofing";
+        case TrapType::StopHunt:         return "stop_hunt";
+        case TrapType::FalseBreakout:    return "false_breakout";
+        case TrapType::MomentumTrap:     return "momentum_trap";
+        case TrapType::NoiseChop:        return "noise_chop";
+        case TrapType::FundingCrowdTrap: return "funding_crowd_trap";
+        case TrapType::BookInstability:  return "book_instability";
     }
     return "unknown";
 }
@@ -358,6 +337,8 @@ inline const char* to_string(FilterReason r) {
         case FilterReason::NotOnline:         return "not_online";
         case FilterReason::Blacklisted:       return "blacklisted";
         case FilterReason::InvalidData:       return "invalid_data";
+        case FilterReason::PriceTooLow:       return "price_too_low";
+        case FilterReason::PoorTickEconomics: return "poor_tick_economics";
     }
     return "unknown";
 }

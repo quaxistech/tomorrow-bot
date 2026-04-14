@@ -43,6 +43,7 @@ public:
     execution::OrderSubmitResult submit_order(const execution::OrderRecord& order) override;
     bool cancel_order(const OrderId& order_id, const Symbol& symbol) override;
     Price query_order_fill_price(const OrderId& exchange_order_id, const Symbol& symbol) override;
+    execution::OrderFillDetail query_order_fill_detail(const OrderId& exchange_order_id, const Symbol& symbol) override;
 
     /// Установить правила инструмента (precision, min notional, min qty)
     void set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules);

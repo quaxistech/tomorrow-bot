@@ -33,6 +33,8 @@ add_subdirectory(unit/portfolio_allocator)
 add_subdirectory(unit/risk)
 add_subdirectory(unit/config)
 add_subdirectory(unit/execution)
+add_subdirectory(unit/logging)
+add_subdirectory(unit/normalizer)
 
 add_subdirectory(unit/persistence)
 add_subdirectory(unit/reconciliation)
@@ -41,6 +43,9 @@ add_subdirectory(unit/resilience)
 add_subdirectory(unit/security)
 add_subdirectory(unit/supervisor)
 add_subdirectory(unit/leverage)
+
+# Сценарные тесты (ожидают реализации tb_synthetic_scenarios / tb_adversarial_defense)
+add_subdirectory(unit/scenario_integration)
 
 # Интеграционные тесты
 add_subdirectory(integration)

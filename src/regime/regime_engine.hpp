@@ -49,9 +49,11 @@ private:
                                       ClassificationExplanation& explanation) const;
 
     /// Применить hysteresis к мгновенному результату
+    /// @param cusum_change_detected Если CUSUM детектировал структурный слом — ускоряет переход
     DetailedRegime apply_hysteresis(DetailedRegime immediate, double confidence,
                                     HysteresisState& state,
-                                    ClassificationExplanation& explanation) const;
+                                    ClassificationExplanation& explanation,
+                                    bool cusum_change_detected) const;
 
     double compute_confidence(const features::FeatureSnapshot& snap,
                               DetailedRegime regime,

@@ -62,6 +62,7 @@ public:
     void observe(double value, const MetricTags& tags) override;
 
     [[nodiscard]] const std::string& name() const override { return name_; }
+    [[nodiscard]] const MetricTags& tags() const { return base_tags_; }
 
     /// Получить количество наблюдений в бакете с границей <= upper_bound
     [[nodiscard]] int64_t bucket_count(double upper_bound) const;

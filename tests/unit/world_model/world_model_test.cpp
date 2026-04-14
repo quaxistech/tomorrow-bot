@@ -110,6 +110,10 @@ TEST_CASE("WorldModel: LiquidityVacuum — очень широкий спред"
     auto engine = make_engine();
     auto snap = make_snapshot();
     snap.technical.sma_valid = true;
+    snap.technical.rsi_valid = true;
+    snap.technical.rsi_14 = 50.0;
+    snap.technical.adx_valid = true;
+    snap.technical.adx = 15.0;
     snap.microstructure.spread_valid = true;
     snap.microstructure.spread_bps = 60.0;
 
@@ -124,6 +128,10 @@ TEST_CASE("WorldModel: LiquidityVacuum — перекос ликвидности
     auto engine = make_engine();
     auto snap = make_snapshot();
     snap.technical.sma_valid = true;
+    snap.technical.rsi_valid = true;
+    snap.technical.rsi_14 = 50.0;
+    snap.technical.adx_valid = true;
+    snap.technical.adx = 15.0;
     snap.microstructure.spread_valid = true;
     snap.microstructure.spread_bps = 25.0;
     snap.microstructure.liquidity_valid = true;
@@ -210,6 +218,8 @@ TEST_CASE("WorldModel: PostShockStabilization — после ExhaustionSpike", "
     snap2.technical.volatility_5 = 0.01;
     snap2.technical.volatility_20 = 0.03;
     snap2.technical.sma_valid = true;
+    snap2.technical.rsi_valid = true;
+    snap2.technical.rsi_14 = 50.0;
     snap2.microstructure.spread_valid = true;
     snap2.microstructure.spread_bps = 5.0;
     auto r2 = engine.update(snap2);
@@ -220,6 +230,7 @@ TEST_CASE("WorldModel: PostShockStabilization — после ExhaustionSpike", "
 TEST_CASE("WorldModel: Unknown — нет данных", "[world_model]") {
     auto engine = make_engine();
     auto snap = make_snapshot();
+    // 0 валидных индикаторов < min_valid_indicators(4)
 
     auto result = engine.update(snap);
 
@@ -288,6 +299,10 @@ TEST_CASE("WorldModel: suitability veto в опасных состояниях",
     auto engine = make_engine();
     auto snap = make_snapshot();
     snap.technical.sma_valid = true;
+    snap.technical.rsi_valid = true;
+    snap.technical.rsi_14 = 50.0;
+    snap.technical.adx_valid = true;
+    snap.technical.adx = 15.0;
     snap.microstructure.spread_valid = true;
     snap.microstructure.spread_bps = 60.0;
     auto result = engine.update(snap);
@@ -403,6 +418,10 @@ TEST_CASE("WorldModel: опасные состояния проходят без
     // LiquidityVacuum — проходит немедленно
     auto snap_lv = make_snapshot();
     snap_lv.technical.sma_valid = true;
+    snap_lv.technical.rsi_valid = true;
+    snap_lv.technical.rsi_14 = 50.0;
+    snap_lv.technical.adx_valid = true;
+    snap_lv.technical.adx = 15.0;
     snap_lv.microstructure.spread_valid = true;
     snap_lv.microstructure.spread_bps = 60.0;
     auto result = engine.update(snap_lv);
@@ -572,6 +591,8 @@ TEST_CASE("WorldModel: transition tendency улучшение", "[world_model]")
     snap2.technical.volatility_5 = 0.01;
     snap2.technical.volatility_20 = 0.03;
     snap2.technical.sma_valid = true;
+    snap2.technical.rsi_valid = true;
+    snap2.technical.rsi_14 = 50.0;
     snap2.microstructure.spread_valid = true;
     snap2.microstructure.spread_bps = 5.0;
     auto r2 = engine.update(snap2);

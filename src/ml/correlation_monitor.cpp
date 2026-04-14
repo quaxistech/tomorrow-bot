@@ -248,6 +248,22 @@ MlComponentStatus CorrelationMonitor::status_impl() const {
         s.warmup_remaining = 0;
         return s;
     }
+    // Report Degraded when no reference feeds have been received — the component
+    // cannot compute cross-asset correlations without reference data and its
+    // output (avg_correlation=0, no breaks) is meaningless.
+    bool has_any_reference = false;
+    for (const auto& asset : config_.reference_assets) {
+        auto it = reference_returns_.find(asset);
+        if (it != reference_returns_.end() && it->second.size() >= 5) {
+            has_any_reference = true;
+            break;
+        }
+    }
+    if (!has_any_reference) {
+        s.health = MlComponentHealth::Degraded;
+        s.warmup_remaining = 0;
+        return s;
+    }
     s.health = MlComponentHealth::Healthy;
     s.warmup_remaining = 0;
     return s;

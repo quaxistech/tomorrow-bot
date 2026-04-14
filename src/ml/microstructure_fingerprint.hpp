@@ -62,11 +62,22 @@ struct FingerprintStats {
     size_t count{0};                   ///< Количество наблюдений
     double avg_return{0.0};            ///< Средняя доходность после этого fingerprint
     double win_rate{0.0};              ///< Процент выигрышей
-    double avg_volatility{0.0};        ///< Средняя волатильность после
     size_t wins{0};                    ///< Количество выигрышных сделок
     size_t losses{0};                  ///< Количество проигрышных сделок
 };
 
+/// Конфигурация fingerprinting.
+///
+/// Научное обоснование:
+/// - num_buckets=5: 5^5 = 3125 уникальных отпечатков — баланс между
+///   гранулярностью и статистической значимостью при min_samples=10.
+/// - favorable_win_rate=0.55: Kelly criterion показывает, что при win_rate
+///   55% и risk/reward ~1:1 уже существует положительное мат. ожидание.
+/// - unfavorable_win_rate=0.45: симметричный нижний порог.
+/// - spread_bps_cap=300.0: крупные монеты редко имеют спред > 300 bps
+///   на USDT-M perpetual; capping предотвращает доминирование одного фактора.
+/// - atr_norm_cap=0.2: ATR_14/price > 20% = экстремальная волатильность,
+///   capping при этом уровне.
 struct FingerprintConfig {
     size_t min_samples{10};            ///< Минимум сэмплов для статистики
     size_t max_history{10000};         ///< Макс размер истории

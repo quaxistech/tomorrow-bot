@@ -5,9 +5,10 @@
  *
  * Требует явного подтверждения перед торговлей реальными деньгами.
  * Проверяет:
- * - Режим торговли (Paper/Shadow/Testnet/Production)
- * - Тип API ключей (testnet vs production)
- * - Наличие переменной окружения TOMORROW_BOT_PRODUCTION_CONFIRM
+ * - Режим торговли (Paper/Production)
+ * - Тип API ключей (testnet vs production URL)
+ * - Наличие переменной окружения TOMORROW_BOT_PRODUCTION_CONFIRM с точным токеном
+ * - Полноту всех трёх API-секретов (key, secret, passphrase)
  * - Хэш конфигурации
  */
 #include "common/types.hpp"
@@ -22,7 +23,7 @@ namespace tb::security {
 struct ProductionGuardResult {
     bool allowed{false};
     std::string reason;
-    TradingMode detected_mode{TradingMode::Paper};
+    TradingMode detected_mode{TradingMode::Production};
     bool api_keys_are_production{false};
     bool env_confirmation_present{false};
     std::string config_hash;
@@ -38,6 +39,8 @@ public:
     [[nodiscard]] ProductionGuardResult validate(
         TradingMode mode,
         const std::string& api_key,
+        const std::string& api_secret,
+        const std::string& api_passphrase,
         const std::string& api_base_url,
         const std::string& config_hash);
 

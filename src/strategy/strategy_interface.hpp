@@ -25,6 +25,16 @@ public:
 
     /// Сбросить внутреннее состояние (для replay)
     virtual void reset() = 0;
+
+    /// Уведомить, что pipeline отклонил вход (sizing/risk/exchange rejection)
+    virtual void notify_entry_rejected() {}
+
+    /// Уведомить о фактическом открытии позиции (feedback от pipeline)
+    virtual void notify_position_opened(double /*entry_price*/, double /*size*/,
+                                         Side /*side*/, PositionSide /*pos_side*/) {}
+
+    /// Уведомить о закрытии позиции
+    virtual void notify_position_closed() {}
 };
 
 } // namespace tb::strategy

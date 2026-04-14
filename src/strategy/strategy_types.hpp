@@ -12,7 +12,7 @@ namespace tb::strategy {
 // Signal & Exit Enums
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Тип торгового намерения (spot + futures).
+/// Тип торгового намерения (USDT-M futures).
 enum class SignalIntent {
     LongEntry,          ///< Открытие длинной позиции (BUY)
     LongExit,           ///< Полное закрытие длинной позиции (SELL)
@@ -199,6 +199,16 @@ struct PositionInfo {
     double unrealized_pnl{0.0};
     int64_t hold_duration_ns{0};
     int64_t entry_time_ns{0};
+
+    // Hedge-mode: раздельное отслеживание long/short ног
+    bool has_long{false};
+    bool has_short{false};
+    double long_size{0.0};
+    double long_entry_price{0.0};
+    double long_unrealized_pnl{0.0};
+    double short_size{0.0};
+    double short_entry_price{0.0};
+    double short_unrealized_pnl{0.0};
 };
 
 /// Сводка состояния Risk Engine
@@ -253,6 +263,10 @@ struct StrategyContext {
     bool is_strategy_enabled{true};
     double strategy_weight{1.0};
     bool futures_enabled{false};
+
+    // HTF (higher-timeframe) trend context — передаётся из pipeline
+    int htf_trend_direction{0};     ///< +1=UP, -1=DOWN, 0=SIDEWAYS
+    double htf_trend_strength{0.0}; ///< 0..1 — сила тренда на HTF
 
     // Strategy Engine расширения (§11 ТЗ)
     PositionInfo position;

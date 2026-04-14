@@ -16,12 +16,13 @@
 
 namespace tb::ml {
 
-/// Действие: войти сейчас или ждать
+/// Действие: войти сейчас или ждать N тиков (периодов обработки).
+/// Конкретная длительность определяется частотой тиков в pipeline.
 enum class EntryAction {
     EnterNow,         ///< Войти немедленно
-    WaitOnePeriod,    ///< Ждать 1 период (5 мин)
-    WaitTwoPeriods,   ///< Ждать 2 периода (10 мин)
-    WaitThreePeriods, ///< Ждать 3 периода (15 мин)
+    WaitOnePeriod,    ///< Ждать 1 период (тик)
+    WaitTwoPeriods,   ///< Ждать 2 периода (тика)
+    WaitThreePeriods, ///< Ждать 3 периода (тика)
     Skip              ///< Пропустить сигнал
 };
 
@@ -60,7 +61,21 @@ struct BetaArm {
     size_t consecutive_losses{0};  ///< Подряд идущие убыточные исходы
 };
 
-/// Конфигурация Thompson Sampling
+/// Конфигурация Thompson Sampling.
+///
+/// Научное обоснование (multi-armed bandit, Thompson 1933):
+/// - reward_threshold=0.0: P&L > 0 = успех, ≤ 0 = неудача —
+///   бинарная классификация для Beta-Bernoulli модели.
+/// - decay_factor=0.995: exponential forgetting с effective window ~200 событий.
+///   Адаптирует к нестационарности рынка (Garivier & Moulines 2011,
+///   "On Upper-Confidence Bound Policies for Switching Bandits").
+/// - min_pulls=5: минимум exploration перед exploitation —
+///   гарантирует минимальную оценку каждой руки (стандарт UCB литературы).
+/// - decay_interval=10: batch decay вместо per-sample снижает computational
+///   cost при сохранении адаптивности.
+/// - magnitude_bonus=0.5: бонус к alpha/beta пропорционален |reward| —
+///   крупные выигрыши/проигрыши влияют сильнее (risk-sensitive bandits,
+///   Sani et al. 2012).
 struct ThompsonConfig {
     double reward_threshold{0.0};  ///< P&L > порога = успех
     double decay_factor{0.995};    ///< Экспоненциальное забывание (для адаптации)

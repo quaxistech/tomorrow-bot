@@ -18,21 +18,25 @@ namespace tb::features {
 // Движок вычисления признаков — агрегирует технические и микроструктурные данные
 class FeatureEngine {
 public:
+    // Конфигурация вычисления признаков.
+    // Дефолты соответствуют каноническим параметрам технических индикаторов
+    // (см. IndicatorEngine для ссылок на Wilder, Bollinger, Appel).
     struct Config {
-        int sma_period{20};
-        int ema_fast_period{20};
-        int ema_slow_period{50};
-        int rsi_period{14};
-        int macd_fast{12};
+        int sma_period{20};            ///< Bollinger (2002): 20-bar SMA — стандартное окно
+        int ema_fast_period{20};       ///< Быстрая EMA = 20 (совпадает с BB/SMA lookback)
+        int ema_slow_period{50};       ///< Медленная EMA = 50 — трендовый benchmark (Murphy, 1999)
+        int rsi_period{14};            ///< Wilder (1978): RSI(14) — оригинальная спецификация
+        int macd_fast{12};             ///< Appel (1979): MACD 12/26/9 — оригинальная спецификация
         int macd_slow{26};
         int macd_signal{9};
-        int bb_period{20};
-        double bb_stddev{2.0};
-        int atr_period{14};
-        int adx_period{14};
-        int trade_flow_window{100};
-        int book_depth_levels{10};
-        int64_t feed_freshness_ns{1'000'000'000LL};
+        int bb_period{20};             ///< Bollinger (2002): 20-bar period
+        double bb_stddev{2.0};         ///< Bollinger (2002): ±2σ, captures ~95% price action
+        int atr_period{14};            ///< Wilder (1978): ATR(14)
+        int adx_period{14};            ///< Wilder (1978): ADX(14)
+        int trade_flow_window{100};    ///< Окно анализа потока сделок (~100 последних трейдов)
+        int book_depth_levels{10};     ///< Глубина стакана для анализа ликвидности (10 уровней)
+        int64_t feed_freshness_ns{1'000'000'000LL}; ///< Порог свежести данных: 1 секунда
+        std::string primary_interval{"1m"};  ///< Основной таймфрейм для теханализа
     };
 
     explicit FeatureEngine(Config config,

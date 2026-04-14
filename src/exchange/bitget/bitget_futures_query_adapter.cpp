@@ -75,6 +75,14 @@ reconciliation::ExchangeOrderInfo BitgetFuturesQueryAdapter::parse_order(
     const auto side_str = json_str(obj, "side");
     info.side = (side_str == "sell") ? Side::Sell : Side::Buy;
 
+    // Position side (hedge mode): "long" / "short"
+    const auto hold_side_str = json_str(obj, "posSide");
+    info.position_side = (hold_side_str == "short") ? PositionSide::Short : PositionSide::Long;
+
+    // Trade side: "open" / "close"
+    const auto trade_side_str = json_str(obj, "tradeSide");
+    info.trade_side = (trade_side_str == "close") ? TradeSide::Close : TradeSide::Open;
+
     const auto order_type_str = json_str(obj, "orderType");
     if (order_type_str == "market")   info.order_type = OrderType::Market;
     else if (order_type_str == "limit") info.order_type = OrderType::Limit;
@@ -104,7 +112,7 @@ FuturesPositionInfo BitgetFuturesQueryAdapter::parse_futures_position(
     info.liquidation_price = Price(json_dbl(obj, "liquidationPrice"));
     info.mark_price       = Price(json_dbl(obj, "markPrice"));
     info.unrealized_pnl   = json_dbl(obj, "unrealizedPL");
-    info.margin           = json_dbl(obj, "margin");
+    info.margin           = json_dbl(obj, "marginSize");
     info.leverage         = static_cast<int>(json_dbl(obj, "leverage"));
     info.margin_mode      = json_str(obj, "marginMode");
 
@@ -227,6 +235,36 @@ BitgetFuturesQueryAdapter::get_account_balances()
         }
         return Err<std::vector<reconciliation::ExchangePositionInfo>>(
             TbError::ReconciliationFailed);
+    }
+
+    return result;
+}
+
+Result<std::vector<reconciliation::ExchangeOpenPositionInfo>>
+BitgetFuturesQueryAdapter::get_open_positions(const Symbol& symbol)
+{
+    Result<std::vector<FuturesPositionInfo>> positions_result = symbol.get().empty()
+        ? get_all_positions()
+        : get_positions(symbol);
+
+    if (!positions_result.has_value()) {
+        return Err<std::vector<reconciliation::ExchangeOpenPositionInfo>>(positions_result.error());
+    }
+
+    std::vector<reconciliation::ExchangeOpenPositionInfo> result;
+    result.reserve(positions_result->size());
+
+    for (const auto& pos : positions_result.value()) {
+        reconciliation::ExchangeOpenPositionInfo info;
+        info.symbol = pos.symbol;
+        info.side = (pos.position_side == PositionSide::Short) ? Side::Sell : Side::Buy;
+        info.position_side = pos.position_side;
+        info.size = pos.total;
+        info.entry_price = pos.entry_price;
+        info.current_price = pos.mark_price;
+        info.notional_usd = pos.mark_price.get() * pos.total.get();
+        info.unrealized_pnl = pos.unrealized_pnl;
+        result.push_back(std::move(info));
     }
 
     return result;
@@ -427,9 +465,19 @@ double BitgetFuturesQueryAdapter::get_current_funding_rate(const Symbol& symbol)
             return 0.0;
         }
 
-        // Bitget Mix v2: { "data": { "symbol": "...", "fundingRate": "0.000125" } }
-        const auto& data = root.at("data").as_object();
-        return json_dbl(data, "fundingRate");
+        // Bitget Mix v2: { "data": [{ "symbol": "...", "fundingRate": "0.000125" }] }
+        const auto& data_val = root.at("data");
+        if (data_val.is_array()) {
+            const auto& arr = data_val.as_array();
+            if (!arr.empty() && arr[0].is_object()) {
+                return json_dbl(arr[0].as_object(), "fundingRate");
+            }
+            return 0.0;
+        }
+        if (data_val.is_object()) {
+            return json_dbl(data_val.as_object(), "fundingRate");
+        }
+        return 0.0;
 
     } catch (const std::exception& ex) {
         if (logger_) {

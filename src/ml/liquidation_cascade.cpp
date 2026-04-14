@@ -180,12 +180,12 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
         numeric::safe_div(signal.volume_ratio, config_.volume_spike_mult));
 
     // Для глубины: чем меньше ratio, тем выше скор (линейная шкала)
+    // Clamp threshold to valid range (0.01, 0.99) — depth_thin_threshold >= 1.0
+    // is a misconfiguration that would disable depth scoring entirely.
     double depth_score = 0.0;
-    if (config_.depth_thin_threshold >= 1.0) {
-        depth_score = (signal.depth_ratio < 0.5) ? 1.0 : 0.0;
-    } else if (signal.depth_ratio < config_.depth_thin_threshold) {
-        const double threshold = std::max(config_.depth_thin_threshold, 0.01);
-        depth_score = numeric::safe_div(threshold - signal.depth_ratio, threshold);
+    const double depth_thr = std::clamp(config_.depth_thin_threshold, 0.01, 0.99);
+    if (signal.depth_ratio < depth_thr) {
+        depth_score = numeric::safe_div(depth_thr - signal.depth_ratio, depth_thr);
     }
 
     // 6. Взвешенная вероятность каскада
@@ -230,33 +230,7 @@ bool LiquidationCascadeDetector::is_cascade_likely() const {
 // ==================== Статус компонента ====================
 
 MlComponentStatus LiquidationCascadeDetector::status() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    MlComponentStatus s;
-    s.last_update_ns = last_tick_ns_;
-    s.samples_processed = static_cast<int>(total_ticks_);
-
-    if (total_ticks_ == 0) {
-        s.health = MlComponentHealth::WarmingUp;
-        s.warmup_remaining = 6;
-        return s;
-    }
-
-    if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
-        s.health = MlComponentHealth::Stale;
-        s.warmup_remaining = 0;
-        return s;
-    }
-
-    if (prices_.size() < 6) {
-        s.health = MlComponentHealth::WarmingUp;
-        s.warmup_remaining = static_cast<int>(6 - prices_.size());
-        return s;
-    }
-
-    s.health = MlComponentHealth::Healthy;
-    s.warmup_remaining = 0;
-    return s;
+    return evaluate().component_status;
 }
 
 } // namespace tb::ml

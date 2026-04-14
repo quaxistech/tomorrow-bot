@@ -52,14 +52,18 @@ ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
         return result;
     }
 
-    // DefensiveOnly + вход (BUY) → блокируем
+    // DefensiveOnly + новый вход (Open) → блокируем
+    // Для USDT-M futures: Open = новая экспозиция (и Long, и Short).
+    // Close/ReducePosition — защитные операции, всегда разрешены.
     if (uncertainty.execution_mode == uncertainty::ExecutionModeRecommendation::DefensiveOnly &&
-        intent.side == Side::Buy) {
+        intent.trade_side == TradeSide::Open) {
         result.should_execute = false;
         result.recommended_style = ExecutionStyle::NoExecution;
-        result.rationale = "NoExecution: режим DefensiveOnly — только защитные операции";
+        result.rationale = "NoExecution: режим DefensiveOnly — только защитные операции (close/reduce)";
         logger_->warn("ExecutionAlpha", "Отказ: DefensiveOnly, новый вход заблокирован",
-            {{"symbol", intent.symbol.get()}});
+            {{"symbol", intent.symbol.get()},
+             {"side", (intent.side == Side::Buy ? "Buy" : "Sell")},
+             {"signal_intent", strategy::to_string(intent.signal_intent)}});
         return result;
     }
 
@@ -202,13 +206,13 @@ ExecutionStyle RuleBasedExecutionAlpha::determine_style(
         return ExecutionStyle::NoExecution;
     }
 
-    // ── Правило 2: VPIN жёсткий стоп — информированный поток обнаружен ───
-    // Проверяется ДО взвешенного adverse, так как VPIN_toxic — бинарный флаг
-    // с высоким confidence (алгоритм специально откалиброван на этот порог)
+    // ── Правило 2: VPIN повышен — пассивное исполнение вместо блокировки ──
+    // Регим ToxicFlow уже снижает размер позиций через аллокатор и risk-лимиты.
+    // Пассивный стиль минимизирует adverse selection при высоком VPIN.
     if (features.microstructure.vpin_valid
         && features.microstructure.vpin_toxic
         && features.microstructure.vpin > config_.vpin_toxic_threshold) {
-        return ExecutionStyle::NoExecution;
+        return ExecutionStyle::Passive;
     }
 
     // ── Правило 3: Высокая взвешенная токсичность → отказ ────────────────
@@ -216,12 +220,12 @@ ExecutionStyle RuleBasedExecutionAlpha::determine_style(
         return ExecutionStyle::NoExecution;
     }
 
-    // ── Правило 3: Высокая срочность → агрессивно ─────────────────────────
+    // ── Правило 4: Высокая срочность → агрессивно ─────────────────────────
     if (urgency > config_.urgency_aggressive_threshold) {
         return ExecutionStyle::Aggressive;
     }
 
-    // ── Правило 4: PostOnly — идеальные условия для нулевых комиссий ──────
+    // ── Правило 5: PostOnly — идеальные условия для минимальной комиссии ──
     // Применяется при очень узком спреде, низкой срочности и чистом потоке
     if (spread_bps < config_.postonly_spread_threshold_bps
         && urgency < config_.postonly_urgency_max
@@ -230,7 +234,7 @@ ExecutionStyle RuleBasedExecutionAlpha::determine_style(
         return ExecutionStyle::PostOnly;
     }
 
-    // ── Правило 5: Пассивный с учётом имбаланса стакана ──────────────────
+    // ── Правило 6: Пассивный с учётом имбаланса стакана ──────────────────
     if (urgency < config_.urgency_passive_threshold
         && spread_bps < config_.max_spread_bps_passive) {
 
@@ -242,7 +246,7 @@ ExecutionStyle RuleBasedExecutionAlpha::determine_style(
         return ExecutionStyle::Passive;
     }
 
-    // ── Правило 6: Промежуточная срочность + имбаланс ─────────────────────
+    // ── Правило 7: Промежуточная срочность + имбаланс ─────────────────────
     // Благоприятный имбаланс при умеренной срочности даёт шанс на Passive
     if (urgency < config_.urgency_aggressive_threshold
         && directional_imbalance > config_.imbalance_favorable_threshold
@@ -353,9 +357,10 @@ double RuleBasedExecutionAlpha::estimate_adverse_selection(
     }
 
     // ── Спред как прокси токсичности ─────────────────────────────────────
+    // Нормализация относительно max_spread_bps_any: при достижении порога score=1.0.
     if (features.microstructure.spread_valid) {
         double spread_score = std::clamp(
-            features.microstructure.spread_bps / 100.0, 0.0, 1.0);
+            features.microstructure.spread_bps / config_.max_spread_bps_any, 0.0, 1.0);
         factors.spread_toxicity = spread_score;
         score += spread_score;
         weight_sum += 1.0;
@@ -383,7 +388,7 @@ double RuleBasedExecutionAlpha::get_directional_imbalance(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// estimate_fill_probability — data-driven, не хардкод
+// estimate_fill_probability — эвристическая модель на основе микроструктуры
 // ─────────────────────────────────────────────────────────────────────────────
 
 double RuleBasedExecutionAlpha::estimate_fill_probability(
@@ -394,6 +399,8 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
 {
     switch (style) {
         case ExecutionStyle::Aggressive:
+            // IOC/Market на ликвидных perpetual futures (~95% full fill учитывая
+            // latency miss и partial fill сценарии; Moallemi & Saglam 2013).
             return 0.95;
 
         case ExecutionStyle::NoExecution:
@@ -401,6 +408,8 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
 
         case ExecutionStyle::Passive:
         case ExecutionStyle::PostOnly: {
+            // Базовая вероятность passive fill на крипто-perpetual: ~60%
+            // (Cont & Kukanov 2017: limit order fill rate at best level 40-65%)
             double fp = 0.60;
 
             // ── Штраф за широкий спред ─────────────────────────────────
@@ -408,15 +417,17 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
                                  / config_.max_spread_bps_passive;
             fp -= std::clamp(spread_ratio * 0.15, 0.0, 0.20);
 
-            // ── Штраф за размер ордера относительно глубины ───────────
+            // ── Штраф за размер ордера относительно opposite-side depth ─
+            // Opposite side = ликвидность, которая может прийти к нам как market order.
+            // Тонкий opposite side → мало встречного потока → ниже fill.
             if (features.microstructure.liquidity_valid) {
-                double available = (intent.side == Side::Buy)
-                    ? features.microstructure.bid_depth_5_notional
-                    : features.microstructure.ask_depth_5_notional;
-                if (available > 0.0) {
+                double opposite_depth = (intent.side == Side::Buy)
+                    ? features.microstructure.ask_depth_5_notional
+                    : features.microstructure.bid_depth_5_notional;
+                if (opposite_depth > 0.0) {
                     double order_notional = intent.suggested_quantity.get()
                                           * features.mid_price.get();
-                    double size_ratio = std::clamp(order_notional / available, 0.0, 1.0);
+                    double size_ratio = std::clamp(order_notional / opposite_depth, 0.0, 1.0);
                     fp -= size_ratio * 0.15;
                 }
             }
@@ -449,7 +460,7 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// estimate_quality — использует data-driven fill_prob, точная модель стоимости
+// estimate_quality — модель стоимости исполнения с учётом биржевых комиссий
 // ─────────────────────────────────────────────────────────────────────────────
 
 ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
@@ -467,7 +478,7 @@ ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
     switch (style) {
         case ExecutionStyle::Passive:
         case ExecutionStyle::PostOnly:
-            // Maker: получаем ребейт (нет slippage), но risk неисполнения
+            // Maker: нет проскальзывания (ордер ждёт в стакане)
             quality.estimated_slippage_bps = 0.0;
             break;
         case ExecutionStyle::Aggressive:
@@ -482,20 +493,23 @@ ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
             return quality;
     }
 
-    // Data-driven вероятность заполнения
+    // Эвристическая вероятность заполнения
     quality.fill_probability = estimate_fill_probability(
         style, intent, features, directional_imbalance);
 
-    // ── Полная стоимость исполнения ───────────────────────────────────────
+    // ── Полная стоимость исполнения (spread + fees + slippage + adverse) ──
+    // Комиссии USDT-M futures: taker 0.06% (6 bps), maker 0.02% (2 bps) standard tier.
     if (style == ExecutionStyle::Passive || style == ExecutionStyle::PostOnly) {
-        // Maker: платим ~30% half-spread (или получаем ребейт при PostOnly)
-        // adverse_selection_risk добавляет к стоимости — покупка при
-        // информированном потоке означает, что цена двинется против нас
+        // Maker: execution shortfall ~30% от spread (posted at best bid/ask with improvement)
+        // + maker комиссия + adverse selection penalty
         quality.total_cost_bps = quality.spread_cost_bps * 0.30
+                                + config_.maker_fee_bps
                                 + adverse_score * quality.spread_cost_bps * 0.20;
     } else {
+        // Taker: пересекаем спред + slippage + taker комиссия + adverse penalty
         quality.total_cost_bps = quality.spread_cost_bps
                                 + quality.estimated_slippage_bps
+                                + config_.taker_fee_bps
                                 + adverse_score * quality.spread_cost_bps * 0.15;
     }
 
@@ -571,9 +585,11 @@ std::optional<SlicePlan> RuleBasedExecutionAlpha::compute_slice_plan(
         return std::nullopt;
     }
 
+    // Opposite-side depth = ликвидность, которую мы потребляем при исполнении.
+    // Buy → потребляем ask-сторону; Sell → потребляем bid-сторону.
     double available_depth = (intent.side == Side::Buy)
-        ? features.microstructure.bid_depth_5_notional
-        : features.microstructure.ask_depth_5_notional;
+        ? features.microstructure.ask_depth_5_notional
+        : features.microstructure.bid_depth_5_notional;
 
     if (available_depth <= 0.0) return std::nullopt;
 

@@ -24,7 +24,7 @@ LiquidityFeatures FeatureCalculator::compute_liquidity(const MarketSnapshot& s) 
     LiquidityFeatures liq;
     liq.volume_24h_usdt = s.turnover_24h;
     liq.turnover_24h = s.turnover_24h;
-    liq.open_interest_usdt = s.open_interest;
+    liq.open_interest_usdt = s.open_interest * s.last_price;  // base coin → USDT
 
     const auto& ob = s.orderbook;
     double mid = ob.mid_price();
@@ -174,18 +174,18 @@ VolatilityFeatures FeatureCalculator::compute_volatility(const MarketSnapshot& s
         }
     }
 
-    // Score: sweet spot for scalping is moderate volatility.
-    // Too low = can't cover spread. Too high = dangerous.
-    // Optimal: vol_to_spread_ratio ∈ [3, 15]
+    // Score: log-normal sweet spot for scalping — ATR/spread ratio centered at ~7x.
+    // Based on Aldridge (2013): optimal vol/spread for scalping is 5-10x.
+    // - ratio < 2: spread dominates profit → bad
+    // - ratio 5-10: sweet spot, enough movement relative to entry cost
+    // - ratio > 20: excessive slippage risk, unstable fills
+    // Gaussian on log(ratio) gives a proper bell curve:
     if (vol.vol_to_spread_ratio > 0.0) {
-        double ratio = vol.vol_to_spread_ratio;
-        if (ratio < 1.5) {
-            vol.score = ratio / 1.5 * 0.3;  // too low
-        } else if (ratio <= 15.0) {
-            vol.score = 0.3 + 0.7 * std::min((ratio - 1.5) / 13.5, 1.0);
-        } else {
-            vol.score = std::max(0.5, 1.0 - (ratio - 15.0) / 30.0); // too high starts declining
-        }
+        double log_ratio = std::log(vol.vol_to_spread_ratio);
+        double log_optimal = std::log(7.0);   // peak at ATR = 7× spread
+        double sigma = 0.8;                    // width of acceptable zone
+        vol.score = std::exp(-(log_ratio - log_optimal) * (log_ratio - log_optimal)
+                             / (2.0 * sigma * sigma));
     }
 
     return vol;

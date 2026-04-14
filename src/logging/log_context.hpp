@@ -4,7 +4,6 @@
  * 
  * Thread-local контекст хранит:
  * - Корреляционный идентификатор запроса
- * - Имя текущего компонента
  * - Произвольные структурированные поля
  * 
  * Автоматически добавляется ко всем событиям лога в потоке.
@@ -35,11 +34,6 @@ public:
         correlation_id_ = std::move(id);
     }
 
-    /// Установить имя компонента
-    void set_component(std::string name) noexcept {
-        component_ = std::move(name);
-    }
-
     /// Добавить структурированное поле
     void set_field(std::string key, std::string value) {
         fields_[std::move(key)] = std::move(value);
@@ -50,7 +44,7 @@ public:
         fields_.erase(key);
     }
 
-    /// Очистить все поля (оставить correlation_id и component)
+    /// Очистить все поля (оставить correlation_id)
     void clear_fields() noexcept {
         fields_.clear();
     }
@@ -58,19 +52,16 @@ public:
     /// Полный сброс контекста
     void reset() noexcept {
         correlation_id_.clear();
-        component_.clear();
         fields_.clear();
     }
 
     [[nodiscard]] const std::string& correlation_id() const noexcept { return correlation_id_; }
-    [[nodiscard]] const std::string& component() const noexcept { return component_; }
     [[nodiscard]] const std::unordered_map<std::string, std::string>& fields() const noexcept { return fields_; }
 
 private:
     LogContext() = default;
 
     std::string correlation_id_;
-    std::string component_;
     std::unordered_map<std::string, std::string> fields_;
 };
 

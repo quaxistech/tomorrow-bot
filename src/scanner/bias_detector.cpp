@@ -53,7 +53,6 @@ BiasDetector::BiasResult BiasDetector::detect(const MarketSnapshot& snapshot,
 
     // 3. Price momentum (вес 0.20) — recent price velocity
     {
-        double vel = features.volatility.price_velocity;
         const auto& candles = snapshot.candles;
         if (!candles.empty() && candles.size() >= 3) {
             double recent_change = candles.back().close - candles[candles.size()-3].close;

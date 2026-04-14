@@ -10,6 +10,7 @@
 #include "resilience/resilience_types.hpp"
 #include "common/types.hpp"
 #include "clock/clock.hpp"
+#include "metrics/metrics_registry.hpp"
 
 #include <atomic>
 #include <memory>
@@ -23,7 +24,8 @@ namespace tb::resilience {
 class IdempotencyManager {
 public:
     explicit IdempotencyManager(IdempotencyConfig config = {},
-                                std::shared_ptr<clock::IClock> clock = nullptr);
+                                std::shared_ptr<clock::IClock> clock = nullptr,
+                                std::shared_ptr<metrics::IMetricsRegistry> metrics = nullptr);
 
     /// @brief Сгенерировать уникальный idempotent ClientOrderId для ордера
     [[nodiscard]] std::string generate_client_order_id(
@@ -47,6 +49,7 @@ private:
 
     IdempotencyConfig config_;
     std::shared_ptr<clock::IClock> clock_;
+    std::shared_ptr<metrics::IMetricsRegistry> metrics_;
     std::unordered_map<std::string, int64_t> sent_ids_;  ///< client_id -> timestamp_ms
     mutable std::mutex mutex_;
     std::atomic<uint64_t> sequence_{0};

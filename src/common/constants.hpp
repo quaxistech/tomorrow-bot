@@ -17,8 +17,6 @@ namespace time {
 namespace finance {
     constexpr double kPercentScaler = 100.0;       ///< Множитель для перевода в проценты
     constexpr int kBasisPointsScaler = 10000;      ///< Множитель для базисных пунктов (bps)
-    constexpr double kFloatEpsilon = 1e-9;         ///< Эпсилон для сравнения чисел с плавающей точкой
-    constexpr double kMinValidPrice = 1e-10;       ///< Минимальная валидная цена
 } // namespace finance
 
 /// Комиссии биржи Bitget (USDT-M Futures)
@@ -27,10 +25,12 @@ namespace fees {
     constexpr double kDefaultMakerFeePct = 0.0002;  ///< Futures Maker-комиссия 0.02%
 } // namespace fees
 
-/// Лимиты биржи Bitget (spot)
+/// Лимиты биржи Bitget (USDT-M futures)
 namespace exchange_limits {
-    /// Минимальный нотионал ордера на Bitget (USDT).
-    /// Реальный минимум биржи = $1.00, используем $1.10 с запасом.
+    /// Абсолютный минимальный нотионал ордера на Bitget USDT-M futures (USDT).
+    /// Реальный минимум зависит от инструмента (от $1 для альткоинов до $5 для BTC/ETH).
+    /// Значение $1.10 — безопасный пол для любого инструмента с 10% запасом.
+    /// Фактический per-symbol минимум приходит через ExchangeSymbolRules::min_trade_usdt.
     constexpr double kMinBitgetNotionalUsdt = 1.10;
 
     /// Минимальный нотионал для определения пылевой позиции (ниже — игнорируется)

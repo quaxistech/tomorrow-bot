@@ -328,14 +328,7 @@ public:
     void evaluate(const RiskContext& ctx, RiskDecision& decision) override;
 };
 
-/// 31. Spot sell without position
-class SpotSellCheck : public IRiskCheck {
-public:
-    std::string_view name() const noexcept override { return "spot_sell_check"; }
-    void evaluate(const RiskContext& ctx, RiskDecision& decision) override;
-};
-
-/// 32. Intraday Drawdown check (новый)
+/// 31. Intraday Drawdown check
 class IntradayDrawdownCheck : public IRiskCheck {
 public:
     IntradayDrawdownCheck(const ExtendedRiskConfig& cfg, const RiskState& state)
@@ -347,7 +340,7 @@ private:
     const RiskState& state_;
 };
 
-/// 33. Drawdown Hard Stop (emergency halt threshold)
+/// 32. Drawdown Hard Stop (emergency halt threshold)
 class DrawdownHardStopCheck : public IRiskCheck {
 public:
     DrawdownHardStopCheck(const ExtendedRiskConfig& cfg, RiskState& state)
@@ -357,6 +350,16 @@ public:
 private:
     const ExtendedRiskConfig& cfg_;
     RiskState& state_;
+};
+
+/// 33. Funding Rate Cost check — блокирует вход при экстремально дорогом фандинге
+class FundingRateCostCheck : public IRiskCheck {
+public:
+    explicit FundingRateCostCheck(const ExtendedRiskConfig& cfg) : cfg_(cfg) {}
+    std::string_view name() const noexcept override { return "funding_rate_cost_check"; }
+    void evaluate(const RiskContext& ctx, RiskDecision& decision) override;
+private:
+    const ExtendedRiskConfig& cfg_;
 };
 
 } // namespace tb::risk

@@ -3,6 +3,7 @@
 add_executable(tomorrow-bot
     main.cpp
     app_bootstrap.cpp
+    http_server.cpp
 )
 
 target_include_directories(tomorrow-bot
@@ -12,6 +13,8 @@ target_include_directories(tomorrow-bot
 
 target_link_libraries(tomorrow-bot
     PRIVATE
+        Boost::json
+        Boost::system
         tb_pipeline
         tb_scanner
         tb_exchange_bitget

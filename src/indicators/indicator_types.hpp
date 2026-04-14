@@ -6,9 +6,7 @@ namespace tb::indicators {
 enum class IndicatorStatus {
     Ok,
     InsufficientData,
-    InvalidInput,
-    Stale,
-    WarmingUp
+    InvalidInput
 };
 
 // ---------------------------------------------------------------------------
@@ -67,14 +65,6 @@ struct VwapResult {
     IndicatorStatus status{IndicatorStatus::InsufficientData};
     int sample_count{0};
     int warmup_remaining{0};
-};
-
-// Pre-computed streaming state for future incremental/streaming indicator API.
-struct RollingState {
-    double last_value{0.0};
-    int bars_processed{0};
-    int warmup_bars{0};
-    bool is_ready() const { return bars_processed >= warmup_bars; }
 };
 
 } // namespace tb::indicators

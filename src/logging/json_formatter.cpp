@@ -72,6 +72,7 @@ std::string format_as_json(const LogEvent& event) {
         oss << ",\"fields\":{";
         bool first = true;
         for (const auto& [k, v] : event.fields) {
+            if (k == "correlation_id") continue;
             if (!first) oss << ",";
             oss << "\"" << json_escape(k) << "\":\"" << json_escape(v) << "\"";
             first = false;

@@ -11,7 +11,6 @@
 
 #include "errors.hpp"
 #include <expected>
-#include <functional>
 
 namespace tb {
 
@@ -60,36 +59,5 @@ template<typename T = void>
 [[nodiscard]] inline VoidResult ErrVoid(TbError error) {
     return std::unexpected<TbError>{error};
 }
-
-// ============================================================
-// Макрос для раннего возврата при ошибке (аналог ? в Rust)
-// ============================================================
-
-/**
- * @brief Возвращает ошибку из функции, если expr завершился с ошибкой
- * 
- * Использование:
- *   TB_TRY(some_result);           // возвращает ошибку если есть
- *   auto val = TB_TRY_VAL(some_result); // извлекает значение или возвращает ошибку
- */
-#define TB_TRY(expr)                                    \
-    do {                                                \
-        auto&& _tb_result = (expr);                     \
-        if (!_tb_result) {                              \
-            return ::tb::Err<decltype(auto)>(_tb_result.error()); \
-        }                                               \
-    } while(0)
-
-#define TB_TRY_VOID(expr)                               \
-    do {                                                \
-        auto&& _tb_result = (expr);                     \
-        if (!_tb_result) {                              \
-            return ::std::unexpected(_tb_result.error()); \
-        }                                               \
-    } while(0)
-
-#define TB_TRY_VAL(var, expr)                           \
-    auto var = [&]() -> decltype(expr) { return (expr); }(); \
-    if (!var) { return ::std::unexpected(var.error()); }
 
 } // namespace tb

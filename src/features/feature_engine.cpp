@@ -5,43 +5,6 @@
 
 namespace tb::features {
 
-namespace {
-
-// Стандартное отклонение логарифмических доходностей последних n свечей
-double returns_std_dev(const std::vector<double>& prices, std::size_t n) {
-    // Нужно n+1 цен чтобы получить n доходностей
-    if (prices.size() < n + 1 || n == 0) return 0.0;
-    const std::size_t start = prices.size() - n - 1;
-
-    // Вычисляем логарифмические доходности
-    std::vector<double> returns;
-    returns.reserve(n);
-    for (std::size_t i = start; i < prices.size() - 1; ++i) {
-        if (prices[i] <= 0.0 || prices[i + 1] <= 0.0) continue;
-        returns.push_back(std::log(prices[i + 1] / prices[i]));
-    }
-
-    if (returns.empty()) return 0.0;
-
-    const double count = static_cast<double>(returns.size());
-    double mean = 0.0;
-    for (double r : returns) {
-        mean += r;
-    }
-    mean /= count;
-
-    double variance = 0.0;
-    for (double r : returns) {
-        const double diff = r - mean;
-        variance += diff * diff;
-    }
-    // Используем несмещённую оценку дисперсии (n-1) для выборочного std dev
-    variance /= (count > 1.0 ? count - 1.0 : count);
-    return std::sqrt(variance);
-}
-
-} // namespace
-
 FeatureEngine::FeatureEngine(Config config,
                              std::shared_ptr<indicators::IndicatorEngine> indicators,
                              std::shared_ptr<tb::clock::IClock> clock,
@@ -56,7 +19,8 @@ FeatureEngine::FeatureEngine(Config config,
 
 void FeatureEngine::on_candle(const normalizer::NormalizedCandle& candle) {
     std::lock_guard lock(mutex_);
-    const std::string key = candle.envelope.symbol.get();
+    // Key by symbol:interval to prevent mixing timeframes (1m/5m/1h)
+    const std::string key = candle.envelope.symbol.get() + ":" + candle.interval;
     auto& buf = candle_buffers_[key];
     if (candle.is_closed) {
         buf.push(candle);
@@ -78,11 +42,13 @@ void FeatureEngine::on_ticker(const normalizer::NormalizedTicker& ticker) {
 
 bool FeatureEngine::is_ready(const tb::Symbol& symbol) const {
     std::lock_guard lock(mutex_);
-    auto it = candle_buffers_.find(symbol.get());
+    const std::string key = symbol.get() + ":" + config_.primary_interval;
+    auto it = candle_buffers_.find(key);
     if (it == candle_buffers_.end()) return false;
-    // Нужно достаточно свечей для самого медленного индикатора
+    // Нужно достаточно свечей для ВСЕХ индикаторов + warm-up
     const std::size_t required = static_cast<std::size_t>(
-        std::max({config_.sma_period, config_.ema_slow_period, config_.macd_slow}) + 1
+        std::max({config_.sma_period, config_.ema_slow_period, config_.macd_slow,
+                  config_.bb_period, config_.atr_period, config_.adx_period}) + 1
     );
     return it->second.has_enough(required);
 }
@@ -95,9 +61,11 @@ std::optional<FeatureSnapshot> FeatureEngine::compute_snapshot(
 
     // Проверяем готовность без повторной блокировки
     {
-        auto it = candle_buffers_.find(symbol.get());
+        const std::string candle_key = symbol.get() + ":" + config_.primary_interval;
+        auto it = candle_buffers_.find(candle_key);
         const std::size_t required = static_cast<std::size_t>(
-            std::max({config_.sma_period, config_.ema_slow_period, config_.macd_slow}) + 1
+            std::max({config_.sma_period, config_.ema_slow_period, config_.macd_slow,
+                      config_.bb_period, config_.atr_period, config_.adx_period}) + 1
         );
         if (it == candle_buffers_.end() || !it->second.has_enough(required)) {
             return std::nullopt;
@@ -132,7 +100,8 @@ std::optional<FeatureSnapshot> FeatureEngine::compute_snapshot(
 TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) const {
     TechnicalFeatures tf;
 
-    auto buf_it = candle_buffers_.find(symbol.get());
+    const std::string key = symbol.get() + ":" + config_.primary_interval;
+    auto buf_it = candle_buffers_.find(key);
     if (buf_it == candle_buffers_.end()) return tf;
     const auto& buf = buf_it->second;
 
@@ -209,41 +178,51 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
         auto obv = indicators_->obv(close, volume);
         tf.obv_valid = obv.valid;
         tf.obv = obv.value;
-        // Нормализация OBV: делим на среднее абсолютных значений за последние 20 периодов
-        const std::size_t norm_window = 20;
-        if (volume.size() >= norm_window) {
+        // ИСПРАВЛЕНИЕ H12: нормализация OBV через slope, а не деление кумулятивного значения.
+        // Проблема старой нормализации: cumulative_obv / mean_vol зависит от длины истории.
+        // Решение: OBV slope (дельта OBV за окно) / (mean_vol × window).
+        // Это даёт стационарный сигнал ∈ [-1, +1], измеряющий текущее согласие
+        // объёма с направлением цены — независимо от времени работы бота.
+        constexpr std::size_t norm_window = 20;
+        if (close.size() >= norm_window + 1 && volume.size() >= norm_window + 1) {
+            // Вычисляем "локальный OBV" за последние norm_window баров
+            double obv_recent = 0.0;
+            const auto start_idx = close.size() - norm_window;
+            for (std::size_t i = start_idx; i < close.size(); ++i) {
+                if (close[i] > close[i - 1])      obv_recent += volume[i];
+                else if (close[i] < close[i - 1]) obv_recent -= volume[i];
+            }
+            // Нормализуем по средней абс. объём × window
+            const auto vol_begin = volume.end() - static_cast<std::ptrdiff_t>(norm_window);
             double sum_vol = 0.0;
-            const std::size_t start = volume.size() - norm_window;
-            for (std::size_t i = start; i < volume.size(); ++i) {
-                sum_vol += std::abs(volume[i]);
+            for (auto it = vol_begin; it != volume.end(); ++it) {
+                sum_vol += std::abs(*it);
             }
             const double mean_vol = sum_vol / static_cast<double>(norm_window);
-            tf.obv_normalized = (mean_vol > 0.0) ? tf.obv / mean_vol : 0.0;
+            const double denominator = mean_vol * static_cast<double>(norm_window);
+            tf.obv_normalized = (denominator > 0.0)
+                ? std::clamp(obv_recent / denominator, -1.0, 1.0)
+                : 0.0;
         }
     }
 
-    // Волатильность: стандартное отклонение логарифмических доходностей
-    if (close.size() >= 6) {  // 6 цен -> 5 доходностей
-        tf.volatility_5 = returns_std_dev(close, 5);
+    // Волатильность: std-dev логарифмических доходностей (IndicatorEngine)
+    {
+        auto vol5 = indicators_->volatility(close, 5);
+        auto vol20 = indicators_->volatility(close, 20);
+        tf.volatility_5 = vol5.valid ? vol5.value : 0.0;
+        tf.volatility_20 = vol20.valid ? vol20.value : 0.0;
+        tf.volatility_valid = vol5.valid && vol20.valid;
     }
-    if (close.size() >= 21) {  // 21 цена -> 20 доходностей
-        tf.volatility_20 = returns_std_dev(close, 20);
-    }
-    // volatility_valid только когда обе волатильности вычислены
-    tf.volatility_valid = (close.size() >= 21);
 
-    // Моментум: (close[-1] - close[-n]) / close[-n]
-    const double last_close = close.back();
-    if (close.size() >= 6) {
-        const double prev_5 = close[close.size() - 6];
-        tf.momentum_5 = (prev_5 > 0.0) ? (last_close - prev_5) / prev_5 : 0.0;
+    // Моментум: (close_now − close_n_ago) / close_n_ago (IndicatorEngine)
+    {
+        auto mom5 = indicators_->momentum(close, 5);
+        auto mom20 = indicators_->momentum(close, 20);
+        tf.momentum_5 = mom5.valid ? mom5.value : 0.0;
+        tf.momentum_20 = mom20.valid ? mom20.value : 0.0;
+        tf.momentum_valid = mom5.valid && mom20.valid;
     }
-    if (close.size() >= 21) {
-        const double prev_20 = close[close.size() - 21];
-        tf.momentum_20 = (prev_20 > 0.0) ? (last_close - prev_20) / prev_20 : 0.0;
-    }
-    // momentum_valid только когда оба моментума вычислены
-    tf.momentum_valid = (close.size() >= 21);
 
     return tf;
 }
@@ -298,10 +277,13 @@ MicrostructureFeatures FeatureEngine::compute_microstructure(
         mf.trade_flow_valid = true;
     }
 
-    // Нестабильность стакана — оценка по дисбалансу глубины и широте спреда
+    // Нестабильность стакана — composite метрика из дисбаланса и спреда.
+    // Cont, Kukanov & Stoikov (2014), "The Price Impact of Order Book Events":
+    //   order imbalance объясняет ~65–70% краткосрочных ценовых движений.
+    // Weights: 0.7 — imbalance (основной предиктор), 0.3 — spread (вторичный).
     if (mf.book_imbalance_valid && mf.spread_valid) {
-        double imbalance_component = std::abs(mf.book_imbalance_5) * 0.6;
-        double spread_component = std::min(mf.spread_bps / 100.0, 1.0) * 0.4;
+        const double imbalance_component = std::abs(mf.book_imbalance_5) * 0.7;
+        const double spread_component = std::min(mf.spread_bps / 100.0, 1.0) * 0.3;
         mf.book_instability = std::clamp(imbalance_component + spread_component, 0.0, 1.0);
         mf.instability_valid = true;
     } else {

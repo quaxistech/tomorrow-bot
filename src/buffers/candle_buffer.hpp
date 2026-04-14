@@ -2,6 +2,7 @@
 #include "ring_buffer.hpp"
 #include "normalizer/normalized_events.hpp"
 #include "common/types.hpp"
+#include <algorithm>
 #include <vector>
 #include <cstddef>
 
@@ -30,15 +31,30 @@ public:
         c.close     = candle.close.get();
         c.volume    = candle.volume.get();
         c.is_closed = candle.is_closed;
-        buffer_.push(c);
+        // Closing a candle that was live-updating: finalize in place instead of duplicating.
+        // Without this, each close event following live updates creates a stale intermediate
+        // copy in the buffer, corrupting the candle history for downstream indicators.
+        if (candle.is_closed && !buffer_.empty() && !buffer_.back().is_closed) {
+            buffer_.back() = c;
+        } else {
+            buffer_.push(c);
+        }
     }
 
-    // Обновляет последнюю незакрытую свечу (не добавляет новую)
+    // Обновляет последнюю незакрытую свечу (не добавляет новую).
+    // Если последняя свеча уже закрыта — значит начался новый период, push.
     void update_last(const normalizer::NormalizedCandle& candle) {
-        if (buffer_.empty()) { push(candle); return; }
+        if (buffer_.empty() || buffer_.back().is_closed) {
+            // Нет live-свечи для обновления — начинаем новый период
+            push(candle);
+            return;
+        }
         auto& last = buffer_.back();
-        last.high   = candle.high.get();
-        last.low    = candle.low.get();
+        // Defensive high/low: гарантируем монотонность даже при out-of-order
+        // или partial upstream-обновлениях. Для нормальных полных snapshot-ов
+        // с биржи std::max/std::min — identity, overhead пренебрежимо мал.
+        last.high   = std::max(last.high, candle.high.get());
+        last.low    = std::min(last.low, candle.low.get());
         last.close  = candle.close.get();
         last.volume = candle.volume.get();
         last.is_closed = candle.is_closed;
@@ -72,6 +88,7 @@ public:
     }
 
     std::size_t size() const noexcept { return buffer_.size(); }
+    bool empty() const noexcept { return buffer_.empty(); }
     bool has_enough(std::size_t required) const noexcept { return buffer_.size() >= required; }
 
 private:

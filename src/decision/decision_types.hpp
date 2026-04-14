@@ -43,47 +43,74 @@ inline std::string to_string(RejectionReason r) {
 
 // ─── Расширенная конфигурация движка решений ────────────────────────────────
 
-/// Конфигурация профессионального уровня — все фичи включаются поэлементно
+/// Конфигурация профессионального уровня — все фичи включаются поэлементно.
+/// Все дефолты калиброваны для USDT-M фьючерсного скальпинга.
 struct AdvancedDecisionConfig {
-    // Regime-aware threshold scaling
+    // ── Regime-aware threshold scaling ───────────────────────────────────
     bool enable_regime_threshold_scaling{true};
-    double regime_trending_factor{1.0};          ///< Множитель порога для trending
-    double regime_choppy_factor{0.95};           ///< Множитель для choppy/noise (-5%, micro-cap chop = норма)
-    double regime_volatile_factor{0.90};         ///< Множитель для vol expansion (-10%)
-    double regime_stress_factor{1.0};           ///< Множитель для liquidity stress (neutral, micro-cap)
-    double regime_mean_reversion_factor{1.0};    ///< Множитель для mean reversion (neutral)
+    double regime_trending_factor{1.0};          ///< Множитель порога для trending (нейтральный)
+    double regime_choppy_factor{1.50};           ///< Множитель для choppy/noise (+50%, блокирует вход в шум)
+    double regime_volatile_factor{0.90};         ///< Множитель для vol expansion (−10%, волатильность = возможность)
+    /// Порог повышен при ликвидном стрессе: slippage и adverse selection растут
+    /// (Menkveld 2013, "HFT and the new market makers", J. Financial Markets)
+    double regime_stress_factor{1.10};           ///< Множитель для stress (+10%, не блокируя полностью)
+    double regime_mean_reversion_factor{1.0};    ///< Множитель для mean reversion (нейтральный)
+    double regime_low_vol_factor{1.0};           ///< Множитель для low vol compression (нейтральный)
+    double regime_anomaly_factor{1.20};          ///< Множитель для anomaly event (+20%, осторожность)
 
-    // Regime-aware dominance scaling
+    // ── Regime-aware dominance scaling ───────────────────────────────────
     bool enable_regime_dominance_scaling{true};
     double dominance_trending{0.55};             ///< В тренде достаточно 55%
     double dominance_choppy{0.72};               ///< В шуме нужно 72%
     double dominance_volatile{0.58};             ///< В расширении волатильности 58%
     double dominance_stress{0.80};               ///< В стрессе нужно 80%
 
-    // Time decay
+    // ── Time decay ──────────────────────────────────────────────────────
     bool enable_time_decay{true};
-    double time_decay_halflife_ms{700.0};        ///< Период полураспада conviction (мс)
+    /// Период полураспада conviction (мс).
+    /// Hasbrouck (2007) "Empirical Market Microstructure": информационное
+    /// полувремя ордер-бука 100–1000 мс в зависимости от ликвидности.
+    /// 500 мс — консервативный выбор для ликвидных USDT-M пар.
+    double time_decay_halflife_ms{500.0};
 
-    // Ensemble conviction
+    // ── Ensemble conviction ─────────────────────────────────────────────
     bool enable_ensemble_conviction{true};
-    double ensemble_agreement_bonus{0.08};       ///< Бонус за каждую согласную стратегию
-    double ensemble_max_bonus{0.20};             ///< Макс. бонус от ансамбля
+    /// Бонус за каждую дополнительную согласную стратегию.
+    /// Breiman (2001) "Random Forests": выигрыш ансамбля уменьшается с ростом
+    /// корреляции базовых классификаторов. 6% — консервативный бонус.
+    double ensemble_agreement_bonus{0.06};
+    double ensemble_max_bonus{0.15};             ///< Макс. бонус от ансамбля
     double ensemble_diminishing_factor{0.6};     ///< Затухание бонуса (60% от предыдущего)
 
-    // Portfolio awareness
+    // ── Portfolio awareness ─────────────────────────────────────────────
     bool enable_portfolio_awareness{true};
-    double drawdown_boost_scale{0.10};           ///< +10% к порогу за каждые 5% просадки
-    double drawdown_max_boost{0.25};             ///< Макс. повышение порога от просадки
-    double consecutive_loss_boost{0.03};         ///< +3% к порогу за каждую убыточную серию
+    /// Референсная просадка для шкалирования порога (%).
+    /// При 10× плече, 5% drawdown ≈ 0.5% движения цены — базовая единица.
+    double drawdown_reference_pct{5.0};
+    /// Шкала повышения порога за каждые drawdown_reference_pct% просадки.
+    /// Thorp (2006) "The Kelly Criterion": при просадке снижаем размер ставки
+    /// пропорционально, а не блокируем торговлю целиком.
+    double drawdown_boost_scale{0.02};
+    double drawdown_max_boost{0.08};             ///< Макс. повышение порога от просадки
+    /// Повышение порога за каждую убыточную серию.
+    /// Aronson (2007): серии 5–8 убытков нормальны даже в прибыльных скальп-системах.
+    /// 0.5% за серию — щадящая калибровка.
+    double consecutive_loss_boost{0.005};
 
-    // Execution cost modeling
+    // ── Execution cost modeling ─────────────────────────────────────────
     bool enable_execution_cost_modeling{true};
-    double execution_cost_conviction_penalty{0.5}; ///< Пенальти = cost × penalty_factor
-    double max_acceptable_cost_bps{80.0};          ///< Вето если cost > 80 bps
+    /// Пенальти conviction = (cost_bps / 100) × penalty_factor.
+    /// Нормализация к 100 bps: при стоимости 100 bps пенальти = penalty_factor.
+    /// Для скальпинга с целевой прибылью 5–20 bps это критически важно.
+    double execution_cost_conviction_penalty{0.3};
+    /// Жёсткое вето если стоимость исполнения > N bps.
+    /// Bitget taker fee ≈ 6 bps + spread 2–5 bps = ~10 bps норма.
+    /// 50 bps — запас на волатильные условия.
+    double max_acceptable_cost_bps{50.0};
 
-    // Time-skew detection
+    // ── Time-skew detection ─────────────────────────────────────────────
     bool enable_time_skew_detection{true};
-    int64_t max_state_skew_ns{200'000'000LL};    ///< Макс. рассинхронизация состояний (200мс)
+    int64_t max_state_skew_ns{200'000'000LL};    ///< Макс. рассинхронизация состояний (200 мс)
 };
 
 // ─── Причина вето ───────────────────────────────────────────────────────────
@@ -105,7 +132,7 @@ struct StrategyContribution {
     double weight{0.0};                           ///< Вес стратегии в аллокации
     double raw_conviction{0.0};                   ///< Исходная conviction стратегии
     double aged_conviction{0.0};                  ///< Conviction после time decay
-    double regime_adjusted_conviction{0.0};       ///< Conviction после regime scaling
+    double cost_adjusted_conviction{0.0};         ///< Conviction после execution-cost penalty
     double execution_cost_penalty{0.0};           ///< Пенальти за стоимость исполнения (bps)
     bool was_vetoed{false};
     std::vector<VetoReason> veto_reasons;
@@ -175,6 +202,11 @@ struct DecisionRecord {
 
     // Текстовое обоснование
     std::string rationale;
+
+    /// Установить обоснование с ограничением длины для предотвращения раздутия логов
+    void set_rationale(const std::string& r) {
+        rationale = r.size() > 2048 ? r.substr(0, 2048) : r;
+    }
 
     // Time-skew (для диагностики)
     int64_t max_state_skew_ns{0};             ///< Макс. рассинхронизация входных состояний

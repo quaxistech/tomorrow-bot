@@ -1,7 +1,6 @@
 #include "reconciliation/reconciliation_engine.hpp"
 #include <algorithm>
 #include <cmath>
-#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -35,88 +34,74 @@ ReconciliationResult ReconciliationEngine::reconcile_on_startup(
     double local_cash_balance)
 {
     auto start_ts = clock_->now();
-    logger_->info("Reconciliation", "Запуск полной reconciliation при старте",
+    logger_->info("Reconciliation", "Запуск полной startup reconciliation (USDT-M Futures)",
         {{"local_orders", std::to_string(local_orders.size())},
          {"local_positions", std::to_string(local_positions.size())},
          {"local_cash", std::to_string(local_cash_balance)}});
 
     ReconciliationResult result;
-    int auto_resolved_count = 0;
 
-    // 1. Получить данные с биржи
+    // 1. Reconcile ордера (обязательный — hard failure при ошибке)
     auto exchange_orders_res = exchange_query_->get_open_orders();
     if (!exchange_orders_res) {
         logger_->error("Reconciliation", "Не удалось получить ордера с биржи",
             {{"error", std::to_string(static_cast<int>(exchange_orders_res.error()))}});
         result.status = ReconciliationStatus::Failed;
-        result.completed_at = clock_->now();
-        std::lock_guard lock(mutex_);
-        last_result_ = result;
-        return result;
-    }
-
-    auto exchange_balances_res = exchange_query_->get_account_balances();
-    if (!exchange_balances_res) {
-        logger_->error("Reconciliation", "Не удалось получить балансы с биржи",
-            {{"error", std::to_string(static_cast<int>(exchange_balances_res.error()))}});
-        result.status = ReconciliationStatus::Failed;
-        result.completed_at = clock_->now();
-        std::lock_guard lock(mutex_);
-        last_result_ = result;
+        finalize_result(result, start_ts);
         return result;
     }
 
     const auto& exchange_orders = exchange_orders_res.value();
-    const auto& exchange_balances = exchange_balances_res.value();
-
-    // 2. Reconcile ордера
     auto order_mismatches = reconcile_orders(local_orders, exchange_orders);
-    result.orders_reconciled = static_cast<int>(local_orders.size() + exchange_orders.size());
+    result.orders_reconciled = static_cast<int>(
+        local_orders.size() + exchange_orders.size());
 
-    // 3. Reconcile позиции
-    auto position_mismatches = reconcile_positions(local_positions, exchange_balances);
-    result.positions_reconciled = static_cast<int>(local_positions.size());
+    // 2. Reconcile фьючерсные позиции (soft failure — продолжаем при ошибке)
+    std::vector<MismatchRecord> position_mismatches;
+    auto exchange_positions_res = exchange_query_->get_open_positions();
+    if (exchange_positions_res) {
+        const auto& exchange_positions = exchange_positions_res.value();
+        position_mismatches = reconcile_positions(local_positions, exchange_positions);
+        result.positions_reconciled = static_cast<int>(
+            local_positions.size() + exchange_positions.size());
+    } else {
+        logger_->warn("Reconciliation",
+            "Не удалось получить фьючерсные позиции с биржи; "
+            "пропуск position reconciliation",
+            {{"error", std::to_string(static_cast<int>(exchange_positions_res.error()))}});
+    }
 
-    // 4. Reconcile баланс
-    auto balance_mismatches = reconcile_balance(local_cash_balance, exchange_balances);
-    result.balances_checked = 1;
+    // 3. Reconcile маржинальный баланс USDT (soft failure)
+    std::vector<MismatchRecord> balance_mismatches;
+    auto exchange_balances_res = exchange_query_->get_account_balances();
+    if (exchange_balances_res) {
+        balance_mismatches = reconcile_balance(
+            local_cash_balance, exchange_balances_res.value());
+        result.balances_checked = 1;
+    } else {
+        logger_->warn("Reconciliation",
+            "Не удалось получить маржинальные балансы с биржи; "
+            "пропуск balance reconciliation",
+            {{"error", std::to_string(static_cast<int>(exchange_balances_res.error()))}});
+    }
 
-    // 5. Объединить все расхождения
+    // 4. Объединить все расхождения
     result.mismatches.reserve(
         order_mismatches.size() + position_mismatches.size() + balance_mismatches.size());
     result.mismatches.insert(result.mismatches.end(),
-        order_mismatches.begin(), order_mismatches.end());
+        std::make_move_iterator(order_mismatches.begin()),
+        std::make_move_iterator(order_mismatches.end()));
     result.mismatches.insert(result.mismatches.end(),
-        position_mismatches.begin(), position_mismatches.end());
+        std::make_move_iterator(position_mismatches.begin()),
+        std::make_move_iterator(position_mismatches.end()));
     result.mismatches.insert(result.mismatches.end(),
-        balance_mismatches.begin(), balance_mismatches.end());
+        std::make_move_iterator(balance_mismatches.begin()),
+        std::make_move_iterator(balance_mismatches.end()));
 
-    // 6. Попробовать авторазрешение
-    for (auto& mismatch : result.mismatches) {
-        if (auto_resolved_count >= config_.max_auto_resolutions_per_run) {
-            logger_->warn("Reconciliation",
-                "Достигнут лимит авторазрешений за один запуск",
-                {{"limit", std::to_string(config_.max_auto_resolutions_per_run)}});
-            break;
-        }
-        if (try_auto_resolve(mismatch)) {
-            ++auto_resolved_count;
-        } else if (!mismatch.resolved) {
-            logger_->error("Reconciliation", "Авто-разрешение расхождения не удалось",
-                {{"type", to_string(mismatch.type)},
-                 {"order_id", mismatch.order_id.get()},
-                 {"description", mismatch.description}});
-        }
-    }
+    // 5. Auto-resolve
+    auto_resolve_mismatches(result);
 
-    result.auto_resolved = auto_resolved_count;
-    result.operator_escalated = static_cast<int>(std::count_if(
-        result.mismatches.begin(), result.mismatches.end(),
-        [](const MismatchRecord& m) {
-            return !m.resolved && m.resolved_by == ResolutionAction::AlertOperator;
-        }));
-
-    // 7. Определить итоговый статус
+    // 6. Определить итоговый статус
     bool has_critical = std::any_of(
         result.mismatches.begin(), result.mismatches.end(),
         [](const MismatchRecord& m) {
@@ -134,27 +119,16 @@ ReconciliationResult ReconciliationEngine::reconcile_on_startup(
         result.status = ReconciliationStatus::PartialMismatch;
     }
 
-    // 8. Замерить время и записать метрики
-    auto end_ts = clock_->now();
-    result.duration_ms = (end_ts.get() - start_ts.get()) / 1'000'000;
-    result.completed_at = end_ts;
+    // 7. Финализация: timing, метрики, store
+    finalize_result(result, start_ts);
 
-    metrics_->counter("reconciliation_mismatches_total")->increment(
-        static_cast<double>(result.mismatches.size()));
-    metrics_->gauge("reconciliation_duration_ms")->set(
-        static_cast<double>(result.duration_ms));
-    metrics_->counter("reconciliation_auto_resolved_total")->increment(
-        static_cast<double>(result.auto_resolved));
-
-    logger_->info("Reconciliation", "Reconciliation при старте завершена",
+    logger_->info("Reconciliation", "Startup reconciliation завершена (USDT-M Futures)",
         {{"status", to_string(result.status)},
          {"mismatches", std::to_string(result.mismatches.size())},
          {"auto_resolved", std::to_string(result.auto_resolved)},
          {"operator_escalated", std::to_string(result.operator_escalated)},
          {"duration_ms", std::to_string(result.duration_ms)}});
 
-    std::lock_guard lock(mutex_);
-    last_result_ = result;
     return result;
 }
 
@@ -170,42 +144,22 @@ ReconciliationResult ReconciliationEngine::reconcile_active_orders(
         {{"count", std::to_string(local_active_orders.size())}});
 
     ReconciliationResult result;
-    int auto_resolved_count = 0;
 
     auto exchange_orders_res = exchange_query_->get_open_orders();
     if (!exchange_orders_res) {
-        logger_->error("Reconciliation", "Не удалось получить ордера с биржи для периодической reconciliation");
+        logger_->error("Reconciliation",
+            "Не удалось получить ордера с биржи для периодической reconciliation");
         result.status = ReconciliationStatus::Failed;
-        result.completed_at = clock_->now();
-        std::lock_guard lock(mutex_);
-        last_result_ = result;
+        finalize_result(result, start_ts);
         return result;
     }
 
-    result.mismatches = reconcile_orders(local_active_orders, exchange_orders_res.value());
+    result.mismatches = reconcile_orders(
+        local_active_orders, exchange_orders_res.value());
     result.orders_reconciled = static_cast<int>(
         local_active_orders.size() + exchange_orders_res.value().size());
 
-    for (auto& mismatch : result.mismatches) {
-        if (auto_resolved_count >= config_.max_auto_resolutions_per_run) {
-            break;
-        }
-        if (try_auto_resolve(mismatch)) {
-            ++auto_resolved_count;
-        } else if (!mismatch.resolved) {
-            logger_->error("Reconciliation", "Авто-разрешение расхождения не удалось",
-                {{"type", to_string(mismatch.type)},
-                 {"order_id", mismatch.order_id.get()},
-                 {"description", mismatch.description}});
-        }
-    }
-
-    result.auto_resolved = auto_resolved_count;
-    result.operator_escalated = static_cast<int>(std::count_if(
-        result.mismatches.begin(), result.mismatches.end(),
-        [](const MismatchRecord& m) {
-            return !m.resolved && m.resolved_by == ResolutionAction::AlertOperator;
-        }));
+    auto_resolve_mismatches(result);
 
     if (result.mismatches.empty()) {
         result.status = ReconciliationStatus::Success;
@@ -218,19 +172,64 @@ ReconciliationResult ReconciliationEngine::reconcile_active_orders(
             : ReconciliationStatus::Success;
     }
 
-    auto end_ts = clock_->now();
-    result.duration_ms = (end_ts.get() - start_ts.get()) / 1'000'000;
-    result.completed_at = end_ts;
+    finalize_result(result, start_ts);
+    return result;
+}
 
-    metrics_->counter("reconciliation_mismatches_total")->increment(
-        static_cast<double>(result.mismatches.size()));
-    metrics_->gauge("reconciliation_duration_ms")->set(
-        static_cast<double>(result.duration_ms));
-    metrics_->counter("reconciliation_auto_resolved_total")->increment(
-        static_cast<double>(result.auto_resolved));
+ReconciliationResult ReconciliationEngine::reconcile_positions_and_balance(
+    const std::vector<portfolio::Position>& local_positions,
+    double local_cash_balance)
+{
+    auto start_ts = clock_->now();
+    logger_->debug("Reconciliation", "Периодическая reconciliation позиций и баланса",
+        {{"local_positions", std::to_string(local_positions.size())},
+         {"local_cash", std::to_string(local_cash_balance)}});
 
-    std::lock_guard lock(mutex_);
-    last_result_ = result;
+    ReconciliationResult result;
+
+    // 1. Reconcile позиции (soft failure)
+    auto exchange_positions_res = exchange_query_->get_open_positions();
+    if (exchange_positions_res) {
+        auto pos_mismatches = reconcile_positions(
+            local_positions, exchange_positions_res.value());
+        result.positions_reconciled = static_cast<int>(
+            local_positions.size() + exchange_positions_res.value().size());
+        result.mismatches.insert(result.mismatches.end(),
+            std::make_move_iterator(pos_mismatches.begin()),
+            std::make_move_iterator(pos_mismatches.end()));
+    } else {
+        logger_->warn("Reconciliation",
+            "Не удалось получить позиции с биржи для периодической reconciliation");
+    }
+
+    // 2. Reconcile баланс (soft failure)
+    auto exchange_balances_res = exchange_query_->get_account_balances();
+    if (exchange_balances_res) {
+        auto bal_mismatches = reconcile_balance(
+            local_cash_balance, exchange_balances_res.value());
+        result.balances_checked = 1;
+        result.mismatches.insert(result.mismatches.end(),
+            std::make_move_iterator(bal_mismatches.begin()),
+            std::make_move_iterator(bal_mismatches.end()));
+    } else {
+        logger_->warn("Reconciliation",
+            "Не удалось получить балансы с биржи для периодической reconciliation");
+    }
+
+    auto_resolve_mismatches(result);
+
+    if (result.mismatches.empty()) {
+        result.status = ReconciliationStatus::Success;
+    } else {
+        bool has_unresolved = std::any_of(
+            result.mismatches.begin(), result.mismatches.end(),
+            [](const MismatchRecord& m) { return !m.resolved; });
+        result.status = has_unresolved
+            ? ReconciliationStatus::CriticalMismatch
+            : ReconciliationStatus::Success;
+    }
+
+    finalize_result(result, start_ts);
     return result;
 }
 
@@ -288,6 +287,25 @@ std::optional<MismatchRecord> ReconciliationEngine::reconcile_single_order(
         return mismatch;
     }
 
+    if (!local_is_active && exchange_is_active) {
+        MismatchRecord mismatch;
+        mismatch.type = MismatchType::StateMismatch;
+        mismatch.symbol = local_order.symbol;
+        mismatch.order_id = local_order.order_id;
+        mismatch.description = "Локальный ордер неактивен (" +
+            execution::to_string(local_order.state) +
+            "), на бирже всё ещё активен: " + exchange_order.status;
+        mismatch.detected_at = clock_->now();
+
+        logger_->warn("Reconciliation", mismatch.description,
+            {{"order_id", local_order.order_id.get()},
+             {"local_state", execution::to_string(local_order.state)},
+             {"exchange_status", exchange_order.status}});
+
+        try_auto_resolve(mismatch);
+        return mismatch;
+    }
+
     // Проверить filled_qty
     double local_filled = local_order.filled_quantity.get();
     double exchange_filled = exchange_order.filled_quantity.get();
@@ -326,6 +344,47 @@ ReconciliationResult ReconciliationEngine::last_result() const {
 
 const ReconciliationConfig& ReconciliationEngine::config() const {
     return config_;
+}
+
+// ============================================================
+// Приватные хелперы
+// ============================================================
+
+void ReconciliationEngine::auto_resolve_mismatches(ReconciliationResult& result) {
+    int auto_resolved_count = 0;
+    for (auto& mismatch : result.mismatches) {
+        if (auto_resolved_count >= config_.max_auto_resolutions_per_run) {
+            logger_->warn("Reconciliation",
+                "Достигнут лимит авторазрешений за один запуск",
+                {{"limit", std::to_string(config_.max_auto_resolutions_per_run)}});
+            break;
+        }
+        if (try_auto_resolve(mismatch)) {
+            ++auto_resolved_count;
+        }
+    }
+    result.auto_resolved = auto_resolved_count;
+    result.operator_escalated = static_cast<int>(std::count_if(
+        result.mismatches.begin(), result.mismatches.end(),
+        [](const MismatchRecord& m) {
+            return !m.resolved && m.resolved_by == ResolutionAction::AlertOperator;
+        }));
+}
+
+void ReconciliationEngine::finalize_result(ReconciliationResult& result, Timestamp start_ts) {
+    auto end_ts = clock_->now();
+    result.duration_ms = (end_ts.get() - start_ts.get()) / 1'000'000;
+    result.completed_at = end_ts;
+
+    metrics_->counter("reconciliation_mismatches_total")->increment(
+        static_cast<double>(result.mismatches.size()));
+    metrics_->gauge("reconciliation_duration_ms")->set(
+        static_cast<double>(result.duration_ms));
+    metrics_->counter("reconciliation_auto_resolved_total")->increment(
+        static_cast<double>(result.auto_resolved));
+
+    std::lock_guard lock(mutex_);
+    last_result_ = result;
 }
 
 // ============================================================
@@ -465,111 +524,130 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_orders(
 }
 
 // ============================================================
-// Reconcile позиции
+// Reconcile фьючерсные позиции
 // ============================================================
 
 std::vector<MismatchRecord> ReconciliationEngine::reconcile_positions(
     const std::vector<portfolio::Position>& local_positions,
-    const std::vector<ExchangePositionInfo>& exchange_balances)
+    const std::vector<ExchangeOpenPositionInfo>& exchange_positions)
 {
     std::vector<MismatchRecord> mismatches;
     auto now = clock_->now();
 
-    // Индекс биржевых балансов по символу
-    std::unordered_map<std::string, const ExchangePositionInfo*> exchange_by_symbol;
-    std::unordered_set<std::string> matched_symbols;
+    // Composite key: "SYMBOL|L" / "SYMBOL|S" — поддерживает hedge mode
+    // (одновременно Long и Short по одному символу)
+    auto make_key = [](const std::string& symbol, Side side) -> std::string {
+        return symbol + (side == Side::Buy ? "|L" : "|S");
+    };
 
-    for (const auto& eb : exchange_balances) {
-        exchange_by_symbol[eb.symbol.get()] = &eb;
+    // Индекс биржевых позиций по composite key
+    std::unordered_map<std::string, const ExchangeOpenPositionInfo*> exchange_by_key;
+    std::unordered_set<std::string> matched_keys;
+
+    for (const auto& ep : exchange_positions) {
+        exchange_by_key[make_key(ep.symbol.get(), ep.side)] = &ep;
     }
 
+    // Проверить каждую локальную позицию
     for (const auto& local : local_positions) {
         if (local.size.get() < 1e-12) {
             continue; // Пропускаем нулевые позиции
         }
 
-        auto it = exchange_by_symbol.find(local.symbol.get());
-        if (it == exchange_by_symbol.end()) {
+        auto key = make_key(local.symbol.get(), local.side);
+        auto it = exchange_by_key.find(key);
+
+        if (it == exchange_by_key.end()) {
             MismatchRecord m;
             m.type = MismatchType::PositionExistsOnlyLocally;
             m.symbol = local.symbol;
-            m.description = "Позиция " + local.symbol.get() +
+            // A2 fix: сохраняем сторону для leg-aware resolution
+            m.position_side = (local.side == Side::Buy) ? PositionSide::Long : PositionSide::Short;
+            m.description = "Фьючерсная позиция " + local.symbol.get() +
+                " " + (local.side == Side::Buy ? "Long" : "Short") +
                 " (size=" + std::to_string(local.size.get()) +
                 ") есть локально, но нет на бирже";
             m.detected_at = now;
             mismatches.push_back(std::move(m));
 
-            logger_->warn("Reconciliation", "Позиция только локально",
+            logger_->warn("Reconciliation", "Фьючерсная позиция только локально",
                 {{"symbol", local.symbol.get()},
+                 {"side", local.side == Side::Buy ? "Long" : "Short"},
                  {"size", std::to_string(local.size.get())}});
             continue;
         }
 
-        matched_symbols.insert(local.symbol.get());
+        matched_keys.insert(key);
         const auto* exchange_pos = it->second;
 
-        // Сравнить total quantity: available + frozen на бирже vs size локально
-        double exchange_total = exchange_pos->available.get() + exchange_pos->frozen.get();
-        double local_total = local.size.get();
-        double diff_pct = (local_total > 1e-12)
-            ? std::abs(exchange_total - local_total) / local_total * 100.0
-            : 0.0;
+        // Сравнить размер позиции с допуском position_tolerance_pct
+        double exchange_size = exchange_pos->size.get();
+        double local_size = local.size.get();
+        double tolerance = std::max(1e-8,
+            exchange_size * config_.position_tolerance_pct / 100.0);
 
-        if (diff_pct > config_.balance_tolerance_pct) {
+        if (std::abs(exchange_size - local_size) > tolerance) {
+            double diff_pct = (exchange_size > 1e-12)
+                ? std::abs(exchange_size - local_size) / exchange_size * 100.0
+                : 100.0;
+
             MismatchRecord m;
             m.type = MismatchType::QuantityMismatch;
             m.symbol = local.symbol;
-            m.description = "Позиция " + local.symbol.get() +
-                ": локально=" + std::to_string(local_total) +
-                " биржа=" + std::to_string(exchange_total) +
+            // A2 fix: сохраняем сторону для leg-aware resolution
+            m.position_side = (local.side == Side::Buy) ? PositionSide::Long : PositionSide::Short;
+            m.description = "Фьючерсная позиция " + local.symbol.get() +
+                " " + (local.side == Side::Buy ? "Long" : "Short") +
+                ": локально=" + std::to_string(local_size) +
+                " биржа=" + std::to_string(exchange_size) +
                 " (diff=" + std::to_string(diff_pct) + "%)";
             m.detected_at = now;
             mismatches.push_back(std::move(m));
 
-            logger_->warn("Reconciliation", "Расхождение размера позиции",
+            logger_->warn("Reconciliation", "Расхождение размера фьючерсной позиции",
                 {{"symbol", local.symbol.get()},
-                 {"local_size", std::to_string(local_total)},
-                 {"exchange_total", std::to_string(exchange_total)},
+                 {"side", local.side == Side::Buy ? "Long" : "Short"},
+                 {"local_size", std::to_string(local_size)},
+                 {"exchange_size", std::to_string(exchange_size)},
                  {"diff_pct", std::to_string(diff_pct)}});
         }
     }
 
     // Проверить позиции, которые есть на бирже, но нет локально
-    // (игнорируем стейблкоины / USDT — они обрабатываются в reconcile_balance)
-    for (const auto& eb : exchange_balances) {
-        if (matched_symbols.contains(eb.symbol.get())) {
+    for (const auto& ep : exchange_positions) {
+        auto key = make_key(ep.symbol.get(), ep.side);
+        if (matched_keys.contains(key)) {
             continue;
         }
-        if (eb.symbol.get() == "USDT" || eb.symbol.get() == "USDC") {
-            continue; // Стейблкоины — обрабатываются отдельно
-        }
-
-        double total = eb.available.get() + eb.frozen.get();
-        if (total < 1e-12) {
-            continue; // Нулевой баланс — не интересно
+        if (ep.size.get() < 1e-12) {
+            continue; // Нулевая позиция — не интересно
         }
 
         MismatchRecord m;
         m.type = MismatchType::PositionExistsOnlyOnExchange;
-        m.symbol = eb.symbol;
-        m.description = "Актив " + eb.symbol.get() +
-            " (available=" + std::to_string(eb.available.get()) +
-            ", frozen=" + std::to_string(eb.frozen.get()) +
+        m.symbol = ep.symbol;
+        // A2 fix: сохраняем сторону для leg-aware resolution
+        m.position_side = (ep.side == Side::Buy) ? PositionSide::Long : PositionSide::Short;
+        m.description = "Фьючерсная позиция " + ep.symbol.get() +
+            " " + (ep.side == Side::Buy ? "Long" : "Short") +
+            " (size=" + std::to_string(ep.size.get()) +
+            ", entry=" + std::to_string(ep.entry_price.get()) +
             ") есть на бирже, но нет локально";
         m.detected_at = now;
         mismatches.push_back(std::move(m));
 
-        logger_->warn("Reconciliation", "Позиция только на бирже",
-            {{"symbol", eb.symbol.get()},
-             {"available", std::to_string(eb.available.get())},
-             {"frozen", std::to_string(eb.frozen.get())}});
+        logger_->warn("Reconciliation", "Фьючерсная позиция только на бирже",
+            {{"symbol", ep.symbol.get()},
+             {"side", ep.side == Side::Buy ? "Long" : "Short"},
+             {"size", std::to_string(ep.size.get())},
+             {"entry_price", std::to_string(ep.entry_price.get())}});
     }
 
     return mismatches;
 }
 
 // ============================================================
-// Reconcile баланс (USDT)
+// Reconcile маржинальный баланс USDT (USDT-M Futures)
 // ============================================================
 
 std::vector<MismatchRecord> ReconciliationEngine::reconcile_balance(
@@ -579,12 +657,16 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_balance(
     std::vector<MismatchRecord> mismatches;
     auto now = clock_->now();
 
-    // Найти USDT в биржевых балансах
+    // Найти USDT equity в биржевых балансах.
+    // Для USDT-M Futures локальный portfolio capital синхронизируется из usdtEquity,
+    // поэтому reconciliation должна сверять именно equity, а не free/locked cash.
     double exchange_usdt = 0.0;
     bool found_usdt = false;
     for (const auto& eb : exchange_balances) {
         if (eb.symbol.get() == "USDT") {
-            exchange_usdt = eb.available.get() + eb.frozen.get();
+            exchange_usdt = eb.total_value_usd > 0.0
+                ? eb.total_value_usd
+                : (eb.available.get() + eb.frozen.get());
             found_usdt = true;
             break;
         }

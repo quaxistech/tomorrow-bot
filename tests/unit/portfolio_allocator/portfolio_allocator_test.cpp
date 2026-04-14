@@ -43,7 +43,14 @@ static AllocationContext make_context(double vol = 0.3,
     ctx.regime = regime;
     ctx.win_rate = 0.55;
     ctx.avg_win_loss_ratio = 1.5;
-    ctx.signal_intent = strategy::SignalIntent::LongEntry;
+    // Default exchange filters для тестов
+    ExchangeFilters ef;
+    ef.min_quantity = 0.00001;
+    ef.quantity_step = 0.00001;
+    ef.min_notional = 1.0;
+    ef.max_quantity = 1000.0;
+    ef.taker_fee_pct = 0.0006;
+    ctx.exchange_filters = ef;
     return ctx;
 }
 

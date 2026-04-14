@@ -67,7 +67,7 @@ TEST_CASE("MicrostructureFingerprinter: edge is bounded") {
     s.microstructure.book_imbalance_5 = 0.2;
     s.microstructure.aggressive_flow = 0.7;
     s.technical.atr_14_normalized = 0.01;
-    s.microstructure.liquidity_ratio = 1.2;
+    s.microstructure.liquidity_ratio = 0.8;
 
     auto f = fp.create_fingerprint(s);
     for (int i = 0; i < 50; ++i) {
@@ -113,4 +113,70 @@ TEST_CASE("ThompsonSampler: returns valid action and bounded arm means") {
         REQUIRE(mean >= 0.0);
         REQUIRE(mean <= 1.0);
     }
+}
+
+TEST_CASE("CorrelationMonitor: reports Degraded without reference feeds") {
+    tb::ml::CorrelationConfig cfg;
+    cfg.reference_assets = {"BTCUSDT"};
+    tb::ml::CorrelationMonitor c(cfg, mk_logger());
+
+    // Only primary ticks — no reference feed connected
+    for (int i = 0; i < 30; ++i) {
+        c.on_primary_tick(100.0 + i * 0.1);
+    }
+
+    auto s = c.status();
+    REQUIRE(s.health == tb::ml::MlComponentHealth::Degraded);
+}
+
+TEST_CASE("MicrostructureFingerprinter: predict_edge blends win_rate and avg_return") {
+    tb::ml::FingerprintConfig cfg;
+    cfg.min_samples = 5;
+    tb::ml::MicrostructureFingerprinter fp(cfg, mk_logger());
+    tb::features::FeatureSnapshot s{};
+    s.microstructure.spread_bps = 7.5;
+    s.microstructure.book_imbalance_5 = 0.2;
+    s.microstructure.aggressive_flow = 0.7;
+    s.technical.atr_14_normalized = 0.01;
+    s.microstructure.liquidity_ratio = 0.8;
+
+    auto f = fp.create_fingerprint(s);
+    // Record consistently positive outcomes
+    for (int i = 0; i < 20; ++i) {
+        fp.record_outcome(f, 0.01);  // 1% positive return
+    }
+    const double edge = fp.predict_edge(f);
+    REQUIRE(edge > 0.0);  // Consistently winning = positive edge
+
+    // Record consistently negative outcomes on a different fingerprint
+    s.microstructure.spread_bps = 200.0;
+    auto f2 = fp.create_fingerprint(s);
+    for (int i = 0; i < 20; ++i) {
+        fp.record_outcome(f2, -0.01);
+    }
+    const double edge2 = fp.predict_edge(f2);
+    REQUIRE(edge2 < 0.0);  // Consistently losing = negative edge
+}
+
+TEST_CASE("MlSignalSnapshot: compute_aggregates blocks on cascade and low quality") {
+    tb::ml::MlSignalSnapshot snap;
+    snap.cascade_imminent = true;
+    snap.cascade_probability = 0.9;
+    snap.is_noisy = false;
+    snap.signal_quality = 0.5;
+    snap.correlation_risk_multiplier = 1.0;
+    snap.compute_aggregates();
+    REQUIRE(snap.should_block_trading);
+    REQUIRE(snap.block_reason == "liquidation_cascade_imminent");
+    REQUIRE(snap.combined_risk_multiplier <= 0.3);
+
+    // Low signal quality blocks trading
+    tb::ml::MlSignalSnapshot snap2;
+    snap2.signal_quality = 0.10;
+    snap2.cascade_imminent = false;
+    snap2.is_noisy = true;
+    snap2.correlation_risk_multiplier = 1.0;
+    snap2.compute_aggregates();
+    REQUIRE(snap2.should_block_trading);
+    REQUIRE(snap2.block_reason == "signal_quality_too_low");
 }

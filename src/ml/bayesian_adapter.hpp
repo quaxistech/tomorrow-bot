@@ -39,10 +39,24 @@ struct BayesianParameter {
 struct ParameterObservation {
     double reward;                       ///< Нормализованный P&L (-1..+1)
     regime::DetailedRegime regime;       ///< Режим рынка
-    std::unordered_map<std::string, double> params; ///< Значения параметров
 };
 
-/// Конфигурация Bayesian адаптера
+/// Конфигурация Bayesian адаптера.
+///
+/// Научное обоснование (Normal-Normal conjugate, Murphy 2012):
+/// - learning_rate=0.05: консервативная скорость — параметры стратегии
+///   меняются медленно, предотвращая overfitting к недавним наблюдениям.
+///   5% от диапазона за наблюдение — стандарт для online Bayesian optimization.
+/// - exploration_rate=0.1: 10% exploration vs 90% exploitation —
+///   Thompson Sampling style ε-greedy, баланс UCB литературы (Auer et al. 2002).
+/// - min_observations=20: порог статистической значимости для N(μ,σ²)
+///   posterior — при n=20 credible interval сужается до ±0.44σ.
+/// - observation_variance=1.0: единичная дисперсия наблюдений — нормализованный
+///   reward [-1,+1] имеет max-var=1.0.
+/// - precision_decay=0.995: exponential forgetting с τ ≈ 200 наблюдений —
+///   предотвращает learning freeze и адаптирует к нестационарности рынка
+///   (Kulhavy & Zarrop 1993).
+/// - max_precision=1000.0: потолок предотвращает полную остановку обучения.
 struct BayesianConfig {
     double learning_rate{0.05};         ///< Скорость обучения (консервативная)
     double exploration_rate{0.1};       ///< Доля exploration vs exploitation

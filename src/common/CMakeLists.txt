@@ -9,7 +9,7 @@ target_include_directories(tb_common
 )
 
 target_compile_features(tb_common
-    INTERFACE cxx_std_20
+    INTERFACE cxx_std_23
 )
 
 # Псевдоним для удобства использования в других модулях

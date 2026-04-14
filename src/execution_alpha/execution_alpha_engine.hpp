@@ -28,20 +28,31 @@ class RuleBasedExecutionAlpha : public IExecutionAlphaEngine {
 public:
     struct Config {
         // ── Базовые пороги ──
-        // ИСПРАВЛЕНИЕ: Micro-cap altcoins имеют спреды 50-150bps.
-        // Старые значения (15bps passive / 50bps any) блокировали микрокапы.
-        double max_spread_bps_passive{60.0};     ///< Макс спред для пассивного исполнения (micro-cap реалистично)
-        double max_spread_bps_any{150.0};        ///< Макс спред для любого исполнения (micro-cap worst-case)
-        double adverse_selection_threshold{0.7};  ///< Порог токсичности для NoExecution
+        // Базовые значения должны быть защитными; production-конфиг может их ослабить.
+        // Ссылки:
+        //   Spread: типичный BTC/USDT perpetual spread на Bitget 1-5 bps в спокойном
+        //   рынке, до 30-50 bps при волатильности (CME Crypto Report 2024).
+        //   VPIN: Easley, López de Prado, O'Hara (2012) «Flow Toxicity and Liquidity
+        //   in a High-frequency World» — порог 0.6-0.8 для детекции информированного потока.
+        //   Slice threshold: Almgren & Chriss (2001) — ордера >5-10% видимой глубины
+        //   требуют алгоритмической нарезки для минимизации market impact.
+        double max_spread_bps_passive{15.0};     ///< Макс спред для пассивного исполнения [bps]
+        double max_spread_bps_any{50.0};         ///< Макс спред для любого исполнения [bps]
+        double adverse_selection_threshold{0.7};  ///< Порог агрегированной токсичности для NoExecution [0,1]
         double urgency_passive_threshold{0.5};    ///< Ниже → пассивно
         double urgency_aggressive_threshold{0.8}; ///< Выше → агрессивно
-        double large_order_slice_threshold{0.1};  ///< % от depth → нарезка
+        double large_order_slice_threshold{0.1};  ///< Доля от opposite-side L5 depth → нарезка
 
         // ── VPIN интеграция ──
+        // Easley et al. (2012): VPIN > 0.6-0.8 указывает на информированный поток.
+        // Вес 0.40 отражает, что VPIN — наиболее информативный одиночный индикатор
+        // токсичности, т.к. объединяет volume и direction в одной метрике.
         double vpin_toxic_threshold{0.65};   ///< VPIN выше этого → высокая токсичность
         double vpin_weight{0.40};            ///< Вес VPIN в расчёте adverse selection
 
         // ── Дисбаланс стакана ──
+        // Cont, Stoikov, Talreja (2010): дисбаланс L1-L5 — статистически значимый
+        // предиктор краткосрочного движения цены на горизонте 1-5 trades.
         double imbalance_favorable_threshold{0.30};   ///< Имбаланс в нашу пользу → Passive предпочтителен
         double imbalance_unfavorable_threshold{0.30};  ///< Имбаланс против нас → предпочесть Hybrid
 
@@ -56,10 +67,16 @@ public:
         // ── Вероятность заполнения ──
         double min_fill_probability_passive{0.25}; ///< Нижняя граница fill_prob для пассивного стиля
 
-        // ── PostOnly условия (премиальный maker, нулевые комиссии) ──
+        // ── PostOnly условия (минимальная maker-комиссия) ──
         double postonly_spread_threshold_bps{4.5};  ///< Спред ниже этого → PostOnly кандидат
         double postonly_urgency_max{0.35};           ///< Срочность ниже этого → PostOnly кандидат
         double postonly_adverse_max{0.35};           ///< Токсичность ниже этого → PostOnly кандидат
+
+        // ── Комиссии биржи (USDT-M futures) ──
+        // Bitget standard tier: taker 0.06%, maker 0.02%.
+        // Для VIP-тиров значения корректируются через production config.
+        double taker_fee_bps{6.0};   ///< Taker комиссия [bps]
+        double maker_fee_bps{2.0};   ///< Maker комиссия [bps]
     };
 
     RuleBasedExecutionAlpha(Config config,
@@ -90,7 +107,7 @@ private:
                            const features::FeatureSnapshot& features,
                            DecisionFactors& factors) const;
 
-    /// Оценить вероятность заполнения на основе данных стакана (data-driven, не хардкод)
+    /// Оценить вероятность заполнения на основе данных стакана (эвристическая модель)
     double estimate_fill_probability(ExecutionStyle style,
                                      const strategy::TradeIntent& intent,
                                      const features::FeatureSnapshot& features,

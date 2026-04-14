@@ -22,9 +22,6 @@ public:
                                       int64_t now_ns) const;
 
 private:
-    /// Проверка time stop
-    bool check_time_stop(const StrategyPositionContext& pos, int64_t now_ns) const;
-
     /// Проверка структурного провала
     bool check_structure_failure(const StrategyPositionContext& pos,
                                  const StrategyContext& ctx) const;

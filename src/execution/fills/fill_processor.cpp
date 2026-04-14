@@ -174,24 +174,24 @@ bool FillProcessor::process_order_fill(const OrderId& order_id,
 void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
     if (!portfolio_) return;
 
-    bool is_close = (order.trade_side == TradeSide::Close);
-    bool is_open = (order.trade_side == TradeSide::Open);
-
-    if (is_close || (!is_open && order.side == Side::Sell)) {
-        // SELL / Close: уменьшить позицию
+    // Фьючерсы USDT-M: логика определяется исключительно по trade_side.
+    // TradeSide::Close — уменьшение/закрытие позиции (long или short).
+    // TradeSide::Open  — открытие/увеличение позиции (long или short).
+    if (order.trade_side == TradeSide::Close) {
         double gross_pnl = compute_gross_pnl(order);
-        portfolio_->reduce_position(order.symbol, order.filled_quantity,
+        portfolio_->reduce_position(order.symbol, order.position_side, order.filled_quantity,
                                     order.avg_fill_price, gross_pnl);
-        double sell_fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
-        portfolio_->record_fee(order.symbol, sell_fee, order.order_id);
+        double fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
+        portfolio_->record_fee(order.symbol, fee, order.order_id);
 
-        logger_->info("FillProcessor", "Позиция уменьшена (sell fill)",
+        logger_->info("FillProcessor", "Позиция уменьшена (close fill)",
             {{"symbol", order.symbol.get()},
+             {"position_side", order.position_side == PositionSide::Long ? "Long" : "Short"},
              {"qty", std::to_string(order.filled_quantity.get())},
              {"gross_pnl", std::to_string(gross_pnl)},
-             {"sell_fee", std::to_string(sell_fee)}});
+             {"fee", std::to_string(fee)}});
     } else {
-        // BUY / Open: открыть позицию
+        // TradeSide::Open — открытие позиции (Long или Short)
         portfolio::Position pos;
         pos.symbol = order.symbol;
         pos.side = order.side;
@@ -205,25 +205,28 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
         pos.updated_at = clock_->now();
         portfolio_->open_position(pos);
         portfolio_->release_cash(order.order_id);
-        double buy_fee = order.filled_quantity.get() * order.avg_fill_price.get() * kDefaultTakerFeePct;
-        portfolio_->record_fee(order.symbol, buy_fee, order.order_id);
+        double fee = order.filled_quantity.get() * order.avg_fill_price.get() * kDefaultTakerFeePct;
+        portfolio_->record_fee(order.symbol, fee, order.order_id);
     }
 }
 
 double FillProcessor::compute_gross_pnl(const OrderRecord& order) const {
     if (!portfolio_) return 0.0;
 
-    auto existing = portfolio_->get_position(order.symbol);
+    auto existing = portfolio_->get_position(order.symbol, order.position_side);
     if (!existing) return 0.0;
 
     double entry = existing->avg_entry_price.get();
     double exit_p = order.avg_fill_price.get();
     double qty = order.filled_quantity.get();
 
-    if (existing->side == Side::Buy) {
-        return (exit_p - entry) * qty;  // Long profit
+    // PnL определяется по position_side ордера (Long/Short),
+    // а не по side (Buy/Sell), т.к. для фьючерсов Buy может быть
+    // как открытием Long, так и закрытием Short.
+    if (order.position_side == PositionSide::Long) {
+        return (exit_p - entry) * qty;  // Long: прибыль при росте
     } else {
-        return (entry - exit_p) * qty;  // Short profit
+        return (entry - exit_p) * qty;  // Short: прибыль при падении
     }
 }
 

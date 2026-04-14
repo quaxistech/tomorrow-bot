@@ -10,7 +10,8 @@ MarketDataGateway::MarketDataGateway(
     std::shared_ptr<tb::logging::ILogger> logger,
     std::shared_ptr<tb::metrics::IMetricsRegistry> metrics,
     std::shared_ptr<tb::clock::IClock> clock,
-    FeatureSnapshotCallback on_snapshot)
+    FeatureSnapshotCallback on_snapshot,
+    TradeCallback on_trade)
     : config_(std::move(config))
     , feature_engine_(std::move(feature_engine))
     , order_book_(std::move(order_book))
@@ -18,6 +19,7 @@ MarketDataGateway::MarketDataGateway(
     , metrics_(std::move(metrics))
     , clock_(std::move(clock))
     , on_snapshot_(std::move(on_snapshot))
+    , on_trade_(std::move(on_trade))
 {
     // Создаём нормализатор с колбэком на нормализованные события
     normalizer_ = std::make_unique<normalizer::BitgetNormalizer>(
@@ -45,7 +47,12 @@ MarketDataGateway::~MarketDataGateway() {
 }
 
 void MarketDataGateway::start() {
-    running_.store(true);
+    // Защита от повторного вызова
+    bool expected = false;
+    if (!running_.compare_exchange_strong(expected, true)) {
+        logger_->warn("MarketDataGateway", "start() уже вызван, игнорируем повторный вызов");
+        return;
+    }
     logger_->info("MarketDataGateway", "Запуск шлюза рыночных данных");
     ws_client_->start();
     subscribe_to_channels();
@@ -70,12 +77,14 @@ bool MarketDataGateway::is_feed_fresh() const {
 }
 
 void MarketDataGateway::on_raw_message(exchange::bitget::RawWsMessage msg) {
-    last_message_ts_.store(clock_->now().get());
-
     // Пропускаем heartbeat-сообщения — они не содержат рыночных данных
     if (msg.type == exchange::bitget::WsMsgType::Heartbeat) return;
     // Пропускаем подтверждения подписок
     if (msg.type == exchange::bitget::WsMsgType::Subscribe) return;
+
+    // Обновляем timestamp ПОСЛЕ фильтрации heartbeat/subscribe,
+    // чтобы is_feed_fresh() отражал свежесть именно рыночных данных
+    last_message_ts_.store(clock_->now().get());
 
     ++raw_message_count_;
     // Периодически логируем количество обработанных сообщений
@@ -92,6 +101,11 @@ void MarketDataGateway::on_connection_changed(bool connected) {
         logger_->info("MarketDataGateway", "WebSocket подключён");
     } else {
         logger_->warn("MarketDataGateway", "WebSocket отключён, ожидаем переподключения");
+        // Сбрасываем стакан — при потере соединения данные устаревают,
+        // sequence integrity after reconnect не гарантирована.
+        // BitgetWsClient при reconnect автоматически переоформит подписки,
+        // и придёт новый snapshot стакана.
+        order_book_->request_resync();
     }
 }
 
@@ -104,7 +118,15 @@ void MarketDataGateway::on_normalized_event(normalizer::NormalizedEvent event) {
             if (ev.update_type == normalizer::BookUpdateType::Snapshot) {
                 order_book_->apply_snapshot(ev);
             } else {
-                order_book_->apply_delta(ev);
+                if (!order_book_->apply_delta(ev)) {
+                    // Sequence break detected — book is now Desynced.
+                    // Request resync so the book transitions to Uninitialized,
+                    // then the next incoming snapshot restores it to Valid.
+                    logger_->warn("MarketDataGateway",
+                        "Стакан рассинхронизирован, ожидаем новый snapshot",
+                        {{"symbol", ev.envelope.symbol.get()}});
+                    order_book_->request_resync();
+                }
             }
         } else if constexpr (std::is_same_v<T, normalizer::NormalizedTicker>) {
             feature_engine_->on_ticker(ev);
@@ -120,6 +142,9 @@ void MarketDataGateway::on_normalized_event(normalizer::NormalizedEvent event) {
             }
         } else if constexpr (std::is_same_v<T, normalizer::NormalizedTrade>) {
             feature_engine_->on_trade(ev);
+            if (on_trade_) {
+                on_trade_(ev.price.get(), ev.size.get(), ev.side == tb::Side::Buy);
+            }
         } else if constexpr (std::is_same_v<T, normalizer::NormalizedCandle>) {
             feature_engine_->on_candle(ev);
         }

@@ -13,9 +13,13 @@ namespace tb::resilience {
 // Конструктор
 // ============================================================
 
-CircuitBreaker::CircuitBreaker(std::string name, CircuitBreakerConfig config)
+CircuitBreaker::CircuitBreaker(std::string name, CircuitBreakerConfig config,
+                               std::shared_ptr<clock::IClock> clock,
+                               std::shared_ptr<metrics::IMetricsRegistry> metrics)
     : name_(std::move(name))
     , config_(config)
+    , clock_(std::move(clock))
+    , metrics_(std::move(metrics))
 {
 }
 
@@ -31,19 +35,30 @@ bool CircuitBreaker::allow_request() const {
             return true;
 
         case CircuitState::Open: {
-            // Проверяем, истёк ли recovery_timeout
             const int64_t elapsed = now_ms() - last_failure_time_ms_.load(std::memory_order_acquire);
             if (elapsed >= config_.recovery_timeout_ms) {
-                // Переходим в HalfOpen
-                state_.store(static_cast<int>(CircuitState::HalfOpen), std::memory_order_release);
-                half_open_attempts_.store(0, std::memory_order_release);
-                return true;
+                // CAS: только один поток выполняет переход Open → HalfOpen
+                int expected = static_cast<int>(CircuitState::Open);
+                if (state_.compare_exchange_strong(
+                        expected,
+                        static_cast<int>(CircuitState::HalfOpen),
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    half_open_attempts_.store(1, std::memory_order_release);
+                    emit_transition(CircuitState::Open, CircuitState::HalfOpen);
+                    return true;
+                }
+                // Другой поток уже перевёл — пробуем как HalfOpen
+                if (expected == static_cast<int>(CircuitState::HalfOpen)) {
+                    const int attempts = half_open_attempts_.fetch_add(1, std::memory_order_acq_rel);
+                    return attempts < config_.half_open_max_attempts;
+                }
+                return false;
             }
             return false;
         }
 
         case CircuitState::HalfOpen: {
-            // Разрешаем ограниченное число попыток
             const int attempts = half_open_attempts_.fetch_add(1, std::memory_order_acq_rel);
             return attempts < config_.half_open_max_attempts;
         }
@@ -60,8 +75,8 @@ void CircuitBreaker::record_success() {
     const auto current = static_cast<CircuitState>(state_.load(std::memory_order_acquire));
 
     if (current == CircuitState::HalfOpen) {
-        // Восстанавливаем нормальную работу
         state_.store(static_cast<int>(CircuitState::Closed), std::memory_order_release);
+        emit_transition(CircuitState::HalfOpen, CircuitState::Closed);
     }
 
     consecutive_failures_.store(0, std::memory_order_release);
@@ -78,9 +93,9 @@ void CircuitBreaker::record_failure() {
     const auto current = static_cast<CircuitState>(state_.load(std::memory_order_acquire));
 
     if (current == CircuitState::HalfOpen) {
-        // Из HalfOpen сразу в Open — инкремент consecutive_failures_ для корректного счётчика
         consecutive_failures_.fetch_add(1, std::memory_order_acq_rel);
         state_.store(static_cast<int>(CircuitState::Open), std::memory_order_release);
+        emit_transition(CircuitState::HalfOpen, CircuitState::Open);
         return;
     }
 
@@ -88,6 +103,7 @@ void CircuitBreaker::record_failure() {
 
     if (failures >= config_.failure_threshold) {
         state_.store(static_cast<int>(CircuitState::Open), std::memory_order_release);
+        emit_transition(CircuitState::Closed, CircuitState::Open);
     }
 }
 
@@ -119,12 +135,29 @@ void CircuitBreaker::reset() {
 }
 
 // ============================================================
-// now_ms — текущее время (steady_clock)
+// now_ms — текущее время в миллисекундах
 // ============================================================
 
-int64_t CircuitBreaker::now_ms() noexcept {
+int64_t CircuitBreaker::now_ms() const noexcept {
+    if (clock_) {
+        return clock_->now().get() / 1'000'000;
+    }
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ============================================================
+// emit_transition — метрика перехода состояния
+// ============================================================
+
+void CircuitBreaker::emit_transition(CircuitState from, CircuitState to) const {
+    if (metrics_) {
+        metrics_->counter("circuit_breaker_transitions_total",
+            {{"name", name_},
+             {"from", std::string(to_string(from))},
+             {"to", std::string(to_string(to))}})
+            ->increment();
+    }
 }
 
 } // namespace tb::resilience

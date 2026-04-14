@@ -39,7 +39,14 @@ ThompsonSampler::ThompsonSampler(
 EntryAction ThompsonSampler::select_action() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Фаза разведки: если есть руки с < min_pulls, выбираем наименее использованную
+    // Фаза разведки: до получения первого feedback (total_rewards_ == 0),
+    // всегда выбираем EnterNow. Без реальных сделок exploration бесполезна —
+    // все руки имеют pulls=0 навсегда (pulls инкрементируется в record_reward).
+    // После первого feedback: стандартная exploration с min_pulls.
+    if (total_rewards_ == 0) {
+        return EntryAction::EnterNow;
+    }
+
     size_t min_pulls = std::numeric_limits<size_t>::max();
     size_t min_idx = 0;
     bool any_underexplored = false;
@@ -51,6 +58,11 @@ EntryAction ThompsonSampler::select_action() {
         }
     }
     if (any_underexplored) {
+        // Инкрементируем pulls при выборе, а не только при reward —
+        // иначе Wait-руки с pulls=0 выбираются бесконечно, т.к.
+        // reward приходит только при закрытии позиции, а Wait
+        // часто не доходит до ордера (conviction drop, regime shift).
+        arms_[min_idx].pulls++;
         return arms_[min_idx].action;
     }
 
@@ -74,6 +86,9 @@ EntryAction ThompsonSampler::select_action() {
              {"beta", std::to_string(arms_[best_idx].beta)}});
     }
 
+    // Increment pulls for Thompson Sampling path (exploration path
+    // already incremented above). Each select_action() = exactly 1 pull.
+    arms_[best_idx].pulls++;
     return arms_[best_idx].action;
 }
 
@@ -95,8 +110,8 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
     // Находим руку по действию
     for (auto& arm : arms_) {
         if (arm.action == action) {
-            // Инкрементируем счётчик выборов ПЕРЕД обновлением
-            arm.pulls++;
+            // pulls НЕ инкрементируется здесь — уже увеличен в select_action()
+            // при каждом выборе, независимо от пути (exploration или exploitation).
 
             const double mag = std::min(std::abs(reward), 1.0);
             if (reward > config_.reward_threshold) {

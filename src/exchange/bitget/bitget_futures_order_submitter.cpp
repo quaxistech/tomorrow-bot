@@ -357,6 +357,10 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     obj["side"]      = api_side;
     obj["tradeSide"] = api_trade_side;
 
+    // NOTE: reduceOnly НЕ отправляется в hedge mode.
+    // Bitget docs: "reduceOnly — Applicable only in one-way-position mode".
+    // В hedge mode закрытие позиции определяется через tradeSide=close.
+
     // === Тип ордера и force ===
     bool is_market    = (order.order_type == OrderType::Market);
     bool is_post_only = (order.order_type == OrderType::PostOnly);
@@ -617,6 +621,92 @@ Price BitgetFuturesOrderSubmitter::query_order_fill_price(
         logger_->warn(kComp, "Исключение при запросе fill price (фьючерсы)",
             {{"error", ex.what()}, {"exchange_order_id", exchange_order_id.get()}});
         return Price(0.0);
+    }
+}
+
+// ==================== query_order_fill_detail ====================
+
+execution::OrderFillDetail BitgetFuturesOrderSubmitter::query_order_fill_detail(
+    const OrderId& exchange_order_id, const Symbol& symbol)
+{
+    execution::OrderFillDetail result;
+    try {
+        std::string query = "symbol=" + symbol.get()
+                          + "&productType=" + futures_config_.product_type
+                          + "&orderId=" + exchange_order_id.get();
+
+        auto response = rest_client_->get(kOrderDetailPath, query);
+        if (!response.success) {
+            logger_->warn(kComp, "Не удалось запросить order detail для подтверждения fill",
+                {{"error", response.error_message}});
+            return result;
+        }
+
+        auto json = boost::json::parse(response.body);
+        auto& obj = json.as_object();
+
+        std::string code = std::string(obj.at("code").as_string());
+        if (code != "00000") {
+            logger_->warn(kComp, "Bitget API ошибка при запросе order detail",
+                {{"code", code}});
+            return result;
+        }
+
+        const auto& data_val = obj.at("data");
+        const boost::json::object* data_ptr = nullptr;
+        if (data_val.is_object()) {
+            data_ptr = &data_val.as_object();
+        } else if (data_val.is_array() && !data_val.as_array().empty()) {
+            data_ptr = &data_val.as_array()[0].as_object();
+        }
+        if (!data_ptr) return result;
+
+        const auto& data = *data_ptr;
+
+        // Парсим status
+        if (auto it = data.find("state"); it != data.end() && it->value().is_string()) {
+            result.status = std::string(it->value().as_string());
+        } else if (auto it2 = data.find("status"); it2 != data.end() && it2->value().is_string()) {
+            result.status = std::string(it2->value().as_string());
+        }
+
+        // Парсим priceAvg
+        if (auto it = data.find("priceAvg"); it != data.end() && it->value().is_string()) {
+            std::string s(it->value().as_string());
+            if (!s.empty()) result.fill_price = Price(std::stod(s));
+        }
+
+        // Парсим baseVolume / filledQty (исполненное количество)
+        for (const char* field : {"baseVolume", "filledQty", "fillQuantity"}) {
+            if (auto it = data.find(field); it != data.end() && it->value().is_string()) {
+                std::string s(it->value().as_string());
+                if (!s.empty()) {
+                    double v = std::stod(s);
+                    if (v > 0.0) { result.filled_qty = Quantity(v); break; }
+                }
+            }
+        }
+
+        // Парсим size (объём ордера)
+        if (auto it = data.find("size"); it != data.end() && it->value().is_string()) {
+            std::string s(it->value().as_string());
+            if (!s.empty()) result.original_qty = Quantity(std::stod(s));
+        }
+
+        result.success = (result.fill_price.get() > 0.0 || result.filled_qty.get() > 0.0);
+
+        logger_->info(kComp, "Order fill detail получен",
+            {{"exchange_order_id", exchange_order_id.get()},
+             {"status", result.status},
+             {"fill_price", std::to_string(result.fill_price.get())},
+             {"filled_qty", std::to_string(result.filled_qty.get())}});
+
+        return result;
+
+    } catch (const std::exception& ex) {
+        logger_->warn(kComp, "Исключение при запросе order fill detail",
+            {{"error", ex.what()}, {"exchange_order_id", exchange_order_id.get()}});
+        return result;
     }
 }
 

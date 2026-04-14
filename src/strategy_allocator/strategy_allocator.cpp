@@ -83,6 +83,12 @@ AllocationResult RegimeAwareAllocator::allocate(
     }
 
     // 5. Нормализуем веса активных стратегий
+    // A5 fix: при единственной стратегии НЕ нормализуем.
+    // Нормализация при одной стратегии всегда даёт weight=1.0,
+    // что уничтожает модификаторы regime/world/uncertainty.
+    // При одной стратегии абсолютный вес (0..1) несёт сигнал:
+    // если world/regime/uncertainty «не одобряют» — weight < 1,
+    // и downstream decision engine корректно ослабляет weighted_score.
     double total_weight = 0.0;
     for (const auto& a : result.allocations) {
         if (a.is_enabled) {
@@ -92,9 +98,16 @@ AllocationResult RegimeAwareAllocator::allocate(
 
     result.enabled_count = 0;
     if (total_weight > 0.0) {
+        int active_count = 0;
+        for (const auto& a : result.allocations) {
+            if (a.is_enabled) ++active_count;
+        }
         for (auto& a : result.allocations) {
             if (a.is_enabled) {
-                a.weight /= total_weight;
+                if (active_count > 1) {
+                    a.weight /= total_weight;
+                }
+                // При active_count == 1: оставляем weight как есть (абсолютный модификатор)
                 ++result.enabled_count;
             }
         }

@@ -33,13 +33,9 @@ static execution_alpha::ExecutionAlphaResult make_exec_alpha(double total_cost_b
     return result;
 }
 
-static PortfolioContext make_portfolio(double exposure = 0.2, double capital = 1000.0) {
+static PortfolioContext make_portfolio(double exposure = 0.2) {
     PortfolioContext ctx;
     ctx.gross_exposure_pct = exposure;
-    ctx.net_exposure_pct = exposure;
-    ctx.available_capital = capital * (1.0 - exposure);
-    ctx.total_capital = capital;
-    ctx.open_positions_count = (exposure > 0.01) ? 1 : 0;
     ctx.current_drawdown_pct = 0.0;
     ctx.consecutive_losses = 0;
     ctx.symbol_exposure_pct = 0.0;
@@ -87,7 +83,7 @@ TEST_CASE("OpportunityCost: Низкая conviction ниже порога → Su
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 
     REQUIRE(result.action == OpportunityAction::Suppress);
-    // conviction 0.1 → expected_return ≈ 4.7 bps, minus exec cost 5.0 → net < min_net → Rule 1
+    // conviction 0.1 → expected_return ≈ 3.2 bps (0.1^1.5 * 100), minus exec cost 5.0 → net < min_net → Rule 1
     REQUIRE(result.reason == OpportunityReason::NegativeNetEdge);
 }
 
@@ -100,6 +96,7 @@ TEST_CASE("OpportunityCost: Высокая экспозиция при сред�
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 
     REQUIRE(result.action == OpportunityAction::Defer);
+    // exposure 0.85 > high_exposure_threshold 0.70 AND conviction 0.5 < min_conviction 0.60
     REQUIRE(result.reason == OpportunityReason::HighExposureLowConviction);
 }
 
@@ -179,7 +176,6 @@ TEST_CASE("OpportunityCost: Upgrade — кандидат лучше худшей
     auto portfolio = make_portfolio(0.60);
     portfolio.has_worst_position = true;
     portfolio.worst_position_net_bps = 5.0;
-    portfolio.worst_position_symbol = Symbol("ETHUSDT");
 
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 
@@ -207,11 +203,11 @@ TEST_CASE("OpportunityCost: Drawdown повышает effective threshold", "[op
     auto intent = make_intent(0.35);  // Чуть выше базового порога 0.3
     auto exec_alpha = make_exec_alpha(5.0);
     auto portfolio = make_portfolio(0.2);
-    portfolio.current_drawdown_pct = 10.0;  // 10% drawdown → +1.0 к порогу
+    portfolio.current_drawdown_pct = 0.10;  // 10% drawdown (fraction) → +1.0 к порогу
 
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 
-    // Effective threshold = 0.3 + 0.5*(10/5) = 1.3, clamped to 0.95
+    // Effective threshold = 0.3 + 0.5*(0.10/0.05) = 1.3, clamped to 0.95
     // conviction 0.35 < 0.95 → Suppress
     REQUIRE(result.action == OpportunityAction::Suppress);
     REQUIRE(result.reason == OpportunityReason::ConvictionBelowThreshold);
@@ -296,7 +292,7 @@ TEST_CASE("OpportunityCost: NaN/Inf safety — нулевой capital", "[opport
     auto engine = make_engine();
     auto intent = make_intent(0.7);
     auto exec_alpha = make_exec_alpha(5.0);
-    auto portfolio = make_portfolio(0.0, 0.0);  // Нулевой капитал
+    auto portfolio = make_portfolio(0.0);  // Нулевая экспозиция
 
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 

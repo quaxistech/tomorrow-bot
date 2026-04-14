@@ -44,9 +44,10 @@ MicroFingerprint MicrostructureFingerprinter::create_fingerprint(
     fp.volatility_bucket = discretize(
         snapshot.technical.atr_14_normalized, 0.0, config_.atr_norm_cap);
 
-    // Глубина: отношение bid/ask ликвидности, типично 0.2..5.0
+    // Глубина: min(bid,ask)/(total/2) — баланс сторон стакана [0.0, 1.0]
+    // (FeatureEngine: min(bid_depth, ask_depth) / (total * 0.5))
     fp.depth_bucket = discretize(
-        snapshot.microstructure.liquidity_ratio, 0.2, 5.0);
+        snapshot.microstructure.liquidity_ratio, 0.0, 1.0);
 
     return fp;
 }
@@ -64,17 +65,25 @@ double MicrostructureFingerprinter::predict_edge(
     // Недостаточно данных — не можем прогнозировать
     if (stats.count < config_.min_samples) return 0.0;
 
-    // Рассчитываем «преимущество» (edge) на основе win_rate:
-    //   edge > 0 → благоприятный fingerprint
-    //   edge < 0 → неблагоприятный fingerprint
-    //   edge = 0 → нейтральный / недостаточно данных
-    if (stats.win_rate >= config_.favorable_win_rate) {
-        // Благоприятный: масштабируем от 0 до +1
-        return numeric::safe_clamp((stats.win_rate - 0.5) * 2.0, -1.0, 1.0);
+    // Blend win_rate and avg_return for a more robust edge estimate:
+    //   - win_rate captures consistency (Kelly-criterion relevant)
+    //   - avg_return captures magnitude (actual expected value)
+    // Edge = 0.7 * win_rate_signal + 0.3 * return_signal
+    // This prevents high-win-rate-low-magnitude and low-win-rate-high-magnitude
+    // patterns from dominating equally.
+    const double wr_signal = (stats.win_rate - 0.5) * 2.0;  // [-1, 1]
+
+    // Normalize avg_return: clamp to ±5% and scale to [-1, 1]
+    const double return_signal = numeric::safe_clamp(stats.avg_return / 0.05, -1.0, 1.0);
+
+    const double blended = 0.7 * wr_signal + 0.3 * return_signal;
+
+    // Apply threshold gates: only report edge outside neutral zone
+    if (stats.win_rate >= config_.favorable_win_rate || blended > 0.1) {
+        return numeric::safe_clamp(blended, -1.0, 1.0);
     }
-    if (stats.win_rate <= config_.unfavorable_win_rate) {
-        // Неблагоприятный: масштабируем от -1 до 0
-        return numeric::safe_clamp((stats.win_rate - 0.5) * 2.0, -1.0, 1.0);
+    if (stats.win_rate <= config_.unfavorable_win_rate || blended < -0.1) {
+        return numeric::safe_clamp(blended, -1.0, 1.0);
     }
 
     // Нейтральная зона

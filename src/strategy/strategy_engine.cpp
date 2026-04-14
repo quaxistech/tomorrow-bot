@@ -95,10 +95,12 @@ std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& conte
             context.position.unrealized_pnl,
             now_ns);
 
-        // Если state machine ещё не знает о позиции — синхронизируем
-        if (state_machine_.state() == SymbolState::Idle ||
-            state_machine_.state() == SymbolState::Cooldown ||
-            state_machine_.state() == SymbolState::Candidate) {
+        // Если position уже появилась в контексте, но state machine ещё в pre-entry
+        // состоянии, немедленно переводим её в PositionOpen. Иначе engine остаётся
+        // в EntrySent и продолжает генерировать повторные entry-сигналы до cooldown.
+        if (state_machine_.state() != SymbolState::PositionOpen &&
+            state_machine_.state() != SymbolState::PositionManaging &&
+            state_machine_.state() != SymbolState::ExitPending) {
             state_machine_.transition_to(SymbolState::PositionOpen, now_ns);
             auto& pos_ctx = state_machine_.position_context();
             pos_ctx.has_position = true;
@@ -107,6 +109,13 @@ std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& conte
             pos_ctx.size = context.position.size;
             pos_ctx.avg_entry_price = context.position.avg_entry_price;
             pos_ctx.entry_time_ns = context.position.entry_time_ns;
+            if (const auto& setup = state_machine_.active_setup(); setup) {
+                pos_ctx.entry_setup_id = setup->id;
+                pos_ctx.entry_setup_type = setup->type;
+                pos_ctx.entry_confidence = setup->confidence;
+                pos_ctx.entry_atr = setup->atr_at_detect;
+            }
+            state_machine_.clear_setup();
             last_reasons_.push_back("position_state_recovered");
         }
     } else if (state_machine_.position_context().has_position) {
@@ -144,6 +153,21 @@ std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& conte
             return handle_position(context, now_ns);
     }
 
+    // Диагностика: причины отсутствия сигнала
+    if (!last_reasons_.empty()) {
+        ++diag_skip_count_;
+        if (diag_skip_count_ % 200 == 1) {
+            std::string reasons;
+            for (const auto& r : last_reasons_) {
+                if (!reasons.empty()) reasons += ",";
+                reasons += r;
+            }
+            logger_->debug("strategy_engine", "Нет сигнала",
+                {{"reasons", reasons},
+                 {"state", to_string(state_machine_.state())},
+                 {"skips_since_last_log", std::to_string(diag_skip_count_)}});
+        }
+    }
     return std::nullopt;
 }
 
@@ -158,6 +182,7 @@ void StrategyEngine::set_active(bool active) {
 void StrategyEngine::reset() {
     state_machine_.reset();
     last_reasons_.clear();
+    exit_signal_sent_ = false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -192,10 +217,21 @@ void StrategyEngine::notify_position_closed() {
     int64_t now_ns = clock_->now().get();
     state_machine_.close_position();
     state_machine_.clear_setup();
+    exit_signal_sent_ = false;
     state_machine_.start_cooldown(now_ns, cfg_.cooldown_after_exit_ms);
 
     logger_->info("strategy_engine", "Позиция закрыта, cooldown активирован",
         {{"cooldown_ms", std::to_string(cfg_.cooldown_after_exit_ms)}});
+}
+
+void StrategyEngine::notify_entry_rejected() {
+    int64_t now_ns = clock_->now().get();
+    constexpr int64_t kRejectionCooldownMs = 30'000; // 30s — не спамить при rejected sizing
+    cancel_setup(now_ns, "entry_rejected_by_pipeline");
+    // Перезаписываем cooldown на более длинный, чтобы не переспамливать
+    state_machine_.start_cooldown(now_ns, kRejectionCooldownMs);
+
+    logger_->info("strategy_engine", "Вход отклонён pipeline, cooldown 30s");
 }
 
 SymbolState StrategyEngine::current_state() const {
@@ -311,6 +347,9 @@ std::optional<TradeIntent> StrategyEngine::handle_pre_entry(const StrategyContex
     // 3c. Финальная проверка перед входом
     if (state_machine_.state() == SymbolState::SetupPendingConfirmation ||
         state_machine_.state() == SymbolState::EntryReady) {
+        if (state_machine_.state() == SymbolState::SetupPendingConfirmation) {
+            state_machine_.transition_to(SymbolState::EntryReady, now_ns);
+        }
 
         // Минимальный confidence
         if (setup->confidence < cfg_.min_setup_confidence) {
@@ -374,6 +413,12 @@ std::optional<TradeIntent> StrategyEngine::handle_position(const StrategyContext
         state_machine_.transition_to(SymbolState::PositionManaging, now_ns);
     }
 
+    // В ExitPending уже отправили сигнал — не спамим pipeline повторными запросами.
+    // Pipeline закроет позицию через trailing/time_exit, а notify_position_closed() сбросит флаг.
+    if (exit_signal_sent_) {
+        return std::nullopt;
+    }
+
     // Оценка менеджером позиций
     auto mgmt = position_manager_.evaluate(pos, ctx, now_ns);
     last_reasons_.insert(last_reasons_.end(), mgmt.reasons.begin(), mgmt.reasons.end());
@@ -385,6 +430,7 @@ std::optional<TradeIntent> StrategyEngine::handle_position(const StrategyContext
         case StrategySignalType::ExitFull:
         case StrategySignalType::EmergencyExit: {
             state_machine_.transition_to(SymbolState::ExitPending, now_ns);
+            exit_signal_sent_ = true;
             logger_->info("strategy_engine", "Выход инициирован",
                 {{"reason", to_string(mgmt.exit_reason)},
                  {"hold_ms", std::to_string(pos.hold_duration_ns / 1'000'000)},

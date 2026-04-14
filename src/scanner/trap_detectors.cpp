@@ -50,7 +50,7 @@ TrapDetection SpoofingDetector::detect(const MarketSnapshot& snapshot,
     // Сильная асимметрия глубины — потенциальный spoofing
     if (total_depth > 0.0) {
         double asymmetry = std::abs(total_bid - total_ask) / total_depth;
-        if (asymmetry > 0.6) {
+        if (asymmetry > cfg_.spoofing_asymmetry_threshold) {
             risk = std::max(risk, asymmetry * 0.7);
             confidence = std::max(confidence, 0.5);
             result.reasons.push_back("depth_asymmetry_" +
@@ -249,6 +249,7 @@ TrapDetection MomentumTrapDetector::detect(const MarketSnapshot& snapshot,
 
     // Ищем паттерн: сильный импульс → остановка → разворот
     double max_impulse = 0.0;
+    int impulse_start_idx = -1;
     int impulse_end_idx = -1;
 
     // Фаза 1: найти самый сильный импульс (3+ свечей в одном направлении)
@@ -271,6 +272,7 @@ TrapDetection MomentumTrapDetector::detect(const MarketSnapshot& snapshot,
         }
         if (consistent >= 3 && std::abs(move) > max_impulse) {
             max_impulse = std::abs(move);
+            impulse_start_idx = static_cast<int>(i);
             impulse_end_idx = static_cast<int>(i + consistent);
         }
     }
@@ -287,8 +289,8 @@ TrapDetection MomentumTrapDetector::detect(const MarketSnapshot& snapshot,
     double reversal_ratio = std::abs(reversal) / max_impulse;
     bool is_reversal = false;
 
-    // Определяем направление импульса
-    double impulse_dir = candles[impulse_end_idx - 1].close - candles[start].open;
+    // Определяем направление из самого импульса (close последней импульсной свечи vs open первой)
+    double impulse_dir = candles[impulse_end_idx - 1].close - candles[impulse_start_idx].open;
     if ((impulse_dir > 0 && reversal < 0) || (impulse_dir < 0 && reversal > 0)) {
         is_reversal = true;
     }
@@ -365,8 +367,8 @@ TrapDetection BookInstabilityDetector::detect(const MarketSnapshot& snapshot,
 
     // Большие гэпы в стакане — нестабильность
     double max_gap = std::max(max_gap_bid, max_gap_ask);
-    if (max_gap > 20.0) {  // > 20 bps gap
-        risk = std::min(max_gap / 100.0, 1.0);
+    if (max_gap > cfg_.book_instability_gap_bps) {
+        risk = std::min(max_gap / (cfg_.book_instability_gap_bps * 5.0), 1.0);
         confidence = 0.6;
         result.reasons.push_back("book_gap_" +
             std::to_string(static_cast<int>(max_gap)) + "bps");
@@ -379,8 +381,7 @@ TrapDetection BookInstabilityDetector::detect(const MarketSnapshot& snapshot,
     for (size_t i = 0; i < std::min(ob.asks.size(), size_t(5)); ++i)
         near_ask += ob.asks[i].quantity * ob.asks[i].price;
 
-    double thin_threshold = 10000.0;  // $10k minimum near mid
-    if (near_bid + near_ask < thin_threshold) {
+    if (near_bid + near_ask < cfg_.book_instability_thin_depth_usdt) {
         risk = std::max(risk, 0.6);
         confidence = std::max(confidence, 0.7);
         result.reasons.push_back("thin_book_near_mid_" +

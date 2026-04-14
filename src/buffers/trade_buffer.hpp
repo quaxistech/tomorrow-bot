@@ -2,9 +2,9 @@
 #include "ring_buffer.hpp"
 #include "normalizer/normalized_events.hpp"
 #include "common/types.hpp"
+#include <algorithm>
 #include <vector>
 #include <cstddef>
-#include <cmath>
 
 namespace tb::buffers {
 
@@ -46,7 +46,10 @@ public:
         return sum_v > 0.0 ? sum_pv / sum_v : 0.0;
     }
 
-    // buy_vol / sell_vol за последние n записей
+    // buy_vol / sell_vol за последние n записей.
+    // Ограничен сверху: односторонний поток даёт cap, а не sentinel.
+    // Cap = 100.0: предотвращает blow-up в downstream ML/стратегиях,
+    // при этом 100:1 уже представляет экстремальный дисбаланс.
     double buy_sell_ratio(std::size_t n = Capacity) const {
         n = std::min(n, buffer_.size());
         if (n == 0) return 1.0;
@@ -57,19 +60,25 @@ public:
             if (t.side == tb::Side::Buy) buy_vol += t.size;
             else sell_vol += t.size;
         }
-        return sell_vol > 0.0 ? buy_vol / sell_vol : (buy_vol > 0.0 ? 1e6 : 1.0);
+        if (sell_vol > 0.0) return std::min(buy_vol / sell_vol, 100.0);
+        return buy_vol > 0.0 ? 100.0 : 1.0;
     }
 
-    // Доля агрессивных сделок [0, 1]
+    // Доля агрессивного объёма [0, 1] — volume-weighted.
+    // Kyle (1985): price impact пропорционален размеру сделки, не количеству.
+    // Для скальпинга volume-weighted агрессивный поток корректнее
+    // отражает реальное давление на стакан.
     double aggressive_flow(std::size_t n = Capacity) const {
         n = std::min(n, buffer_.size());
         if (n == 0) return 0.5;
-        std::size_t agg = 0;
+        double agg_volume = 0.0, total_volume = 0.0;
         std::size_t start = buffer_.size() > n ? buffer_.size() - n : 0;
         for (std::size_t i = start; i < buffer_.size(); ++i) {
-            if (buffer_[i].is_aggressive) ++agg;
+            const auto& t = buffer_[i];
+            total_volume += t.size;
+            if (t.is_aggressive) agg_volume += t.size;
         }
-        return static_cast<double>(agg) / static_cast<double>(n);
+        return total_volume > 0.0 ? agg_volume / total_volume : 0.5;
     }
 
     std::size_t size() const noexcept { return buffer_.size(); }

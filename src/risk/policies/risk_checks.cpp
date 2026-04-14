@@ -30,7 +30,13 @@ void deny_lock(RiskDecision& d, RiskAction action,
 void reduce(RiskDecision& d, double ratio, const std::string& code, const std::string& msg) {
     if (d.verdict == RiskVerdict::Approved)
         d.verdict = RiskVerdict::ReduceSize;
-    d.approved_quantity = Quantity(d.approved_quantity.get() * ratio);
+    // Используем min-семантику: каждый reduce вычисляет целевой размер от original_size,
+    // итоговый approved_quantity = min(все предложения). Это предотвращает мультипликативное
+    // компаундирование нескольких ReduceSize-проверок.
+    double target = d.original_size.get() * std::clamp(ratio, 0.0, 1.0);
+    if (target < d.approved_quantity.get()) {
+        d.approved_quantity = Quantity(target);
+    }
     d.reasons.push_back({code, msg, 0.5});
     d.warnings.push_back(code);
 }
@@ -40,11 +46,6 @@ void throttle(RiskDecision& d, const std::string& code, const std::string& msg) 
         d.verdict = RiskVerdict::Throttled;
     d.reasons.push_back({code, msg, 0.6});
     d.warnings.push_back(code);
-}
-
-void warn(RiskDecision& d, const std::string& code, const std::string& msg) {
-    d.warnings.push_back(code);
-    d.reasons.push_back({code, msg, 0.3});
 }
 
 } // namespace
@@ -205,12 +206,15 @@ void SameDirectionCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
 void ExposureLimitCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     if (ctx.portfolio.total_capital <= 0.0) return;
 
-    const double gross_pct = ctx.portfolio.exposure.gross_exposure / ctx.portfolio.total_capital * 100.0;
+    // Проецируем post-trade экспозицию: текущая + номинал нового ордера
+    const double projected_gross = ctx.portfolio.exposure.gross_exposure +
+                                   ctx.sizing.approved_notional.get();
+    const double gross_pct = projected_gross / ctx.portfolio.total_capital * 100.0;
     d.current_gross_exposure = ctx.portfolio.exposure.gross_exposure;
 
     if (gross_pct >= cfg_.max_gross_exposure_pct) {
         deny(d, "MAX_EXPOSURE",
-             "Валовая экспозиция " + std::to_string(gross_pct) + "% >= " +
+             "Проецируемая экспозиция " + std::to_string(gross_pct) + "% >= " +
              std::to_string(cfg_.max_gross_exposure_pct) + "%", 0.9);
     }
 }
@@ -237,11 +241,18 @@ void PerTradeRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
 void MaxLeverageCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     if (ctx.portfolio.total_capital <= 0.0) return;
 
-    const double leverage = ctx.portfolio.exposure.gross_exposure / ctx.portfolio.total_capital;
-    if (leverage >= cfg_.max_leverage) {
+    // Проецируем post-trade leverage: (текущая экспозиция + новый ордер) / капитал
+    const double projected_exposure = ctx.portfolio.exposure.gross_exposure +
+                                      ctx.sizing.approved_notional.get();
+    const double leverage = projected_exposure / ctx.portfolio.total_capital;
+    double buffer_factor = 1.0 - (cfg_.liquidation_buffer_pct / 100.0);
+    double effective_max = cfg_.max_leverage * buffer_factor;
+
+    if (leverage >= effective_max) {
         deny(d, "MAX_LEVERAGE",
-             "Плечо " + std::to_string(leverage) + "x >= " +
-             std::to_string(cfg_.max_leverage) + "x", 0.9);
+             "Проецируемое плечо " + std::to_string(leverage) + "x >= effective max " +
+             std::to_string(effective_max) + "x (buffer " +
+             std::to_string(cfg_.liquidation_buffer_pct) + "%)", 0.9);
     }
 }
 
@@ -287,12 +298,13 @@ void PerSymbolRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
 
     const auto& symbol = ctx.intent.symbol.get();
 
-    // Концентрация символа
+    // Концентрация символа (projected: существующая + предлагаемый ордер)
     double symbol_exposure = 0.0;
     for (const auto& pos : ctx.portfolio.positions) {
         if (pos.symbol.get() == symbol) symbol_exposure += pos.notional.get();
     }
-    const double conc_pct = symbol_exposure / ctx.portfolio.total_capital * 100.0;
+    const double projected_exposure = symbol_exposure + ctx.sizing.approved_notional.get();
+    const double conc_pct = projected_exposure / ctx.portfolio.total_capital * 100.0;
     d.symbol_concentration_pct = conc_pct;
 
     if (conc_pct >= cfg_.max_symbol_concentration_pct) {
@@ -489,8 +501,8 @@ void RegimeScaledLimitsCheck::evaluate(const RiskContext& ctx, RiskDecision& d) 
 
     const double ratio = scaled_max / notional;
     reduce(d, ratio, "REGIME_SCALED_LIMIT",
-           "Режим scale=" + std::to_string(scale) + " — номинал снижен до " +
-           std::to_string(d.approved_quantity.get() * ratio));
+           "Режим scale=" + std::to_string(scale) + " — макс. номинал " +
+           std::to_string(scaled_max));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -534,37 +546,7 @@ void UncertaintyExecutionModeCheck::evaluate(const RiskContext& ctx, RiskDecisio
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 31. Spot Sell Without Position
-// ═══════════════════════════════════════════════════════════════
-
-void SpotSellCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
-    if (ctx.intent.side != Side::Sell) return;
-    if (ctx.intent.position_side == PositionSide::Short) return;
-
-    bool has_long = false;
-    double pos_size = 0.0;
-    for (const auto& pos : ctx.portfolio.positions) {
-        if (pos.symbol == ctx.intent.symbol && pos.side == Side::Buy && pos.size.get() > 0.0) {
-            has_long = true;
-            pos_size = pos.size.get();
-            break;
-        }
-    }
-
-    if (!has_long) {
-        deny(d, "SPOT_SELL_NO_POSITION", "Нет открытой long-позиции для продажи");
-        return;
-    }
-
-    if (d.approved_quantity.get() > pos_size) {
-        const double ratio = pos_size / d.approved_quantity.get();
-        reduce(d, ratio, "INSUFFICIENT_POSITION_SIZE",
-               "SELL ограничен до размера позиции " + std::to_string(pos_size));
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 32. Intraday Drawdown
+// 31. Intraday Drawdown
 // ═══════════════════════════════════════════════════════════════
 
 void IntradayDrawdownCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
@@ -577,7 +559,7 @@ void IntradayDrawdownCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 33. Drawdown Hard Stop
+// 32. Drawdown Hard Stop
 // ═══════════════════════════════════════════════════════════════
 
 void DrawdownHardStopCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
@@ -588,6 +570,33 @@ void DrawdownHardStopCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
         // Активируем emergency halt
         state_.locks.add_lock(LockType::EmergencyHalt, "", "Drawdown hard stop",
                               d.decided_at);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 33. Funding Rate Cost
+// ═══════════════════════════════════════════════════════════════
+
+void FundingRateCostCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    double rate = ctx.current_funding_rate;
+    if (std::abs(rate) < 1e-9) return;  // Нет данных или нулевой rate
+
+    // Funding cost depends on position direction:
+    // Long pays when rate > 0, receives when rate < 0
+    // Short pays when rate < 0, receives when rate > 0
+    bool is_long = (ctx.intent.side == Side::Buy);
+    double effective_cost = is_long ? rate : -rate;
+
+    // If funding is favorable (effective_cost <= 0), no check needed
+    if (effective_cost <= 0.0) return;
+
+    // Годовая стоимость: cost × 3 сеанса/день × 365 дней × 100 (%)
+    double annual_cost_pct = effective_cost * 3.0 * 365.0 * 100.0;
+    if (annual_cost_pct > cfg_.max_annual_funding_cost_pct) {
+        deny(d, "FUNDING_COST_EXCESSIVE",
+             "Годовая стоимость фандинга " + std::to_string(annual_cost_pct) +
+             "% > лимит " + std::to_string(cfg_.max_annual_funding_cost_pct) + "%",
+             0.7);
     }
 }
 

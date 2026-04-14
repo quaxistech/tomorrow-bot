@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run_production.sh — Запуск Tomorrow Bot в production-режиме
 # ВНИМАНИЕ: этот скрипт запускает РЕАЛЬНУЮ торговлю!
+# A7 fix: унифицирован с корневым run_prod.sh — те же guardrails.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,21 +9,33 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
-# Загрузка переменных окружения
-if [[ -f .env ]]; then
-    set -a
-    source .env
-    set +a
-    echo "✓ Переменные окружения загружены из .env"
-else
-    echo "✗ ОШИБКА: Файл .env не найден в $PROJECT_ROOT"
-    echo "  Создайте .env с API-ключами Bitget (см. deploy/env/production.env.template)"
+# Загрузка секретов из файла (НЕ хранить в .env рядом с кодом!)
+SECRETS_FILE="${SECRETS_FILE:-/home/quaxis/projects/tomorrow-bot/.secrets/secrets.env}"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "FATAL: Secrets file not found: $SECRETS_FILE" >&2
+    echo "Create it with: BITGET_API_KEY=xxx / BITGET_API_SECRET=xxx / BITGET_PASSPHRASE=xxx" >&2
     exit 1
 fi
+set -a
+source "$SECRETS_FILE"
+set +a
+echo "✓ Секреты загружены из $SECRETS_FILE"
 
-# Проверка наличия API-ключей
-if [[ -z "${BITGET_API_KEY:-}" ]]; then
-    echo "✗ ОШИБКА: BITGET_API_KEY не задан в .env"
+# Проверка обязательных переменных
+for var in BITGET_API_KEY BITGET_API_SECRET BITGET_PASSPHRASE; do
+    if [[ -z "${!var:-}" ]]; then
+        echo "FATAL: $var not set in $SECRETS_FILE" >&2
+        exit 1
+    fi
+done
+
+# Production guard: оператор должен подтвердить ТОЧНЫМ токеном
+if [[ "${TOMORROW_BOT_PRODUCTION_CONFIRM:-}" != "I_UNDERSTAND_LIVE_TRADING" ]]; then
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "ВНИМАНИЕ: Запуск PRODUCTION режима с РЕАЛЬНЫМИ ДЕНЬГАМИ!"
+    echo "Для подтверждения установите переменную окружения:"
+    echo "  export TOMORROW_BOT_PRODUCTION_CONFIRM=I_UNDERSTAND_LIVE_TRADING"
+    echo "═══════════════════════════════════════════════════════════════════"
     exit 1
 fi
 
@@ -31,6 +44,9 @@ BINARY=""
 if [[ -x "build-release/src/app/tomorrow-bot" ]]; then
     BINARY="build-release/src/app/tomorrow-bot"
     echo "✓ Используется Release-сборка"
+elif [[ -x "build/src/app/tomorrow-bot" ]]; then
+    BINARY="build/src/app/tomorrow-bot"
+    echo "⚠ Используется сборка из build/ (рекомендуется Release)"
 elif [[ -x "build-check/src/app/tomorrow-bot" ]]; then
     BINARY="build-check/src/app/tomorrow-bot"
     echo "⚠ Используется Debug-сборка (рекомендуется Release для production)"

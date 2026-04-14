@@ -3,7 +3,6 @@
 #include "risk/risk_context.hpp"
 #include "risk/policies/i_risk_check.hpp"
 #include "risk/state/risk_state.hpp"
-#include "risk/sizing/position_sizer.hpp"
 #include "strategy/strategy_types.hpp"
 #include "portfolio_allocator/allocation_types.hpp"
 #include "portfolio/portfolio_types.hpp"
@@ -67,6 +66,14 @@ public:
     /// Установить текущий режим рынка (для regime-aware limits)
     virtual void set_current_regime(regime::DetailedRegime regime) = 0;
 
+    /// Установить текущий funding rate (USDT-M futures, 8ч период)
+    virtual void set_funding_rate(double rate) = 0;
+
+    /// Установить per-symbol минимальный notional (из exchange rules)
+    virtual void set_min_notional_usdt(double value) {
+        (void)value; // default no-op для backward compat
+    }
+
     /// Получить снимок состояния риск-системы (observability)
     virtual RiskSnapshot get_risk_snapshot() const = 0;
 
@@ -74,7 +81,7 @@ public:
     virtual void reset_daily() = 0;
 };
 
-/// Policy-based риск-движок с 33 проверками
+/// Policy-based риск-движок с 33 проверками (USDT-M futures)
 class ProductionRiskEngine : public IRiskEngine {
 public:
     ProductionRiskEngine(ExtendedRiskConfig config,
@@ -108,6 +115,8 @@ public:
                              double realized_pnl) override;
 
     void set_current_regime(regime::DetailedRegime regime) override;
+    void set_funding_rate(double rate) override;
+    void set_min_notional_usdt(double value) override;
 
     RiskSnapshot get_risk_snapshot() const override;
 
@@ -131,9 +140,6 @@ private:
     /// Централизованное состояние (locks, PnL, drawdown, rates, streaks)
     RiskState state_;
 
-    /// Position sizer
-    PositionSizer sizer_;
-
     /// Цепочка проверок (33 policy checks выполняются последовательно)
     std::vector<std::unique_ptr<IRiskCheck>> checks_;
 
@@ -142,6 +148,8 @@ private:
     std::string kill_switch_reason_;
     regime::DetailedRegime current_regime_{regime::DetailedRegime::Undefined};
     std::atomic<double> regime_scale_factor_{1.0};
+    std::atomic<double> current_funding_rate_{0.0};
+    std::atomic<double> min_notional_usdt_{0.0};
 
     mutable std::mutex mutex_;
 };

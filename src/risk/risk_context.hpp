@@ -18,6 +18,8 @@ struct RiskContext {
     const features::FeatureSnapshot& features;
     const execution_alpha::ExecutionAlphaResult& exec_alpha;
     const uncertainty::UncertaintySnapshot& uncertainty;
+    double current_funding_rate{0.0};  ///< Текущий funding rate (8ч)
+    double min_notional_usdt{0.0};     ///< Per-symbol минимальный notional (из exchange rules, 0 = fallback на kMinBitgetNotionalUsdt)
 };
 
 } // namespace tb::risk

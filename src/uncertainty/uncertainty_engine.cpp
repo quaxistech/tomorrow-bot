@@ -92,29 +92,32 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     // 2. Aggregate with regime-specific weight adjustment
     double agg = aggregate(dims, regime);
 
-    // 3. World fragility stress amplifier (same as v1)
+    // 3. World fragility stress amplifier
     if (world.fragility.valid && world.fragility.value > 0.7) {
         agg = std::min(1.0, agg + 0.1);
     }
 
-    // 4. Retrieve/create SymbolState (copy to avoid dangling pointer on rehash)
+    // 4. Retrieve SymbolState (copy to avoid dangling pointer on rehash)
     SymbolState state;
     {
         std::lock_guard lock(mutex_);
         state = states_[features.symbol.get()];
     }
 
-    // 5. EMA smoothing → persistent_score
-    double persistent = config_.ema_alpha * agg +
-                        (1.0 - config_.ema_alpha) * state.ema_score;
-
-    // 6. spike_score
-    double spike = std::max(0.0, agg - persistent);
-
-    // 7. Apply hysteresis to determine final level
+    // 5. Determine level via hysteresis (on pre-update state for consistent thresholds)
     auto level = apply_hysteresis(agg, state);
 
-    // 8. recommended_action from level
+    // 6. Update state FIRST — so cooldown and execution_mode see current tick's
+    //    consecutive counters. This fixes the one-tick lag in cooldown activation.
+    update_state(state, agg, level, now_ns);
+
+    // 7. EMA smoothing → persistent_score (use updated ema_score)
+    double persistent = state.ema_score;
+
+    // 8. spike_score
+    double spike = std::max(0.0, agg - persistent);
+
+    // 9. recommended_action from level
     UncertaintyAction action;
     switch (level) {
         case UncertaintyLevel::Low:      action = UncertaintyAction::Normal; break;
@@ -123,52 +126,36 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
         case UncertaintyLevel::Extreme:   action = UncertaintyAction::NoTrade; break;
     }
 
-    // 9. size_multiplier
+    // 10. size_multiplier
     double size_mult = std::max(config_.size_floor, 1.0 - agg);
 
-    // 10. threshold_multiplier
+    // 11. threshold_multiplier
     double threshold_mult = std::min(config_.threshold_ceiling, 1.0 + agg);
 
-    // 11. execution_mode
+    // 12. execution_mode — uses updated state with current consecutive counts
     auto exec_mode = determine_execution_mode(level, agg, state);
 
-    // 12. cooldown
+    // 13. cooldown — uses updated state
     auto cooldown = compute_cooldown(state, now_ns);
 
-    // 13. top_drivers (top-3)
+    // 14. top_drivers (top-3)
     auto drivers = compute_drivers(dims);
-
-    // 14. freshness_ns = 0 (just computed)
-    constexpr int64_t freshness = 0;
-
-    // 15. calibration_confidence from diagnostics
-    double cal_conf;
-    {
-        std::lock_guard lock(mutex_);
-        if (diagnostics_.feedback_samples < config_.min_feedback_samples) {
-            cal_conf = 0.5;
-        } else {
-            double ratio = static_cast<double>(diagnostics_.feedback_samples) /
-                           (2.0 * static_cast<double>(config_.min_feedback_samples));
-            cal_conf = std::min(0.95, 0.5 + 0.5 * ratio);
-        }
-    }
 
     // Build explanation
     std::ostringstream explanation;
-    explanation << "Неопределённость: " << agg << " ("
-                << "режим=" << dims.regime_uncertainty
-                << ", сигнал=" << dims.signal_uncertainty
-                << ", данные=" << dims.data_quality_uncertainty
-                << ", исполнение=" << dims.execution_uncertainty
-                << ", портфель=" << dims.portfolio_uncertainty
-                << ", ML=" << dims.ml_uncertainty
-                << ", корреляция=" << dims.correlation_uncertainty
-                << ", переход=" << dims.transition_uncertainty
-                << ", операционная=" << dims.operational_uncertainty << ")";
+    explanation << "Uncertainty: " << agg << " ("
+                << "regime=" << dims.regime_uncertainty
+                << ", signal=" << dims.signal_uncertainty
+                << ", data=" << dims.data_quality_uncertainty
+                << ", exec=" << dims.execution_uncertainty
+                << ", portfolio=" << dims.portfolio_uncertainty
+                << ", ml=" << dims.ml_uncertainty
+                << ", corr=" << dims.correlation_uncertainty
+                << ", trans=" << dims.transition_uncertainty
+                << ", ops=" << dims.operational_uncertainty << ")";
 
     if (world.fragility.valid && world.fragility.value > 0.7) {
-        explanation << " | Высокая хрупкость мира: " << world.fragility.value;
+        explanation << " | fragility=" << world.fragility.value;
     }
 
     // Build snapshot
@@ -185,16 +172,10 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     result.top_drivers            = std::move(drivers);
     result.execution_mode         = exec_mode;
     result.cooldown               = cooldown;
-    result.freshness_ns           = freshness;
-    result.calibration_confidence = cal_conf;
-    result.model_version          = 1;
     result.persistent_score       = persistent;
     result.spike_score            = spike;
 
-    // 16. Update local state copy
-    update_state(state, agg, level, now_ns);
-
-    // 17. Update diagnostics & 18. Cache snapshot & 19. Write state back
+    // Update diagnostics & cache snapshot & write state back
     {
         std::lock_guard lock(mutex_);
         states_[features.symbol.get()] = state;
@@ -210,14 +191,13 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
         diagnostics_.avg_aggregate_score =
             diagnostics_.avg_aggregate_score * ((n - 1.0) / n) + agg / n;
         diagnostics_.last_assessment = now;
-        diagnostics_.active_model_version = 1;
 
         snapshots_[features.symbol.get()] = result;
     }
 
-    // 19. Log
+    // Log
     logger_->debug("Uncertainty",
-                   "Неопределённость: " + to_string(action) +
+                   "uncertainty=" + to_string(action) +
                    " score=" + std::to_string(agg),
                    {{"level",      std::to_string(static_cast<int>(level))},
                     {"aggregate",  std::to_string(agg)},
@@ -226,7 +206,6 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
                     {"persistent", std::to_string(persistent)},
                     {"spike",      std::to_string(spike)}});
 
-    // 20. Return
     return result;
 }
 
@@ -234,44 +213,24 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
 // Queries
 // ============================================================
 
-std::optional<UncertaintySnapshot> RuleBasedUncertaintyEngine::current(
-    const Symbol& symbol) const {
-    std::lock_guard lock(mutex_);
-    auto it = snapshots_.find(symbol.get());
-    if (it != snapshots_.end()) {
-        return it->second;
-    }
-    return std::nullopt;
-}
-
 UncertaintyDiagnostics RuleBasedUncertaintyEngine::diagnostics() const {
     std::lock_guard lock(mutex_);
     return diagnostics_;
 }
 
 // ============================================================
-// Feedback / Lifecycle
+// Lifecycle
 // ============================================================
-
-void RuleBasedUncertaintyEngine::record_feedback(
-    const UncertaintyFeedback& feedback) {
-    std::lock_guard lock(mutex_);
-    feedback_buffer_.push_back(feedback);
-    diagnostics_.feedback_samples =
-        static_cast<uint32_t>(feedback_buffer_.size());
-    diagnostics_.last_feedback = feedback.trade_time;
-}
 
 void RuleBasedUncertaintyEngine::reset_state() {
     std::lock_guard lock(mutex_);
     snapshots_.clear();
     states_.clear();
-    feedback_buffer_.clear();
     diagnostics_ = UncertaintyDiagnostics{};
 }
 
 // ============================================================
-// Dimension computors — v1 dimensions (identical logic)
+// Dimension computors
 // ============================================================
 
 double RuleBasedUncertaintyEngine::compute_regime_uncertainty(
@@ -311,6 +270,11 @@ double RuleBasedUncertaintyEngine::compute_signal_uncertainty(
         }
     }
 
+    // ATR-based volatility: high normalized ATR = wider stops = less certainty for scalping
+    if (tech.atr_valid && tech.atr_14_normalized > 0.03) {
+        uncertainty += std::min(0.2, (tech.atr_14_normalized - 0.03) * 5.0);
+    }
+
     // Мало валидных индикаторов
     int valid_count = 0;
     if (tech.rsi_valid)  ++valid_count;
@@ -348,6 +312,18 @@ double RuleBasedUncertaintyEngine::compute_data_quality_uncertainty(
         uncertainty += 0.1;
     }
 
+    // VPIN toxicity: high toxicity = informed traders dominating
+    // (Easley, Lopez de Prado, O'Hara 2012: "Flow Toxicity and Liquidity")
+    if (features.microstructure.vpin_valid && features.microstructure.vpin_toxic) {
+        uncertainty += 0.2;
+    }
+
+    // Book instability: unstable book = unreliable levels
+    if (features.microstructure.instability_valid &&
+        features.microstructure.book_instability > 0.7) {
+        uncertainty += 0.15;
+    }
+
     return std::clamp(uncertainty, 0.0, 1.0);
 }
 
@@ -356,23 +332,33 @@ double RuleBasedUncertaintyEngine::compute_execution_uncertainty(
 
     double uncertainty = 0.0;
 
+    // Spread: for scalping 10 bps = significant portion of profit
     if (features.microstructure.spread_valid) {
         uncertainty += std::min(0.4, features.microstructure.spread_bps / 100.0);
     }
+
+    // Estimated slippage
     if (features.execution_context.slippage_valid) {
         uncertainty += std::min(0.3,
             features.execution_context.estimated_slippage_bps / 50.0);
     }
-    if (features.microstructure.liquidity_valid &&
-        features.microstructure.liquidity_ratio > 3.0) {
-        uncertainty += 0.2;
+
+    // Liquidity ratio: min(bid_depth, ask_depth) / avg(bid_depth, ask_depth)
+    // Range [0, 1]. Low value = order book asymmetry = adverse selection risk.
+    // When ratio < threshold (default 0.5): linear penalty up to +0.3
+    if (features.microstructure.liquidity_valid) {
+        double ratio = features.microstructure.liquidity_ratio;
+        if (ratio < config_.liquidity_ratio_penalty_threshold) {
+            double penalty = 0.3 * (1.0 - ratio / config_.liquidity_ratio_penalty_threshold);
+            uncertainty += penalty;
+        }
     }
 
     return std::clamp(uncertainty, 0.0, 1.0);
 }
 
 // ============================================================
-// Dimension computors — v2 dimensions (NEW)
+// Portfolio, ML, correlation, transition, operational dimensions
 // ============================================================
 
 double RuleBasedUncertaintyEngine::compute_portfolio_uncertainty(
@@ -398,7 +384,7 @@ double RuleBasedUncertaintyEngine::compute_portfolio_uncertainty(
         }
     }
 
-    // Exposure crowding (capital_utilization_pct is 0–100 %)
+    // Exposure crowding (capital_utilization_pct is 0-100 %)
     if (portfolio.capital_utilization_pct > 90.0) {
         base += 0.4;
     } else if (portfolio.capital_utilization_pct > 70.0) {
@@ -414,6 +400,13 @@ double RuleBasedUncertaintyEngine::compute_portfolio_uncertainty(
         } else if (daily_pnl_pct < -0.01) {
             base += 0.2;
         }
+    }
+
+    // Current drawdown from peak
+    if (portfolio.pnl.current_drawdown_pct > 5.0) {
+        base += 0.3;
+    } else if (portfolio.pnl.current_drawdown_pct > 3.0) {
+        base += 0.15;
     }
 
     // Many concurrent positions
@@ -440,6 +433,11 @@ double RuleBasedUncertaintyEngine::compute_ml_uncertainty(
         base += ml_signals.cascade_probability * 0.3;
     }
 
+    // should_block_trading is a strong ML-level aggregate signal
+    if (ml_signals.should_block_trading) {
+        base += 0.3;
+    }
+
     if (ml_signals.recommended_wait_periods < 0) {
         base += 0.2;
     }
@@ -463,7 +461,8 @@ double RuleBasedUncertaintyEngine::compute_transition_uncertainty(
 
     double base = 0.0;
     if (regime.last_transition.has_value()) {
-        base = regime.last_transition->confidence;
+        double confidence = regime.last_transition->confidence;
+        base = 0.3 + 0.4 * (1.0 - confidence);
     }
 
     if (regime.stability < 0.3) {
@@ -617,7 +616,10 @@ UncertaintyLevel RuleBasedUncertaintyEngine::apply_hysteresis(
 }
 
 // ============================================================
-// update_state() — per-symbol tracking after each assessment
+// update_state() — per-symbol tracking
+//
+// Called BEFORE compute_cooldown() and determine_execution_mode()
+// so that consecutive counters reflect the current tick.
 // ============================================================
 
 void RuleBasedUncertaintyEngine::update_state(
@@ -654,10 +656,9 @@ void RuleBasedUncertaintyEngine::update_state(
         state.consecutive_high = 0;
     }
 
-    // 3+ consecutive extreme → activate 60-second cooldown
-    if (state.consecutive_extreme >= 3) {
-        constexpr int64_t sixty_seconds_ns = 60'000'000'000LL;
-        state.cooldown_until_ns = now_ns + sixty_seconds_ns;
+    // N consecutive extreme -> activate cooldown
+    if (state.consecutive_extreme >= config_.consecutive_extreme_for_cooldown) {
+        state.cooldown_until_ns = now_ns + config_.cooldown_duration_ns;
     }
 }
 
@@ -673,15 +674,12 @@ CooldownRecommendation RuleBasedUncertaintyEngine::compute_cooldown(
     if (now_ns < state.cooldown_until_ns) {
         cd.active       = true;
         cd.remaining_ns = state.cooldown_until_ns - now_ns;
-        constexpr int64_t max_cooldown_ns = 60'000'000'000LL;
         double ratio = static_cast<double>(cd.remaining_ns) /
-                       static_cast<double>(max_cooldown_ns);
-        // ИСПРАВЛЕНИЕ: Инвертированная формула — чем больше осталось времени,
-        // тем сильнее должна быть редукция (decay_factor ближе к 0.5).
-        // При ratio=1.0 (только что активирован) → decay=0.5 (50% размера)
-        // При ratio=0.0 (истекает) → decay=1.0 (полный размер)
+                       static_cast<double>(config_.cooldown_duration_ns);
         cd.decay_factor    = 0.5 + 0.5 * std::clamp(1.0 - ratio, 0.0, 1.0);
-        cd.trigger_reason  = "Серия экстремальных оценок (≥3 подряд)";
+        cd.trigger_reason  = "Серия экстремальных оценок (>=" +
+                             std::to_string(config_.consecutive_extreme_for_cooldown) +
+                             " подряд)";
     } else {
         cd.active       = false;
         cd.remaining_ns = 0;
@@ -701,7 +699,8 @@ ExecutionModeRecommendation RuleBasedUncertaintyEngine::determine_execution_mode
     if (level == UncertaintyLevel::Extreme) {
         return ExecutionModeRecommendation::HaltNewEntries;
     }
-    if (level == UncertaintyLevel::High && state.consecutive_high >= 3) {
+    if (level == UncertaintyLevel::High &&
+        state.consecutive_high >= config_.consecutive_high_for_defensive) {
         return ExecutionModeRecommendation::DefensiveOnly;
     }
     if (level == UncertaintyLevel::High) {

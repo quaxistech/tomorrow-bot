@@ -10,18 +10,21 @@
 #include "common/types.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
-#include <algorithm>
 
 namespace tb {
 
-/// Ограничения торгового инструмента, полученные с биржи (exchange info)
+/// Максимальная точность для snprintf %.*f (защита от UB)
+inline constexpr int kMaxPrecisionDigits = 18;
+
+/// Ограничения торгового инструмента USDT-M futures, полученные с биржи (exchange info)
 struct ExchangeSymbolRules {
     Symbol symbol{Symbol("")};
 
     int quantity_precision{6};    ///< Количество десятичных знаков для quantity (base)
     int price_precision{2};       ///< Количество десятичных знаков для price (quote)
-    double min_trade_usdt{1.0};   ///< Минимальный notional (USDT) для ордера
+    double min_trade_usdt{5.0};   ///< Минимальный notional (USDT) для ордера
     double min_quantity{0.0};     ///< Минимальный quantity (base), 0 = не задан
     double max_quantity{0.0};     ///< Максимальный quantity (base), 0 = не задан
 
@@ -30,26 +33,24 @@ struct ExchangeSymbolRules {
     /// при высоком значении quantity_precision (>6).
     [[nodiscard]] double floor_quantity(double qty) const noexcept {
         if (qty <= 0.0) return 0.0;
-        // Округляем вниз через целочисленную арифметику на масштабированном значении
-        // std::pow избегается намеренно — precompute factor inline
+        const int prec = std::clamp(quantity_precision, 0, kMaxPrecisionDigits);
         double factor = 1.0;
-        for (int i = 0; i < quantity_precision; ++i) factor *= 10.0;
-        // floor на целочисленной части масштабированного значения
-        double scaled = qty * factor;
-        double floored = std::floor(scaled);
-        // Используем snprintf → parse roundtrip для точного представления
+        for (int i = 0; i < prec; ++i) factor *= 10.0;
+        double floored = std::floor(qty * factor);
+        // snprintf → strtod roundtrip для точного представления
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", quantity_precision, floored / factor);
+        std::snprintf(buf, sizeof(buf), "%.*f", prec, floored / factor);
         return std::strtod(buf, nullptr);
     }
 
     /// Округлить цену до допустимой точности (round half-up)
     [[nodiscard]] double round_price(double price) const noexcept {
         if (price <= 0.0) return 0.0;
+        const int prec = std::clamp(price_precision, 0, kMaxPrecisionDigits);
         double factor = 1.0;
-        for (int i = 0; i < price_precision; ++i) factor *= 10.0;
+        for (int i = 0; i < prec; ++i) factor *= 10.0;
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", price_precision, std::round(price * factor) / factor);
+        std::snprintf(buf, sizeof(buf), "%.*f", prec, std::round(price * factor) / factor);
         return std::strtod(buf, nullptr);
     }
 
@@ -75,19 +76,21 @@ struct ExchangeSymbolRules {
         return is_notional_valid(notional);
     }
 
-    /// Количество precision как string с нулями (для formatting)
+    /// Форматировать quantity для отправки на биржу
     [[nodiscard]] std::string format_quantity(double qty) const {
         double floored = floor_quantity(qty);
-        // Use fixed precision formatting
+        const int prec = std::clamp(quantity_precision, 0, kMaxPrecisionDigits);
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", quantity_precision, floored);
+        std::snprintf(buf, sizeof(buf), "%.*f", prec, floored);
         return std::string(buf);
     }
 
+    /// Форматировать цену для отправки на биржу
     [[nodiscard]] std::string format_price(double price) const {
         double rounded = round_price(price);
+        const int prec = std::clamp(price_precision, 0, kMaxPrecisionDigits);
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", price_precision, rounded);
+        std::snprintf(buf, sizeof(buf), "%.*f", prec, rounded);
         return std::string(buf);
     }
 };

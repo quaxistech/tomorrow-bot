@@ -28,6 +28,21 @@ using namespace Catch::Matchers;
 
 namespace {
 
+class RejectingSubmitter final : public IOrderSubmitter {
+public:
+    OrderSubmitResult submit_order(const OrderRecord& order) override {
+        OrderSubmitResult result;
+        result.order_id = order.order_id;
+        result.success = false;
+        result.error_message = "forced reject";
+        return result;
+    }
+
+    bool cancel_order(const OrderId&, const Symbol&) override {
+        return true;
+    }
+};
+
 auto make_logger()  { return std::make_shared<TestLogger>(); }
 auto make_clock()   { return std::make_shared<TestClock>(); }
 auto make_metrics() { return std::make_shared<TestMetrics>(); }
@@ -208,11 +223,61 @@ TEST_CASE("PaperOrderSubmitter: Немедленное подтверждени�
     order.order_id = OrderId("ORD-1");
     order.symbol = Symbol("BTCUSDT");
     order.side = Side::Buy;
+    order.original_quantity = Quantity(0.01);
+    order.price = Price(50000.0);
 
     auto result = submitter.submit_order(order);
     REQUIRE(result.success);
     REQUIRE(result.order_id.get() == "ORD-1");
     REQUIRE_FALSE(result.exchange_order_id.get().empty());
+}
+
+TEST_CASE("PaperOrderSubmitter: применяет exchange floor к quantity", "[execution][paper]") {
+    PaperOrderSubmitter submitter;
+
+    ExchangeSymbolRules rules;
+    rules.symbol = Symbol("XAUUSDT");
+    rules.quantity_precision = 2;
+    rules.price_precision = 1;
+    rules.min_trade_usdt = 1.0;
+    rules.min_quantity = 0.01;
+    submitter.set_rules(rules.symbol, rules);
+
+    OrderRecord order;
+    order.order_id = OrderId("ORD-FLOOR");
+    order.symbol = Symbol("XAUUSDT");
+    order.side = Side::Buy;
+    order.trade_side = TradeSide::Open;
+    order.original_quantity = Quantity(1.239);
+    order.price = Price(3200.5);
+
+    auto result = submitter.submit_order(order);
+    REQUIRE(result.success);
+    REQUIRE_THAT(result.submitted_quantity.get(), WithinAbs(1.23, 1e-9));
+}
+
+TEST_CASE("PaperOrderSubmitter: отклоняет futures dust после floor", "[execution][paper]") {
+    PaperOrderSubmitter submitter;
+
+    ExchangeSymbolRules rules;
+    rules.symbol = Symbol("XAUUSDT");
+    rules.quantity_precision = 2;
+    rules.price_precision = 1;
+    rules.min_trade_usdt = 1.0;
+    rules.min_quantity = 0.01;
+    submitter.set_rules(rules.symbol, rules);
+
+    OrderRecord order;
+    order.order_id = OrderId("ORD-DUST");
+    order.symbol = Symbol("XAUUSDT");
+    order.side = Side::Buy;
+    order.trade_side = TradeSide::Open;
+    order.original_quantity = Quantity(0.000238);
+    order.price = Price(3200.5);
+
+    auto result = submitter.submit_order(order);
+    REQUIRE_FALSE(result.success);
+    REQUIRE(result.error_message.find("quantity invalid") != std::string::npos);
 }
 
 TEST_CASE("PaperOrderSubmitter: Отмена всегда успешна", "[execution][paper]") {
@@ -685,6 +750,42 @@ TEST_CASE("ExecutionEngine: execution_stats reflects submissions", "[execution][
     auto stats = engine.execution_stats();
     REQUIRE(stats.total_orders >= 1);
     REQUIRE(stats.filled_orders >= 1);
+}
+
+TEST_CASE("ExecutionEngine: short open reserves and releases margin on reject", "[execution][engine][futures]") {
+    auto submitter = std::make_shared<RejectingSubmitter>();
+    auto log = make_logger();
+    auto clk = make_clock();
+    auto met = make_metrics();
+    auto portfolio = std::make_shared<portfolio::InMemoryPortfolioEngine>(
+        1000.0, log, clk, met);
+
+    ExecutionEngine engine(submitter, portfolio, log, clk, met);
+    engine.set_leverage(10.0);
+
+    auto result = engine.execute(
+        make_intent("BTCUSDT", Side::Sell, 0.01, 50000.0),
+        make_risk_approved(0.01),
+        make_exec_alpha(),
+        make_uncertainty());
+
+    REQUIRE_FALSE(result.has_value());
+
+    bool saw_reserved = false;
+    bool saw_released = false;
+    for (const auto& event : portfolio->recent_events()) {
+        if (event.type == portfolio::PortfolioEventType::CashReserved) {
+            saw_reserved = true;
+        }
+        if (event.type == portfolio::PortfolioEventType::CashReleased) {
+            saw_released = true;
+        }
+    }
+
+    REQUIRE(saw_reserved);
+    REQUIRE(saw_released);
+    REQUIRE_THAT(portfolio->cash_ledger().reserved_for_orders, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(portfolio->cash_ledger().available_cash, WithinAbs(1000.0, 1e-9));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

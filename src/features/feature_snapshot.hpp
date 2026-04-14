@@ -132,9 +132,14 @@ struct FeatureSnapshot {
 
     tb::order_book::BookQuality book_quality{tb::order_book::BookQuality::Uninitialized};
 
-    // Снимок считается полным, если доступны базовые технические и микроструктурные признаки
+    // Снимок считается полным, если доступны минимально необходимые для
+    // скальпинговых стратегий признаки: тренд (SMA), волатильность (ATR) и спред.
+    // Без ATR невозможна корректная оценка stop-loss / take-profit,
+    // без спреда — execution cost модель.
     [[nodiscard]] bool is_complete() const noexcept {
-        return technical.sma_valid && microstructure.spread_valid;
+        return technical.sma_valid
+            && technical.atr_valid
+            && microstructure.spread_valid;
     }
 };
 

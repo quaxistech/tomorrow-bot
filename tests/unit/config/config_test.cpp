@@ -37,7 +37,7 @@ static AppConfig make_valid_config() {
     cfg.risk.max_strategy_exposure_pct   = 50.0;
     cfg.risk.max_symbol_concentration_pct = 30.0;
 
-    cfg.trading.mode = TradingMode::Paper;
+    cfg.trading.mode = TradingMode::Production;
 
     return cfg;
 }
@@ -140,13 +140,13 @@ TEST_CASE("Config: ProductionWithoutKillSwitchFails", "[config]") {
     REQUIRE_FALSE(result.has_value());
 }
 
-TEST_CASE("Config: ProductionWithDebugLogFails", "[config]") {
+TEST_CASE("Config: ProductionWithDebugLogAllowed", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.trading.mode   = TradingMode::Production;
     cfg.logging.level  = "debug";
     auto result = validator.validate(cfg);
-    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.has_value());
 }
 
 TEST_CASE("Config: ProductionWithInfoLogPasses", "[config]") {
@@ -361,6 +361,90 @@ TEST_CASE("Config: CrossZeroInitialCapitalFails", "[config]") {
     ConfigValidator validator;
     auto cfg = make_valid_config();
     cfg.trading.initial_capital = 0.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты futures-only режима
+// ============================================================
+
+TEST_CASE("Config: FuturesDisabledFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.futures.enabled = false;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: FuturesInvalidProductTypeFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.futures.product_type = "COIN-FUTURES";
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: FuturesOnlyUsdtFuturesPasses", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.futures.product_type = "USDT-FUTURES";
+    auto result = validator.validate(cfg);
+    REQUIRE(result.has_value());
+}
+
+// ============================================================
+// Тесты валидации pair_selection
+// ============================================================
+
+TEST_CASE("Config: PairSelectionZeroTopNFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.pair_selection.top_n = 0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: PairSelectionNegativeVolumeFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.pair_selection.min_volume_usdt = -1.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: PairSelectionSpreadTooHighFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.pair_selection.max_spread_bps = 600.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ============================================================
+// Тесты расширенной валидации trading_params
+// ============================================================
+
+TEST_CASE("Config: TradingParamsNegativePriceStopFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.price_stop_loss_pct = -1.0;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsNegativeMinRRFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.min_risk_reward_ratio = -0.5;
+    auto result = validator.validate(cfg);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Config: TradingParamsQuickProfitFeeMultBelowOneFails", "[config]") {
+    ConfigValidator validator;
+    auto cfg = make_valid_config();
+    cfg.trading_params.quick_profit_fee_multiplier = 0.5;
     auto result = validator.validate(cfg);
     REQUIRE_FALSE(result.has_value());
 }

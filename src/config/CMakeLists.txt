@@ -19,6 +19,6 @@ target_link_libraries(tb_config
         OpenSSL::Crypto
 )
 
-target_compile_features(tb_config PUBLIC cxx_std_20)
+target_compile_features(tb_config PUBLIC cxx_std_23)
 
 add_library(TomorrowBot::Config ALIAS tb_config)

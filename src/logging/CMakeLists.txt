@@ -13,8 +13,10 @@ target_include_directories(tb_logging
 target_link_libraries(tb_logging
     PUBLIC
         tb_common
+    PRIVATE
+        tb_security
 )
 
-target_compile_features(tb_logging PUBLIC cxx_std_20)
+target_compile_features(tb_logging PUBLIC cxx_std_23)
 
 add_library(TomorrowBot::Logging ALIAS tb_logging)

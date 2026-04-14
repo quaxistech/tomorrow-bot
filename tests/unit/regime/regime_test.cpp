@@ -385,14 +385,14 @@ TEST_CASE("Regime: ToxicFlow detection", "[regime][stress]") {
     REQUIRE(result.label == RegimeLabel::Volatile);
 }
 
-TEST_CASE("Regime: LiquidityStress — wide spread + low depth", "[regime][stress]") {
+TEST_CASE("Regime: LiquidityStress — wide spread + book imbalance", "[regime][stress]") {
     auto [logger, clk, metrics] = make_deps();
     RuleBasedRegimeEngine engine(logger, clk, metrics);
 
     auto snap = make_snapshot();
-    snap.microstructure.spread_bps = 35.0;          // > 30 threshold
+    snap.microstructure.spread_bps = 35.0;          // > 30 bps stress threshold
     snap.microstructure.spread_valid = true;
-    snap.microstructure.liquidity_ratio = 4.0;      // > 3.0 threshold
+    snap.microstructure.liquidity_ratio = 0.15;     // < 0.3 threshold = severe book imbalance
     snap.microstructure.liquidity_valid = true;
     snap.technical.rsi_valid = true;
     snap.technical.rsi_14 = 50.0;
@@ -406,28 +406,131 @@ TEST_CASE("Regime: LiquidityStress — wide spread + low depth", "[regime][stres
     REQUIRE(result.label == RegimeLabel::Volatile);
 }
 
-TEST_CASE("Regime: RegimePolicy — stress regimes have restrictive policies", "[regime][policy]") {
+TEST_CASE("Regime: LiquidityStress — balanced book does not trigger", "[regime][stress]") {
+    auto [logger, clk, metrics] = make_deps();
+    RuleBasedRegimeEngine engine(logger, clk, metrics);
+
+    auto snap = make_snapshot();
+    snap.microstructure.spread_bps = 35.0;          // > 30 bps stress threshold
+    snap.microstructure.spread_valid = true;
+    snap.microstructure.liquidity_ratio = 0.85;     // balanced book > 0.3 threshold
+    snap.microstructure.liquidity_valid = true;
+    snap.technical.rsi_valid = true;
+    snap.technical.rsi_14 = 50.0;
+    snap.technical.adx_valid = true;
+    snap.technical.adx = 10.0;
+    snap.technical.ema_valid = true;
+
+    auto result = engine.classify(snap);
+
+    // Even with high spread, balanced book should NOT trigger LiquidityStress
+    REQUIRE(result.detailed != DetailedRegime::LiquidityStress);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5b: FUTURES SAFETY — ADX-only fallback (no directional bias)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Regime: ADX-only strong trend without RSI returns Undefined (futures safety)", "[regime][futures]") {
+    auto [logger, clk, metrics] = make_deps();
+    RuleBasedRegimeEngine engine(logger, clk, metrics);
+
+    auto snap = make_snapshot();
+    snap.technical.adx = 40.0;  // Strong ADX
+    snap.technical.adx_valid = true;
+    snap.technical.ema_valid = false;  // No EMA
+    snap.technical.rsi_valid = false;  // No RSI
+
+    auto result = engine.classify(snap);
+
+    // FUTURES: без EMA и RSI нельзя определять направление
+    REQUIRE(result.detailed == DetailedRegime::Undefined);
+}
+
+TEST_CASE("Regime: ADX-only strong trend with neutral RSI returns Undefined", "[regime][futures]") {
+    auto [logger, clk, metrics] = make_deps();
+    RuleBasedRegimeEngine engine(logger, clk, metrics);
+
+    auto snap = make_snapshot();
+    snap.technical.adx = 40.0;  // Strong ADX
+    snap.technical.adx_valid = true;
+    snap.technical.ema_valid = false;
+    snap.technical.rsi_14 = 50.0;  // Neutral RSI — no directional confirmation
+    snap.technical.rsi_valid = true;
+
+    auto result = engine.classify(snap);
+
+    // RSI in neutral zone [45, 55) — no directional bias allowed
+    REQUIRE(result.detailed == DetailedRegime::Undefined);
+}
+
+TEST_CASE("Regime: ADX-only strong trend with directional RSI gives direction", "[regime][futures]") {
+    auto [logger, clk, metrics] = make_deps();
+    RuleBasedRegimeEngine engine(logger, clk, metrics);
+
+    auto snap = make_snapshot();
+    snap.technical.adx = 40.0;
+    snap.technical.adx_valid = true;
+    snap.technical.ema_valid = false;
+    snap.technical.rsi_14 = 60.0;  // > 55 = bullish
+    snap.technical.rsi_valid = true;
+
+    auto result = engine.classify(snap);
+    REQUIRE(result.detailed == DetailedRegime::StrongUptrend);
+
+    // Test bearish direction
+    snap.technical.rsi_14 = 40.0;  // < 45 = bearish
+    RuleBasedRegimeEngine engine2(logger, clk, metrics);
+    auto result2 = engine2.classify(snap);
+    REQUIRE(result2.detailed == DetailedRegime::StrongDowntrend);
+}
+
+TEST_CASE("Regime: ADX-only weak range without RSI returns Undefined", "[regime][futures]") {
+    auto [logger, clk, metrics] = make_deps();
+    RuleBasedRegimeEngine engine(logger, clk, metrics);
+
+    auto snap = make_snapshot();
+    snap.technical.adx = 22.0;  // In weak range [18, 30]
+    snap.technical.adx_valid = true;
+    snap.technical.ema_valid = false;
+    snap.technical.rsi_valid = false;
+
+    auto result = engine.classify(snap);
+    REQUIRE(result.detailed == DetailedRegime::Undefined);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5c: CUSUM-accelerated hysteresis transitions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Regime: CUSUM accelerates hysteresis transition", "[regime][cusum]") {
+    auto [logger, clk, metrics] = make_deps();
+
     RegimeConfig cfg;
+    cfg.transition.confirmation_ticks = 3;   // Normally need 3 ticks
+    cfg.transition.dwell_time_ticks = 1;
+    cfg.transition.min_confidence_to_switch = 0.3;
 
-    auto anomaly_policy = cfg.get_policy(DetailedRegime::AnomalyEvent);
-    REQUIRE(anomaly_policy.action == StressAction::HaltAll);
-    REQUIRE(anomaly_policy.size_cap == 0.0);
-    REQUIRE(!anomaly_policy.allow_new_entries);
+    RuleBasedRegimeEngine engine(logger, clk, metrics, cfg);
 
-    auto toxic_policy = cfg.get_policy(DetailedRegime::ToxicFlow);
-    REQUIRE(toxic_policy.action == StressAction::BlockEntry);
-    REQUIRE(!toxic_policy.allow_new_entries);
-    REQUIRE(toxic_policy.allow_exits);
+    // Establish uptrend
+    auto uptrend = make_strong_uptrend();
+    engine.classify(uptrend);
+    engine.classify(uptrend);
 
-    auto chop_policy = cfg.get_policy(DetailedRegime::Chop);
-    REQUIRE(chop_policy.action == StressAction::ReduceSize);
-    REQUIRE(chop_policy.size_cap < 1.0);
-    REQUIRE(chop_policy.threshold_multiplier > 1.0);
+    // Build a chop snapshot with CUSUM change signal
+    auto chop_with_cusum = make_chop();
+    chop_with_cusum.technical.cusum_valid = true;
+    chop_with_cusum.technical.cusum_regime_change = true;
+    chop_with_cusum.technical.cusum_positive = 5.0;
+    chop_with_cusum.technical.cusum_negative = 0.0;
 
-    auto uptrend_policy = cfg.get_policy(DetailedRegime::StrongUptrend);
-    REQUIRE(uptrend_policy.action == StressAction::Allow);
-    REQUIRE(uptrend_policy.allow_new_entries);
-    REQUIRE(uptrend_policy.size_cap == 1.0);
+    // With CUSUM, confirmation_ticks effectively becomes 2 (3-1)
+    engine.classify(chop_with_cusum);  // tick 1
+    engine.classify(chop_with_cusum);  // tick 2 — should confirm due to CUSUM
+    auto result = engine.classify(chop_with_cusum);  // tick 3
+
+    REQUIRE(result.detailed == DetailedRegime::Chop);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

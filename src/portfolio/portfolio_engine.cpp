@@ -1,9 +1,25 @@
 #include "portfolio/portfolio_engine.hpp"
 #include "common/constants.hpp"
+#include "common/numeric_utils.hpp"
 #include <cmath>
 #include <algorithm>
 
 namespace tb::portfolio {
+
+namespace {
+/// Composite key for hedge-mode: "SYMBOL:long" or "SYMBOL:short"
+std::string make_pos_key(const std::string& symbol, Side side) {
+    return symbol + (side == Side::Buy ? ":long" : ":short");
+}
+
+std::string make_pos_key(const std::string& symbol, PositionSide ps) {
+    return symbol + (ps == PositionSide::Long ? ":long" : ":short");
+}
+
+PositionSide side_to_position_side(Side s) {
+    return s == Side::Buy ? PositionSide::Long : PositionSide::Short;
+}
+} // namespace
 
 InMemoryPortfolioEngine::InMemoryPortfolioEngine(
     double total_capital,
@@ -23,13 +39,12 @@ InMemoryPortfolioEngine::InMemoryPortfolioEngine(
 void InMemoryPortfolioEngine::open_position(const Position& pos) {
     std::lock_guard lock(mutex_);
 
-    auto key = pos.symbol.get();
+    auto key = make_pos_key(pos.symbol.get(), pos.side);
     auto existing_it = positions_.find(key);
 
-    if (existing_it != positions_.end() &&
-        existing_it->second.side == pos.side &&
-        existing_it->second.size.get() > 0.0) {
-        // Добавление к существующей позиции: средневзвешенная цена входа
+    if (existing_it != positions_.end() && existing_it->second.size.get() > 0.0) {
+        // Добавление к существующей позиции той же стороны: средневзвешенная цена входа
+        // (With composite key, opposite-side would be a different key — hedge mode compatible)
         auto& existing = existing_it->second;
         double old_size = existing.size.get();
         double new_size = pos.size.get();
@@ -56,8 +71,10 @@ void InMemoryPortfolioEngine::open_position(const Position& pos) {
                        {"avg_entry", std::to_string(existing.avg_entry_price.get())}});
     } else {
         // Новая позиция
-        positions_[key] = pos;
-        positions_[key].updated_at = clock_->now();
+        auto stored = pos;
+        stored.position_side = side_to_position_side(pos.side);
+        stored.updated_at = clock_->now();
+        positions_[key] = stored;
         recalculate_position_pnl(positions_[key]);
 
         logger_->info("Portfolio", "Открыта позиция",
@@ -82,28 +99,31 @@ void InMemoryPortfolioEngine::open_position(const Position& pos) {
 void InMemoryPortfolioEngine::update_price(const Symbol& symbol, Price price) {
     std::lock_guard lock(mutex_);
 
-    auto it = positions_.find(symbol.get());
-    if (it == positions_.end()) {
-        return;
+    // Update both legs (hedge mode: long and short can coexist)
+    bool found_any = false;
+    for (auto* suffix : {":long", ":short"}) {
+        auto it = positions_.find(symbol.get() + suffix);
+        if (it == positions_.end()) continue;
+        found_any = true;
+
+        auto& pos = it->second;
+
+        // Если позиция загружена с биржи (sync) — цена входа неизвестна.
+        if (pos.avg_entry_price.get() <= 0.0 && price.get() > 0.0) {
+            pos.avg_entry_price = price;
+            logger_->info("Portfolio", "Установлена цена входа для синхронизированной позиции",
+                {{"symbol", symbol.get()},
+                 {"entry_price", std::to_string(price.get())}});
+        }
+
+        pos.current_price = price;
+        pos.notional = NotionalValue(pos.size.get() * price.get());
+        pos.updated_at = clock_->now();
+
+        recalculate_position_pnl(pos);
     }
 
-    auto& pos = it->second;
-
-    // Если позиция загружена с биржи (sync) — цена входа неизвестна.
-    // Ставим текущую рыночную цену как цену входа при первом обновлении.
-    // Это даёт корректный P&L с момента старта бота.
-    if (pos.avg_entry_price.get() <= 0.0 && price.get() > 0.0) {
-        pos.avg_entry_price = price;
-        logger_->info("Portfolio", "Установлена цена входа для синхронизированной позиции",
-            {{"symbol", symbol.get()},
-             {"entry_price", std::to_string(price.get())}});
-    }
-
-    pos.current_price = price;
-    pos.notional = NotionalValue(pos.size.get() * price.get());
-    pos.updated_at = clock_->now();
-
-    recalculate_position_pnl(pos);
+    if (!found_any) return;
 
     // Обновить пик капитала для расчёта просадки
     double current_equity = total_capital_ + realized_pnl_today_;
@@ -118,31 +138,30 @@ void InMemoryPortfolioEngine::update_price(const Symbol& symbol, Price price) {
 void InMemoryPortfolioEngine::record_funding_payment(const Symbol& symbol, double funding_amount) {
     std::lock_guard lock(mutex_);
 
-    auto it = positions_.find(symbol.get());
-    if (it == positions_.end()) {
-        // Нет позиции - игнорируем funding payment
-        return;
+    // Apply to both legs (hedge mode)
+    for (auto* suffix : {":long", ":short"}) {
+        auto it = positions_.find(symbol.get() + suffix);
+        if (it == positions_.end()) continue;
+
+        auto& pos = it->second;
+
+        // Добавляем funding payment к accumulated_funding
+        pos.accumulated_funding += funding_amount;
+
+        // Пересчитываем P&L с учетом нового funding
+        recalculate_position_pnl(pos);
+
+        logger_->debug("Portfolio", "Записан funding payment",
+                      {{"symbol", symbol.get()},
+                       {"leg", suffix},
+                       {"funding_amount", std::to_string(funding_amount)},
+                       {"accumulated_funding", std::to_string(pos.accumulated_funding)},
+                       {"unrealized_pnl", std::to_string(pos.unrealized_pnl)}});
+
+        emit_event(PortfolioEventType::PositionUpdated, symbol,
+                   funding_amount, cash_ledger_.available_cash,
+                   "funding_payment=" + std::to_string(funding_amount));
     }
-
-    auto& pos = it->second;
-
-    // Добавляем funding payment к accumulated_funding
-    // Положительный funding_amount = мы платим (уменьшает P&L)
-    // Отрицательный funding_amount = нам платят (увеличивает P&L)
-    pos.accumulated_funding += funding_amount;
-
-    // Пересчитываем P&L с учетом нового funding
-    recalculate_position_pnl(pos);
-
-    logger_->debug("Portfolio", "Записан funding payment",
-                  {{"symbol", symbol.get()},
-                   {"funding_amount", std::to_string(funding_amount)},
-                   {"accumulated_funding", std::to_string(pos.accumulated_funding)},
-                   {"unrealized_pnl", std::to_string(pos.unrealized_pnl)}});
-
-    emit_event(PortfolioEventType::PositionUpdated, symbol,
-               funding_amount, cash_ledger_.available_cash,
-               "funding_payment=" + std::to_string(funding_amount));
 }
 
 void InMemoryPortfolioEngine::close_position(
@@ -150,7 +169,9 @@ void InMemoryPortfolioEngine::close_position(
 {
     std::lock_guard lock(mutex_);
 
-    auto it = positions_.find(symbol.get());
+    // Search both legs by composite key
+    auto it = positions_.find(symbol.get() + ":long");
+    if (it == positions_.end()) it = positions_.find(symbol.get() + ":short");
     if (it == positions_.end()) {
         logger_->warn("Portfolio", "Попытка закрыть несуществующую позицию",
                       {{"symbol", symbol.get()}});
@@ -205,13 +226,75 @@ void InMemoryPortfolioEngine::close_position(
                " pnl=" + std::to_string(realized_pnl));
 }
 
+void InMemoryPortfolioEngine::close_position(
+    const Symbol& symbol, PositionSide ps,
+    Price close_price, double realized_pnl)
+{
+    std::lock_guard lock(mutex_);
+
+    auto key = make_pos_key(symbol.get(), ps);
+    auto it = positions_.find(key);
+    if (it == positions_.end()) {
+        logger_->warn("Portfolio", "Попытка закрыть несуществующую позицию (hedge)",
+                      {{"symbol", symbol.get()},
+                       {"side", ps == PositionSide::Long ? "long" : "short"}});
+        return;
+    }
+
+    realized_pnl_today_ += realized_pnl;
+    realized_pnl_gross_ += realized_pnl;
+    trades_today_++;
+
+    cash_ledger_.realized_pnl_net += realized_pnl;
+    cash_ledger_.realized_pnl_gross += realized_pnl;
+    cash_ledger_.total_cash += realized_pnl;
+    cash_ledger_.available_cash += realized_pnl;
+
+    if (realized_pnl < 0.0) {
+        consecutive_losses_++;
+    } else if (realized_pnl > 0.0) {
+        consecutive_losses_ = 0;
+    }
+
+    logger_->info("Portfolio", "Закрыта позиция (hedge)",
+                  {{"symbol", symbol.get()},
+                   {"side", ps == PositionSide::Long ? "long" : "short"},
+                   {"close_price", std::to_string(close_price.get())},
+                   {"realized_pnl", std::to_string(realized_pnl)},
+                   {"consecutive_losses", std::to_string(consecutive_losses_)}});
+
+    positions_.erase(it);
+
+    double current_equity = total_capital_ + realized_pnl_today_;
+    for (const auto& [_, p] : positions_) {
+        current_equity += p.unrealized_pnl;
+    }
+    if (current_equity > peak_equity_) {
+        peak_equity_ = current_equity;
+    }
+
+    if (metrics_) {
+        metrics_->gauge("portfolio_positions_count", {})->set(
+            static_cast<double>(positions_.size()));
+        metrics_->counter("portfolio_trades_total", {})->increment();
+    }
+
+    emit_event(PortfolioEventType::PositionClosed, symbol,
+               realized_pnl, cash_ledger_.available_cash,
+               "side=" + std::string(ps == PositionSide::Long ? "long" : "short") +
+               " close_price=" + std::to_string(close_price.get()) +
+               " pnl=" + std::to_string(realized_pnl));
+}
+
 double InMemoryPortfolioEngine::reduce_position(
     const Symbol& symbol, Quantity sold_qty,
     Price close_price, double realized_pnl)
 {
     std::lock_guard lock(mutex_);
 
-    auto it = positions_.find(symbol.get());
+    // Search both legs by composite key
+    auto it = positions_.find(symbol.get() + ":long");
+    if (it == positions_.end()) it = positions_.find(symbol.get() + ":short");
     if (it == positions_.end()) {
         logger_->warn("Portfolio", "Попытка уменьшить несуществующую позицию",
                       {{"symbol", symbol.get()}});
@@ -294,14 +377,119 @@ double InMemoryPortfolioEngine::reduce_position(
     return new_size;
 }
 
+double InMemoryPortfolioEngine::reduce_position(
+    const Symbol& symbol, PositionSide ps, Quantity sold_qty,
+    Price close_price, double realized_pnl)
+{
+    std::lock_guard lock(mutex_);
+
+    auto key = make_pos_key(symbol.get(), ps);
+    auto it = positions_.find(key);
+    if (it == positions_.end()) {
+        logger_->warn("Portfolio", "Попытка уменьшить несуществующую позицию (hedge)",
+                      {{"symbol", symbol.get()},
+                       {"side", ps == PositionSide::Long ? "long" : "short"}});
+        return 0.0;
+    }
+
+    auto& pos = it->second;
+    const double old_size = pos.size.get();
+    const double reduce_qty = std::min(sold_qty.get(), old_size);
+    const double new_size = old_size - reduce_qty;
+
+    realized_pnl_today_ += realized_pnl;
+    realized_pnl_gross_ += realized_pnl;
+
+    cash_ledger_.realized_pnl_net += realized_pnl;
+    cash_ledger_.realized_pnl_gross += realized_pnl;
+    cash_ledger_.total_cash += realized_pnl;
+    cash_ledger_.available_cash += realized_pnl;
+
+    if (new_size <= 1e-12) {
+        trades_today_++;
+        if (realized_pnl < 0.0) {
+            consecutive_losses_++;
+        } else if (realized_pnl > 0.0) {
+            consecutive_losses_ = 0;
+        }
+    }
+
+    if (new_size <= 1e-12) {
+        logger_->info("Portfolio", "Позиция полностью закрыта через reduce (hedge)",
+                      {{"symbol", symbol.get()},
+                       {"side", ps == PositionSide::Long ? "long" : "short"},
+                       {"close_price", std::to_string(close_price.get())},
+                       {"realized_pnl", std::to_string(realized_pnl)}});
+        positions_.erase(it);
+    } else {
+        pos.size = Quantity(new_size);
+        pos.current_price = close_price;
+        pos.notional = NotionalValue(new_size * close_price.get());
+        pos.updated_at = clock_->now();
+        recalculate_position_pnl(pos);
+
+        logger_->info("Portfolio", "Позиция частично уменьшена (hedge)",
+                      {{"symbol", symbol.get()},
+                       {"side", ps == PositionSide::Long ? "long" : "short"},
+                       {"sold_qty", std::to_string(reduce_qty)},
+                       {"remaining_size", std::to_string(new_size)},
+                       {"close_price", std::to_string(close_price.get())},
+                       {"realized_pnl", std::to_string(realized_pnl)}});
+    }
+
+    double current_equity = total_capital_ + realized_pnl_today_;
+    for (const auto& [_, p] : positions_) {
+        current_equity += p.unrealized_pnl;
+    }
+    if (current_equity > peak_equity_) {
+        peak_equity_ = current_equity;
+    }
+
+    if (metrics_) {
+        metrics_->gauge("portfolio_positions_count", {})->set(
+            static_cast<double>(positions_.size()));
+        if (new_size <= 1e-12) {
+            metrics_->counter("portfolio_trades_total", {})->increment();
+        }
+    }
+
+    emit_event(new_size <= 1e-12 ? PortfolioEventType::PositionClosed
+                                 : PortfolioEventType::PositionUpdated,
+               symbol, realized_pnl, cash_ledger_.available_cash,
+               "side=" + std::string(ps == PositionSide::Long ? "long" : "short") +
+               " reduce_qty=" + std::to_string(reduce_qty) +
+               " remaining=" + std::to_string(new_size) +
+               " close_price=" + std::to_string(close_price.get()) +
+               " pnl=" + std::to_string(realized_pnl));
+
+    return new_size;
+}
+
 void InMemoryPortfolioEngine::add_realized_pnl(double amount) {
     std::lock_guard lock(mutex_);
     realized_pnl_today_ += amount;
+
+    // Синхронизировать cash ledger для поддержания консистентности
+    cash_ledger_.realized_pnl_gross += amount;
+    cash_ledger_.realized_pnl_net += amount;
+    cash_ledger_.total_cash += amount;
+    cash_ledger_.available_cash += amount;
 }
 
 std::optional<Position> InMemoryPortfolioEngine::get_position(const Symbol& symbol) const {
     std::lock_guard lock(mutex_);
-    auto it = positions_.find(symbol.get());
+    // Search both legs (hedge mode)
+    auto it = positions_.find(symbol.get() + ":long");
+    if (it == positions_.end()) it = positions_.find(symbol.get() + ":short");
+    if (it == positions_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<Position> InMemoryPortfolioEngine::get_position(const Symbol& symbol, PositionSide ps) const {
+    std::lock_guard lock(mutex_);
+    auto it = positions_.find(make_pos_key(symbol.get(), ps));
     if (it == positions_.end()) {
         return std::nullopt;
     }
@@ -310,7 +498,8 @@ std::optional<Position> InMemoryPortfolioEngine::get_position(const Symbol& symb
 
 bool InMemoryPortfolioEngine::has_position(const Symbol& symbol) const {
     std::lock_guard lock(mutex_);
-    return positions_.contains(symbol.get());
+    return positions_.contains(symbol.get() + ":long") ||
+           positions_.contains(symbol.get() + ":short");
 }
 
 PortfolioSnapshot InMemoryPortfolioEngine::snapshot() const {
@@ -365,7 +554,7 @@ PortfolioSnapshot InMemoryPortfolioEngine::snapshot() const {
     double margin_used = snap.exposure.gross_exposure / leverage_;
 
     // Использование капитала (%)
-    if (total_capital_ > common::finance::kMinValidPrice) {
+    if (total_capital_ > numeric::kMinValidPrice) {
         snap.capital_utilization_pct = ((margin_used + cash_ledger_.reserved_for_orders) /
                                         total_capital_) * common::finance::kPercentScaler;
     }
@@ -388,6 +577,14 @@ PnlSummary InMemoryPortfolioEngine::pnl() const {
 void InMemoryPortfolioEngine::reset_daily() {
     std::lock_guard lock(mutex_);
 
+    // Вычис текущий equity до сброса (для корректного пересчёта base capital)
+    double total_unrealized = 0.0;
+    for (const auto& [_, pos] : positions_) {
+        total_unrealized += pos.unrealized_pnl;
+    }
+    double current_equity = total_capital_ + realized_pnl_today_ + total_unrealized;
+
+    // Сброс дневных счётчиков
     realized_pnl_today_ = 0.0;
     trades_today_ = 0;
     consecutive_losses_ = 0;
@@ -399,12 +596,17 @@ void InMemoryPortfolioEngine::reset_daily() {
     cash_ledger_.realized_pnl_gross = 0.0;
     cash_ledger_.realized_pnl_net = 0.0;
 
-    // Сбросить пик капитала к текущему уровню
-    double current_equity = total_capital_;
-    for (const auto& [_, pos] : positions_) {
-        current_equity += pos.unrealized_pnl;
-    }
+    // Пересчитать total_capital_ так, чтобы equity-инвариант сохранялся:
+    //   equity = total_capital_ + realized_today(=0) + unrealized
+    //   → total_capital_ = equity - unrealized
+    total_capital_ = current_equity - total_unrealized;
+
+    // Сбросить пик капитала к текущему equity
     peak_equity_ = current_equity;
+
+    // Обновить cash ledger
+    cash_ledger_.total_cash = total_capital_;
+    cash_ledger_.available_cash = total_capital_ - cash_ledger_.reserved_for_orders;
 
     emit_event(PortfolioEventType::DailyReset, Symbol(""), 0.0,
                cash_ledger_.available_cash, "daily counters reset");
@@ -412,25 +614,42 @@ void InMemoryPortfolioEngine::reset_daily() {
     logger_->info("Portfolio", "Дневные счётчики сброшены", {});
 }
 
-void InMemoryPortfolioEngine::set_capital(double capital) {
+void InMemoryPortfolioEngine::set_capital(double equity_from_exchange) {
     std::lock_guard lock(mutex_);
     double old_capital = total_capital_;
-    total_capital_ = capital;
-    // Сброс realized_pnl, т.к. новый капитал уже включает все реализованные P&L.
-    // Без сброса realized_pnl будет считаться дважды в compute_pnl().
-    realized_pnl_today_ = 0.0;
-    peak_equity_ = capital;
+
+    // ИСПРАВЛЕНИЕ C3: equity_from_exchange (usdtEquity) уже включает unrealized PnL и realized PnL.
+    // compute_pnl() отдельно добавляет realized_pnl_today_ и unrealized_pnl.
+    // Чтобы исключить двойной учёт, вычисляем базовый капитал:
+    //   total_capital_ = equity - realized_today - unrealized
+    // Тогда: compute_pnl().current_equity = total_capital_ + realized_today + unrealized = equity ✓
+    double total_unrealized = 0.0;
+    for (const auto& [_, pos] : positions_) {
+        total_unrealized += pos.unrealized_pnl;
+    }
+    total_capital_ = equity_from_exchange - realized_pnl_today_ - total_unrealized;
+
+    // НЕ сбрасываем realized_pnl_today_ — это внутридневной трекер, сброс обнулит историю.
+    // НЕ сбрасываем peak_equity_ вниз — обновляем только вверх.
+    if (equity_from_exchange > peak_equity_) {
+        peak_equity_ = equity_from_exchange;
+    }
 
     // Обновить cash ledger
-    cash_ledger_.total_cash = capital;
-    cash_ledger_.available_cash = capital - cash_ledger_.reserved_for_orders;
+    cash_ledger_.total_cash = total_capital_;
+    cash_ledger_.available_cash = total_capital_ - cash_ledger_.reserved_for_orders;
 
-    emit_event(PortfolioEventType::CapitalSynced, Symbol(""), capital,
+    emit_event(PortfolioEventType::CapitalSynced, Symbol(""), equity_from_exchange,
                cash_ledger_.available_cash,
-               "old=" + std::to_string(old_capital) + " new=" + std::to_string(capital));
+               "old_base=" + std::to_string(old_capital) +
+               " new_base=" + std::to_string(total_capital_) +
+               " exchange_equity=" + std::to_string(equity_from_exchange));
 
-    logger_->info("Portfolio", "Капитал обновлён (realized PnL сброшен)",
-                  {{"capital", std::to_string(capital)}});
+    logger_->info("Portfolio", "Капитал синхронизирован с биржей",
+                  {{"exchange_equity", std::to_string(equity_from_exchange)},
+                   {"base_capital", std::to_string(total_capital_)},
+                   {"unrealized_deducted", std::to_string(total_unrealized)},
+                   {"realized_today", std::to_string(realized_pnl_today_)}});
 }
 
 void InMemoryPortfolioEngine::set_leverage(double leverage) {
@@ -464,7 +683,7 @@ void InMemoryPortfolioEngine::recalculate_position_pnl(Position& pos) const {
 
     // Безопасный расчёт процента P&L с проверкой делителя
     const double entry_notional = entry * size;
-    if (entry_notional > common::finance::kMinValidPrice) {
+    if (entry_notional > numeric::kMinValidPrice) {
         pos.unrealized_pnl_pct = (pos.unrealized_pnl / entry_notional) * common::finance::kPercentScaler;
     } else {
         pos.unrealized_pnl_pct = 0.0;
@@ -490,7 +709,7 @@ ExposureSummary InMemoryPortfolioEngine::compute_exposure() const {
     // Для фьючерсов: exposure_pct считается от margin (notional / leverage),
     // а не от полного notional, чтобы корректно работать с CapitalExhausted.
     double margin_exposure = exp.gross_exposure / leverage_;
-    exp.exposure_pct = (total_capital_ > common::finance::kMinValidPrice)
+    exp.exposure_pct = (total_capital_ > numeric::kMinValidPrice)
         ? (margin_exposure / total_capital_) * common::finance::kPercentScaler
         : 0.0;
 
@@ -512,7 +731,7 @@ PnlSummary InMemoryPortfolioEngine::compute_pnl() const {    PnlSummary summary;
 
     // Текущая просадка от пика
     double current_equity = total_capital_ + summary.total_pnl;
-    if (peak_equity_ > common::finance::kMinValidPrice) {
+    if (peak_equity_ > numeric::kMinValidPrice) {
         summary.current_drawdown_pct = ((peak_equity_ - current_equity) / peak_equity_) * common::finance::kPercentScaler;
         summary.current_drawdown_pct = std::max(summary.current_drawdown_pct, 0.0);
     }
@@ -524,7 +743,7 @@ PnlSummary InMemoryPortfolioEngine::compute_pnl() const {    PnlSummary summary;
 
 bool InMemoryPortfolioEngine::reserve_cash(
     const OrderId& order_id, const Symbol& symbol,
-    double notional, double estimated_fee,
+    Side side, double notional, double estimated_fee,
     const StrategyId& strategy_id)
 {
     std::lock_guard lock(mutex_);
@@ -536,6 +755,7 @@ bool InMemoryPortfolioEngine::reserve_cash(
         logger_->warn("Portfolio", "Недостаточно cash для резервирования",
                       {{"order_id", order_id.get()},
                        {"symbol", symbol.get()},
+                       {"side", side == Side::Buy ? "Long" : "Short"},
                        {"required", std::to_string(total_required)},
                        {"available", std::to_string(cash_ledger_.available_cash)}});
         return false;
@@ -544,7 +764,7 @@ bool InMemoryPortfolioEngine::reserve_cash(
     PendingOrderInfo info;
     info.order_id = order_id;
     info.symbol = symbol;
-    info.side = Side::Buy;
+    info.side = side;
     info.reserved_cash = total_required;
     info.reserved_notional = notional;
     info.estimated_fee = estimated_fee;
@@ -565,6 +785,7 @@ bool InMemoryPortfolioEngine::reserve_cash(
     logger_->info("Portfolio", "Cash зарезервирован",
                   {{"order_id", order_id.get()},
                    {"symbol", symbol.get()},
+                   {"side", side == Side::Buy ? "Long" : "Short"},
                    {"reserved", std::to_string(total_required)},
                    {"available_after", std::to_string(cash_ledger_.available_cash)}});
 
@@ -724,15 +945,6 @@ void InMemoryPortfolioEngine::emit_event(
         event_log_.erase(event_log_.begin(),
                          event_log_.begin() + static_cast<std::ptrdiff_t>(event_log_.size() - kMaxEventLogSize));
     }
-}
-
-void InMemoryPortfolioEngine::recompute_cash_ledger() {
-    double reserved = 0.0;
-    for (const auto& [_, info] : pending_orders_) {
-        reserved += info.reserved_cash;
-    }
-    cash_ledger_.reserved_for_orders = reserved;
-    cash_ledger_.available_cash = cash_ledger_.total_cash - reserved;
 }
 
 } // namespace tb::portfolio

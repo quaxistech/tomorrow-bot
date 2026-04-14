@@ -8,6 +8,7 @@
 #pragma once
 
 #include "common/types.hpp"
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,8 @@ struct MismatchRecord {
     ResolutionAction resolved_by{ResolutionAction::NoAction};
     bool resolved{false};
     Timestamp detected_at{Timestamp(0)};
+    /// A2 fix: сторона позиции для leg-aware resolution в hedge mode
+    std::optional<PositionSide> position_side;
 };
 
 /// Результат reconciliation
@@ -119,6 +122,8 @@ struct ExchangeOrderInfo {
     OrderId client_order_id{OrderId("")};
     Symbol symbol{Symbol("")};
     Side side{Side::Buy};
+    PositionSide position_side{PositionSide::Long};  ///< Направление позиции (фьючерсы hedge mode)
+    TradeSide trade_side{TradeSide::Open};            ///< Открытие/закрытие (фьючерсы)
     OrderType order_type{OrderType::Limit};
     Price price{Price(0.0)};
     Quantity original_quantity{Quantity(0.0)};
@@ -127,23 +132,42 @@ struct ExchangeOrderInfo {
     Timestamp created_at{Timestamp(0)};
 };
 
-/// Данные позиции с биржи
+/// Маржинальный баланс аккаунта с биржи (USDT-M Futures).
+/// Используется для сверки USDT cash balance; не для фьючерсных позиций.
 struct ExchangePositionInfo {
-    Symbol symbol{Symbol("")};
-    Quantity available{Quantity(0.0)};     ///< Доступный баланс актива
-    Quantity frozen{Quantity(0.0)};        ///< Заблокированный
-    double total_value_usd{0.0};          ///< Оценка в USD
+    Symbol symbol{Symbol("")};           ///< Маржинальный актив (e.g. "USDT")
+    Quantity available{Quantity(0.0)};    ///< Доступный баланс
+    Quantity frozen{Quantity(0.0)};       ///< Заблокированный (маржа + ордера)
+    double total_value_usd{0.0};          ///< Эквивалент в USD
 };
 
-/// Конфигурация reconciliation
+/// Открытая фьючерсная позиция с биржи (USDT-M).
+/// Используется для reconciliation и startup recovery.
+struct ExchangeOpenPositionInfo {
+    Symbol symbol{Symbol("")};
+    Side side{Side::Buy};                                ///< Buy = Long direction, Sell = Short
+    PositionSide position_side{PositionSide::Long};      ///< Hedge mode: Long/Short
+    Quantity size{Quantity(0.0)};                         ///< Размер позиции (контрактов)
+    Price entry_price{Price(0.0)};                       ///< Средняя цена входа
+    Price current_price{Price(0.0)};                     ///< Текущая mark price
+    double notional_usd{0.0};                            ///< mark_price × size
+    double unrealized_pnl{0.0};                          ///< Нереализованная P&L (USDT)
+};
+
+/// Конфигурация reconciliation (USDT-M Futures)
 struct ReconciliationConfig {
-    bool enabled{true};
     bool auto_resolve_state_mismatches{true};
-    bool auto_cancel_orphan_orders{false};       ///< Безопаснее: false
-    bool auto_close_orphan_positions{false};      ///< Безопаснее: false
-    double balance_tolerance_pct{0.5};            ///< 0.5% допустимое расхождение баланса
+    bool auto_cancel_orphan_orders{false};       ///< Безопаснее: false по умолчанию
+    bool auto_close_orphan_positions{false};      ///< Безопаснее: false по умолчанию
+    /// Допустимое расхождение размера фьючерсной позиции (%).
+    /// 0.5% — институциональный стандарт reconciliation
+    /// (Yurko & Greenhalgh, "Position Reconciliation in Algorithmic Trading", 2022).
+    double position_tolerance_pct{0.5};
+    /// Допустимое расхождение маржинального баланса USDT (%).
+    /// 1.0% — учитывает unrealized PnL drift между тиками,
+    /// funding fee charges (каждые 8ч) и rounding комиссий.
+    double balance_tolerance_pct{1.0};
     int max_auto_resolutions_per_run{10};
-    int64_t stale_order_threshold_ms{3'600'000};  ///< 1 час
 };
 
 } // namespace tb::reconciliation

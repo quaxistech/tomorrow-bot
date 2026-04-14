@@ -19,6 +19,7 @@ class MockExchangeQueryService : public IExchangeQueryService {
 public:
     std::vector<ExchangeOrderInfo> open_orders_;
     std::vector<ExchangePositionInfo> account_balances_;
+    std::vector<ExchangeOpenPositionInfo> open_positions_;
     std::unordered_map<std::string, ExchangeOrderInfo> order_statuses_;
 
     Result<std::vector<ExchangeOrderInfo>>
@@ -29,6 +30,11 @@ public:
     Result<std::vector<ExchangePositionInfo>>
     get_account_balances() override {
         return account_balances_;
+    }
+
+    Result<std::vector<ExchangeOpenPositionInfo>>
+    get_open_positions(const Symbol& /*symbol*/) override {
+        return open_positions_;
     }
 
     Result<ExchangeOrderInfo>
@@ -43,15 +49,28 @@ public:
 
 // ========== Вспомогательные функции ==========
 
+inline ExchangeOpenPositionInfo make_exchange_position(
+    const std::string& symbol, Side side, double size, double entry_price = 50000.0) {
+    ExchangeOpenPositionInfo pos;
+    pos.symbol = Symbol(symbol);
+    pos.side = side;
+    pos.position_side = (side == Side::Buy) ? PositionSide::Long : PositionSide::Short;
+    pos.size = Quantity(size);
+    pos.entry_price = Price(entry_price);
+    pos.current_price = Price(entry_price);
+    pos.notional_usd = entry_price * size;
+    pos.unrealized_pnl = 0.0;
+    return pos;
+}
+
 inline ReconciliationConfig make_default_config() {
     ReconciliationConfig cfg;
-    cfg.enabled = true;
     cfg.auto_resolve_state_mismatches = true;
     cfg.auto_cancel_orphan_orders = true;
     cfg.auto_close_orphan_positions = true;
+    cfg.position_tolerance_pct = 0.5;
     cfg.balance_tolerance_pct = 1.0;
     cfg.max_auto_resolutions_per_run = 10;
-    cfg.stale_order_threshold_ms = 60000;
     return cfg;
 }
 
@@ -219,6 +238,33 @@ TEST_CASE("ReconciliationEngine: обнаружение расхождения �
     REQUIRE(found_balance);
 }
 
+TEST_CASE("ReconciliationEngine: баланс сверяется по equity, а не по available", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // Для USDT-M Futures available уменьшается на margin открытых позиций,
+    // но local_cash синхронизируется из полного usdtEquity.
+    ExchangePositionInfo usdt;
+    usdt.symbol = Symbol("USDT");
+    usdt.available = Quantity(8000.0);
+    usdt.frozen = Quantity(1000.0);
+    usdt.total_value_usd = 12000.0;
+    exchange->account_balances_ = {usdt};
+    exchange->open_orders_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {}, 12000.0);
+
+    bool found_balance = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::BalanceMismatch) {
+            found_balance = true;
+            break;
+        }
+    }
+    REQUIRE_FALSE(found_balance);
+}
+
 TEST_CASE("ReconciliationEngine: авто-разрешение расхождений", "[reconciliation]") {
     auto [logger, clk, metrics, exchange] = make_engine_deps();
 
@@ -249,4 +295,186 @@ TEST_CASE("ReconciliationEngine: авто-разрешение расхожде�
     if (!result.mismatches.empty()) {
         CHECK(result.auto_resolved > 0);
     }
+}
+
+// ========== Тесты фьючерсных позиций ==========
+
+TEST_CASE("ReconciliationEngine: фьючерсные позиции совпадают", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // Локальная позиция: BTCUSDT Long 0.01
+    portfolio::Position local_pos;
+    local_pos.symbol = Symbol("BTCUSDT");
+    local_pos.side = Side::Buy;
+    local_pos.size = Quantity(0.01);
+    local_pos.avg_entry_price = Price(60000.0);
+
+    // Биржевая позиция совпадает
+    exchange->open_positions_ = {make_exchange_position("BTCUSDT", Side::Buy, 0.01, 60000.0)};
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {local_pos}, 0.0);
+
+    // Не должно быть расхождений позиций
+    bool has_position_mismatch = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::PositionExistsOnlyLocally ||
+            m.type == MismatchType::PositionExistsOnlyOnExchange ||
+            m.type == MismatchType::QuantityMismatch) {
+            has_position_mismatch = true;
+            break;
+        }
+    }
+    REQUIRE_FALSE(has_position_mismatch);
+}
+
+TEST_CASE("ReconciliationEngine: фьючерсная позиция только локально", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    portfolio::Position local_pos;
+    local_pos.symbol = Symbol("ETHUSDT");
+    local_pos.side = Side::Sell;
+    local_pos.size = Quantity(0.5);
+
+    // На бирже позиций нет
+    exchange->open_positions_ = {};
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {local_pos}, 0.0);
+
+    bool found = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::PositionExistsOnlyLocally &&
+            m.symbol.get() == "ETHUSDT") {
+            found = true;
+            CHECK(m.description.find("Short") != std::string::npos);
+            break;
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("ReconciliationEngine: фьючерсная позиция только на бирже", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // На бирже есть позиция, локально — нет
+    exchange->open_positions_ = {make_exchange_position("BTCUSDT", Side::Buy, 0.005, 62000.0)};
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {}, 0.0);
+
+    bool found = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::PositionExistsOnlyOnExchange &&
+            m.symbol.get() == "BTCUSDT") {
+            found = true;
+            CHECK(m.description.find("Long") != std::string::npos);
+            CHECK(m.description.find("62000") != std::string::npos);
+            break;
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("ReconciliationEngine: расхождение размера фьючерсной позиции", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // Локально 0.01, на бирже 0.02 — разница 100% > 0.5%
+    portfolio::Position local_pos;
+    local_pos.symbol = Symbol("BTCUSDT");
+    local_pos.side = Side::Buy;
+    local_pos.size = Quantity(0.01);
+
+    exchange->open_positions_ = {make_exchange_position("BTCUSDT", Side::Buy, 0.02)};
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {local_pos}, 0.0);
+
+    bool found = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::QuantityMismatch &&
+            m.symbol.get() == "BTCUSDT") {
+            found = true;
+            break;
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("ReconciliationEngine: hedge mode — Long и Short по одному символу", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // Две локальные позиции: BTCUSDT Long 0.01 + BTCUSDT Short 0.005
+    portfolio::Position long_pos;
+    long_pos.symbol = Symbol("BTCUSDT");
+    long_pos.side = Side::Buy;
+    long_pos.size = Quantity(0.01);
+
+    portfolio::Position short_pos;
+    short_pos.symbol = Symbol("BTCUSDT");
+    short_pos.side = Side::Sell;
+    short_pos.size = Quantity(0.005);
+
+    // На бирже тоже обе позиции
+    exchange->open_positions_ = {
+        make_exchange_position("BTCUSDT", Side::Buy, 0.01),
+        make_exchange_position("BTCUSDT", Side::Sell, 0.005)
+    };
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {long_pos, short_pos}, 0.0);
+
+    // Не должно быть расхождений позиций — обе совпадают при hedge mode matching
+    bool has_position_mismatch = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::PositionExistsOnlyLocally ||
+            m.type == MismatchType::PositionExistsOnlyOnExchange ||
+            m.type == MismatchType::QuantityMismatch) {
+            has_position_mismatch = true;
+            break;
+        }
+    }
+    REQUIRE_FALSE(has_position_mismatch);
+}
+
+TEST_CASE("ReconciliationEngine: позиция в пределах допуска не вызывает mismatch", "[reconciliation]") {
+    auto [logger, clk, metrics, exchange] = make_engine_deps();
+
+    // Разница 0.3% < position_tolerance_pct (0.5%)
+    portfolio::Position local_pos;
+    local_pos.symbol = Symbol("BTCUSDT");
+    local_pos.side = Side::Buy;
+    local_pos.size = Quantity(1.000);
+
+    exchange->open_positions_ = {make_exchange_position("BTCUSDT", Side::Buy, 1.003)};
+    exchange->open_orders_ = {};
+    exchange->account_balances_ = {};
+
+    ReconciliationEngine engine(make_default_config(), exchange, logger, clk, metrics);
+
+    auto result = engine.reconcile_on_startup({}, {local_pos}, 0.0);
+
+    bool has_qty_mismatch = false;
+    for (const auto& m : result.mismatches) {
+        if (m.type == MismatchType::QuantityMismatch) {
+            has_qty_mismatch = true;
+            break;
+        }
+    }
+    REQUIRE_FALSE(has_qty_mismatch);
 }

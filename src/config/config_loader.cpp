@@ -100,7 +100,7 @@ YamlConfigLoader::parse_yaml_flat(std::string_view content) {
     std::unordered_map<std::string, std::string> result;
     std::istringstream stream{std::string(content)};
     std::string line;
-    std::string current_section;
+    std::vector<std::pair<int, std::string>> section_stack;
 
     while (std::getline(stream, line)) {
         // Пропускаем комментарии и пустые строки
@@ -112,14 +112,25 @@ YamlConfigLoader::parse_yaml_flat(std::string_view content) {
 
         if (key.empty()) continue;
 
-        if (value.empty() && indent == 0) {
-            // Это заголовок секции
-            current_section = key;
+        while (!section_stack.empty() && indent <= section_stack.back().first) {
+            section_stack.pop_back();
+        }
+
+        if (value.empty()) {
+            // Это заголовок секции любого уровня вложенности.
+            section_stack.emplace_back(indent, key);
         } else {
-            // Это значение
-            std::string full_key = current_section.empty()
-                ? key
-                : current_section + "." + key;
+            std::string full_key;
+            for (const auto& [_, section] : section_stack) {
+                if (!full_key.empty()) {
+                    full_key += ".";
+                }
+                full_key += section;
+            }
+            if (!full_key.empty()) {
+                full_key += ".";
+            }
+            full_key += key;
             result[full_key] = value;
         }
     }
@@ -158,12 +169,63 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     AppConfig cfg;
     cfg.config_hash = hash;
 
+    // Список ошибок парсинга для fail-fast
+    std::vector<std::string> parse_errors;
+
+    // Безопасный парсинг double с fail-fast: при ошибке парсинга добавляет ошибку
+    auto parse_double = [&parse_errors](const std::string& s, double def, const char* field_name = "") -> double {
+        if (s.empty()) return def; // ключ отсутствует — default ОК
+        try { return std::stod(s); }
+        catch (...) {
+            std::string msg = std::string("Невалидное значение для '") + field_name +
+                              "': '" + s + "' (ожидалось число)";
+            parse_errors.push_back(msg);
+            std::fprintf(stderr, "[config_loader] ERROR: %s\n", msg.c_str());
+            return def;
+        }
+    };
+
+    // Безопасный парсинг int с fail-fast
+    auto parse_int = [&parse_errors](const std::string& s, int def, const char* field_name) -> int {
+        if (s.empty()) return def;
+        try { return std::stoi(s); }
+        catch (...) {
+            std::string msg = std::string("Невалидное значение для '") + field_name +
+                              "': '" + s + "' (ожидалось целое число)";
+            parse_errors.push_back(msg);
+            std::fprintf(stderr, "[config_loader] ERROR: %s\n", msg.c_str());
+            return def;
+        }
+    };
+
+    // Универсальный парсинг bool: true/1/yes → true; false/0/no → false; иначе — ошибка
+    auto parse_bool = [&parse_errors](const std::string& s, bool def, const char* field_name) -> bool {
+        if (s.empty()) return def;
+        std::string lower = s;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == "true" || lower == "1" || lower == "yes") return true;
+        if (lower == "false" || lower == "0" || lower == "no") return false;
+        std::string msg = std::string("Невалидное значение для '") + field_name +
+                          "': '" + s + "' (ожидалось true/false/1/0/yes/no)";
+        parse_errors.push_back(msg);
+        std::fprintf(stderr, "[config_loader] ERROR: %s\n", msg.c_str());
+        return def;
+    };
+
     // Секция trading
-    auto mode_str = get_value(kv, "trading.mode", "paper");
+    auto mode_str = get_value(kv, "trading.mode", "production");
     auto mode = trading_mode_from_string(mode_str);
-    cfg.trading.mode = mode.value_or(TradingMode::Paper);
-    cfg.trading.initial_capital = std::stod(
-        get_value(kv, "trading.initial_capital", "10000.0"));
+    // ИСПРАВЛЕНИЕ H11: неизвестный mode не должен тихо подставлять Production.
+    // Если пользователь указал несуществующий режим (backtesting, testnet и т.д.),
+    // бот НЕ должен запускаться — иначе он будет торговать реальными деньгами.
+    if (!mode.has_value()) {
+        throw std::runtime_error(
+            "Неподдерживаемый trading.mode: '" + mode_str +
+            "'. Допустимые значения: paper, production");
+    }
+    cfg.trading.mode = mode.value();
+    cfg.trading.initial_capital = parse_double(
+        get_value(kv, "trading.initial_capital", "10000.0"), 10000.0, "trading.initial_capital");
 
     // Секция exchange
     cfg.exchange.endpoint_rest  = get_value(kv, "exchange.endpoint_rest",  "https://api.bitget.com");
@@ -172,99 +234,60 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.exchange.api_secret_ref = get_value(kv, "exchange.api_secret_ref", "BITGET_API_SECRET");
     cfg.exchange.passphrase_ref = get_value(kv, "exchange.passphrase_ref", "BITGET_PASSPHRASE");
     auto timeout_str = get_value(kv, "exchange.timeout_ms", "5000");
-    try {
-        cfg.exchange.timeout_ms = std::stoi(timeout_str);
-    } catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать exchange.timeout_ms (value='%s'), default=5000\n", timeout_str.c_str());
-        cfg.exchange.timeout_ms = 5000;
-    }
+    cfg.exchange.timeout_ms = parse_int(timeout_str, 5000, "exchange.timeout_ms");
 
     // Секция logging
     cfg.logging.level            = get_value(kv, "logging.level",           "info");
     cfg.logging.output_path      = get_value(kv, "logging.output_path",     "-");
     auto json_str = get_value(kv, "logging.structured_json", "false");
-    cfg.logging.structured_json  = (json_str == "true" || json_str == "1");
+    cfg.logging.structured_json  = parse_bool(json_str, false, "logging.structured_json");
 
     // Секция metrics
     auto metrics_enabled_str = get_value(kv, "metrics.enabled", "true");
-    cfg.metrics.enabled = (metrics_enabled_str != "false" && metrics_enabled_str != "0");
+    cfg.metrics.enabled = parse_bool(metrics_enabled_str, true, "metrics.enabled");
     auto metrics_port_str = get_value(kv, "metrics.port", "9090");
-    try {
-        cfg.metrics.port = std::stoi(metrics_port_str);
-    } catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать metrics.port (value='%s'), default=9090\n", metrics_port_str.c_str());
-        cfg.metrics.port = 9090;
-    }
+    cfg.metrics.port = parse_int(metrics_port_str, 9090, "metrics.port");
     cfg.metrics.path = get_value(kv, "metrics.path", "/metrics");
 
     // Секция risk
-    auto parse_double = [](const std::string& s, double def, const char* field_name = "") -> double {
-        try { return std::stod(s); }
-        catch (...) {
-            if (field_name[0] != '\0') {
-                std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать '%s' (value='%s'), используется default=%.6g\n",
-                              field_name, s.c_str(), def);
-            }
-            return def;
-        }
-    };
     cfg.risk.max_position_notional = parse_double(get_value(kv, "risk.max_position_notional", "10000"), 10000.0, "risk.max_position_notional");
     cfg.risk.max_daily_loss_pct    = parse_double(get_value(kv, "risk.max_daily_loss_pct",    "2.0"),   2.0, "risk.max_daily_loss_pct");
     cfg.risk.max_drawdown_pct      = parse_double(get_value(kv, "risk.max_drawdown_pct",      "5.0"),   5.0, "risk.max_drawdown_pct");
+    cfg.risk.max_intraday_drawdown_pct = parse_double(get_value(kv, "risk.max_intraday_drawdown_pct", "3.0"), 3.0, "risk.max_intraday_drawdown_pct");
     auto ks_str = get_value(kv, "risk.kill_switch_enabled", "true");
-    cfg.risk.kill_switch_enabled   = (ks_str != "false" && ks_str != "0");
+    cfg.risk.kill_switch_enabled   = parse_bool(ks_str, true, "risk.kill_switch_enabled");
 
     // Расширенные параметры риска (desk-grade)
     cfg.risk.max_strategy_daily_loss_pct   = parse_double(get_value(kv, "risk.max_strategy_daily_loss_pct",   "1.5"),  1.5, "risk.max_strategy_daily_loss_pct");
     cfg.risk.max_strategy_exposure_pct     = parse_double(get_value(kv, "risk.max_strategy_exposure_pct",     "30.0"), 30.0, "risk.max_strategy_exposure_pct");
     cfg.risk.max_symbol_concentration_pct  = parse_double(get_value(kv, "risk.max_symbol_concentration_pct",  "35.0"), 35.0, "risk.max_symbol_concentration_pct");
     auto sdp_str = get_value(kv, "risk.max_same_direction_positions", "3");
-    try { cfg.risk.max_same_direction_positions = std::stoi(sdp_str); }
-    catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать risk.max_same_direction_positions (value='%s'), default=3\n", sdp_str.c_str());
-        cfg.risk.max_same_direction_positions = 3;
-    }
+    cfg.risk.max_same_direction_positions = parse_int(sdp_str, 3, "risk.max_same_direction_positions");
     auto ral_str = get_value(kv, "risk.regime_aware_limits_enabled", "true");
-    cfg.risk.regime_aware_limits_enabled   = (ral_str != "false" && ral_str != "0");
+    cfg.risk.regime_aware_limits_enabled   = parse_bool(ral_str, true, "risk.regime_aware_limits_enabled");
     cfg.risk.stress_regime_scale           = parse_double(get_value(kv, "risk.stress_regime_scale",           "0.5"),  0.5, "risk.stress_regime_scale");
     cfg.risk.trending_regime_scale         = parse_double(get_value(kv, "risk.trending_regime_scale",         "1.2"),  1.2, "risk.trending_regime_scale");
     cfg.risk.chop_regime_scale             = parse_double(get_value(kv, "risk.chop_regime_scale",             "0.7"),  0.7, "risk.chop_regime_scale");
     auto tph_str = get_value(kv, "risk.max_trades_per_hour", "8");
-    try { cfg.risk.max_trades_per_hour = std::stoi(tph_str); }
-    catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать risk.max_trades_per_hour (value='%s'), default=8\n", tph_str.c_str());
-        cfg.risk.max_trades_per_hour = 8;
-    }
+    cfg.risk.max_trades_per_hour = parse_int(tph_str, 8, "risk.max_trades_per_hour");
     cfg.risk.min_trade_interval_sec        = parse_double(get_value(kv, "risk.min_trade_interval_sec",        "30.0"), 30.0, "risk.min_trade_interval_sec");
     cfg.risk.max_adverse_excursion_pct     = parse_double(get_value(kv, "risk.max_adverse_excursion_pct",     "3.0"),  3.0, "risk.max_adverse_excursion_pct");
     cfg.risk.max_realized_daily_loss_pct   = parse_double(get_value(kv, "risk.max_realized_daily_loss_pct",   "1.5"),  1.5, "risk.max_realized_daily_loss_pct");
     auto cutoff_str = get_value(kv, "risk.utc_cutoff_hour", "-1");
-    try { cfg.risk.utc_cutoff_hour = std::stoi(cutoff_str); }
-    catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать risk.utc_cutoff_hour (value='%s'), default=-1\n", cutoff_str.c_str());
-        cfg.risk.utc_cutoff_hour = -1;
-    }
+    cfg.risk.utc_cutoff_hour = parse_int(cutoff_str, -1, "risk.utc_cutoff_hour");
 
     // Секция pair_selection
     auto ps_mode_str = get_value(kv, "pair_selection.mode", "auto");
     cfg.pair_selection.mode = (ps_mode_str == "manual")
         ? PairSelectionMode::Manual : PairSelectionMode::Auto;
     auto top_n_str = get_value(kv, "pair_selection.top_n", "5");
-    try { cfg.pair_selection.top_n = std::stoi(top_n_str); }
-    catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать pair_selection.top_n (value='%s'), default=5\n", top_n_str.c_str());
-        cfg.pair_selection.top_n = 5;
-    }
+    cfg.pair_selection.top_n = parse_int(top_n_str, 5, "pair_selection.top_n");
     cfg.pair_selection.min_volume_usdt = parse_double(
         get_value(kv, "pair_selection.min_volume_usdt", "500000"), 500000.0, "pair_selection.min_volume_usdt");
     cfg.pair_selection.max_spread_bps = parse_double(
         get_value(kv, "pair_selection.max_spread_bps", "50"), 50.0, "pair_selection.max_spread_bps");
     auto rotation_str = get_value(kv, "pair_selection.rotation_interval_hours", "24");
-    try { cfg.pair_selection.rotation_interval_hours = std::stoi(rotation_str); }
-    catch (...) {
-        std::fprintf(stderr, "[config_loader] WARN: не удалось разобрать pair_selection.rotation_interval_hours (value='%s'), default=24\n", rotation_str.c_str());
-        cfg.pair_selection.rotation_interval_hours = 24;
-    }
+    cfg.pair_selection.rotation_interval_hours = parse_int(rotation_str, 24, "pair_selection.rotation_interval_hours");
 
     // Парсинг comma-separated списков (manual_symbols, blacklist)
     auto parse_list = [](const std::string& s) -> std::vector<std::string> {
@@ -286,41 +309,32 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "pair_selection.blacklist", ""));
 
     // Расширенные настройки pair_selection
-    auto max_cand_str = get_value(kv, "pair_selection.max_candidates_for_candles", "30");
-    try { cfg.pair_selection.max_candidates_for_candles = std::stoi(max_cand_str); }
-    catch (...) { cfg.pair_selection.max_candidates_for_candles = 30; }
-    auto candle_conc_str = get_value(kv, "pair_selection.candle_fetch_concurrency", "5");
-    try { cfg.pair_selection.candle_fetch_concurrency = std::stoi(candle_conc_str); }
-    catch (...) { cfg.pair_selection.candle_fetch_concurrency = 5; }
-    auto candle_hist_str = get_value(kv, "pair_selection.candle_history_hours", "48");
-    try { cfg.pair_selection.candle_history_hours = std::stoi(candle_hist_str); }
-    catch (...) { cfg.pair_selection.candle_history_hours = 48; }
-    auto scan_to_str = get_value(kv, "pair_selection.scan_timeout_ms", "60000");
-    try { cfg.pair_selection.scan_timeout_ms = std::stoi(scan_to_str); }
-    catch (...) { cfg.pair_selection.scan_timeout_ms = 60000; }
-    auto api_retry_str = get_value(kv, "pair_selection.api_retry_max", "3");
-    try { cfg.pair_selection.api_retry_max = std::stoi(api_retry_str); }
-    catch (...) { cfg.pair_selection.api_retry_max = 3; }
-    auto api_retry_delay_str = get_value(kv, "pair_selection.api_retry_base_delay_ms", "200");
-    try { cfg.pair_selection.api_retry_base_delay_ms = std::stoi(api_retry_delay_str); }
-    catch (...) { cfg.pair_selection.api_retry_base_delay_ms = 200; }
-    auto cb_thr_str = get_value(kv, "pair_selection.circuit_breaker_threshold", "5");
-    try { cfg.pair_selection.circuit_breaker_threshold = std::stoi(cb_thr_str); }
-    catch (...) { cfg.pair_selection.circuit_breaker_threshold = 5; }
-    auto cb_reset_str = get_value(kv, "pair_selection.circuit_breaker_reset_ms", "300000");
-    try { cfg.pair_selection.circuit_breaker_reset_ms = std::stoi(cb_reset_str); }
-    catch (...) { cfg.pair_selection.circuit_breaker_reset_ms = 300000; }
+    cfg.pair_selection.max_candidates_for_candles = parse_int(
+        get_value(kv, "pair_selection.max_candidates_for_candles", "30"), 30, "pair_selection.max_candidates_for_candles");
+    cfg.pair_selection.candle_fetch_concurrency = parse_int(
+        get_value(kv, "pair_selection.candle_fetch_concurrency", "5"), 5, "pair_selection.candle_fetch_concurrency");
+    cfg.pair_selection.candle_history_hours = parse_int(
+        get_value(kv, "pair_selection.candle_history_hours", "48"), 48, "pair_selection.candle_history_hours");
+    cfg.pair_selection.scan_timeout_ms = parse_int(
+        get_value(kv, "pair_selection.scan_timeout_ms", "60000"), 60000, "pair_selection.scan_timeout_ms");
+    cfg.pair_selection.api_retry_max = parse_int(
+        get_value(kv, "pair_selection.api_retry_max", "3"), 3, "pair_selection.api_retry_max");
+    cfg.pair_selection.api_retry_base_delay_ms = parse_int(
+        get_value(kv, "pair_selection.api_retry_base_delay_ms", "200"), 200, "pair_selection.api_retry_base_delay_ms");
+    cfg.pair_selection.circuit_breaker_threshold = parse_int(
+        get_value(kv, "pair_selection.circuit_breaker_threshold", "5"), 5, "pair_selection.circuit_breaker_threshold");
+    cfg.pair_selection.circuit_breaker_reset_ms = parse_int(
+        get_value(kv, "pair_selection.circuit_breaker_reset_ms", "300000"), 300000, "pair_selection.circuit_breaker_reset_ms");
     cfg.pair_selection.max_correlation_in_basket = parse_double(
         get_value(kv, "pair_selection.max_correlation_in_basket", "0.85"), 0.85, "pair_selection.max_correlation_in_basket");
-    auto mpp_str = get_value(kv, "pair_selection.max_pairs_per_sector", "2");
-    try { cfg.pair_selection.max_pairs_per_sector = std::stoi(mpp_str); }
-    catch (...) { cfg.pair_selection.max_pairs_per_sector = 2; }
+    cfg.pair_selection.max_pairs_per_sector = parse_int(
+        get_value(kv, "pair_selection.max_pairs_per_sector", "2"), 2, "pair_selection.max_pairs_per_sector");
     cfg.pair_selection.min_liquidity_depth_usdt = parse_double(
         get_value(kv, "pair_selection.min_liquidity_depth_usdt", "50000"), 50000.0, "pair_selection.min_liquidity_depth_usdt");
-    auto div_str = get_value(kv, "pair_selection.enable_diversification", "true");
-    cfg.pair_selection.enable_diversification = (div_str != "false" && div_str != "0");
-    auto persist_scan_str = get_value(kv, "pair_selection.persist_scan_results", "true");
-    cfg.pair_selection.persist_scan_results = (persist_scan_str != "false" && persist_scan_str != "0");
+    cfg.pair_selection.enable_diversification = parse_bool(
+        get_value(kv, "pair_selection.enable_diversification", "true"), true, "pair_selection.enable_diversification");
+    cfg.pair_selection.persist_scan_results = parse_bool(
+        get_value(kv, "pair_selection.persist_scan_results", "true"), true, "pair_selection.persist_scan_results");
 
     // ScorerConfig (вложенный в pair_selection)
     auto& sc = cfg.pair_selection.scorer;
@@ -356,60 +370,59 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     sc.steady_gainer_max = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_max", "10.0"), 10.0, "pair_selection.scorer_steady_gainer_max");
     sc.steady_gainer_bonus = parse_double(get_value(kv, "pair_selection.scorer_steady_gainer_bonus", "8.0"), 8.0, "pair_selection.scorer_steady_gainer_bonus");
     sc.negative_change_penalty = parse_double(get_value(kv, "pair_selection.scorer_negative_change_penalty", "0.5"), 0.5, "pair_selection.scorer_negative_change_penalty");
-    auto scorer_futures_str = get_value(kv, "pair_selection.scorer_futures_mode", "false");
-    sc.futures_mode = (scorer_futures_str != "false" && scorer_futures_str != "0");
 
     // ============================================================
     // Decision Engine
     // ============================================================
     cfg.decision.min_conviction_threshold = parse_double(
-        get_value(kv, "decision.min_conviction_threshold", "0.28"), 0.28, "decision.min_conviction_threshold");
+        get_value(kv, "decision.min_conviction_threshold", "0.45"), 0.45, "decision.min_conviction_threshold");
     cfg.decision.conflict_dominance_threshold = parse_double(
         get_value(kv, "decision.conflict_dominance_threshold", "0.60"), 0.60, "decision.conflict_dominance_threshold");
 
     // Advanced decision features
-    cfg.decision.enable_regime_threshold_scaling = (
-        get_value(kv, "decision.enable_regime_threshold_scaling", "true") != "false");
-    cfg.decision.enable_regime_dominance_scaling = (
-        get_value(kv, "decision.enable_regime_dominance_scaling", "true") != "false");
-    cfg.decision.enable_time_decay = (
-        get_value(kv, "decision.enable_time_decay", "true") != "false");
+    cfg.decision.enable_regime_threshold_scaling = parse_bool(
+        get_value(kv, "decision.enable_regime_threshold_scaling", "true"), true, "decision.enable_regime_threshold_scaling");
+    cfg.decision.enable_regime_dominance_scaling = parse_bool(
+        get_value(kv, "decision.enable_regime_dominance_scaling", "true"), true, "decision.enable_regime_dominance_scaling");
+    cfg.decision.enable_time_decay = parse_bool(
+        get_value(kv, "decision.enable_time_decay", "true"), true, "decision.enable_time_decay");
     cfg.decision.time_decay_halflife_ms = parse_double(
-        get_value(kv, "decision.time_decay_halflife_ms", "700"), 700.0, "decision.time_decay_halflife_ms");
-    cfg.decision.enable_ensemble_conviction = (
-        get_value(kv, "decision.enable_ensemble_conviction", "true") != "false");
+        get_value(kv, "decision.time_decay_halflife_ms", "500"), 500.0, "decision.time_decay_halflife_ms");
+    cfg.decision.enable_ensemble_conviction = parse_bool(
+        get_value(kv, "decision.enable_ensemble_conviction", "true"), true, "decision.enable_ensemble_conviction");
     cfg.decision.ensemble_agreement_bonus = parse_double(
-        get_value(kv, "decision.ensemble_agreement_bonus", "0.08"), 0.08, "decision.ensemble_agreement_bonus");
+        get_value(kv, "decision.ensemble_agreement_bonus", "0.06"), 0.06, "decision.ensemble_agreement_bonus");
     cfg.decision.ensemble_max_bonus = parse_double(
-        get_value(kv, "decision.ensemble_max_bonus", "0.20"), 0.20, "decision.ensemble_max_bonus");
-    cfg.decision.enable_portfolio_awareness = (
-        get_value(kv, "decision.enable_portfolio_awareness", "true") != "false");
+        get_value(kv, "decision.ensemble_max_bonus", "0.15"), 0.15, "decision.ensemble_max_bonus");
+    cfg.decision.enable_portfolio_awareness = parse_bool(
+        get_value(kv, "decision.enable_portfolio_awareness", "true"), true, "decision.enable_portfolio_awareness");
     cfg.decision.drawdown_boost_scale = parse_double(
-        get_value(kv, "decision.drawdown_boost_scale", "0.10"), 0.10, "decision.drawdown_boost_scale");
+        get_value(kv, "decision.drawdown_boost_scale", "0.02"), 0.02, "decision.drawdown_boost_scale");
     cfg.decision.drawdown_max_boost = parse_double(
-        get_value(kv, "decision.drawdown_max_boost", "0.25"), 0.25, "decision.drawdown_max_boost");
+        get_value(kv, "decision.drawdown_max_boost", "0.08"), 0.08, "decision.drawdown_max_boost");
     cfg.decision.consecutive_loss_boost = parse_double(
-        get_value(kv, "decision.consecutive_loss_boost", "0.03"), 0.03, "decision.consecutive_loss_boost");
-    cfg.decision.enable_execution_cost_modeling = (
-        get_value(kv, "decision.enable_execution_cost_modeling", "true") != "false");
+        get_value(kv, "decision.consecutive_loss_boost", "0.005"), 0.005, "decision.consecutive_loss_boost");
+    cfg.decision.enable_execution_cost_modeling = parse_bool(
+        get_value(kv, "decision.enable_execution_cost_modeling", "true"), true, "decision.enable_execution_cost_modeling");
     cfg.decision.max_acceptable_cost_bps = parse_double(
-        get_value(kv, "decision.max_acceptable_cost_bps", "80"), 80.0, "decision.max_acceptable_cost_bps");
-    cfg.decision.enable_time_skew_detection = (
-        get_value(kv, "decision.enable_time_skew_detection", "true") != "false");
+        get_value(kv, "decision.max_acceptable_cost_bps", "50"), 50.0, "decision.max_acceptable_cost_bps");
+    cfg.decision.enable_time_skew_detection = parse_bool(
+        get_value(kv, "decision.enable_time_skew_detection", "true"), true, "decision.enable_time_skew_detection");
 
     // ============================================================
     // Trading Params (position management)
+    // Defaults match TradingParamsConfig struct for USDT-M futures scalping.
     // ============================================================
     cfg.trading_params.atr_stop_multiplier = parse_double(
         get_value(kv, "trading_params.atr_stop_multiplier", "2.0"), 2.0, "trading_params.atr_stop_multiplier");
     cfg.trading_params.max_loss_per_trade_pct = parse_double(
         get_value(kv, "trading_params.max_loss_per_trade_pct", "1.0"), 1.0, "trading_params.max_loss_per_trade_pct");
     cfg.trading_params.price_stop_loss_pct = parse_double(
-        get_value(kv, "trading_params.price_stop_loss_pct", "3.0"), 3.0, "trading_params.price_stop_loss_pct");
+        get_value(kv, "trading_params.price_stop_loss_pct", "1.5"), 1.5, "trading_params.price_stop_loss_pct");
     cfg.trading_params.min_risk_reward_ratio = parse_double(
-        get_value(kv, "trading_params.min_risk_reward_ratio", "1.5"), 1.5, "trading_params.min_risk_reward_ratio");
+        get_value(kv, "trading_params.min_risk_reward_ratio", "0.8"), 0.8, "trading_params.min_risk_reward_ratio");
     cfg.trading_params.breakeven_atr_threshold = parse_double(
-        get_value(kv, "trading_params.breakeven_atr_threshold", "1.5"), 1.5, "trading_params.breakeven_atr_threshold");
+        get_value(kv, "trading_params.breakeven_atr_threshold", "0.8"), 0.8, "trading_params.breakeven_atr_threshold");
     cfg.trading_params.partial_tp_atr_threshold = parse_double(
         get_value(kv, "trading_params.partial_tp_atr_threshold", "2.0"), 2.0, "trading_params.partial_tp_atr_threshold");
     cfg.trading_params.partial_tp_fraction = parse_double(
@@ -419,11 +432,31 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.trading_params.max_hold_absolute_minutes = static_cast<int>(parse_double(
         get_value(kv, "trading_params.max_hold_absolute_minutes", "60"), 60, "trading_params.max_hold_absolute_minutes"));
     cfg.trading_params.min_hold_minutes = static_cast<int>(parse_double(
-        get_value(kv, "trading_params.min_hold_minutes", "30"), 30, "trading_params.min_hold_minutes"));
+        get_value(kv, "trading_params.min_hold_minutes", "1"), 1, "trading_params.min_hold_minutes"));
     cfg.trading_params.order_cooldown_seconds = static_cast<int>(parse_double(
         get_value(kv, "trading_params.order_cooldown_seconds", "10"), 10, "trading_params.order_cooldown_seconds"));
     cfg.trading_params.stop_loss_cooldown_seconds = static_cast<int>(parse_double(
-        get_value(kv, "trading_params.stop_loss_cooldown_seconds", "300"), 300, "trading_params.stop_loss_cooldown_seconds"));
+        get_value(kv, "trading_params.stop_loss_cooldown_seconds", "180"), 180, "trading_params.stop_loss_cooldown_seconds"));
+    cfg.trading_params.dust_threshold_usdt = parse_double(
+        get_value(kv, "trading_params.dust_threshold_usdt", "0.50"), 0.50, "trading_params.dust_threshold_usdt");
+    cfg.trading_params.quick_profit_min_hold_seconds = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.quick_profit_min_hold_seconds", "60"), 60, "trading_params.quick_profit_min_hold_seconds"));
+    cfg.trading_params.quick_profit_fee_multiplier = parse_double(
+        get_value(kv, "trading_params.quick_profit_fee_multiplier", "5.0"), 5.0, "trading_params.quick_profit_fee_multiplier");
+    cfg.trading_params.pnl_gate_loss_pct = parse_double(
+        get_value(kv, "trading_params.pnl_gate_loss_pct", "0.5"), 0.5, "trading_params.pnl_gate_loss_pct");
+
+    // ── Hedge Recovery ──
+    cfg.trading_params.hedge_recovery_enabled =
+        get_value(kv, "trading_params.hedge_recovery_enabled", "false") == "true";
+    cfg.trading_params.hedge_trigger_loss_pct = parse_double(
+        get_value(kv, "trading_params.hedge_trigger_loss_pct", "1.5"), 1.5, "trading_params.hedge_trigger_loss_pct");
+    cfg.trading_params.hedge_min_hold_seconds = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.hedge_min_hold_seconds", "30"), 30, "trading_params.hedge_min_hold_seconds"));
+    cfg.trading_params.hedge_max_hold_minutes = static_cast<int>(parse_double(
+        get_value(kv, "trading_params.hedge_max_hold_minutes", "5"), 5, "trading_params.hedge_max_hold_minutes"));
+    cfg.trading_params.hedge_profit_close_fee_mult = parse_double(
+        get_value(kv, "trading_params.hedge_profit_close_fee_mult", "2.0"), 2.0, "trading_params.hedge_profit_close_fee_mult");
 
     // ── Исполнительная альфа (execution_alpha) ────────────────────────────
     cfg.execution_alpha.max_spread_bps_passive = parse_double(
@@ -446,8 +479,8 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "execution_alpha.imbalance_favorable_threshold", "0.30"), 0.30, "execution_alpha.imbalance_favorable_threshold");
     cfg.execution_alpha.imbalance_unfavorable_threshold = parse_double(
         get_value(kv, "execution_alpha.imbalance_unfavorable_threshold", "0.30"), 0.30, "execution_alpha.imbalance_unfavorable_threshold");
-    cfg.execution_alpha.use_weighted_mid_price =
-        (get_value(kv, "execution_alpha.use_weighted_mid_price", "true") != "false");
+    cfg.execution_alpha.use_weighted_mid_price = parse_bool(
+        get_value(kv, "execution_alpha.use_weighted_mid_price", "true"), true, "execution_alpha.use_weighted_mid_price");
     cfg.execution_alpha.limit_price_passive_bps = parse_double(
         get_value(kv, "execution_alpha.limit_price_passive_bps", "3.0"), 3.0, "execution_alpha.limit_price_passive_bps");
     cfg.execution_alpha.urgency_cusum_boost = parse_double(
@@ -462,22 +495,26 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "execution_alpha.postonly_urgency_max", "0.35"), 0.35, "execution_alpha.postonly_urgency_max");
     cfg.execution_alpha.postonly_adverse_max = parse_double(
         get_value(kv, "execution_alpha.postonly_adverse_max", "0.35"), 0.35, "execution_alpha.postonly_adverse_max");
+    cfg.execution_alpha.taker_fee_bps = parse_double(
+        get_value(kv, "execution_alpha.taker_fee_bps", "6.0"), 6.0, "execution_alpha.taker_fee_bps");
+    cfg.execution_alpha.maker_fee_bps = parse_double(
+        get_value(kv, "execution_alpha.maker_fee_bps", "2.0"), 2.0, "execution_alpha.maker_fee_bps");
 
     // ── Opportunity Cost ──────────────────────────────────────────────────
     cfg.opportunity_cost.min_net_expected_bps = parse_double(
-        get_value(kv, "opportunity_cost.min_net_expected_bps", "0.0"), 0.0, "opportunity_cost.min_net_expected_bps");
+        get_value(kv, "opportunity_cost.min_net_expected_bps", "1.0"), 1.0, "opportunity_cost.min_net_expected_bps");
     cfg.opportunity_cost.execute_min_net_bps = parse_double(
-        get_value(kv, "opportunity_cost.execute_min_net_bps", "15.0"), 15.0, "opportunity_cost.execute_min_net_bps");
+        get_value(kv, "opportunity_cost.execute_min_net_bps", "3.0"), 3.0, "opportunity_cost.execute_min_net_bps");
     cfg.opportunity_cost.high_exposure_threshold = parse_double(
-        get_value(kv, "opportunity_cost.high_exposure_threshold", "0.75"), 0.75, "opportunity_cost.high_exposure_threshold");
+        get_value(kv, "opportunity_cost.high_exposure_threshold", "0.70"), 0.70, "opportunity_cost.high_exposure_threshold");
     cfg.opportunity_cost.high_exposure_min_conviction = parse_double(
-        get_value(kv, "opportunity_cost.high_exposure_min_conviction", "0.65"), 0.65, "opportunity_cost.high_exposure_min_conviction");
+        get_value(kv, "opportunity_cost.high_exposure_min_conviction", "0.60"), 0.60, "opportunity_cost.high_exposure_min_conviction");
     cfg.opportunity_cost.max_symbol_concentration = parse_double(
         get_value(kv, "opportunity_cost.max_symbol_concentration", "0.25"), 0.25, "opportunity_cost.max_symbol_concentration");
     cfg.opportunity_cost.max_strategy_concentration = parse_double(
         get_value(kv, "opportunity_cost.max_strategy_concentration", "0.35"), 0.35, "opportunity_cost.max_strategy_concentration");
     cfg.opportunity_cost.capital_exhaustion_threshold = parse_double(
-        get_value(kv, "opportunity_cost.capital_exhaustion_threshold", "0.90"), 0.90, "opportunity_cost.capital_exhaustion_threshold");
+        get_value(kv, "opportunity_cost.capital_exhaustion_threshold", "0.85"), 0.85, "opportunity_cost.capital_exhaustion_threshold");
     cfg.opportunity_cost.weight_conviction = parse_double(
         get_value(kv, "opportunity_cost.weight_conviction", "0.35"), 0.35, "opportunity_cost.weight_conviction");
     cfg.opportunity_cost.weight_net_edge = parse_double(
@@ -487,11 +524,13 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.opportunity_cost.weight_urgency = parse_double(
         get_value(kv, "opportunity_cost.weight_urgency", "0.15"), 0.15, "opportunity_cost.weight_urgency");
     cfg.opportunity_cost.conviction_to_bps_scale = parse_double(
-        get_value(kv, "opportunity_cost.conviction_to_bps_scale", "120.0"), 120.0, "opportunity_cost.conviction_to_bps_scale");
+        get_value(kv, "opportunity_cost.conviction_to_bps_scale", "100.0"), 100.0, "opportunity_cost.conviction_to_bps_scale");
     cfg.opportunity_cost.upgrade_min_edge_advantage_bps = parse_double(
-        get_value(kv, "opportunity_cost.upgrade_min_edge_advantage_bps", "10.0"), 10.0, "opportunity_cost.upgrade_min_edge_advantage_bps");
+        get_value(kv, "opportunity_cost.upgrade_min_edge_advantage_bps", "5.0"), 5.0, "opportunity_cost.upgrade_min_edge_advantage_bps");
     cfg.opportunity_cost.drawdown_penalty_scale = parse_double(
         get_value(kv, "opportunity_cost.drawdown_penalty_scale", "0.5"), 0.5, "opportunity_cost.drawdown_penalty_scale");
+    cfg.opportunity_cost.consecutive_loss_penalty = parse_double(
+        get_value(kv, "opportunity_cost.consecutive_loss_penalty", "0.02"), 0.02, "opportunity_cost.consecutive_loss_penalty");
 
     // ── Секция regime ──
     // Trend thresholds
@@ -502,7 +541,7 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.regime.trend.adx_weak_max = parse_double(
         get_value(kv, "regime.trend_adx_weak_max", "30.0"), 30.0, "regime.trend_adx_weak_max");
     cfg.regime.trend.rsi_trend_bias = parse_double(
-        get_value(kv, "regime.trend_rsi_bias", "50.0"), 50.0, "regime.trend_rsi_bias");
+        get_value(kv, "regime.trend_rsi_bias", "55.0"), 55.0, "regime.trend_rsi_bias");
 
     // Mean-reversion thresholds
     cfg.regime.mean_reversion.rsi_overbought = parse_double(
@@ -538,7 +577,7 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.regime.stress.spread_stress_bps = parse_double(
         get_value(kv, "regime.stress_spread_bps", "30.0"), 30.0, "regime.stress_spread_bps");
     cfg.regime.stress.liquidity_ratio_stress = parse_double(
-        get_value(kv, "regime.stress_liquidity_ratio", "3.0"), 3.0, "regime.stress_liquidity_ratio");
+        get_value(kv, "regime.stress_liquidity_ratio", "0.3"), 0.3, "regime.stress_liquidity_ratio");
 
     // Chop thresholds
     cfg.regime.chop.adx_max = parse_double(
@@ -549,8 +588,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_value(kv, "regime.transition_confirmation_ticks", "3"), 3.0, "regime.transition_confirmation_ticks"));
     cfg.regime.transition.min_confidence_to_switch = parse_double(
         get_value(kv, "regime.transition_min_confidence", "0.55"), 0.55, "regime.transition_min_confidence");
-    cfg.regime.transition.inertia_alpha = parse_double(
-        get_value(kv, "regime.transition_inertia_alpha", "0.15"), 0.15, "regime.transition_inertia_alpha");
     cfg.regime.transition.dwell_time_ticks = static_cast<int>(parse_double(
         get_value(kv, "regime.transition_dwell_ticks", "5"), 5.0, "regime.transition_dwell_ticks"));
 
@@ -560,7 +597,7 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.regime.confidence.data_quality_weight = parse_double(
         get_value(kv, "regime.confidence_data_quality_weight", "0.2"), 0.2, "regime.confidence_data_quality_weight");
     cfg.regime.confidence.max_indicator_count = static_cast<int>(parse_double(
-        get_value(kv, "regime.confidence_max_indicators", "6"), 6.0, "regime.confidence_max_indicators"));
+        get_value(kv, "regime.confidence_max_indicators", "12"), 12.0, "regime.confidence_max_indicators"));
     cfg.regime.confidence.anomaly_confidence = parse_double(
         get_value(kv, "regime.confidence_anomaly", "0.9"), 0.9, "regime.confidence_anomaly");
     cfg.regime.confidence.same_regime_stability = parse_double(
@@ -568,11 +605,123 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.regime.confidence.first_classification_stability = parse_double(
         get_value(kv, "regime.stability_first_classification", "0.5"), 0.5, "regime.stability_first_classification");
 
+    // ── Секция world_model ───────────────────────────────────────────────
+    cfg.world_model.model_version = get_value(
+        kv, "world_model.model_version", cfg.world_model.model_version);
+    cfg.world_model.min_valid_indicators = static_cast<int>(parse_double(
+        get_value(kv, "world_model.min_valid_indicators", std::to_string(cfg.world_model.min_valid_indicators)),
+        static_cast<double>(cfg.world_model.min_valid_indicators), "world_model.min_valid_indicators"));
+
+    cfg.world_model.toxic.book_instability_min = parse_double(
+        get_value(kv, "world_model.toxic_microstructure.book_instability_min", std::to_string(cfg.world_model.toxic.book_instability_min)),
+        cfg.world_model.toxic.book_instability_min, "world_model.toxic_microstructure.book_instability_min");
+    cfg.world_model.toxic.aggressive_flow_min = parse_double(
+        get_value(kv, "world_model.toxic_microstructure.aggressive_flow_min", std::to_string(cfg.world_model.toxic.aggressive_flow_min)),
+        cfg.world_model.toxic.aggressive_flow_min, "world_model.toxic_microstructure.aggressive_flow_min");
+    cfg.world_model.toxic.spread_bps_min = parse_double(
+        get_value(kv, "world_model.toxic_microstructure.spread_bps_min", std::to_string(cfg.world_model.toxic.spread_bps_min)),
+        cfg.world_model.toxic.spread_bps_min, "world_model.toxic_microstructure.spread_bps_min");
+
+    cfg.world_model.liquidity_vacuum.spread_bps_critical = parse_double(
+        get_value(kv, "world_model.liquidity_vacuum.spread_bps_critical", std::to_string(cfg.world_model.liquidity_vacuum.spread_bps_critical)),
+        cfg.world_model.liquidity_vacuum.spread_bps_critical, "world_model.liquidity_vacuum.spread_bps_critical");
+    cfg.world_model.liquidity_vacuum.spread_bps_secondary = parse_double(
+        get_value(kv, "world_model.liquidity_vacuum.spread_bps_secondary", std::to_string(cfg.world_model.liquidity_vacuum.spread_bps_secondary)),
+        cfg.world_model.liquidity_vacuum.spread_bps_secondary, "world_model.liquidity_vacuum.spread_bps_secondary");
+    cfg.world_model.liquidity_vacuum.liquidity_ratio_min = parse_double(
+        get_value(kv, "world_model.liquidity_vacuum.liquidity_ratio_min", std::to_string(cfg.world_model.liquidity_vacuum.liquidity_ratio_min)),
+        cfg.world_model.liquidity_vacuum.liquidity_ratio_min, "world_model.liquidity_vacuum.liquidity_ratio_min");
+
+    cfg.world_model.exhaustion.rsi_upper = parse_double(
+        get_value(kv, "world_model.exhaustion_spike.rsi_upper", std::to_string(cfg.world_model.exhaustion.rsi_upper)),
+        cfg.world_model.exhaustion.rsi_upper, "world_model.exhaustion_spike.rsi_upper");
+    cfg.world_model.exhaustion.rsi_lower = parse_double(
+        get_value(kv, "world_model.exhaustion_spike.rsi_lower", std::to_string(cfg.world_model.exhaustion.rsi_lower)),
+        cfg.world_model.exhaustion.rsi_lower, "world_model.exhaustion_spike.rsi_lower");
+    cfg.world_model.exhaustion.momentum_abs_min = parse_double(
+        get_value(kv, "world_model.exhaustion_spike.momentum_abs_min", std::to_string(cfg.world_model.exhaustion.momentum_abs_min)),
+        cfg.world_model.exhaustion.momentum_abs_min, "world_model.exhaustion_spike.momentum_abs_min");
+
+    cfg.world_model.fragile_breakout.bb_percent_b_upper = parse_double(
+        get_value(kv, "world_model.fragile_breakout.bb_percent_b_upper", std::to_string(cfg.world_model.fragile_breakout.bb_percent_b_upper)),
+        cfg.world_model.fragile_breakout.bb_percent_b_upper, "world_model.fragile_breakout.bb_percent_b_upper");
+    cfg.world_model.fragile_breakout.bb_percent_b_lower = parse_double(
+        get_value(kv, "world_model.fragile_breakout.bb_percent_b_lower", std::to_string(cfg.world_model.fragile_breakout.bb_percent_b_lower)),
+        cfg.world_model.fragile_breakout.bb_percent_b_lower, "world_model.fragile_breakout.bb_percent_b_lower");
+    cfg.world_model.fragile_breakout.volatility_5_min = parse_double(
+        get_value(kv, "world_model.fragile_breakout.volatility_5_min", std::to_string(cfg.world_model.fragile_breakout.volatility_5_min)),
+        cfg.world_model.fragile_breakout.volatility_5_min, "world_model.fragile_breakout.volatility_5_min");
+    cfg.world_model.fragile_breakout.book_imbalance_abs_min = parse_double(
+        get_value(kv, "world_model.fragile_breakout.book_imbalance_abs_min", std::to_string(cfg.world_model.fragile_breakout.book_imbalance_abs_min)),
+        cfg.world_model.fragile_breakout.book_imbalance_abs_min, "world_model.fragile_breakout.book_imbalance_abs_min");
+
+    cfg.world_model.compression.bb_bandwidth_max = parse_double(
+        get_value(kv, "world_model.compression.bb_bandwidth_max", std::to_string(cfg.world_model.compression.bb_bandwidth_max)),
+        cfg.world_model.compression.bb_bandwidth_max, "world_model.compression.bb_bandwidth_max");
+    cfg.world_model.compression.atr_normalized_max = parse_double(
+        get_value(kv, "world_model.compression.atr_normalized_max", std::to_string(cfg.world_model.compression.atr_normalized_max)),
+        cfg.world_model.compression.atr_normalized_max, "world_model.compression.atr_normalized_max");
+    cfg.world_model.compression.volatility_5_max = parse_double(
+        get_value(kv, "world_model.compression.volatility_5_max", std::to_string(cfg.world_model.compression.volatility_5_max)),
+        cfg.world_model.compression.volatility_5_max, "world_model.compression.volatility_5_max");
+
+    cfg.world_model.stable_trend.adx_min = parse_double(
+        get_value(kv, "world_model.stable_trend.adx_min", std::to_string(cfg.world_model.stable_trend.adx_min)),
+        cfg.world_model.stable_trend.adx_min, "world_model.stable_trend.adx_min");
+    cfg.world_model.stable_trend.rsi_lower = parse_double(
+        get_value(kv, "world_model.stable_trend.rsi_lower", std::to_string(cfg.world_model.stable_trend.rsi_lower)),
+        cfg.world_model.stable_trend.rsi_lower, "world_model.stable_trend.rsi_lower");
+    cfg.world_model.stable_trend.rsi_upper = parse_double(
+        get_value(kv, "world_model.stable_trend.rsi_upper", std::to_string(cfg.world_model.stable_trend.rsi_upper)),
+        cfg.world_model.stable_trend.rsi_upper, "world_model.stable_trend.rsi_upper");
+
+    cfg.world_model.chop_noise.adx_max = parse_double(
+        get_value(kv, "world_model.chop_noise.adx_max", std::to_string(cfg.world_model.chop_noise.adx_max)),
+        cfg.world_model.chop_noise.adx_max, "world_model.chop_noise.adx_max");
+    cfg.world_model.chop_noise.rsi_lower = parse_double(
+        get_value(kv, "world_model.chop_noise.rsi_lower", std::to_string(cfg.world_model.chop_noise.rsi_lower)),
+        cfg.world_model.chop_noise.rsi_lower, "world_model.chop_noise.rsi_lower");
+    cfg.world_model.chop_noise.rsi_upper = parse_double(
+        get_value(kv, "world_model.chop_noise.rsi_upper", std::to_string(cfg.world_model.chop_noise.rsi_upper)),
+        cfg.world_model.chop_noise.rsi_upper, "world_model.chop_noise.rsi_upper");
+    cfg.world_model.chop_noise.spread_bps_max = parse_double(
+        get_value(kv, "world_model.chop_noise.spread_bps_max", std::to_string(cfg.world_model.chop_noise.spread_bps_max)),
+        cfg.world_model.chop_noise.spread_bps_max, "world_model.chop_noise.spread_bps_max");
+
+    cfg.world_model.fragility.spread_stress_weight = parse_double(
+        get_value(kv, "world_model.fragility.spread_stress_weight", std::to_string(cfg.world_model.fragility.spread_stress_weight)),
+        cfg.world_model.fragility.spread_stress_weight, "world_model.fragility.spread_stress_weight");
+    cfg.world_model.fragility.book_instability_weight = parse_double(
+        get_value(kv, "world_model.fragility.book_instability_weight", std::to_string(cfg.world_model.fragility.book_instability_weight)),
+        cfg.world_model.fragility.book_instability_weight, "world_model.fragility.book_instability_weight");
+    cfg.world_model.fragility.volatility_accel_weight = parse_double(
+        get_value(kv, "world_model.fragility.volatility_accel_weight", std::to_string(cfg.world_model.fragility.volatility_accel_weight)),
+        cfg.world_model.fragility.volatility_accel_weight, "world_model.fragility.volatility_accel_weight");
+    cfg.world_model.fragility.liquidity_imbalance_weight = parse_double(
+        get_value(kv, "world_model.fragility.liquidity_imbalance_weight", std::to_string(cfg.world_model.fragility.liquidity_imbalance_weight)),
+        cfg.world_model.fragility.liquidity_imbalance_weight, "world_model.fragility.liquidity_imbalance_weight");
+    cfg.world_model.fragility.transition_instability_weight = parse_double(
+        get_value(kv, "world_model.fragility.transition_instability_weight", std::to_string(cfg.world_model.fragility.transition_instability_weight)),
+        cfg.world_model.fragility.transition_instability_weight, "world_model.fragility.transition_instability_weight");
+    cfg.world_model.fragility.vpin_toxicity_weight = parse_double(
+        get_value(kv, "world_model.fragility.vpin_toxicity_weight", std::to_string(cfg.world_model.fragility.vpin_toxicity_weight)),
+        cfg.world_model.fragility.vpin_toxicity_weight, "world_model.fragility.vpin_toxicity_weight");
+
+    cfg.world_model.hysteresis.enabled = parse_bool(
+        get_value(kv, "world_model.hysteresis.enabled", cfg.world_model.hysteresis.enabled ? "true" : "false"),
+        cfg.world_model.hysteresis.enabled, "world_model.hysteresis.enabled");
+    cfg.world_model.hysteresis.confirmation_ticks = static_cast<int>(parse_double(
+        get_value(kv, "world_model.hysteresis.confirmation_ticks", std::to_string(cfg.world_model.hysteresis.confirmation_ticks)),
+        static_cast<double>(cfg.world_model.hysteresis.confirmation_ticks), "world_model.hysteresis.confirmation_ticks"));
+    cfg.world_model.hysteresis.min_dwell_ticks = static_cast<int>(parse_double(
+        get_value(kv, "world_model.hysteresis.min_dwell_ticks", std::to_string(cfg.world_model.hysteresis.min_dwell_ticks)),
+        static_cast<double>(cfg.world_model.hysteresis.min_dwell_ticks), "world_model.hysteresis.min_dwell_ticks"));
+
     // ── Секция futures ───────────────────────────────────────────────────
     {
         auto& f = cfg.futures;
-        auto futures_enabled_str = get_value(kv, "futures.enabled", "false");
-        f.enabled = (futures_enabled_str == "true" || futures_enabled_str == "1");
+        auto futures_enabled_str = get_value(kv, "futures.enabled", "true");
+        f.enabled = parse_bool(futures_enabled_str, true, "futures.enabled");
 
         f.product_type = get_value(kv, "futures.product_type", f.product_type);
         f.margin_coin  = get_value(kv, "futures.margin_coin", f.margin_coin);
@@ -598,17 +747,11 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         f.leverage_volatile = static_cast<int>(parse_double(
             get_value(kv, "futures.leverage_volatile", std::to_string(f.leverage_volatile)),
             static_cast<double>(f.leverage_volatile), "futures.leverage_volatile"));
-        f.leverage_stress = static_cast<int>(parse_double(
-            get_value(kv, "futures.leverage_stress", std::to_string(f.leverage_stress)),
-            static_cast<double>(f.leverage_stress), "futures.leverage_stress"));
 
         // Защита от ликвидации
         f.liquidation_buffer_pct = parse_double(
             get_value(kv, "futures.liquidation_buffer_pct", std::to_string(f.liquidation_buffer_pct)),
             f.liquidation_buffer_pct, "futures.liquidation_buffer_pct");
-        f.max_leverage_drawdown_scale = parse_double(
-            get_value(kv, "futures.max_leverage_drawdown_scale", std::to_string(f.max_leverage_drawdown_scale)),
-            f.max_leverage_drawdown_scale, "futures.max_leverage_drawdown_scale");
 
         // Фандинг
         f.funding_rate_threshold = parse_double(
@@ -623,11 +766,129 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
             get_value(kv, "futures.maintenance_margin_rate", std::to_string(f.maintenance_margin_rate)),
             f.maintenance_margin_rate, "futures.maintenance_margin_rate");
 
-        // Propagate futures mode to pair_selection so PairScanner uses futures endpoints
-        if (f.enabled) {
-            cfg.pair_selection.futures_enabled = true;
-            cfg.pair_selection.product_type = f.product_type;
+        // LeverageEngineConfig
+        auto& le = f.leverage_engine;
+        le.vol_low_atr = parse_double(
+            get_value(kv, "futures.leverage_engine.vol_low_atr", std::to_string(le.vol_low_atr)),
+            le.vol_low_atr, "futures.leverage_engine.vol_low_atr");
+        le.vol_mid_atr = parse_double(
+            get_value(kv, "futures.leverage_engine.vol_mid_atr", std::to_string(le.vol_mid_atr)),
+            le.vol_mid_atr, "futures.leverage_engine.vol_mid_atr");
+        le.vol_high_atr = parse_double(
+            get_value(kv, "futures.leverage_engine.vol_high_atr", std::to_string(le.vol_high_atr)),
+            le.vol_high_atr, "futures.leverage_engine.vol_high_atr");
+        le.vol_extreme_atr = parse_double(
+            get_value(kv, "futures.leverage_engine.vol_extreme_atr", std::to_string(le.vol_extreme_atr)),
+            le.vol_extreme_atr, "futures.leverage_engine.vol_extreme_atr");
+        le.vol_floor = parse_double(
+            get_value(kv, "futures.leverage_engine.vol_floor", std::to_string(le.vol_floor)),
+            le.vol_floor, "futures.leverage_engine.vol_floor");
+        le.conviction_breakpoint = parse_double(
+            get_value(kv, "futures.leverage_engine.conviction_breakpoint", std::to_string(le.conviction_breakpoint)),
+            le.conviction_breakpoint, "futures.leverage_engine.conviction_breakpoint");
+        le.conviction_min_mult = parse_double(
+            get_value(kv, "futures.leverage_engine.conviction_min_mult", std::to_string(le.conviction_min_mult)),
+            le.conviction_min_mult, "futures.leverage_engine.conviction_min_mult");
+        le.conviction_max_mult = parse_double(
+            get_value(kv, "futures.leverage_engine.conviction_max_mult", std::to_string(le.conviction_max_mult)),
+            le.conviction_max_mult, "futures.leverage_engine.conviction_max_mult");
+        le.drawdown_floor_mult = parse_double(
+            get_value(kv, "futures.leverage_engine.drawdown_floor_mult", std::to_string(le.drawdown_floor_mult)),
+            le.drawdown_floor_mult, "futures.leverage_engine.drawdown_floor_mult");
+        le.drawdown_halfpoint_pct = parse_double(
+            get_value(kv, "futures.leverage_engine.drawdown_halfpoint_pct", std::to_string(le.drawdown_halfpoint_pct)),
+            le.drawdown_halfpoint_pct, "futures.leverage_engine.drawdown_halfpoint_pct");
+        le.ema_alpha = parse_double(
+            get_value(kv, "futures.leverage_engine.ema_alpha", std::to_string(le.ema_alpha)),
+            le.ema_alpha, "futures.leverage_engine.ema_alpha");
+        le.taker_fee_rate = parse_double(
+            get_value(kv, "futures.leverage_engine.taker_fee_rate", std::to_string(le.taker_fee_rate)),
+            le.taker_fee_rate, "futures.leverage_engine.taker_fee_rate");
+        le.min_leverage_change_delta = static_cast<int>(parse_double(
+            get_value(kv, "futures.leverage_engine.min_leverage_change_delta", std::to_string(le.min_leverage_change_delta)),
+            static_cast<double>(le.min_leverage_change_delta), "futures.leverage_engine.min_leverage_change_delta"));
+    }
+
+    // ── Секция uncertainty ───────────────────────────────────────────────
+    {
+        auto& u = cfg.uncertainty;
+        u.w_regime = parse_double(
+            get_value(kv, "uncertainty.w_regime", std::to_string(u.w_regime)),
+            u.w_regime, "uncertainty.w_regime");
+        u.w_signal = parse_double(
+            get_value(kv, "uncertainty.w_signal", std::to_string(u.w_signal)),
+            u.w_signal, "uncertainty.w_signal");
+        u.w_data_quality = parse_double(
+            get_value(kv, "uncertainty.w_data_quality", std::to_string(u.w_data_quality)),
+            u.w_data_quality, "uncertainty.w_data_quality");
+        u.w_execution = parse_double(
+            get_value(kv, "uncertainty.w_execution", std::to_string(u.w_execution)),
+            u.w_execution, "uncertainty.w_execution");
+        u.w_portfolio = parse_double(
+            get_value(kv, "uncertainty.w_portfolio", std::to_string(u.w_portfolio)),
+            u.w_portfolio, "uncertainty.w_portfolio");
+        u.w_ml = parse_double(
+            get_value(kv, "uncertainty.w_ml", std::to_string(u.w_ml)),
+            u.w_ml, "uncertainty.w_ml");
+        u.w_correlation = parse_double(
+            get_value(kv, "uncertainty.w_correlation", std::to_string(u.w_correlation)),
+            u.w_correlation, "uncertainty.w_correlation");
+        u.w_transition = parse_double(
+            get_value(kv, "uncertainty.w_transition", std::to_string(u.w_transition)),
+            u.w_transition, "uncertainty.w_transition");
+        u.w_operational = parse_double(
+            get_value(kv, "uncertainty.w_operational", std::to_string(u.w_operational)),
+            u.w_operational, "uncertainty.w_operational");
+
+        u.threshold_low = parse_double(
+            get_value(kv, "uncertainty.threshold_low", std::to_string(u.threshold_low)),
+            u.threshold_low, "uncertainty.threshold_low");
+        u.threshold_moderate = parse_double(
+            get_value(kv, "uncertainty.threshold_moderate", std::to_string(u.threshold_moderate)),
+            u.threshold_moderate, "uncertainty.threshold_moderate");
+        u.threshold_high = parse_double(
+            get_value(kv, "uncertainty.threshold_high", std::to_string(u.threshold_high)),
+            u.threshold_high, "uncertainty.threshold_high");
+
+        u.hysteresis_up = parse_double(
+            get_value(kv, "uncertainty.hysteresis_up", std::to_string(u.hysteresis_up)),
+            u.hysteresis_up, "uncertainty.hysteresis_up");
+        u.hysteresis_down = parse_double(
+            get_value(kv, "uncertainty.hysteresis_down", std::to_string(u.hysteresis_down)),
+            u.hysteresis_down, "uncertainty.hysteresis_down");
+
+        u.ema_alpha = parse_double(
+            get_value(kv, "uncertainty.ema_alpha", std::to_string(u.ema_alpha)),
+            u.ema_alpha, "uncertainty.ema_alpha");
+        u.size_floor = parse_double(
+            get_value(kv, "uncertainty.size_floor", std::to_string(u.size_floor)),
+            u.size_floor, "uncertainty.size_floor");
+        u.threshold_ceiling = parse_double(
+            get_value(kv, "uncertainty.threshold_ceiling", std::to_string(u.threshold_ceiling)),
+            u.threshold_ceiling, "uncertainty.threshold_ceiling");
+
+        u.consecutive_extreme_for_cooldown = static_cast<int>(parse_double(
+            get_value(kv, "uncertainty.consecutive_extreme_for_cooldown", std::to_string(u.consecutive_extreme_for_cooldown)),
+            static_cast<double>(u.consecutive_extreme_for_cooldown), "uncertainty.consecutive_extreme_for_cooldown"));
+        u.cooldown_duration_ns = static_cast<int64_t>(parse_double(
+            get_value(kv, "uncertainty.cooldown_duration_s", "60"),
+            60.0, "uncertainty.cooldown_duration_s") * 1'000'000'000.0);
+        u.consecutive_high_for_defensive = static_cast<int>(parse_double(
+            get_value(kv, "uncertainty.consecutive_high_for_defensive", std::to_string(u.consecutive_high_for_defensive)),
+            static_cast<double>(u.consecutive_high_for_defensive), "uncertainty.consecutive_high_for_defensive"));
+
+        u.liquidity_ratio_penalty_threshold = parse_double(
+            get_value(kv, "uncertainty.liquidity_ratio_penalty_threshold", std::to_string(u.liquidity_ratio_penalty_threshold)),
+            u.liquidity_ratio_penalty_threshold, "uncertainty.liquidity_ratio_penalty_threshold");
+    }
+
+    // Fail-fast: если при парсинге обнаружены невалидные значения — не запускаться
+    if (!parse_errors.empty()) {
+        std::cerr << "[CONFIG] ОШИБКИ ПАРСИНГА КОНФИГУРАЦИИ (" << parse_errors.size() << "):\n";
+        for (const auto& e : parse_errors) {
+            std::cerr << "  - " << e << "\n";
         }
+        return Err<AppConfig>(TbError::ConfigLoadFailed);
     }
 
     // Валидация

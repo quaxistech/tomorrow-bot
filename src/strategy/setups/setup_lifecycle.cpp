@@ -11,14 +11,26 @@ namespace tb::strategy {
 std::optional<Setup> SetupDetector::detect(const StrategyContext& ctx,
                                            const std::string& setup_id,
                                            int64_t now_ns) const {
+    // Gating по world state и uncertainty:
+    // - Экстремальная неопределённость → не генерируем сетапы
+    // - Disrupted world state → не генерируем сетапы (токсичный, вакуум, кризис)
+    if (ctx.uncertainty == UncertaintyLevel::Extreme) return std::nullopt;
+    if (ctx.world_state == WorldStateLabel::Disrupted) return std::nullopt;
+
+    // High uncertainty → только retest и rejection (более консервативные сетапы)
+    bool conservative_only = (ctx.uncertainty == UncertaintyLevel::High);
+
+    // Ranging regime → блокируем momentum и pullback
+    bool chop_mode = (ctx.regime == RegimeLabel::Ranging);
+
     // Пробуем каждый тип сетапа в порядке приоритета
-    if (cfg_.enable_momentum_continuation) {
+    if (cfg_.enable_momentum_continuation && !chop_mode && !conservative_only) {
         if (auto s = detect_momentum(ctx, setup_id, now_ns)) return s;
     }
     if (cfg_.enable_retest_scenarios) {
         if (auto s = detect_retest(ctx, setup_id, now_ns)) return s;
     }
-    if (cfg_.enable_pullback_scenarios) {
+    if (cfg_.enable_pullback_scenarios && !chop_mode && !conservative_only) {
         if (auto s = detect_pullback(ctx, setup_id, now_ns)) return s;
     }
     if (cfg_.enable_rejection_scenarios) {
@@ -41,15 +53,17 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     double mid = micro.mid_price;
     if (mid <= 0.0) return std::nullopt;
 
-    // BUY: сильный перекос стакана + покупатели доминируют + импульс вверх
-    bool buy_signal = (imb > cfg_.imbalance_threshold) &&
-                      (bsr > cfg_.buy_sell_ratio_buy) &&
-                      (tech.momentum_5 > cfg_.momentum_min_buy);
+    // BUY: 2 из 3 подтверждений (перекос стакана, bsr, импульс)
+    int buy_score = (imb > cfg_.imbalance_threshold ? 1 : 0)
+                  + (bsr > cfg_.buy_sell_ratio_buy ? 1 : 0)
+                  + (tech.momentum_5 > cfg_.momentum_min_buy ? 1 : 0);
+    bool buy_signal = (buy_score >= 2) && (bsr > 1.0 || imb > cfg_.imbalance_threshold);
 
-    // SELL: обратный перекос + продавцы доминируют + импульс вниз
-    bool sell_signal = (imb < -cfg_.imbalance_threshold) &&
-                       (bsr < cfg_.buy_sell_ratio_sell) &&
-                       (tech.momentum_5 < cfg_.momentum_max_sell);
+    // SELL: 2 из 3 подтверждений
+    int sell_score = (imb < -cfg_.imbalance_threshold ? 1 : 0)
+                   + (bsr < cfg_.buy_sell_ratio_sell ? 1 : 0)
+                   + (tech.momentum_5 < cfg_.momentum_max_sell ? 1 : 0);
+    bool sell_signal = (sell_score >= 2) && (bsr < 1.0 || imb < -cfg_.imbalance_threshold);
 
     if (!buy_signal && !sell_signal) return std::nullopt;
 
@@ -61,10 +75,22 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     if (buy_signal && tech.bb_valid && tech.bb_percent_b > cfg_.bb_max_buy) return std::nullopt;
     if (sell_signal && tech.bb_valid && tech.bb_percent_b < cfg_.bb_min_sell) return std::nullopt;
 
-    // Тренд guard
+    // Тренд guard (1m EMA)
     if (cfg_.block_counter_trend && tech.ema_valid) {
         if (buy_signal && tech.ema_20 < tech.ema_50) return std::nullopt;
         if (sell_signal && tech.ema_20 > tech.ema_50) return std::nullopt;
+    }
+
+    // HTF тренд guard: блокируем вход против СИЛЬНОГО тренда старшего ТФ
+    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+        // BUY при очень сильном HTF DOWN — запрещено
+        if (buy_signal && ctx.htf_trend_direction == -1) return std::nullopt;
+        // SELL при очень сильном HTF UP — запрещено
+        if (sell_signal && ctx.htf_trend_direction == 1) return std::nullopt;
+    }
+    // При SIDEWAYS HTF — требуем чуть более строгий ADX на рабочем ТФ
+    if (cfg_.block_counter_trend && ctx.htf_trend_direction == 0 && tech.adx < cfg_.adx_min + 3.0) {
+        return std::nullopt;
     }
 
     // Short entry только при futures
@@ -83,6 +109,21 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
         bool trend_aligned = buy_signal ? (tech.ema_20 > tech.ema_50) : (tech.ema_20 < tech.ema_50);
         if (trend_aligned) confidence += cfg_.trend_bonus;
     }
+
+    // ИСПРАВЛЕНИЕ M5: Volume Profile — цена у POC = высоколиквидная зона → усиливает conviction.
+    // Dalton (1990) "Mind Over Markets": POC = fair value, цена тяготеет к нему.
+    // Вход около POC имеет лучший risk/reward, чем на краях value area.
+    if (tech.vp_valid && mid > 0.0) {
+        double poc_dist = std::abs(tech.vp_price_vs_poc);  // 0..1: 0=at POC, 1=at VA edge
+        if (poc_dist < 0.3) {
+            // Цена у POC — сильная зона. Бонус за вход с поддержкой Volume Profile.
+            confidence += 0.03;
+        } else if (poc_dist > 0.8) {
+            // Цена на краю Value Area — против VP. Вход рискованнее, снижаем.
+            confidence -= 0.02;
+        }
+    }
+
     confidence = std::min(confidence, cfg_.max_conviction);
 
     // Стоп = ATR-based
@@ -141,10 +182,20 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
 
     if (!buy_retest && !sell_retest) return std::nullopt;
 
-    // Тренд guard
+    // Тренд guard (1m EMA)
     if (cfg_.block_counter_trend && tech.ema_valid) {
         if (buy_retest && tech.ema_20 < tech.ema_50) return std::nullopt;
         if (sell_retest && tech.ema_20 > tech.ema_50) return std::nullopt;
+    }
+
+    // HTF тренд guard для retest: только при очень сильном тренде
+    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+        if (buy_retest && ctx.htf_trend_direction == -1) return std::nullopt;
+        if (sell_retest && ctx.htf_trend_direction == 1) return std::nullopt;
+    }
+    // SIDEWAYS: retest ненадёжен без сильного тренда на 1m
+    if (cfg_.block_counter_trend && ctx.htf_trend_direction == 0 && tech.adx < cfg_.adx_min + 3.0) {
+        return std::nullopt;
     }
 
     if (sell_retest && !ctx.futures_enabled && !ctx.position.has_position) return std::nullopt;
@@ -217,6 +268,12 @@ std::optional<Setup> SetupDetector::detect_pullback(const StrategyContext& ctx,
                          (micro.book_imbalance_5 < 0.1);
 
     if (!buy_pullback && !sell_pullback) return std::nullopt;
+
+    // HTF тренд guard для pullback: только при очень сильном тренде
+    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+        if (buy_pullback && ctx.htf_trend_direction == -1) return std::nullopt;
+        if (sell_pullback && ctx.htf_trend_direction == 1) return std::nullopt;
+    }
 
     // RSI: не должен быть в экстремальной зоне
     if (buy_pullback && tech.rsi_valid && tech.rsi_14 > cfg_.rsi_upper_guard) return std::nullopt;
@@ -339,28 +396,38 @@ SetupValidationResult SetupValidator::validate(const Setup& setup,
         return result;
     }
 
-    // 3. Ликвидность ухудшилась
-    if (micro.liquidity_valid && micro.liquidity_ratio < cfg_.min_liquidity_ratio * 0.5) {
+    // 3. Ликвидность ухудшилась — soft penalty, не hard reject
+    // В books15 (15 уровней) перекосы bid/ask частые и кратковременные
+    if (micro.liquidity_valid && micro.liquidity_ratio < cfg_.min_liquidity_ratio * 0.2) {
+        // Только при крайне низкой ликвидности (ratio < 0.06) — hard reject
         result.valid = false;
         result.conditions_degraded = true;
         result.reasons.push_back("liquidity_degraded");
         return result;
     }
-
-    // 4. VPIN стал токсичным
-    if (micro.vpin_valid && micro.vpin_toxic) {
-        result.valid = false;
-        result.trap_detected = true;
-        result.reasons.push_back("vpin_became_toxic");
-        return result;
+    if (micro.liquidity_valid && micro.liquidity_ratio < cfg_.min_liquidity_ratio) {
+        // Мягкий штраф — помечаем деградацию, но не отвергаем
+        result.conditions_degraded = true;
+        result.reasons.push_back("liquidity_warning");
     }
 
-    // 5. Структура сломалась — imbalance развернулся
+    // 4. VPIN повышен — мягкий штраф, а не hard reject
+    //    Регим ToxicFlow уже снижает веса стратегий (0.1-0.3×),
+    //    аллокацию (10% cap) и risk-лимиты — этого достаточно.
+    if (micro.vpin_valid && micro.vpin_toxic) {
+        result.conditions_degraded = true;
+        result.reasons.push_back("vpin_elevated");
+    }
+
+    // 5. Структура сломалась — imbalance развернулся сильно
+    //    Крипто-книги (15 уровней) очень волатильны — используем 5× порог,
+    //    чтобы не отменять сетап из-за кратковременных колебаний.
     bool imbalance_reversed = false;
-    if (setup.side == Side::Buy && micro.book_imbalance_5 < -cfg_.imbalance_threshold) {
+    const double rev_threshold = cfg_.imbalance_threshold * 10.0;  // 10× — crypto books are noisy
+    if (setup.side == Side::Buy && micro.book_imbalance_5 < -rev_threshold) {
         imbalance_reversed = true;
     }
-    if (setup.side == Side::Sell && micro.book_imbalance_5 > cfg_.imbalance_threshold) {
+    if (setup.side == Side::Sell && micro.book_imbalance_5 > rev_threshold) {
         imbalance_reversed = true;
     }
     if (imbalance_reversed) {

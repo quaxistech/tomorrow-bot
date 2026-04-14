@@ -22,8 +22,7 @@ enum class JournalEntryType {
     SystemEvent,        ///< Системное событие
     TelemetrySnapshot,  ///< Снимок телеметрии
     GovernanceEvent,    ///< Событие governance-слоя
-    DiagnosticEvent,    ///< Событие диагностики системы
-    ShadowEvent         ///< Событие shadow trading подсистемы
+    DiagnosticEvent     ///< Событие диагностики системы
 };
 
 /// Строковое представление типа записи
@@ -39,7 +38,6 @@ enum class JournalEntryType {
         case JournalEntryType::TelemetrySnapshot: return "TelemetrySnapshot";
         case JournalEntryType::GovernanceEvent:   return "GovernanceEvent";
         case JournalEntryType::DiagnosticEvent:   return "DiagnosticEvent";
-        case JournalEntryType::ShadowEvent:       return "ShadowEvent";
     }
     return "Unknown";
 }

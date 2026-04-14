@@ -78,6 +78,15 @@ RegimeSnapshot RuleBasedRegimeEngine::classify(const features::FeatureSnapshot& 
     auto immediate = classify_immediate(snapshot, explanation);
     explanation.immediate_regime = immediate;
 
+    // Проверяем CUSUM-сигнал для ускорения hysteresis (Basseville & Nikiforov 1993)
+    bool cusum_triggered = false;
+    for (const auto& cond : explanation.triggered_conditions) {
+        if (cond.indicator == "cusum_regime_change") {
+            cusum_triggered = true;
+            break;
+        }
+    }
+
     // Предыдущий режим и hysteresis (thread-safe)
     DetailedRegime previous = DetailedRegime::Undefined;
     DetailedRegime final_regime;
@@ -93,7 +102,8 @@ RegimeSnapshot RuleBasedRegimeEngine::classify(const features::FeatureSnapshot& 
         auto confidence_for_switch = compute_confidence(snapshot, immediate, explanation);
 
         auto& hyst = hysteresis_[sym];
-        final_regime = apply_hysteresis(immediate, confidence_for_switch, hyst, explanation);
+        final_regime = apply_hysteresis(immediate, confidence_for_switch, hyst,
+                                        explanation, cusum_triggered);
     }
     explanation.persistent_regime = final_regime;
 
@@ -138,6 +148,17 @@ RegimeSnapshot RuleBasedRegimeEngine::classify(const features::FeatureSnapshot& 
                     {"confidence", std::to_string(confidence)},
                     {"stability",  std::to_string(stability)}});
 
+    // Метрики классификации
+    if (metrics_) {
+        metrics_->counter("regime_classification_total",
+                          {{"regime", to_string(final_regime)}})->increment();
+        if (previous != final_regime && previous != DetailedRegime::Undefined) {
+            metrics_->counter("regime_transition_total",
+                              {{"from", to_string(previous)},
+                               {"to", to_string(final_regime)}})->increment();
+        }
+    }
+
     return result;
 }
 
@@ -175,14 +196,20 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
         return triggered;
     };
 
-    // Подсчёт валидных индикаторов (ядро, используемое в confidence)
+    // Подсчёт валидных индикаторов, реально участвующих в классификации
     int valid = 0;
-    if (tech.ema_valid)        ++valid;
-    if (tech.rsi_valid)        ++valid;
-    if (tech.adx_valid)        ++valid;
-    if (tech.bb_valid)         ++valid;
-    if (tech.macd_valid)       ++valid;
-    if (micro.spread_valid)    ++valid;
+    if (tech.ema_valid)           ++valid;
+    if (tech.rsi_valid)          ++valid;
+    if (tech.adx_valid)          ++valid;
+    if (tech.bb_valid)           ++valid;
+    if (tech.atr_valid)          ++valid;
+    if (tech.obv_valid)          ++valid;
+    if (tech.cusum_valid)        ++valid;
+    if (micro.vpin_valid)        ++valid;
+    if (micro.trade_flow_valid)  ++valid;
+    if (micro.spread_valid)      ++valid;
+    if (micro.instability_valid) ++valid;
+    if (micro.liquidity_valid)   ++valid;
 
     explanation.valid_indicator_count = valid;
     explanation.total_indicator_count = config_.confidence.max_indicator_count;
@@ -194,14 +221,13 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
         return DetailedRegime::Undefined;
     }
 
-    // --- CUSUM: раннее обнаружение смены режима ---
+    // --- CUSUM: ранний сигнал структурной смены режима (Page 1954, Basseville & Nikiforov 1993)
+    // Когда CUSUM детектирует change-point, hysteresis ускоряет переход
     if (tech.cusum_valid && tech.cusum_regime_change) {
         check("cusum_regime_change", 1.0, 1.0, "==", true);
-        if (logger_) {
-            logger_->info("Regime", "CUSUM обнаружил смену режима",
-                {{"cusum_pos", std::to_string(tech.cusum_positive)},
-                 {"cusum_neg", std::to_string(tech.cusum_negative)}});
-        }
+        logger_->debug("Regime", "CUSUM: структурный слом обнаружен",
+            {{"cusum_pos", std::to_string(tech.cusum_positive)},
+             {"cusum_neg", std::to_string(tech.cusum_negative)}});
     }
 
     // --- AnomalyEvent: экстремальный RSI + экстремальный объём ---
@@ -222,6 +248,9 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
     // --- VPIN ToxicFlow ---
     if (micro.vpin_valid) {
         if (check("VPIN_toxic", micro.vpin_toxic ? 1.0 : 0.0, 1.0, "==", micro.vpin_toxic)) {
+            logger_->debug("Regime", "ToxicFlow via VPIN",
+                {{"vpin", std::to_string(micro.vpin)},
+                 {"vpin_toxic", micro.vpin_toxic ? "true" : "false"}});
             return DetailedRegime::ToxicFlow;
         }
     }
@@ -235,6 +264,9 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                                   config_.stress.spread_toxic_bps, ">",
                                   micro.spread_bps > config_.stress.spread_toxic_bps);
         if (flow_toxic && spread_toxic) {
+            logger_->debug("Regime", "ToxicFlow via flow+spread",
+                {{"aggressive_flow", std::to_string(micro.aggressive_flow)},
+                 {"spread_bps", std::to_string(micro.spread_bps)}});
             return DetailedRegime::ToxicFlow;
         }
     }
@@ -248,14 +280,15 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
         }
     }
 
-    // --- LiquidityStress: широкий спред + низкая глубина ---
+    // --- LiquidityStress: широкий спред + сильный дисбаланс книги ордеров ---
+    // liquidity_ratio = min(bid,ask)/avg(bid,ask) ∈ [0,1]; низкое значение = перекос (Cont et al. 2010)
     if (micro.spread_valid && micro.liquidity_valid) {
         bool spread_stress = check("spread_bps", micro.spread_bps,
                                    config_.stress.spread_stress_bps, ">",
                                    micro.spread_bps > config_.stress.spread_stress_bps);
         bool liq_stress    = check("liquidity_ratio", micro.liquidity_ratio,
-                                   config_.stress.liquidity_ratio_stress, ">",
-                                   micro.liquidity_ratio > config_.stress.liquidity_ratio_stress);
+                                   config_.stress.liquidity_ratio_stress, "<",
+                                   micro.liquidity_ratio < config_.stress.liquidity_ratio_stress);
         if (spread_stress && liq_stress) {
             return DetailedRegime::LiquidityStress;
         }
@@ -322,10 +355,10 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                 }
             }
 
-            // WeakUptrend: EMA20 > EMA50, ADX in [adx_weak_min, adx_weak_max]
-            if (check("ADX", tech.adx, config_.trend.adx_weak_min, "in_range",
-                      tech.adx >= config_.trend.adx_weak_min &&
-                      tech.adx <= config_.trend.adx_weak_max)) {
+            // WeakUptrend: EMA20 > EMA50, ADX >= adx_weak_min (covers both weak and strong ADX
+            // when RSI doesn't confirm strong directional bias)
+            if (check("ADX", tech.adx, config_.trend.adx_weak_min, ">=",
+                      tech.adx >= config_.trend.adx_weak_min)) {
                 return DetailedRegime::WeakUptrend;
             }
         }
@@ -346,13 +379,51 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                 }
             }
 
-            // WeakDowntrend: EMA20 < EMA50, ADX in [adx_weak_min, adx_weak_max]
-            if (check("ADX", tech.adx, config_.trend.adx_weak_min, "in_range",
-                      tech.adx >= config_.trend.adx_weak_min &&
-                      tech.adx <= config_.trend.adx_weak_max)) {
+            // WeakDowntrend: EMA20 < EMA50, ADX >= adx_weak_min (covers both weak and strong ADX
+            // when RSI doesn't confirm strong directional bias)
+            if (check("ADX", tech.adx, config_.trend.adx_weak_min, ">=",
+                      tech.adx >= config_.trend.adx_weak_min)) {
                 return DetailedRegime::WeakDowntrend;
             }
         }
+    }
+
+    // --- ADX-only trend fallback: тренд обнаружен по ADX, но EMA ещё не прогрелись ---
+    // FUTURES SAFETY: без EMA направление определяется только по RSI с подтверждением.
+    // Без RSI или при нейтральном RSI (45-55) классификатор возвращает Undefined,
+    // исключая скрытый directional bias (критично для фьючерсного скальпинга).
+    if (tech.adx_valid && !tech.ema_valid && tech.adx > config_.trend.adx_strong) {
+        check("ADX_only_trend", tech.adx, config_.trend.adx_strong, ">", true);
+        if (tech.rsi_valid) {
+            double rsi_bearish_threshold = 100.0 - config_.trend.rsi_trend_bias;
+            if (tech.rsi_14 >= config_.trend.rsi_trend_bias) {
+                check("RSI_direction", tech.rsi_14, config_.trend.rsi_trend_bias, ">=", true);
+                return DetailedRegime::StrongUptrend;
+            } else if (tech.rsi_14 < rsi_bearish_threshold) {
+                check("RSI_direction", tech.rsi_14, rsi_bearish_threshold, "<", true);
+                return DetailedRegime::StrongDowntrend;
+            }
+            // RSI в нейтральной зоне — направление неопределённо
+            return DetailedRegime::Undefined;
+        }
+        // Нет RSI — нельзя определить направление, возвращаем Undefined
+        return DetailedRegime::Undefined;
+    }
+
+    // --- ADX-only weak trend fallback: ADX в диапазоне weak без EMA ---
+    if (tech.adx_valid && !tech.ema_valid &&
+        tech.adx >= config_.trend.adx_weak_min && tech.adx <= config_.trend.adx_weak_max) {
+        check("ADX_only_weak", tech.adx, config_.trend.adx_weak_min, "in_range", true);
+        if (tech.rsi_valid) {
+            double rsi_bearish_threshold = 100.0 - config_.trend.rsi_trend_bias;
+            if (tech.rsi_14 >= config_.trend.rsi_trend_bias) {
+                return DetailedRegime::WeakUptrend;
+            } else if (tech.rsi_14 < rsi_bearish_threshold) {
+                return DetailedRegime::WeakDowntrend;
+            }
+        }
+        // Нет RSI или RSI нейтральный — возвращаем Undefined
+        return DetailedRegime::Undefined;
     }
 
     // --- Chop: ADX < порога, нет выраженного направления ---
@@ -373,9 +444,16 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
 DetailedRegime RuleBasedRegimeEngine::apply_hysteresis(
     DetailedRegime immediate, double confidence,
     HysteresisState& state,
-    ClassificationExplanation& explanation) const {
+    ClassificationExplanation& explanation,
+    bool cusum_change_detected) const {
 
     DetailedRegime result;
+
+    // CUSUM ускоряет подтверждение: при детекции структурного слома
+    // требуется на 1 тик меньше для переключения (min 1)
+    const int effective_confirmation_ticks = cusum_change_detected
+        ? std::max(1, config_.transition.confirmation_ticks - 1)
+        : config_.transition.confirmation_ticks;
 
     if (state.confirmed_regime == DetailedRegime::Undefined) {
         // Первая классификация — принимаем сразу
@@ -402,7 +480,7 @@ DetailedRegime RuleBasedRegimeEngine::apply_hysteresis(
         // Кандидат повторяется — наращиваем счётчик
         ++state.candidate_ticks;
 
-        bool enough_ticks = state.candidate_ticks >= config_.transition.confirmation_ticks;
+        bool enough_ticks = state.candidate_ticks >= effective_confirmation_ticks;
         bool enough_conf  = confidence >= config_.transition.min_confidence_to_switch;
         bool enough_dwell = state.dwell_ticks >= config_.transition.dwell_time_ticks;
 
@@ -420,7 +498,7 @@ DetailedRegime RuleBasedRegimeEngine::apply_hysteresis(
 
     explanation.hysteresis_overrode = (immediate != result);
     explanation.confirmation_ticks_remaining =
-        std::max(0, config_.transition.confirmation_ticks - state.candidate_ticks);
+        std::max(0, effective_confirmation_ticks - state.candidate_ticks);
     explanation.dwell_ticks = state.dwell_ticks;
 
     return result;
@@ -511,7 +589,7 @@ std::vector<RegimeStrategyHint> RuleBasedRegimeEngine::generate_hints(DetailedRe
         case DetailedRegime::StrongUptrend:
         case DetailedRegime::StrongDowntrend:
             add("momentum",            true,  1.5, "Сильный тренд — momentum эффективен");
-            add("mean_reversion",      true,  0.15,"Сильный тренд — mean reversion пониженный");
+            add("mean_reversion",      false, 0.0, "Сильный тренд — mean reversion отключён");
             add("breakout",            true,  0.8, "Продолжение тренда возможно");
             add("scalp_engine",true,  0.6, "Скальпинг в направлении тренда");
             add("vol_expansion",       true,  0.7, "Волатильность может расти");

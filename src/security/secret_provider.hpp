@@ -15,6 +15,7 @@
 #include "common/result.hpp"
 #include <string>
 #include <memory>
+#include <unordered_map>
 
 namespace tb::security {
 

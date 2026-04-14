@@ -718,71 +718,115 @@ TEST_CASE("Risk: get_risk_snapshot возвращает корректный с�
     REQUIRE(snapshot.computed_at.get() > 0);
 }
 
-// ========== Тесты spot-семантики (проверка 27) ==========
+// ========== Тесты futures-specific: funding rate ==========
 
-TEST_CASE("Risk: SELL без открытой позиции отклоняется на споте", "[risk]") {
-    auto engine = make_risk_engine();
-    auto intent = make_intent();
-    intent.side = Side::Sell;
-    intent.symbol = Symbol("BTCUSDT");
+TEST_CASE("Risk: Funding rate excessive → Denied", "[risk]") {
+    auto cfg = default_risk_config();
+    cfg.max_annual_funding_cost_pct = 30.0;
+    auto engine = make_risk_engine(cfg);
 
-    auto portfolio = make_clean_portfolio();
-    portfolio.positions.clear(); // Нет позиций
+    // Устанавливаем высокий funding rate: 0.1% за 8ч = 109.5% годовых > 30% лимит
+    engine->set_funding_rate(0.001);
 
     auto decision = engine->evaluate(
-        intent, make_sizing(), portfolio,
+        make_intent(), make_sizing(), make_clean_portfolio(),
         make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
-    REQUIRE(decision.verdict == risk::RiskVerdict::Denied);
-    bool has_spot_reason = false;
+    REQUIRE(decision.verdict == RiskVerdict::Denied);
+    bool found = false;
     for (const auto& r : decision.reasons) {
-        if (r.code == "SPOT_SELL_NO_POSITION") {
-            has_spot_reason = true;
-            break;
-        }
+        if (r.code == "FUNDING_COST_EXCESSIVE") found = true;
     }
-    REQUIRE(has_spot_reason);
+    REQUIRE(found);
 }
 
-TEST_CASE("Risk: SELL с открытой long позицией одобряется", "[risk]") {
-    auto engine = make_risk_engine();
-    auto intent = make_intent();
-    intent.side = Side::Sell;
-    intent.symbol = Symbol("BTCUSDT");
+TEST_CASE("Risk: Funding rate normal → не блокирует", "[risk]") {
+    auto cfg = default_risk_config();
+    cfg.max_annual_funding_cost_pct = 30.0;
+    auto engine = make_risk_engine(cfg);
 
-    auto portfolio = make_clean_portfolio();
-    portfolio::Position pos;
-    pos.symbol = Symbol("BTCUSDT");
-    pos.side = Side::Buy;
-    pos.size = Quantity(0.5);
-    pos.avg_entry_price = Price(50000.0);
-    pos.current_price = Price(51000.0);
-    pos.notional = NotionalValue(25000.0);
-    portfolio.positions.push_back(pos);
+    // Нормальный funding rate: 0.01% за 8ч = 10.95% годовых < 30%
+    engine->set_funding_rate(0.0001);
 
     auto decision = engine->evaluate(
-        intent, make_sizing(), portfolio,
+        make_intent(), make_sizing(), make_clean_portfolio(),
         make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
-    // Не должно быть spot-denial
     for (const auto& r : decision.reasons) {
-        REQUIRE(r.code != "SPOT_SELL_NO_POSITION");
+        REQUIRE(r.code != "FUNDING_COST_EXCESSIVE");
     }
 }
 
-TEST_CASE("Risk: BUY без позиции не блокируется spot-проверкой", "[risk]") {
-    auto engine = make_risk_engine();
-    auto intent = make_intent(); // side = Buy по умолчанию
+TEST_CASE("Risk: ReduceSize min-семантика — не компаундится", "[risk]") {
+    auto cfg = default_risk_config();
+    // Настраиваем: рассинхронизируем notional limit и regime scale так,
+    // чтобы оба reduce сработали.
+    cfg.max_position_notional = 8000.0;       // notional 10000 > 8000 → ratio = 0.8
+    cfg.regime_aware_limits_enabled = true;
+    cfg.stress_regime_scale = 0.5;            // scaled_max = 8000 * 0.5 = 4000 → ratio = 0.4
+    auto engine = make_risk_engine(cfg);
+    engine->set_current_regime(regime::DetailedRegime::LiquidityStress);
 
-    auto portfolio = make_clean_portfolio();
-    portfolio.positions.clear();
+    auto sizing = make_sizing(10000.0); // notional = 10000
+    sizing.approved_quantity = Quantity(0.2);
 
     auto decision = engine->evaluate(
-        intent, make_sizing(), portfolio,
+        make_intent(), sizing, make_clean_portfolio(),
         make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
 
-    // Spot guard не должен вмешиваться в BUY
+    // С min-семантикой: original_size = 0.2
+    // MAX_NOTIONAL: ratio = 0.8 → target = 0.2 * 0.8 = 0.16
+    // REGIME_SCALED_LIMIT: ratio = 0.4 → target = 0.2 * 0.4 = 0.08
+    // min(0.16, 0.08) = 0.08
+    // Без min-семантики (старый компаунд): 0.2 * 0.8 * 0.4 = 0.064
+    REQUIRE(decision.approved_quantity.get() == Catch::Approx(0.08).margin(1e-6));
+}
+
+TEST_CASE("Risk: Projected exposure — блокирует при превышении post-trade", "[risk]") {
+    auto cfg = default_risk_config();
+    cfg.max_gross_exposure_pct = 50.0;
+    auto engine = make_risk_engine(cfg);
+
+    auto portfolio = make_clean_portfolio();
+    portfolio.total_capital = 100000.0;
+    portfolio.exposure.gross_exposure = 45000.0; // 45% — под лимитом
+
+    // Но новый ордер 10000 USDT сделает 55% > 50%
+    auto sizing = make_sizing(10000.0);
+
+    auto decision = engine->evaluate(
+        make_intent(), sizing, portfolio,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    REQUIRE(decision.verdict == RiskVerdict::Denied);
+    bool found = false;
     for (const auto& r : decision.reasons) {
-        REQUIRE(r.code != "SPOT_SELL_NO_POSITION");
+        if (r.code == "MAX_EXPOSURE") found = true;
     }
+    REQUIRE(found);
+}
+
+TEST_CASE("Risk: Projected leverage — блокирует при превышении post-trade", "[risk]") {
+    auto cfg = default_risk_config();
+    cfg.max_leverage = 3.0;
+    cfg.liquidation_buffer_pct = 5.0; // effective_max = 3.0 * 0.95 = 2.85
+    auto engine = make_risk_engine(cfg);
+
+    auto portfolio = make_clean_portfolio();
+    portfolio.total_capital = 10000.0;
+    portfolio.exposure.gross_exposure = 23000.0; // 2.3x — под лимитом
+
+    // Новый ордер 6000 → projected = 29000 / 10000 = 2.9x > 2.85x
+    auto sizing = make_sizing(6000.0);
+
+    auto decision = engine->evaluate(
+        make_intent(), sizing, portfolio,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    REQUIRE(decision.verdict == RiskVerdict::Denied);
+    bool found = false;
+    for (const auto& r : decision.reasons) {
+        if (r.code == "MAX_LEVERAGE") found = true;
+    }
+    REQUIRE(found);
 }

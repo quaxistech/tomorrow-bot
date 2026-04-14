@@ -231,10 +231,10 @@ TEST_CASE("StrategyEngine: setup cancelled on spread degradation", "[strategy][e
 }
 
 // ============================================================
-// Position management: time stop
+// Position management: pipeline owns time stop
 // ============================================================
 
-TEST_CASE("StrategyEngine: time stop exits position", "[strategy][engine]") {
+TEST_CASE("StrategyEngine: strategy layer does not emit time stop", "[strategy][engine]") {
     auto logger = std::make_shared<TestLogger>();
     auto clk = std::make_shared<TestClock>();
     clk->current_time = 10'000'000'000LL;
@@ -256,8 +256,41 @@ TEST_CASE("StrategyEngine: time stop exits position", "[strategy][engine]") {
     clk->current_time += 2'000'000'000LL;  // 2 seconds
 
     auto result = engine.evaluate(ctx);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("StrategyEngine: context position sync stops repeated entry signals", "[strategy][engine]") {
+    auto logger = std::make_shared<TestLogger>();
+    auto clk = std::make_shared<TestClock>();
+    clk->current_time = 10'000'000'000LL;
+    ScalpStrategyConfig cfg;
+    cfg.setup_confirmation_window_ms = 0;
+    StrategyEngine engine(logger, clk, cfg);
+
+    auto ctx = make_context();
+    ctx.features.microstructure.book_imbalance_5 = 0.5;
+    ctx.features.microstructure.buy_sell_ratio = 2.0;
+
+    auto result = engine.evaluate(ctx);
+    REQUIRE_FALSE(result.has_value());
+
+    clk->current_time += 1'000'000'000LL;
+    result = engine.evaluate(ctx);
     REQUIRE(result.has_value());
-    REQUIRE(result->exit_reason == ExitReason::TimeExit);
+    REQUIRE(result->signal_intent == SignalIntent::LongEntry);
+
+    ctx.position.has_position = true;
+    ctx.position.side = Side::Buy;
+    ctx.position.position_side = PositionSide::Long;
+    ctx.position.size = 0.1;
+    ctx.position.avg_entry_price = 50000.0;
+    ctx.position.entry_time_ns = clk->current_time;
+
+    clk->current_time += 10'000'000LL;
+    result = engine.evaluate(ctx);
+
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(engine.current_state() == SymbolState::PositionManaging);
 }
 
 // ============================================================

@@ -22,6 +22,7 @@ namespace tb::execution {
 
 /// Действие, которое должен совершить модуль исполнения
 enum class ExecutionAction {
+    NoAction,               ///< Ничего не делать (Hold, нет сигнала)
     OpenPosition,           ///< Открыть новую позицию
     IncreasePosition,       ///< Увеличить существующую позицию
     ReducePosition,         ///< Частично закрыть позицию

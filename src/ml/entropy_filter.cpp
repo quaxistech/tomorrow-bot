@@ -155,33 +155,7 @@ bool EntropyFilter::is_noisy() const
 
 MlComponentStatus EntropyFilter::status() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    MlComponentStatus s;
-    s.last_update_ns = last_tick_ns_;
-    s.samples_processed = static_cast<int>(total_ticks_);
-
-    if (total_ticks_ == 0) {
-        s.health = MlComponentHealth::WarmingUp;
-        s.warmup_remaining = static_cast<int>(config_.min_samples);
-        return s;
-    }
-
-    if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
-        s.health = MlComponentHealth::Stale;
-        s.warmup_remaining = 0;
-        return s;
-    }
-
-    if (returns_.size() < config_.min_samples) {
-        s.health = MlComponentHealth::WarmingUp;
-        s.warmup_remaining = static_cast<int>(config_.min_samples - returns_.size());
-        return s;
-    }
-
-    s.health = MlComponentHealth::Healthy;
-    s.warmup_remaining = 0;
-    return s;
+    return compute().component_status;
 }
 
 // Энтропия Шеннона с нормализацией к [0, 1]:

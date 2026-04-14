@@ -50,7 +50,7 @@ private:
     /// Внутренняя логика отмены (FSM → submit → confirm)
     bool do_cancel(const OrderId& order_id);
 
-    /// Освободить cash reservation при отмене Buy-ордера
+    /// Освободить margin reservation при отмене открывающего ордера (Long/Short)
     void release_cash_if_needed(const OrderRecord& order);
 
     OrderRegistry& registry_;

@@ -162,3 +162,147 @@ TEST_CASE("Недостаточно данных → valid=false") {
     REQUIRE(eng.ema({1.0, 2.0}, 5).valid == false);
     REQUIRE(eng.rsi({1.0, 2.0, 3.0}, 14).valid == false);
 }
+
+// ============================================================
+// Тесты ADX
+// ============================================================
+
+TEST_CASE("ADX: trending market → ADX > 20") {
+    auto eng = make_engine();
+    // Сильный тренд вверх: high/low/close растут последовательно
+    std::vector<double> h, l, c;
+    for (int i = 0; i < 50; ++i) {
+        double base = 100.0 + i * 2.0;
+        h.push_back(base + 3.0);
+        l.push_back(base - 1.0);
+        c.push_back(base + 1.0);
+    }
+    auto r = eng.adx(h, l, c, 14);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.adx > 20.0);
+    // При тренде вверх +DI > -DI
+    REQUIRE(r.plus_di > r.minus_di);
+}
+
+TEST_CASE("ADX: недостаточно данных → invalid") {
+    auto eng = make_engine();
+    std::vector<double> h = {100.0, 101.0};
+    std::vector<double> l = {99.0, 100.0};
+    std::vector<double> c = {100.0, 100.5};
+    auto r = eng.adx(h, l, c, 14);
+    REQUIRE(r.valid == false);
+}
+
+// ============================================================
+// Тесты Volatility (log-return std dev)
+// ============================================================
+
+TEST_CASE("Volatility: постоянная цена → vol ≈ 0") {
+    auto eng = make_engine();
+    std::vector<double> prices(25, 100.0);
+    auto r = eng.volatility(prices, 20);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value == Catch::Approx(0.0).margin(1e-9));
+}
+
+TEST_CASE("Volatility: растущие цены → vol > 0") {
+    auto eng = make_engine();
+    auto prices = linspace(100.0, 110.0, 25);
+    auto r = eng.volatility(prices, 20);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value > 0.0);
+}
+
+TEST_CASE("Volatility: короткое окно vs длинное") {
+    auto eng = make_engine();
+    // Цены с колебаниями
+    std::vector<double> prices;
+    for (int i = 0; i < 30; ++i) {
+        prices.push_back(100.0 + (i % 2 == 0 ? 1.0 : -1.0));
+    }
+    auto vol5 = eng.volatility(prices, 5);
+    auto vol20 = eng.volatility(prices, 20);
+    REQUIRE(vol5.valid == true);
+    REQUIRE(vol20.valid == true);
+    // Обе должны быть положительны
+    REQUIRE(vol5.value > 0.0);
+    REQUIRE(vol20.value > 0.0);
+}
+
+TEST_CASE("Volatility: недостаточно данных → invalid") {
+    auto eng = make_engine();
+    auto r = eng.volatility({100.0, 101.0}, 5);
+    REQUIRE(r.valid == false);
+    REQUIRE(r.status == tb::indicators::IndicatorStatus::InsufficientData);
+}
+
+// ============================================================
+// Тесты Momentum
+// ============================================================
+
+TEST_CASE("Momentum: рост 10% → momentum ≈ 0.1") {
+    auto eng = make_engine();
+    // 6 цен, momentum(5) = (110-100)/100 = 0.1
+    std::vector<double> prices = {100.0, 102.0, 104.0, 106.0, 108.0, 110.0};
+    auto r = eng.momentum(prices, 5);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value == Catch::Approx(0.1).epsilon(0.001));
+}
+
+TEST_CASE("Momentum: падение → отрицательный momentum") {
+    auto eng = make_engine();
+    // 6 цен с падением
+    std::vector<double> prices = {100.0, 98.0, 96.0, 94.0, 92.0, 90.0};
+    auto r = eng.momentum(prices, 5);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value < 0.0);
+    // (90-100)/100 = -0.1
+    REQUIRE(r.value == Catch::Approx(-0.1).epsilon(0.001));
+}
+
+TEST_CASE("Momentum: плоская цена → momentum ≈ 0") {
+    auto eng = make_engine();
+    std::vector<double> prices(25, 100.0);
+    auto r = eng.momentum(prices, 20);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value == Catch::Approx(0.0).margin(1e-9));
+}
+
+TEST_CASE("Momentum: недостаточно данных → invalid") {
+    auto eng = make_engine();
+    auto r = eng.momentum({100.0, 101.0}, 5);
+    REQUIRE(r.valid == false);
+}
+
+// ============================================================
+// Тесты Rate of Change
+// ============================================================
+
+TEST_CASE("ROC: рост 10% → ROC ≈ 10.0%") {
+    auto eng = make_engine();
+    std::vector<double> prices = {100.0, 102.0, 104.0, 106.0, 108.0, 110.0};
+    auto r = eng.rate_of_change(prices, 5);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value == Catch::Approx(10.0).epsilon(0.001));
+}
+
+// ============================================================
+// Тесты Z-Score
+// ============================================================
+
+TEST_CASE("Z-Score: последняя цена == средняя → z ≈ 0") {
+    auto eng = make_engine();
+    std::vector<double> prices(20, 100.0);
+    auto r = eng.z_score(prices, 20);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value == Catch::Approx(0.0).margin(1e-6));
+}
+
+TEST_CASE("Z-Score: последняя цена > средней → z > 0") {
+    auto eng = make_engine();
+    std::vector<double> prices(19, 100.0);
+    prices.push_back(110.0);
+    auto r = eng.z_score(prices, 20);
+    REQUIRE(r.valid == true);
+    REQUIRE(r.value > 0.0);
+}

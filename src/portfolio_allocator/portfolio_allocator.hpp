@@ -45,6 +45,9 @@ public:
         (void)win_rate;
         (void)avg_win_loss_ratio;
     }
+
+    /// Обновить глобальный бюджет (например, после синхронизации с биржей)
+    virtual void update_global_budget(double new_budget) { (void)new_budget; }
 };
 
 /// Иерархический аллокатор с многоуровневыми ограничениями
@@ -92,6 +95,8 @@ public:
                             regime::DetailedRegime current_regime,
                             double win_rate = 0.5,
                             double avg_win_loss_ratio = 1.5) override;
+
+    void update_global_budget(double new_budget) override;
 
 private:
     /// Рассчитать максимальный нотионал из бюджетных ограничений

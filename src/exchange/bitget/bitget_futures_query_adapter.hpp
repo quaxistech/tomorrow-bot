@@ -54,6 +54,10 @@ public:
     Result<std::vector<reconciliation::ExchangePositionInfo>>
     get_account_balances() override;
 
+    /// Получить открытые фьючерсные позиции в унифицированном формате
+    Result<std::vector<reconciliation::ExchangeOpenPositionInfo>>
+    get_open_positions(const Symbol& symbol = Symbol("")) override;
+
     /// Получить статус конкретного фьючерсного ордера
     Result<reconciliation::ExchangeOrderInfo>
     get_order_status(const OrderId& order_id, const Symbol& symbol) override;

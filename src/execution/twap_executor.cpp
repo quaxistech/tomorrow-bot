@@ -1,4 +1,5 @@
 #include "execution/twap_executor.hpp"
+#include "common/constants.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -34,8 +35,14 @@ bool SmartTwapExecutor::should_use_twap(
     // Нотионал ордера
     double order_notional = intent.suggested_quantity.get() * mid;
 
-    // Для малых ордеров (< $10) TWAP не нужен — одним ордером дешевле
-    if (order_notional < 10.0) {
+    // Для малых ордеров TWAP не нужен — одним ордером дешевле.
+    // Market impact при $50-$500 ордерах на ликвидных фьючерсах ≈ 0.
+    // TWAP имеет смысл только при крупных ордерах ($500+), где реальный market impact.
+    const double effective_min = min_notional_usdt_.load(std::memory_order_acquire) > 0.0
+        ? min_notional_usdt_.load(std::memory_order_acquire)
+        : tb::common::exchange_limits::kMinBitgetNotionalUsdt;
+    const double kMinTwapNotional = std::max(effective_min * 2.0, 500.0);
+    if (order_notional < kMinTwapNotional) {
         return false;
     }
 
@@ -68,6 +75,12 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if (approved_qty.get() <= 0.0) {
+        logger_->error("TWAP", "Cannot create plan for zero quantity",
+            {{"symbol", intent.symbol.get()}});
+        return TwapOrder{};
+    }
+
     double total = approved_qty.get();
     double liquidity = snapshot.execution_context.immediate_liquidity;
     double mid = snapshot.mid_price.get();
@@ -82,9 +95,11 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
     }
     num_slices = std::clamp(num_slices, config_.min_slices, config_.max_slices);
 
-    // Ограничение: каждый слайс должен иметь нотионал >= $1.10 (минимум Bitget)
+    // Ограничение: каждый слайс должен иметь нотионал >= min notional
     if (mid > 0.0) {
-        constexpr double kMinSliceNotional = 1.10;
+        const double kMinSliceNotional = min_notional_usdt_.load(std::memory_order_acquire) > 0.0
+            ? min_notional_usdt_.load(std::memory_order_acquire)
+            : tb::common::exchange_limits::kMinBitgetNotionalUsdt;
         double total_notional = total * mid;
         size_t max_by_notional = std::max(
             static_cast<size_t>(1),
@@ -132,6 +147,9 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
     twap.twap_id = "TWAP-" + std::to_string(twap_seq.fetch_add(1));
     twap.symbol = intent.symbol;
     twap.side = intent.side;
+    twap.position_side = intent.position_side;
+    twap.trade_side = intent.trade_side;
+    twap.signal_intent = intent.signal_intent;
     twap.total_qty = approved_qty;
     twap.filled_qty = Quantity(0.0);
     twap.avg_fill_price = 0.0;
@@ -207,10 +225,17 @@ std::optional<strategy::TradeIntent> SmartTwapExecutor::get_next_slice(
     slice_intent.strategy_id = StrategyId("TWAP");
     slice_intent.symbol = twap_order.symbol;
     slice_intent.side = twap_order.side;
+    slice_intent.position_side = twap_order.position_side;
+    slice_intent.trade_side = twap_order.trade_side;
+    slice_intent.signal_intent = twap_order.signal_intent;
     slice_intent.suggested_quantity = slice.target_qty;
     slice_intent.conviction = 1.0;  // TWAP слайсы имеют максимальную уверенность
+    slice_intent.urgency = 0.7;     // Умеренная urgency — ордер уже запланирован
     slice_intent.signal_name = "twap_slice_" + std::to_string(idx);
     slice_intent.correlation_id = CorrelationId(twap_order.twap_id + "-" + std::to_string(idx));
+
+    // Snapshot mid price — нужен execution planner для planned_price
+    slice_intent.snapshot_mid_price = snapshot.mid_price;
 
     // Адаптивная цена на основе текущего рынка
     Price slice_price = compute_slice_price(slice_intent, snapshot);

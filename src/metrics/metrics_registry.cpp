@@ -8,6 +8,8 @@
 #include "histogram.hpp"
 #include <sstream>
 #include <algorithm>
+#include <map>
+#include <set>
 
 namespace tb::metrics {
 
@@ -128,30 +130,80 @@ std::map<double, int64_t> SimpleHistogram::get_buckets() const {
 }
 
 // ============================================================
+// ИСПРАВЛЕНИЕ H8: label-aware ключи и Prometheus export
+// ============================================================
+
+std::string InMemoryMetricsRegistry::make_key(const std::string& name, const MetricTags& tags) {
+    if (tags.empty()) return name;
+    // Сортируем по ключу для стабильного порядка
+    std::map<std::string, std::string> sorted(tags.begin(), tags.end());
+    std::string key = name + "{";
+    bool first = true;
+    for (const auto& [k, v] : sorted) {
+        if (!first) key += ",";
+        key += k + "=" + v;
+        first = false;
+    }
+    key += "}";
+    return key;
+}
+
+// ИСПРАВЛЕНИЕ M1 (аудит): Prometheus-совместимое экранирование label values
+static std::string prometheus_escape_label_value(const std::string& v) {
+    std::string result;
+    result.reserve(v.size());
+    for (char c : v) {
+        switch (c) {
+            case '\\': result += "\\\\"; break;
+            case '"':  result += "\\\""; break;
+            case '\n': result += "\\n";  break;
+            default:   result += c;
+        }
+    }
+    return result;
+}
+
+std::string InMemoryMetricsRegistry::format_labels(const MetricTags& tags) {
+    if (tags.empty()) return "";
+    std::map<std::string, std::string> sorted(tags.begin(), tags.end());
+    std::string result = "{";
+    bool first = true;
+    for (const auto& [k, v] : sorted) {
+        if (!first) result += ",";
+        result += k + "=\"" + prometheus_escape_label_value(v) + "\"";
+        first = false;
+    }
+    result += "}";
+    return result;
+}
+
+// ============================================================
 // InMemoryMetricsRegistry
 // ============================================================
 
 std::shared_ptr<ICounter>
 InMemoryMetricsRegistry::counter(std::string name, MetricTags tags) {
     std::lock_guard lock{mutex_};
-    auto it = counters_.find(name);
+    auto key = make_key(name, tags);
+    auto it = counters_.find(key);
     if (it != counters_.end()) {
         return it->second;
     }
-    auto c = std::make_shared<AtomicCounter>(name, std::move(tags));
-    counters_[name] = c;
+    auto c = std::make_shared<AtomicCounter>(name, tags);
+    counters_[key] = c;
     return c;
 }
 
 std::shared_ptr<IGauge>
 InMemoryMetricsRegistry::gauge(std::string name, MetricTags tags) {
     std::lock_guard lock{mutex_};
-    auto it = gauges_.find(name);
+    auto key = make_key(name, tags);
+    auto it = gauges_.find(key);
     if (it != gauges_.end()) {
         return it->second;
     }
-    auto g = std::make_shared<AtomicGauge>(name, std::move(tags));
-    gauges_[name] = g;
+    auto g = std::make_shared<AtomicGauge>(name, tags);
+    gauges_[key] = g;
     return g;
 }
 
@@ -160,12 +212,13 @@ InMemoryMetricsRegistry::histogram(std::string name,
                                     std::vector<double> buckets,
                                     MetricTags tags) {
     std::lock_guard lock{mutex_};
-    auto it = histograms_.find(name);
+    auto key = make_key(name, tags);
+    auto it = histograms_.find(key);
     if (it != histograms_.end()) {
         return it->second;
     }
-    auto h = std::make_shared<SimpleHistogram>(name, std::move(buckets), std::move(tags));
-    histograms_[name] = h;
+    auto h = std::make_shared<SimpleHistogram>(name, std::move(buckets), tags);
+    histograms_[key] = h;
     return h;
 }
 
@@ -174,31 +227,50 @@ std::string InMemoryMetricsRegistry::export_prometheus() const {
     std::lock_guard lock{mutex_};
     std::ostringstream oss;
 
+    // ИСПРАВЛЕНИЕ M1 (аудит): корректная группировка # TYPE через set
+    // для предотвращения дублирования при неупорядоченном обходе
+    std::set<std::string> emitted_types;
+
     // Счётчики
-    for (const auto& [name, c] : counters_) {
-        oss << "# TYPE " << name << " counter\n";
-        oss << name << " " << c->value() << "\n";
+    for (const auto& [key, c] : counters_) {
+        const auto& metric_name = c->name();
+        if (emitted_types.insert("counter:" + metric_name).second) {
+            oss << "# TYPE " << metric_name << " counter\n";
+        }
+        auto* ac = dynamic_cast<const AtomicCounter*>(c.get());
+        std::string labels = ac ? format_labels(ac->tags()) : "";
+        oss << metric_name << labels << " " << c->value() << "\n";
     }
 
     // Gauges
-    for (const auto& [name, g] : gauges_) {
-        oss << "# TYPE " << name << " gauge\n";
-        oss << name << " " << g->value() << "\n";
+    for (const auto& [key, g] : gauges_) {
+        const auto& metric_name = g->name();
+        if (emitted_types.insert("gauge:" + metric_name).second) {
+            oss << "# TYPE " << metric_name << " gauge\n";
+        }
+        auto* ag = dynamic_cast<const AtomicGauge*>(g.get());
+        std::string labels = ag ? format_labels(ag->tags()) : "";
+        oss << metric_name << labels << " " << g->value() << "\n";
     }
 
     // Гистограммы
-    for (const auto& [name, h_ptr] : histograms_) {
-        // Динамически приводим к SimpleHistogram для доступа к бакетам
+    for (const auto& [key, h_ptr] : histograms_) {
         auto* sh = dynamic_cast<const SimpleHistogram*>(h_ptr.get());
         if (!sh) continue;
 
-        oss << "# TYPE " << name << " histogram\n";
-        for (const auto& [bound, count] : sh->get_buckets()) {
-            oss << name << "_bucket{le=\"" << bound << "\"} " << count << "\n";
+        const auto& metric_name = sh->name();
+        if (emitted_types.insert("histogram:" + metric_name).second) {
+            oss << "# TYPE " << metric_name << " histogram\n";
         }
-        oss << name << "_bucket{le=\"+Inf\"} " << sh->total_count() << "\n";
-        oss << name << "_sum "   << sh->total_sum()   << "\n";
-        oss << name << "_count " << sh->total_count() << "\n";
+        std::string labels_base = format_labels(sh->tags());
+        // Для бакетов нужно вставить le= внутрь labels
+        std::string prefix = labels_base.empty() ? "{" : labels_base.substr(0, labels_base.size()-1) + ",";
+        for (const auto& [bound, count] : sh->get_buckets()) {
+            oss << metric_name << "_bucket" << prefix << "le=\"" << bound << "\"} " << count << "\n";
+        }
+        oss << metric_name << "_bucket" << prefix << "le=\"+Inf\"} " << sh->total_count() << "\n";
+        oss << metric_name << "_sum" << labels_base << " " << sh->total_sum() << "\n";
+        oss << metric_name << "_count" << labels_base << " " << sh->total_count() << "\n";
     }
 
     return oss.str();

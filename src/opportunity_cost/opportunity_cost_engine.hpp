@@ -24,37 +24,66 @@ public:
     ) = 0;
 };
 
-/// Конфигурация модуля opportunity cost (загружается из YAML)
+/// Конфигурация модуля opportunity cost (загружается из YAML).
+///
+/// Дефолты откалиброваны для USDT-M futures scalping на 1-минутных свечах.
+/// Все доли и пороги экспозиции выражены как fraction [0, 1], не как проценты.
+///
+/// Научные основания:
+///   - Kelly criterion (Kelly 1956): связь edge/variance с оптимальным sizing
+///   - Optimal execution (Almgren & Chriss 2001): пороги edge > execution cost
+///   - Futures risk management (Hull 2018): margin reserve, concentration limits
+///   - Drawdown recovery (Thorp 2006, Vince 1992): half-Kelly при просадке
 struct OpportunityCostConfig {
     // ── Пороги net edge (базисные пункты) ──
-    double min_net_expected_bps{0.0};          ///< Мин чистый ожидаемый доход для входа
-    double execute_min_net_bps{15.0};          ///< Мин чистый доход для немедленного исполнения
+    // min_net_expected_bps ≥ средний half-spread (~0.5 bps на основных USDT-M парах).
+    // Almgren & Chriss 2001: edge должен покрывать transaction costs.
+    double min_net_expected_bps{1.0};          ///< Мин чистый ожидаемый доход для входа (bps)
+    double execute_min_net_bps{3.0};           ///< Мин чистый доход для немедленного исполнения (bps)
 
     // ── Пороги экспозиции ──
-    double high_exposure_threshold{0.75};      ///< Порог высокой экспозиции [0,1]
-    double high_exposure_min_conviction{0.65}; ///< Мин conviction при высокой экспозиции
+    // 70% margin utilization оставляет 30% резерв для maintenance margin
+    // и покрытия волатильности (Hull 2018, ch. 2: futures margin mechanics).
+    double high_exposure_threshold{0.70};      ///< Порог высокой маржинальной экспозиции [0,1]
+    double high_exposure_min_conviction{0.60}; ///< Мин conviction при высокой экспозиции
 
     // ── Пороги концентрации ──
-    double max_symbol_concentration{0.25};     ///< Макс доля капитала на один символ
-    double max_strategy_concentration{0.35};   ///< Макс доля капитала на одну стратегию
+    // Markowitz MPT: диверсификация снижает unsystematic risk.
+    // Практика HFT risk: max 25-40% на один инструмент.
+    double max_symbol_concentration{0.25};     ///< Макс маржинальная доля капитала на один символ [0,1]
+    double max_strategy_concentration{0.35};   ///< Макс маржинальная доля капитала на одну стратегию [0,1]
 
     // ── Пороги капитала ──
-    double capital_exhaustion_threshold{0.90}; ///< Порог исчерпания капитала [0,1]
+    // 85% — 15% buffer для maintenance margin (~5-10% на Binance USDT-M)
+    // + запас для adverse price movement.
+    double capital_exhaustion_threshold{0.85}; ///< Порог исчерпания маржинального капитала [0,1]
 
-    // ── Веса скоринга ──
+    // ── Веса скоринга (composite score для аудита и телеметрии) ──
+    // Сумма весов = 1.0. Conviction и net_edge — основные драйверы.
     double weight_conviction{0.35};            ///< Вес conviction в composite score
     double weight_net_edge{0.35};              ///< Вес net edge
     double weight_capital_efficiency{0.15};    ///< Вес capital efficiency
-    double weight_urgency{0.15};               ///< Вес urgency
+    double weight_urgency{0.15};              ///< Вес urgency
 
     // ── Масштабирование expected return ──
-    double conviction_to_bps_scale{120.0};     ///< Масштаб: conviction 1.0 → N bps
+    // conviction 1.0 → 100 bps ожидаемого дохода на leveraged USDT-M scalp.
+    // Типичный диапазон: 50-200 bps в зависимости от волатильности и плеча.
+    double conviction_to_bps_scale{100.0};     ///< Масштаб: conviction 1.0 → N bps
 
     // ── Upgrade ──
-    double upgrade_min_edge_advantage_bps{10.0}; ///< Мин разница edge для Upgrade vs худшей позиции
+    // Порог должен превышать 2× round-trip execution cost (~4 bps при maker fees),
+    // чтобы ротация окупалась.
+    double upgrade_min_edge_advantage_bps{5.0}; ///< Мин разница edge для Upgrade vs худшей позиции
 
     // ── Drawdown penalty ──
+    // Thorp 2006: half-Kelly при значительной просадке.
+    // +scale к conviction threshold за каждые 5% drawdown от пика.
     double drawdown_penalty_scale{0.5};        ///< Множитель: +X к порогу за каждые 5% просадки
+
+    // ── Consecutive loss penalty ──
+    // Серия убытков повышает required conviction для входа.
+    // 0.02 на loss: после 5 подряд убытков +10% к порогу.
+    double consecutive_loss_penalty{0.02};     ///< +X к порогу за каждый убыточный трейд подряд
 };
 
 /// Реализация на основе правил (production-grade)

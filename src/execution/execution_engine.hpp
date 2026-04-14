@@ -114,6 +114,11 @@ public:
     /// Установить leverage для фьючерсов
     void set_leverage(double leverage) { leverage_ = std::max(leverage, 1.0); }
 
+    /// ИСПРАВЛЕНИЕ H5: Обновить min notional из exchange rules (symbol-specific)
+    void set_min_notional_usdt(double min_usdt) {
+        if (min_usdt > 0.0) config_.min_notional_usdt = min_usdt;
+    }
+
     /// Получить статистику fills для ордера
     [[nodiscard]] std::optional<OrderExecutionInfo> get_execution_info(const OrderId& order_id) const;
 
@@ -143,8 +148,8 @@ private:
                                const execution_alpha::ExecutionAlphaResult& exec_alpha,
                                const uncertainty::UncertaintySnapshot& uncertainty);
 
-    /// Cash reservation для BUY-ордера
-    bool try_reserve_cash(const OrderRecord& order);
+    /// Margin reservation для открывающего ордера (Long или Short)
+    bool try_reserve_margin(OrderRecord& order);
 
     ExecutionConfig config_;
     std::shared_ptr<IOrderSubmitter> submitter_;

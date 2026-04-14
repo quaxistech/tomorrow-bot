@@ -1,11 +1,9 @@
-# Библиотека интеграции с Bitget API
+# Библиотека интеграции с Bitget API (USDT-M Futures ONLY)
 add_library(tb_exchange_bitget STATIC
     bitget_signing.cpp
     bitget_ws_client.cpp
     bitget_rest_client.cpp
-    bitget_order_submitter.cpp
     bitget_futures_order_submitter.cpp
-    bitget_exchange_query_adapter.cpp
     bitget_futures_query_adapter.cpp
 )
 target_include_directories(tb_exchange_bitget PUBLIC ${CMAKE_SOURCE_DIR}/src)

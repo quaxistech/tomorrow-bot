@@ -14,10 +14,13 @@
  * 9. Корректное завершение работы
  */
 #include "app_bootstrap.hpp"
+#include "http_server.hpp"
 #include "supervisor/supervisor.hpp"
 #include "pipeline/trading_pipeline.hpp"
+#include "portfolio/portfolio_engine.hpp"
 #include "scanner/scanner_engine.hpp"
 #include "common/exchange_rules.hpp"
+#include "exchange/bitget/bitget_futures_query_adapter.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "security/secret_provider.hpp"
 #include "common/enums.hpp"
@@ -27,6 +30,7 @@
 #include <vector>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <chrono>
 
@@ -34,7 +38,7 @@ namespace {
 
 /// Параметры командной строки
 struct CliArgs {
-    std::string config_path{"configs/paper.yaml"};  ///< Путь к файлу конфигурации
+    std::string config_path{"configs/production.yaml"};  ///< Путь к файлу конфигурации
     bool        show_help{false};                    ///< Показать справку
     bool        show_version{false};                 ///< Показать версию
 };
@@ -62,14 +66,9 @@ void print_help(std::string_view program_name) {
     std::cout << "Tomorrow Bot — Adaptive Trading System\n\n"
               << "Использование: " << program_name << " [ОПЦИИ]\n\n"
               << "Опции:\n"
-              << "  -c, --config=PATH  Путь к файлу конфигурации (по умолчанию: configs/paper.yaml)\n"
+              << "  -c, --config=PATH  Путь к файлу конфигурации (по умолчанию: configs/production.yaml)\n"
               << "  -v, --version      Показать версию и выйти\n"
-              << "  -h, --help         Показать эту справку\n\n"
-              << "Режимы торговли (задаются в конфигурации):\n"
-              << "  paper      Бумажная торговля (без реальных денег)\n"
-              << "  shadow     Теневой режим (расчёты без исполнения)\n"
-              << "  testnet    Тестовая сеть биржи\n"
-              << "  production Реальная торговля\n";
+              << "  -h, --help         Показать эту справку\n";
 }
 
 /// Выводит версию приложения
@@ -117,6 +116,53 @@ int main(int argc, const char* argv[]) {
          {"mode",   std::string(tb::to_string(config.trading.mode))},
          {"config_hash", config.config_hash}});
 
+    std::unique_ptr<tb::app::HttpEndpointServer> metrics_server;
+    if (config.metrics.enabled) {
+        metrics_server = std::make_unique<tb::app::HttpEndpointServer>(
+            "127.0.0.1",
+            config.metrics.port,
+            "metrics_http",
+            [metrics = comp.metrics, metrics_path = config.metrics.path](std::string_view method,
+                                                                          std::string_view target) {
+                const auto query_pos = target.find('?');
+                const auto path = target.substr(0, query_pos);
+                if (method != "GET") {
+                    tb::app::HttpResponse response;
+                    response.status_code = 405;
+                    response.status_text = "Method Not Allowed";
+                    response.body = "Method Not Allowed\n";
+                    response.headers.emplace_back("Allow", "GET");
+                    return response;
+                }
+                if (path != metrics_path) {
+                    tb::app::HttpResponse response;
+                    response.status_code = 404;
+                    response.status_text = "Not Found";
+                    response.body = "Not Found\n";
+                    return response;
+                }
+
+                tb::app::HttpResponse response;
+                response.content_type = "text/plain; version=0.0.4; charset=utf-8";
+                response.headers.emplace_back("Cache-Control", "no-store");
+                response.body = metrics->export_prometheus();
+                return response;
+            },
+            logger);
+
+        if (metrics_server->start()) {
+            logger->info("main", "Metrics endpoint запущен",
+                {{"address", "127.0.0.1"},
+                 {"port", std::to_string(config.metrics.port)},
+                 {"path", config.metrics.path}});
+        } else {
+            logger->error("main", "Не удалось запустить metrics endpoint",
+                {{"port", std::to_string(config.metrics.port)},
+                 {"path", config.metrics.path}});
+            metrics_server.reset();
+        }
+    }
+
     // ---- 4. Сканирование торговых пар (ScannerEngine v2) ----
     // Создаём REST-клиент для сканера (публичный, без аутентификации)
     auto scanner_rest_client = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
@@ -126,45 +172,95 @@ int main(int argc, const char* argv[]) {
     tb::scanner::ScannerConfig scanner_cfg;
     scanner_cfg.top_n = config.pair_selection.top_n;
     scanner_cfg.blacklist = config.pair_selection.blacklist;
-    scanner_cfg.product_type = config.pair_selection.product_type;
+    scanner_cfg.product_type = config.futures.product_type;
     scanner_cfg.rotation_interval_hours = config.pair_selection.rotation_interval_hours;
-    scanner_cfg.prefilter_min_volume_usdt = config.pair_selection.min_volume_usdt;
+    // Предфильтр должен быть НАМНОГО мягче глубокого фильтра — пропускаем больше кандидатов
+    // для детального анализа (orderbook + candles). 20% от min_volume = разумный компромисс.
+    scanner_cfg.prefilter_min_volume_usdt = std::max(config.pair_selection.min_volume_usdt * 0.2, 500'000.0);
+    scanner_cfg.prefilter_max_spread_bps = config.pair_selection.max_spread_bps * 3.0;  // pre-filter 3x looser
     scanner_cfg.min_volume_usdt = config.pair_selection.min_volume_usdt;
     scanner_cfg.max_spread_bps = config.pair_selection.max_spread_bps;
     scanner_cfg.max_candidates_detailed = config.pair_selection.max_candidates_for_candles;
     scanner_cfg.api_retry_max = config.pair_selection.api_retry_max;
 
+    // ИСПРАВЛЕНИЕ H10: пробросить scorer-настройки из YAML в ScannerConfig
+    scanner_cfg.filter_min_change_24h = config.pair_selection.scorer.filter_min_change_24h;
+    scanner_cfg.filter_max_change_24h = config.pair_selection.scorer.filter_max_change_24h;
+
+    // ИСПРАВЛЕНИЕ H3 (аудит): пробросить дополнительные scorer-поля в ScannerConfig,
+    // чтобы YAML-параметры реально влияли на runtime фильтрацию и ранжирование.
+    const auto& sc = config.pair_selection.scorer;
+    scanner_cfg.min_volume_usdt = std::max(scanner_cfg.min_volume_usdt, sc.volume_tier_minimal);
+    scanner_cfg.min_volatility_pct = sc.volatility_low_threshold;
+    scanner_cfg.max_volatility_pct = sc.volatility_high_threshold;
+
+    // Микро-аккаунт: ослабляем фильтры сканера (нам не нужна глубина $50K для $5 ордеров)
+    if (config.trading.initial_capital < 100.0) {
+        scanner_cfg.min_orderbook_depth_usdt = 5'000.0;   // $5K вместо $50K (наши ордера ~$5)
+        scanner_cfg.min_open_interest_usdt = 100'000.0;    // $100K вместо $500K
+        // Устраняем deadzone: trade_state_max_trap_risk должен совпадать с max_trap_risk
+        // Иначе пары проходят фильтр (trap < 0.7) но получают DoNotTrade (trap > 0.6)
+        scanner_cfg.trade_state_max_trap_risk = scanner_cfg.max_trap_risk;  // 0.7
+    }
+
     // Создаём ScannerEngine (v2: features, traps, bias, ranking)
     auto market_scanner = std::make_shared<tb::scanner::ScannerEngine>(
         scanner_cfg, scanner_rest_client, logger, comp.metrics);
 
-    // Выполняем первичное сканирование
-    logger->info("main", "Запуск сканирования торговых пар (ScannerEngine v2)...");
-    auto scanner_result = market_scanner->scan();
-
-    // Определяем символы для торговли
+    // Выполняем сканирование с ретраями — если рынок не даёт пар, ждём
+    tb::scanner::ScannerResult scanner_result;
     std::vector<std::string> active_symbols;
-    auto new_symbols = scanner_result.selected_symbols();
-    if (!new_symbols.empty()) {
-        active_symbols = new_symbols;
 
-        // Логируем детали сканера
-        for (const auto& p : scanner_result.top_pairs) {
-            logger->info("main", "Scanner v2: " + p.symbol +
-                " | Score=" + std::to_string(p.score.total) +
-                " | Bias=" + std::string(tb::scanner::to_string(p.bias)) +
-                " | State=" + std::string(tb::scanner::to_string(p.trade_state)));
+    if (config.pair_selection.mode == tb::config::PairSelectionMode::Manual &&
+        !config.pair_selection.manual_symbols.empty()) {
+        // Ручной режим: используем заданные символы, пропускаем сканер
+        active_symbols = config.pair_selection.manual_symbols;
+        std::string syms_str;
+        for (const auto& s : active_symbols) {
+            if (!syms_str.empty()) syms_str += ", ";
+            syms_str += s;
         }
+        logger->info("main", "Ручной режим: используем заданные символы",
+            {{"symbols", syms_str},
+             {"count", std::to_string(active_symbols.size())}});
     } else {
-        active_symbols.push_back("BTCUSDT");
-        logger->warn("main", "Сканер не нашёл подходящих пар. Используется BTCUSDT по умолчанию");
+        logger->info("main", "Запуск сканирования торговых пар (ScannerEngine v2)...");
+
+        constexpr int kScanRetryIntervalSec = 60;
+        constexpr int kMaxScanRetries = 30;  // макс 30 мин ожидания
+
+        for (int attempt = 1; attempt <= kMaxScanRetries; ++attempt) {
+            scanner_result = market_scanner->scan();
+            active_symbols = scanner_result.selected_symbols();
+
+            if (!active_symbols.empty()) {
+                for (const auto& p : scanner_result.top_pairs) {
+                    logger->info("main", "Scanner v2: " + p.symbol +
+                        " | Score=" + std::to_string(p.score.total) +
+                        " | Bias=" + std::string(tb::scanner::to_string(p.bias)) +
+                        " | State=" + std::string(tb::scanner::to_string(p.trade_state)));
+                }
+                break;
+            }
+
+            if (attempt == kMaxScanRetries) {
+                logger->critical("main", "Сканер не нашёл подходящих пар после " +
+                    std::to_string(kMaxScanRetries) + " попыток. Завершение.");
+                return 1;
+            }
+
+            logger->warn("main", "Сканер не нашёл подходящих пар, повторная попытка через " +
+                std::to_string(kScanRetryIntervalSec) + " сек",
+                {{"attempt", std::to_string(attempt)},
+                 {"max_attempts", std::to_string(kMaxScanRetries)},
+                 {"errors", std::to_string(scanner_result.errors.size())}});
+
+            std::this_thread::sleep_for(std::chrono::seconds(kScanRetryIntervalSec));
+        }
     }
 
-    // ---- 4.5. Проверка удерживаемых активов на бирже ----
-    // Если есть открытые позиции (ненулевые балансы), принудительно включаем их символы.
-    // Это предотвращает "сиротские" позиции, которые никто не отслеживает.
-    if (config.trading.mode == tb::TradingMode::Production ||
-        config.trading.mode == tb::TradingMode::Testnet) {
+    // ---- 4.5. Проверка уже открытых позиций на бирже ----
+    {
         try {
             auto api_key_res = comp.secret_provider->get_secret(tb::security::SecretRef{"BITGET_API_KEY"});
             auto api_secret_res = comp.secret_provider->get_secret(tb::security::SecretRef{"BITGET_API_SECRET"});
@@ -176,86 +272,53 @@ int main(int argc, const char* argv[]) {
                     *api_key_res, *api_secret_res, *passphrase_res,
                     logger, config.exchange.timeout_ms);
 
-                // Use spot for spot mode, futures for futures mode
-                std::string balance_endpoint = config.futures.enabled
-                    ? "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
-                    : "/api/v2/spot/account/assets";
-                auto resp = auth_rest->get(balance_endpoint);
-                if (resp.status_code == 200) {
-                    auto root = boost::json::parse(resp.body);
-                    auto& data = root.as_object()["data"].as_array();
-                    std::vector<std::string> held_symbols;
+                {
+                    tb::exchange::bitget::BitgetFuturesQueryAdapter futures_query{
+                        auth_rest, logger, config.futures};
+                    auto open_positions = futures_query.get_open_positions();
+                    if (!open_positions.has_value()) {
+                        logger->warn("main", "Не удалось загрузить открытые фьючерсные позиции",
+                            {{"error", tb::TbErrorCategory::instance().message(
+                                static_cast<int>(open_positions.error()))}});
+                    } else {
+                        std::string positions_str;
+                        for (const auto& position : open_positions.value()) {
+                            const std::string symbol = position.symbol.get();
+                            if (symbol.empty() || position.size.get() <= 0.0) {
+                                continue;
+                            }
 
-                    for (auto& asset : data) {
-                        auto& obj = asset.as_object();
-                        // Futures uses "marginCoin", spot uses "coin"
-                        std::string coin;
-                        if (obj.contains("marginCoin")) {
-                            coin = std::string(obj["marginCoin"].as_string());
-                        } else if (obj.contains("coin")) {
-                            coin = std::string(obj["coin"].as_string());
-                        } else {
-                            continue;
-                        }
-                        double avail = std::stod(std::string(obj["available"].as_string()));
-                        if (coin == "USDT" || avail <= 0.0) continue;
+                            if (!positions_str.empty()) {
+                                positions_str += ", ";
+                            }
+                            positions_str += symbol + " " + std::string(tb::to_string(position.side));
 
-                        double usd_val = 0.0;
-                        if (obj.contains("usdtValue")) {
-                            try { usd_val = std::stod(std::string(obj["usdtValue"].as_string())); }
-                            catch (...) { logger->debug("main", "Не удалось разобрать usdtValue", {{"coin", coin}}); }
-                        }
-
-                        // Fallback: если usdtValue ненадёжен (0), запрашиваем тикер
-                        if (usd_val < 0.01 && avail > 0.0) {
-                            std::string sym = coin + "USDT";
-                            auto tresp = auth_rest->get("/api/v2/spot/market/tickers?symbol=" + sym);
-                            if (tresp.success) {
-                                try {
-                                    auto tdoc = boost::json::parse(tresp.body);
-                                    auto& tobj = tdoc.as_object();
-                                    if (tobj.at("code").as_string() == "00000") {
-                                        auto& tdata = tobj.at("data").as_array();
-                                        if (!tdata.empty()) {
-                                            double px = std::stod(std::string(
-                                                tdata[0].as_object().at("lastPr").as_string()));
-                                            usd_val = avail * px;
-                                        }
-                                    }
-                                } catch (...) { logger->debug("main", "Не удалось получить тикер для оценки баланса", {{"symbol", sym}}); }
+                            // Если есть открытая позиция по символу не из сканера — добавляем
+                            bool already_tracked = false;
+                            for (const auto& s : active_symbols) {
+                                if (s == symbol) { already_tracked = true; break; }
+                            }
+                            if (!already_tracked) {
+                                active_symbols.push_back(symbol);
+                                logger->warn("main",
+                                    "Принудительно добавлен символ с открытой фьючерсной позицией: " + symbol,
+                                    {{"side", std::string(tb::to_string(position.side))},
+                                     {"size", std::to_string(position.size.get())},
+                                     {"entry_price", std::to_string(position.entry_price.get())},
+                                     {"mark_price", std::to_string(position.current_price.get())},
+                                     {"notional_usd", std::to_string(position.notional_usd)},
+                                     {"unrealized_pnl", std::to_string(position.unrealized_pnl)}});
                             }
                         }
 
-                        if (usd_val < 0.50) continue;
-
-                        std::string symbol = coin + "USDT";
-                        held_symbols.push_back(symbol);
-
-                        bool already_selected = false;
-                        for (const auto& s : active_symbols) {
-                            if (s == symbol) { already_selected = true; break; }
+                        if (!positions_str.empty()) {
+                            logger->info("main", "Открытые фьючерсные позиции на бирже: " + positions_str);
                         }
-                        if (!already_selected) {
-                            active_symbols.push_back(symbol);
-                            logger->warn("main",
-                                "Принудительно добавлен символ с открытой позицией: " + symbol,
-                                {{"coin", coin},
-                                 {"balance", std::to_string(avail)},
-                                 {"usdt_value", std::to_string(usd_val)}});
-                        }
-                    }
-                    if (!held_symbols.empty()) {
-                        std::string held_str;
-                        for (const auto& s : held_symbols) {
-                            if (!held_str.empty()) held_str += ", ";
-                            held_str += s;
-                        }
-                        logger->info("main", "Удерживаемые активы: " + held_str);
                     }
                 }
             }
         } catch (const std::exception& e) {
-            logger->warn("main", "Не удалось проверить удерживаемые активы",
+            logger->warn("main", "Не удалось проверить уже открытые позиции на бирже",
                 {{"error", e.what()}});
         }
     }
@@ -280,6 +343,7 @@ int main(int argc, const char* argv[]) {
         rules.quantity_precision = sa.quantity_precision;
         rules.price_precision = sa.price_precision;
         rules.min_trade_usdt = sa.min_trade_usdt;
+        rules.min_quantity = sa.min_quantity;
         symbol_rules[sa.symbol] = rules;
     }
     for (const auto& sa : scanner_result.rejected_pairs) {
@@ -289,6 +353,7 @@ int main(int argc, const char* argv[]) {
         rules.quantity_precision = sa.quantity_precision;
         rules.price_precision = sa.price_precision;
         rules.min_trade_usdt = sa.min_trade_usdt;
+        rules.min_quantity = sa.min_quantity;
         symbol_rules[sa.symbol] = rules;
     }
 
@@ -301,7 +366,11 @@ int main(int argc, const char* argv[]) {
 
     supervisor.install_signal_handlers();
 
-    // ---- 5.5. Создание торговых pipeline для КАЖДОЙ выбранной пары ----
+    // ---- 5.5. Единый account-level портфель (shared между всеми pipeline) ----
+    auto shared_portfolio = std::make_shared<tb::portfolio::InMemoryPortfolioEngine>(
+        config.trading.initial_capital, comp.logger, comp.clock, comp.metrics);
+
+    // ---- 5.6. Создание торговых pipeline для КАЖДОЙ выбранной пары ----
     std::vector<std::shared_ptr<tb::pipeline::TradingPipeline>> pipelines;
     pipelines.reserve(active_symbols.size());
 
@@ -309,7 +378,8 @@ int main(int argc, const char* argv[]) {
         const auto& sym = active_symbols[i];
 
         auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
-            config, comp.secret_provider, comp.logger, comp.clock, comp.metrics, sym);
+            config, comp.secret_provider, comp.logger, comp.clock, comp.metrics,
+            sym, shared_portfolio);
 
         // Устанавливаем правила инструмента из данных сканирования
         auto rules_it = symbol_rules.find(sym);
@@ -333,19 +403,21 @@ int main(int argc, const char* argv[]) {
              {"total", std::to_string(active_symbols.size())}});
     }
 
-    // ---- 5.6. Запуск ротации пар (каждые N часов) ----
-    // Ротация через новый ScannerEngine
-    market_scanner->start_rotation([&logger](const tb::scanner::ScannerResult& result) {
-        auto syms = result.selected_symbols();
-        std::string symbols_str;
-        for (const auto& s : syms) {
-            if (!symbols_str.empty()) symbols_str += ", ";
-            symbols_str += s;
-        }
-        logger->info("main", "Плановая ротация (ScannerEngine v2). Лучшие пары: " + symbols_str,
-            {{"count", std::to_string(syms.size())},
-             {"scan_duration_ms", std::to_string(result.scan_duration_ms)}});
-    });
+    // ---- 5.7. Запуск ротации пар (каждые N часов) ----
+    // Ротация через новый ScannerEngine (только в auto режиме)
+    if (config.pair_selection.mode != tb::config::PairSelectionMode::Manual) {
+        market_scanner->start_rotation([&logger](const tb::scanner::ScannerResult& result) {
+            auto syms = result.selected_symbols();
+            std::string symbols_str;
+            for (const auto& s : syms) {
+                if (!symbols_str.empty()) symbols_str += ", ";
+                symbols_str += s;
+            }
+            logger->info("main", "Плановая ротация (ScannerEngine v2). Лучшие пары: " + symbols_str,
+                {{"count", std::to_string(syms.size())},
+                 {"scan_duration_ms", std::to_string(result.scan_duration_ms)}});
+        });
+    }
 
     try {
         supervisor.start();
@@ -355,12 +427,13 @@ int main(int argc, const char* argv[]) {
         return 2;
     }
 
-    // ---- 5.7. Динамическая ротация при простое pipeline ----
-    // Фоновый поток проверяет каждые 5 минут: если ВСЕ pipeline простаивают
+    // ---- 5.8. Динамическая ротация при простое pipeline ----
+    // В ручном режиме (Manual) ротация отключена — всегда торгуем заданными символами.
+    // В автоматическом режиме: фоновый поток проверяет каждые 5 минут: если ВСЕ pipeline простаивают
     // (нет торговли > 30 мин) и нет открытых позиций — пересканировать рынок
     // и заменить pipeline на новые символы.
-    // Профессиональный throttling: максимум 1 ресканирование каждые 30 минут.
-    constexpr int64_t kIdleThresholdNs = 30LL * 60 * 1'000'000'000LL;  // 30 мин
+    const bool rotation_enabled = (config.pair_selection.mode != tb::config::PairSelectionMode::Manual);
+    constexpr int64_t kIdleThresholdNs = 30LL * 60 * 1'000'000'000LL;  // 30 мин простоя перед ротацией
     constexpr int kIdleCheckIntervalSec = 300;                          // 5 мин между проверками
     constexpr int64_t kMinRescanIntervalNs = 30LL * 60 * 1'000'000'000LL; // 30 мин между ресканами
 
@@ -376,28 +449,33 @@ int main(int argc, const char* argv[]) {
             }
             if (!idle_monitor_running.load()) break;
 
+            // В ручном режиме ротация отключена
+            if (!rotation_enabled) continue;
+
             // Throttle: не ресканировать чаще чем раз в 30 мин
             int64_t now_ns = comp.clock->now().get();
             if ((now_ns - last_rescan_ns) < kMinRescanIntervalNs) continue;
 
-            // Проверяем: все ли pipeline простаивают и нет ли открытых позиций
-            bool all_idle = true;
+            // Проверяем: есть ли pipeline без позиций, которые простаивают > порога
+            bool any_idle_without_position = false;
             bool any_has_position = false;
+            int idle_count = 0;
             for (const auto& p : pipelines) {
                 if (p->has_open_position()) {
                     any_has_position = true;
-                    all_idle = false;
-                    break;
-                }
-                if (!p->is_idle(kIdleThresholdNs)) {
-                    all_idle = false;
+                } else if (p->is_idle(kIdleThresholdNs)) {
+                    any_idle_without_position = true;
+                    ++idle_count;
                 }
             }
 
-            if (!all_idle || any_has_position) continue;
+            // Ресканируем если хотя бы один pipeline простаивает без позиции
+            if (!any_idle_without_position) continue;
 
-            logger->warn("main", "Все pipeline простаивают > 30 мин. Запуск ресканирования...",
-                {{"pipeline_count", std::to_string(pipelines.size())}});
+            logger->warn("main", "Простаивающие pipeline обнаружены. Запуск ресканирования...",
+                {{"pipeline_count", std::to_string(pipelines.size())},
+                 {"idle_count", std::to_string(idle_count)},
+                 {"has_positions", any_has_position ? "true" : "false"}});
 
             try {
                 // Используем новый ScannerEngine для ресканирования
@@ -410,54 +488,17 @@ int main(int argc, const char* argv[]) {
                     continue;
                 }
 
-                // Проверяем: новые символы отличаются от текущих?
-                bool symbols_changed = false;
-                if (rescan_syms.size() != active_symbols.size()) {
-                    symbols_changed = true;
-                } else {
-                    for (size_t i = 0; i < rescan_syms.size(); ++i) {
-                        if (rescan_syms[i] != active_symbols[i]) {
-                            symbols_changed = true;
-                            break;
-                        }
-                    }
-                }
+                // Частичная ротация: заменяем только простаивающие pipeline без позиций
+                // Pipeline с открытыми позициями продолжают работать.
 
-                if (!symbols_changed) {
-                    logger->info("main", "Ресканирование: пары не изменились, оставляем текущие");
-                    last_rescan_ns = comp.clock->now().get();
-                    continue;
-                }
-
-                // Символы изменились — горячая замена pipeline
-                std::string old_str, new_str;
-                for (const auto& s : active_symbols) {
-                    if (!old_str.empty()) old_str += ", ";
-                    old_str += s;
-                }
-                for (const auto& s : rescan_syms) {
-                    if (!new_str.empty()) new_str += ", ";
-                    new_str += s;
-                }
-                logger->warn("main", "Горячая замена пар: [" + old_str + "] → [" + new_str + "]");
-
-                // 1. Останавливаем старые pipeline и удаляем из supervisor
-                for (const auto& sym : active_symbols) {
-                    supervisor.unregister_subsystem("pipeline_" + sym);
-                }
-                for (auto& p : pipelines) {
-                    p->stop();
-                }
-                pipelines.clear();
-
-                // 2. Обновляем правила инструментов из нового сканирования
-                symbol_rules.clear();
+                // 1. Обновляем правила инструментов из нового сканирования
                 for (const auto& sa : rescan_v2.top_pairs) {
                     tb::ExchangeSymbolRules rules;
                     rules.symbol = tb::Symbol(sa.symbol);
                     rules.quantity_precision = sa.quantity_precision;
                     rules.price_precision = sa.price_precision;
                     rules.min_trade_usdt = sa.min_trade_usdt;
+                    rules.min_quantity = sa.min_quantity;
                     symbol_rules[sa.symbol] = rules;
                 }
                 for (const auto& sa : rescan_v2.rejected_pairs) {
@@ -467,41 +508,107 @@ int main(int argc, const char* argv[]) {
                     rules.quantity_precision = sa.quantity_precision;
                     rules.price_precision = sa.price_precision;
                     rules.min_trade_usdt = sa.min_trade_usdt;
+                    rules.min_quantity = sa.min_quantity;
                     symbol_rules[sa.symbol] = rules;
                 }
 
-                // 3. Обновляем список активных символов
-                active_symbols = rescan_syms;
+                // 2. Определяем какие символы уже активны (и не будут заменены)
+                std::vector<size_t> idle_indices;
+                std::unordered_set<std::string> kept_symbols;
+                for (size_t i = 0; i < pipelines.size(); ++i) {
+                    if (!pipelines[i]->has_open_position() &&
+                        pipelines[i]->is_idle(kIdleThresholdNs)) {
+                        idle_indices.push_back(i);
+                    } else {
+                        kept_symbols.insert(active_symbols[i]);
+                    }
+                }
 
-                // 4. Создаём и запускаем новые pipeline
-                for (size_t i = 0; i < active_symbols.size(); ++i) {
-                    const auto& sym = active_symbols[i];
+                if (idle_indices.empty()) {
+                    last_rescan_ns = comp.clock->now().get();
+                    continue;
+                }
+
+                // 3. Собираем ВСЕ активные символы (включая idle) для проверки дубликатов
+                std::unordered_set<std::string> all_active_symbols;
+                for (const auto& s : active_symbols) {
+                    all_active_symbols.insert(s);
+                }
+
+                // 4. Выбираем новые символы из ресканирования (не пересекаются с ЛЮБЫМ активным)
+                std::vector<std::string> new_candidates;
+                for (const auto& s : rescan_syms) {
+                    if (all_active_symbols.find(s) == all_active_symbols.end()) {
+                        new_candidates.push_back(s);
+                    }
+                }
+
+                // 5. Заменяем idle pipeline новыми символами
+                size_t replaced = 0;
+                for (size_t idx = 0; idx < idle_indices.size() && replaced < new_candidates.size(); ++idx) {
+                    size_t pi = idle_indices[idx];
+                    const auto& old_sym = active_symbols[pi];
+                    const auto& new_sym = new_candidates[replaced];
+
+                    // Если idle pipeline и так на хорошем символе из нового скана — пропускаем
+                    bool still_good = false;
+                    for (const auto& s : rescan_syms) {
+                        if (s == old_sym) { still_good = true; break; }
+                    }
+                    if (still_good) {
+                        kept_symbols.insert(old_sym);
+                        continue;
+                    }
+
+                    // Двойная проверка: new_sym не должен совпадать с другим активным pipeline
+                    if (all_active_symbols.count(new_sym)) {
+                        logger->warn("main", "Пропуск ротации: символ уже активен в другом pipeline",
+                            {{"symbol", new_sym}});
+                        ++replaced;
+                        continue;
+                    }
+
+                    logger->warn("main", "Замена pipeline: " + old_sym + " → " + new_sym);
+
+                    // Останавливаем старый pipeline
+                    supervisor.unregister_subsystem("pipeline_" + old_sym);
+                    pipelines[pi]->stop();
+
+                    // Создаём новый pipeline
                     auto pipeline = std::make_shared<tb::pipeline::TradingPipeline>(
                         config, comp.secret_provider, comp.logger, comp.clock,
-                        comp.metrics, sym);
+                        comp.metrics, new_sym, shared_portfolio);
 
-                    auto rules_it = symbol_rules.find(sym);
+                    auto rules_it = symbol_rules.find(new_sym);
                     if (rules_it != symbol_rules.end()) {
                         pipeline->set_exchange_rules(rules_it->second);
                     }
                     pipeline->set_num_pipelines(static_cast<int>(active_symbols.size()));
                     pipeline->start();
-                    pipelines.push_back(pipeline);
 
-                    // Регистрируем в supervisor для мониторинга жизненного цикла
-                    std::string subsystem_name = "pipeline_" + sym;
+                    std::string subsystem_name = "pipeline_" + new_sym;
                     supervisor.register_subsystem(subsystem_name,
                         [pipeline]() { return pipeline->start(); },
                         [pipeline]() { pipeline->stop(); });
 
-                    logger->info("main", "Новый pipeline создан для " + sym,
-                        {{"index", std::to_string(i + 1)},
-                         {"total", std::to_string(active_symbols.size())}});
+                    pipelines[pi] = pipeline;
+                    active_symbols[pi] = new_sym;
+                    all_active_symbols.erase(old_sym);
+                    all_active_symbols.insert(new_sym);
+                    ++replaced;
                 }
 
                 last_rescan_ns = comp.clock->now().get();
-                logger->info("main", "Горячая замена завершена",
-                    {{"new_count", std::to_string(active_symbols.size())}});
+                if (replaced > 0) {
+                    std::string all_syms;
+                    for (const auto& s : active_symbols) {
+                        if (!all_syms.empty()) all_syms += ", ";
+                        all_syms += s;
+                    }
+                    logger->info("main", "Частичная ротация завершена",
+                        {{"replaced", std::to_string(replaced)},
+                         {"active", all_syms}});
+                }
 
             } catch (const std::exception& e) {
                 logger->error("main", "Ошибка при ресканировании: " + std::string(e.what()));
@@ -530,6 +637,9 @@ int main(int argc, const char* argv[]) {
         idle_monitor_thread.join();
     }
     market_scanner->stop_rotation();
+    if (metrics_server) {
+        metrics_server->stop();
+    }
     // Останавливаем pipeline вручную (supervisor может не знать о горячих заменах)
     for (auto& p : pipelines) {
         p->stop();

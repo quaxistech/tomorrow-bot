@@ -1,14 +1,13 @@
 #pragma once
 /**
  * @file recovery_types.hpp
- * @brief Типы и конфигурация модуля восстановления состояния
+ * @brief Типы и конфигурация модуля восстановления состояния (USDT-M Futures)
  *
- * Описывает режимы восстановления, статусы, записи о
- * восстановленных позициях/ордерах и итоговый результат.
+ * Описывает статусы recovery, записи о восстановленных
+ * фьючерсных позициях и итоговый результат.
  */
 
 #include "common/types.hpp"
-#include "execution/order_types.hpp"
 
 #include <cstdint>
 #include <string>
@@ -20,14 +19,6 @@ namespace tb::recovery {
 // ============================================================
 // Перечисления
 // ============================================================
-
-/// Режим восстановления
-enum class RecoveryMode {
-    Full,           ///< Полное восстановление (ордера + позиции + баланс)
-    OrdersOnly,     ///< Только ордера
-    PositionsOnly,  ///< Только позиции
-    BalanceOnly     ///< Только баланс
-};
 
 /// Статус восстановления
 enum class RecoveryStatus {
@@ -41,16 +32,6 @@ enum class RecoveryStatus {
 // ============================================================
 // to_string
 // ============================================================
-
-[[nodiscard]] inline constexpr std::string_view to_string(RecoveryMode m) noexcept {
-    switch (m) {
-        case RecoveryMode::Full:          return "Full";
-        case RecoveryMode::OrdersOnly:    return "OrdersOnly";
-        case RecoveryMode::PositionsOnly: return "PositionsOnly";
-        case RecoveryMode::BalanceOnly:   return "BalanceOnly";
-    }
-    return "Unknown";
-}
 
 [[nodiscard]] inline constexpr std::string_view to_string(RecoveryStatus s) noexcept {
     switch (s) {
@@ -67,25 +48,15 @@ enum class RecoveryStatus {
 // Записи о восстановленных объектах
 // ============================================================
 
-/// Запись о восстановленной позиции
+/// Запись о восстановленной фьючерсной позиции
 struct RecoveredPosition {
     Symbol symbol{""};
-    Side side{Side::Buy};
+    Side side{Side::Buy};                        ///< Buy = Long, Sell = Short
     Quantity size{0.0};
     Price avg_entry_price{0.0};
     double estimated_pnl{0.0};
-    bool had_matching_strategy{false};   ///< Была ли стратегия для этой позиции
-    std::string resolution;              ///< Что было сделано
-};
-
-/// Запись о восстановленном ордере
-struct RecoveredOrder {
-    OrderId order_id{""};
-    OrderId exchange_order_id{""};
-    Symbol symbol{""};
-    execution::OrderState exchange_state{execution::OrderState::New};
-    execution::OrderState local_state_before{execution::OrderState::New};
-    std::string resolution;
+    bool had_matching_strategy{false};           ///< Была ли стратегия для этой позиции
+    std::string resolution;                      ///< Что было сделано
 };
 
 // ============================================================
@@ -96,7 +67,6 @@ struct RecoveredOrder {
 struct RecoveryResult {
     RecoveryStatus status{RecoveryStatus::NotStarted};
     std::vector<RecoveredPosition> recovered_positions;
-    std::vector<RecoveredOrder> recovered_orders;
     double recovered_cash_balance{0.0};
     double balance_adjustment{0.0};
     int warnings{0};
@@ -106,14 +76,27 @@ struct RecoveryResult {
     std::vector<std::string> messages;
 };
 
-/// Конфигурация recovery
+/// Конфигурация recovery (USDT-M Futures)
+///
+/// Значения по умолчанию основаны на:
+/// - Bitget USDT-M Futures API v2 contract specifications
+/// - Almgren & Chriss (2000) "Optimal Execution of Portfolio Transactions"
+///   для рекомендаций по threshold-based reconciliation
 struct RecoveryConfig {
     bool enabled{true};
-    bool close_orphan_positions{false};        ///< Закрыть позиции без стратегий (осторожно!)
-    bool cancel_stale_orders{true};            ///< Отменить старые ордера при recovery
-    int64_t stale_order_age_ms{7200000};       ///< 2 часа — порог «старости» ордера
-    double min_position_value_usd{1.0};        ///< Игнорировать пылевые позиции
-    int max_recovery_attempts{3};
+
+    /// Не синхронизировать orphan-позиции в портфель (только логировать).
+    /// false (default) = синхронизировать в портфель для отслеживания.
+    /// true = пропустить, только предупреждение в лог.
+    bool close_orphan_positions{false};
+
+    /// Минимальная стоимость позиции (USD) для восстановления.
+    /// Позиции ниже этого порога считаются пылевыми и пропускаются.
+    /// Bitget USDT-M minimum notional: $5 (per contract specifications).
+    double min_position_value_usd{5.0};
+
+    /// Ограничить recovery конкретным символом (пустой = все).
+    Symbol symbol_filter{Symbol("")};
 };
 
 } // namespace tb::recovery

@@ -1,5 +1,6 @@
 #include "pair_filter.hpp"
 #include <algorithm>
+#include <cmath>
 
 namespace tb::scanner {
 
@@ -25,6 +26,24 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
         }
     }
 
+    // Minimum price (reject micro-price contracts with poor scalping economics)
+    if (snapshot.last_price > 0.0 && snapshot.last_price < cfg_.min_price_usdt) {
+        return {FilterReason::PriceTooLow,
+                "price=" + std::to_string(snapshot.last_price) +
+                " < min=" + std::to_string(cfg_.min_price_usdt)};
+    }
+
+    // Tick-to-fee economics: reject if single tick in bps is too large for precise entries
+    if (snapshot.last_price > 0.0 && snapshot.price_precision > 0) {
+        double tick_size = std::pow(10.0, -snapshot.price_precision);
+        double tick_value_bps = (tick_size / snapshot.last_price) * 10000.0;
+        if (tick_value_bps > cfg_.max_tick_value_bps) {
+            return {FilterReason::PoorTickEconomics,
+                    "tick_bps=" + std::to_string(tick_value_bps) +
+                    " > max=" + std::to_string(cfg_.max_tick_value_bps)};
+        }
+    }
+
     // Low liquidity
     if (features.liquidity.volume_24h_usdt < cfg_.min_volume_usdt) {
         return {FilterReason::LowLiquidity,
@@ -46,9 +65,10 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
                 " < min=" + std::to_string(static_cast<int64_t>(cfg_.min_open_interest_usdt))};
     }
 
-    // Thin orderbook
+    // Thin orderbook (skip when orderbook is ticker-derived with < 2 levels)
     double total_depth = features.liquidity.bid_depth_5_levels + features.liquidity.ask_depth_5_levels;
-    if (total_depth < cfg_.min_orderbook_depth_usdt) {
+    bool has_real_book = (snapshot.orderbook.bids.size() >= 2 || snapshot.orderbook.asks.size() >= 2);
+    if (has_real_book && total_depth < cfg_.min_orderbook_depth_usdt) {
         return {FilterReason::ThinOrderBook,
                 "depth_5=" + std::to_string(static_cast<int64_t>(total_depth)) +
                 " < min=" + std::to_string(static_cast<int64_t>(cfg_.min_orderbook_depth_usdt))};
@@ -81,6 +101,21 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
         return {FilterReason::LowVolatility,
                 "vol=" + std::to_string(features.volatility.realized_vol_pct) +
                 "% < min=" + std::to_string(cfg_.min_volatility_pct) + "%"};
+    }
+
+    // ИСПРАВЛЕНИЕ H10: 24h price change фильтр (YAML scorer_filter_* → ScannerConfig)
+    // Exhausted pump/dump: позиции, прошедшие >X% 24h имеют повышенный риск разворота.
+    if (snapshot.change_24h_pct != 0.0) {
+        if (snapshot.change_24h_pct < cfg_.filter_min_change_24h) {
+            return {FilterReason::ExtremeVolatility,
+                    "change_24h=" + std::to_string(static_cast<int>(snapshot.change_24h_pct)) +
+                    "% < min=" + std::to_string(static_cast<int>(cfg_.filter_min_change_24h)) + "%"};
+        }
+        if (snapshot.change_24h_pct > cfg_.filter_max_change_24h) {
+            return {FilterReason::ExtremeVolatility,
+                    "change_24h=" + std::to_string(static_cast<int>(snapshot.change_24h_pct)) +
+                    "% > max=" + std::to_string(static_cast<int>(cfg_.filter_max_change_24h)) + "%"};
+        }
     }
 
     return {FilterReason::Passed, ""};

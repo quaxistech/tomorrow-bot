@@ -10,6 +10,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <boost/json.hpp>
 
 #include <chrono>
 #include <mutex>
@@ -94,10 +95,10 @@ void BitgetRestClient::wait_for_rate_limit() {
     logger_->debug(kComp, "Rate limit: ожидание токена",
         {{"wait_ms", std::to_string(wait_duration.count())}});
 
-    // Освобождаем мьютекс на время ожидания, чтобы не блокировать другие потоки
-    lock.unlock();
+    // Спим под мьютексом — сериализует все запросы через token bucket.
+    // Это предотвращает burst: при unlock/sleep/relock несколько потоков
+    // могут одновременно увидеть дефицит и проснуться вместе, вызывая 429.
     std::this_thread::sleep_for(wait_duration);
-    lock.lock();
 
     // После ожидания пересчитываем токены
     now = std::chrono::steady_clock::now();
@@ -208,8 +209,25 @@ RestResponse BitgetRestClient::execute(const std::string& method,
 
         if (!response.success) {
             response.error_message = "HTTP " + std::to_string(response.status_code);
+            // Извлекаем Bitget error code из тела ответа
+            if (!response.body.empty()) {
+                try {
+                    auto err_json = boost::json::parse(response.body);
+                    auto& err_obj = err_json.as_object();
+                    if (err_obj.contains("code")) {
+                        response.error_code = std::string(err_obj.at("code").as_string());
+                        response.error_message += " [code=" + response.error_code + "]";
+                    }
+                    if (err_obj.contains("msg")) {
+                        response.error_message += " " + std::string(err_obj.at("msg").as_string());
+                    }
+                } catch (...) {
+                    // JSON parsing failed — сохраняем HTTP-level error
+                }
+            }
             logger_->warn(kComp, "HTTP ошибка",
                 {{"status", std::to_string(response.status_code)},
+                 {"error_code", response.error_code},
                  {"body", response.body.substr(0, 512)}});
         }
 

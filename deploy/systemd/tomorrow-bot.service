@@ -29,7 +29,8 @@ Restart=on-failure
 RestartSec=5s
 
 # Переменные окружения из файла (СЕКРЕТЫ — не в unit файле!)
-EnvironmentFile=/etc/tomorrow-bot/secrets.env
+# Канонический путь: совпадает с shell launchers и документацией
+EnvironmentFile=/opt/tomorrow-bot/.secrets/secrets.env
 
 # Безопасность: ограничение привилегий
 NoNewPrivileges=true

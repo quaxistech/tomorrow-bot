@@ -89,6 +89,7 @@ ScannerResult ScannerEngine::scan() {
             snap.quantity_precision = it->second.quantity_precision;
             snap.price_precision = it->second.price_precision;
             snap.min_trade_usdt = it->second.min_trade_usdt;
+            snap.min_quantity = it->second.min_quantity;
             snap.status = it->second.status;
         }
     }
@@ -148,6 +149,7 @@ ScannerResult ScannerEngine::scan() {
         analysis.quantity_precision = snap.quantity_precision;
         analysis.price_precision = snap.price_precision;
         analysis.min_trade_usdt = snap.min_trade_usdt;
+        analysis.min_quantity = snap.min_quantity;
 
         // 5a. Compute features (§5.3)
         analysis.features = feature_calc_.compute(snap);
@@ -163,6 +165,13 @@ ScannerResult ScannerEngine::scan() {
             analysis.reasons.push_back(to_string(analysis.filter.reason));
             if (!analysis.filter.details.empty())
                 analysis.reasons.push_back(analysis.filter.details);
+            // Diagnostic: log first rejections
+            if (result.rejected_pairs.size() < 5) {
+                logger_->debug(kComp, "Candidate rejected",
+                    {{"symbol", analysis.symbol},
+                     {"reason", to_string(analysis.filter.reason)},
+                     {"details", analysis.filter.details}});
+            }
             result.rejected_pairs.push_back(std::move(analysis));
             continue;
         }
@@ -176,11 +185,12 @@ ScannerResult ScannerEngine::scan() {
         analysis.bias_confidence = bias_result.confidence;
         analysis.reasons = std::move(bias_result.reasons);
 
-        // 5f. Determine trade state
-        if (analysis.traps.total_risk > 0.6) {
+        // 5f. Determine trade state (using configurable thresholds)
+        if (analysis.traps.total_risk > config_.trade_state_max_trap_risk) {
             analysis.trade_state = TradeState::DoNotTrade;
             analysis.reasons.push_back("elevated_trap_risk");
-        } else if (analysis.score.total > 0.3 && analysis.score.confidence > 0.4) {
+        } else if (analysis.score.total > config_.trade_state_min_score &&
+                   analysis.score.confidence > config_.trade_state_min_confidence) {
             analysis.trade_state = TradeState::TradeAllowed;
         } else {
             analysis.trade_state = TradeState::Neutral;
@@ -203,14 +213,17 @@ ScannerResult ScannerEngine::scan() {
 
     result.after_filter_count = static_cast<int>(analyzed.size());
 
-    // ── Step 7: Select top-N ──
-    int top_n = std::min(config_.top_n, static_cast<int>(analyzed.size()));
-    for (int i = 0; i < top_n; ++i) {
-        result.top_pairs.push_back(std::move(analyzed[i]));
-    }
-    // Rest go to rejected (they passed filters but didn't make top-N)
-    for (int i = top_n; i < static_cast<int>(analyzed.size()); ++i) {
-        result.rejected_pairs.push_back(std::move(analyzed[i]));
+    // ── Step 7: Select top-N (skip DoNotTrade pairs) ──
+    for (auto& a : analyzed) {
+        if (static_cast<int>(result.top_pairs.size()) >= config_.top_n) {
+            result.rejected_pairs.push_back(std::move(a));
+            continue;
+        }
+        if (a.trade_state == TradeState::DoNotTrade) {
+            result.rejected_pairs.push_back(std::move(a));
+            continue;
+        }
+        result.top_pairs.push_back(std::move(a));
     }
 
     // ── Step 8: Timing & logging ──
@@ -373,14 +386,17 @@ std::vector<ScannerEngine::SymbolInfo> ScannerEngine::fetch_symbols() {
             else if (obj.contains("status"))
                 si.status = std::string(obj.at("status").as_string());
 
-            if (obj.contains("pricePrecision"))
+            if (obj.contains("pricePlace"))
                 si.price_precision = static_cast<int>(parse_double(
-                    std::string(obj.at("pricePrecision").as_string())));
-            if (obj.contains("quantityPrecision"))
+                    std::string(obj.at("pricePlace").as_string())));
+            if (obj.contains("volumePlace"))
                 si.quantity_precision = static_cast<int>(parse_double(
-                    std::string(obj.at("quantityPrecision").as_string())));
-            if (obj.contains("minTradeNum"))
+                    std::string(obj.at("volumePlace").as_string())));
+            if (obj.contains("minTradeUSDT"))
                 si.min_trade_usdt = parse_double(
+                    std::string(obj.at("minTradeUSDT").as_string()));
+            if (obj.contains("minTradeNum"))
+                si.min_quantity = parse_double(
                     std::string(obj.at("minTradeNum").as_string()));
 
             // Only include USDT-quoted pairs
@@ -444,11 +460,11 @@ std::vector<MarketSnapshot> ScannerEngine::fetch_tickers() {
             snap.high_24h = pv("high24h");
             snap.low_24h = pv("low24h");
             snap.open_24h = pv("open24h");
-            snap.change_24h_pct = pv("change24h");
-            snap.volume_24h = pv("baseVolume24h");
-            snap.turnover_24h = pv("quoteVolume24h");
+            snap.change_24h_pct = pv("change24h") * 100.0;  // A3 fix: Bitget возвращает ratio (0.02), нормализуем в percent (2.0)
+            snap.volume_24h = pv("baseVolume");
+            snap.turnover_24h = pv("quoteVolume");
             snap.funding_rate = pv("fundingRate");
-            snap.open_interest = pv("openUtcInterest");
+            snap.open_interest = pv("holdingAmount");
 
             if (obj.contains("ts")) {
                 auto& ts = obj.at("ts");
@@ -495,13 +511,22 @@ OrderBookSnapshot ScannerEngine::fetch_orderbook(const std::string& symbol) {
 
         auto& data = root.at("data").as_object();
 
+        // Helper: parse value that may be string or numeric
+        auto to_double = [](const boost::json::value& v) -> double {
+            if (v.is_string()) return parse_double(std::string(v.as_string()));
+            if (v.is_double()) return v.as_double();
+            if (v.is_int64()) return static_cast<double>(v.as_int64());
+            if (v.is_uint64()) return static_cast<double>(v.as_uint64());
+            return 0.0;
+        };
+
         // Bids: [[price, size], ...]
         if (data.contains("bids")) {
             for (const auto& level : data.at("bids").as_array()) {
                 auto& arr = level.as_array();
                 if (arr.size() >= 2) {
-                    double price = parse_double(std::string(arr[0].as_string()));
-                    double qty = parse_double(std::string(arr[1].as_string()));
+                    double price = to_double(arr[0]);
+                    double qty = to_double(arr[1]);
                     ob.bids.push_back({price, qty});
                 }
             }
@@ -512,16 +537,15 @@ OrderBookSnapshot ScannerEngine::fetch_orderbook(const std::string& symbol) {
             for (const auto& level : data.at("asks").as_array()) {
                 auto& arr = level.as_array();
                 if (arr.size() >= 2) {
-                    double price = parse_double(std::string(arr[0].as_string()));
-                    double qty = parse_double(std::string(arr[1].as_string()));
+                    double price = to_double(arr[0]);
+                    double qty = to_double(arr[1]);
                     ob.asks.push_back({price, qty});
                 }
             }
         }
 
         if (data.contains("ts")) {
-            ob.timestamp_ms = static_cast<int64_t>(
-                parse_double(std::string(data.at("ts").as_string())));
+            ob.timestamp_ms = static_cast<int64_t>(to_double(data.at("ts")));
         }
     } catch (const std::exception& e) {
         logger_->debug(kComp, "Failed to parse orderbook for " + symbol,

@@ -7,7 +7,13 @@ std::string ExecutionPlan::summary() const {
     s += "action=" + to_string(action);
     s += " style=" + to_string(style);
     s += " type=";
-    s += (order_type == OrderType::Market ? "market" : "limit");
+    switch (order_type) {
+        case OrderType::Market:    s += "market"; break;
+        case OrderType::Limit:     s += "limit"; break;
+        case OrderType::PostOnly:  s += "post_only"; break;
+        case OrderType::StopMarket: s += "stop_market"; break;
+        case OrderType::StopLimit: s += "stop_limit"; break;
+    }
     s += " qty=" + std::to_string(planned_quantity.get());
     if (planned_price.get() > 0.0) {
         s += " price=" + std::to_string(planned_price.get());
@@ -22,6 +28,7 @@ std::string ExecutionPlan::summary() const {
 
 std::string to_string(ExecutionAction action) {
     switch (action) {
+        case ExecutionAction::NoAction:               return "NoAction";
         case ExecutionAction::OpenPosition:           return "OpenPosition";
         case ExecutionAction::IncreasePosition:       return "IncreasePosition";
         case ExecutionAction::ReducePosition:         return "ReducePosition";

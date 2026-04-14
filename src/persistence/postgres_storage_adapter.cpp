@@ -61,7 +61,6 @@ JournalEntryType journal_type_from_str(const std::string& s) {
     if (s == "TelemetrySnapshot") return JournalEntryType::TelemetrySnapshot;
     if (s == "GovernanceEvent")   return JournalEntryType::GovernanceEvent;
     if (s == "DiagnosticEvent")   return JournalEntryType::DiagnosticEvent;
-    if (s == "ShadowEvent")       return JournalEntryType::ShadowEvent;
     throw std::invalid_argument("Unknown JournalEntryType: " + s);
 }
 

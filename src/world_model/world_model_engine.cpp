@@ -16,16 +16,6 @@ WorldModelConfig WorldModelConfig::make_default() {
     return cfg;
 }
 
-bool WorldModelConfig::validate() const {
-    if (stable_trend.adx_min <= 0.0 || stable_trend.adx_min > 100.0) return false;
-    if (chop_noise.adx_max <= 0.0 || chop_noise.adx_max > 100.0) return false;
-    if (exhaustion.rsi_upper <= exhaustion.rsi_lower) return false;
-    if (liquidity_vacuum.spread_bps_critical <= 0.0) return false;
-    if (hysteresis.confirmation_ticks < 0) return false;
-    if (history.max_entries == 0) return false;
-    return true;
-}
-
 // ============================================================
 // SuitabilityConfig
 // ============================================================
@@ -103,31 +93,31 @@ SuitabilityConfig SuitabilityConfig::make_default() {
         add(v, "vwap_reversion",       0.6, "VWAP reversion после спайка — хорошо");
         add(v, "volume_profile",       0.5, "Объёмные уровни после спайка");
     }
-    // LiquidityVacuum (5) — для микро-кэпов это нормальное состояние
+    // LiquidityVacuum (5)
     {
         auto& v = cfg.table[5];
-        add(v, "momentum",             0.35, "Вакуум ликвидности — осторожная торговля");
-        add(v, "mean_reversion",       0.30, "Вакуум ликвидности — mean reversion возможен");
-        add(v, "breakout",             0.30, "Вакуум ликвидности — пробои с осторожностью");
-        add(v, "scalp_engine", 0.10, "Вакуум ликвидности — скальпинг ограниченно");
-        add(v, "vol_expansion",        0.25, "Вакуум ликвидности — волатильность присутствует");
-        add(v, "ema_pullback",         0.30, "Вакуум ликвидности — pullback возможен");
-        add(v, "rsi_divergence",       0.25, "Вакуум ликвидности — дивергенции надёжнее");
-        add(v, "vwap_reversion",       0.25, "Вакуум ликвидности — VWAP актуален");
-        add(v, "volume_profile",       0.25, "Вакуум ликвидности — объёмные уровни работают");
+        add(v, "momentum",             0.25, "Вакуум ликвидности — импульс ненадёжен");
+        add(v, "mean_reversion",       0.20, "Вакуум ликвидности — возврат к среднему рискован");
+        add(v, "breakout",             0.10, "Вакуум ликвидности — пробои легко манипулируются");
+        add(v, "scalp_engine",         0.05, "Вакуум ликвидности — скальпинг блокируется");
+        add(v, "vol_expansion",        0.20, "Вакуум ликвидности — волатильность токсична");
+        add(v, "ema_pullback",         0.15, "Вакуум ликвидности — pullback ненадёжен");
+        add(v, "rsi_divergence",       0.20, "Вакуум ликвидности — дивергенции требуют подтверждения");
+        add(v, "vwap_reversion",       0.15, "Вакуум ликвидности — VWAP малоинформативен");
+        add(v, "volume_profile",       0.15, "Вакуум ликвидности — объёмные уровни нестабильны");
     }
-    // ToxicMicrostructure (6) — для микро-кэпов "токсичность" обычна
+    // ToxicMicrostructure (6)
     {
         auto& v = cfg.table[6];
-        add(v, "momentum",             0.30, "Токсичная микроструктура — momentum с осторожностью");
-        add(v, "mean_reversion",       0.30, "Токсичная микроструктура — mean reversion возможен");
-        add(v, "breakout",             0.25, "Токсичная микроструктура — пробои с осторожностью");
-        add(v, "scalp_engine", 0.10, "Токсичная микроструктура — скальпинг ограничен");
-        add(v, "vol_expansion",        0.30, "Токсичная микроструктура — волатильность есть");
-        add(v, "ema_pullback",         0.25, "Токсичная микроструктура — pullback возможен");
-        add(v, "rsi_divergence",       0.25, "Дивергенции в токсичном режиме — проверять");
-        add(v, "vwap_reversion",       0.20, "VWAP reversion — осторожно");
-        add(v, "volume_profile",       0.20, "Объёмные уровни — c поправкой");
+        add(v, "momentum",             0.20, "Токсичная микроструктура — momentum подвержен ловушкам");
+        add(v, "mean_reversion",       0.20, "Токсичная микроструктура — mean reversion ненадёжен");
+        add(v, "breakout",             0.10, "Токсичная микроструктура — breakout уязвим к манипуляциям");
+        add(v, "scalp_engine",         0.05, "Токсичная микроструктура — скальпинг блокируется");
+        add(v, "vol_expansion",        0.20, "Токсичная микроструктура — волатильность некачественная");
+        add(v, "ema_pullback",         0.15, "Токсичная микроструктура — pullback требует фильтрации");
+        add(v, "rsi_divergence",       0.15, "Токсичная микроструктура — дивергенции шумные");
+        add(v, "vwap_reversion",       0.10, "Токсичная микроструктура — VWAP reversion слаб");
+        add(v, "volume_profile",       0.10, "Токсичная микроструктура — profiles искажены");
     }
     // PostShockStabilization (7)
     {
@@ -437,10 +427,9 @@ WorldState RuleBasedWorldModelEngine::classify_immediate(
     const auto& tech = snap.technical;
     const auto& micro = snap.microstructure;
 
-    // Подсчёт валидных индикаторов
+    // Подсчёт валидных индикаторов (12 первичных входов модели)
     int valid = 0;
-    int total = 7; // sma, rsi, bb, atr, adx, volatility, momentum + spread, instability, flow, liquidity, vpin
-    total = 12;
+    constexpr int total = 12;
     if (tech.sma_valid)        ++valid;
     if (tech.rsi_valid)        ++valid;
     if (tech.bb_valid)         ++valid;
@@ -483,9 +472,12 @@ WorldState RuleBasedWorldModelEngine::classify_immediate(
     };
 
     // ── PostShockStabilization ───────────────────────────────
+    // Срабатывает после опасных состояний, когда волатильность снижается
     {
         auto prev = ctx.confirmed_snapshot.state;
-        bool was_shock = (prev == WorldState::ExhaustionSpike || prev == WorldState::LiquidityVacuum);
+        bool was_shock = (prev == WorldState::ExhaustionSpike ||
+                          prev == WorldState::LiquidityVacuum ||
+                          prev == WorldState::ToxicMicrostructure);
         bool vol_recovering = tech.volatility_valid && tech.volatility_5 < tech.volatility_20;
 
         double prox = 0.0;
@@ -578,11 +570,14 @@ WorldState RuleBasedWorldModelEngine::classify_immediate(
 
         double prox = 0.0;
         if (tech.rsi_valid && tech.momentum_valid) {
-            double rsi_dist = std::max(
-                tech.rsi_14 / config_.exhaustion.rsi_upper,
-                config_.exhaustion.rsi_lower / std::max(tech.rsi_14, 0.01));
+            // RSI proximity: 0 в нейтральной зоне, 1 при пороге
+            double rsi_mid = (config_.exhaustion.rsi_lower + config_.exhaustion.rsi_upper) / 2.0;
+            double rsi_half = (config_.exhaustion.rsi_upper - config_.exhaustion.rsi_lower) / 2.0;
+            double rsi_prox = (rsi_half > 0.0)
+                ? std::clamp((std::abs(tech.rsi_14 - rsi_mid) - rsi_half * 0.5) / (rsi_half * 0.5), 0.0, 1.0)
+                : 0.0;
             double mom_ratio = std::abs(tech.momentum_5) / config_.exhaustion.momentum_abs_min;
-            prox = std::clamp(std::min(rsi_dist, mom_ratio), 0.0, 1.0);
+            prox = std::clamp(std::min(rsi_prox, mom_ratio), 0.0, 1.0);
         }
 
         if (check("ExhaustionSpike", triggered, prox,
@@ -743,7 +738,8 @@ WorldState RuleBasedWorldModelEngine::apply_hysteresis(
     // PostShockStabilization — естественный преемник шоковых состояний
     if (immediate == WorldState::PostShockStabilization &&
         (current_confirmed == WorldState::ExhaustionSpike ||
-         current_confirmed == WorldState::LiquidityVacuum)) {
+         current_confirmed == WorldState::LiquidityVacuum ||
+         current_confirmed == WorldState::ToxicMicrostructure)) {
         ctx.candidate_state = immediate;
         ctx.candidate_ticks = config_.hysteresis.confirmation_ticks;
         return immediate;
@@ -1071,37 +1067,57 @@ std::vector<StrategySuitability> RuleBasedWorldModelEngine::compute_suitability(
         // Signal suitability (из таблицы конфигурации)
         suit.signal_suitability = entry.suitability;
 
-        // Execution suitability: штраф при плохом исполнении
-        // Для micro-cap: спреды 50-150 bps — норма, штрафуем мягко
+        // Execution suitability: штраф при плохом исполнении.
+        // USDT-M perpetual futures: нормальный spread 1-5 bps (BTC/ETH).
+        // >10 bps = повышенные издержки для скальпинга.
+        // >50 bps = критическая деградация исполнения.
         suit.execution_suitability = 1.0;
-        if (snap.microstructure.spread_valid && snap.microstructure.spread_bps > 50.0) {
-            suit.execution_suitability = std::max(0.5, 1.0 - (snap.microstructure.spread_bps - 50.0) / 200.0);
+        if (snap.microstructure.spread_valid && snap.microstructure.spread_bps > 10.0) {
+            suit.execution_suitability = std::max(0.3, 1.0 - (snap.microstructure.spread_bps - 10.0) / 90.0);
         }
-        if (snap.execution_context.slippage_valid && snap.execution_context.estimated_slippage_bps > 20.0) {
-            suit.execution_suitability *= std::max(0.5, 1.0 - snap.execution_context.estimated_slippage_bps / 100.0);
+        if (snap.execution_context.slippage_valid && snap.execution_context.estimated_slippage_bps > 5.0) {
+            suit.execution_suitability *= std::max(0.3, 1.0 - snap.execution_context.estimated_slippage_bps / 50.0);
         }
 
-        // Risk suitability: штраф при опасных состояниях
-        // Для микро-кэпов эти состояния — норма, не блокируем полностью
+        // Risk suitability: опасные состояния резко занижают пригодность.
+        // USDT-M futures: в опасной микроструктуре скальпинг особенно уязвим
+        // из-за widened spreads и slippage.
         suit.risk_suitability = 1.0;
-        if (state == WorldState::LiquidityVacuum || state == WorldState::ToxicMicrostructure) {
-            suit.risk_suitability = 0.6;
+        if (state == WorldState::LiquidityVacuum) {
+            suit.risk_suitability = 0.15;  // Вакуум: максимально опасно для любой стратегии
+        } else if (state == WorldState::ToxicMicrostructure) {
+            suit.risk_suitability = 0.20;  // Токсичная микроструктура: высокий adverse selection
         } else if (state == WorldState::ExhaustionSpike) {
-            suit.risk_suitability = 0.5;
+            suit.risk_suitability = 0.25;  // Спайк: резкий разворот вероятен
         }
 
         // Feedback adjustment: blend с исторической производительностью
-        std::string feedback_key = std::to_string(si) + ":" + entry.strategy_id;
-        auto fb_it = feedback_stats_.find(feedback_key);
-        if (fb_it != feedback_stats_.end() &&
-            fb_it->second.total_trades >= static_cast<int>(config_.suitability.min_trades_for_feedback)) {
+        if (config_.feedback.enabled) {
+            std::string feedback_key = std::to_string(si) + ":" + entry.strategy_id;
+            auto fb_it = feedback_stats_.find(feedback_key);
+            if (fb_it != feedback_stats_.end() &&
+                fb_it->second.total_trades >= static_cast<int>(config_.suitability.min_trades_for_feedback)) {
 
-            double historical_score = fb_it->second.ema_win_rate;
-            double blend = config_.suitability.feedback_blend_weight;
-            suit.signal_suitability = suit.signal_suitability * (1.0 - blend) + historical_score * blend;
+                double historical_score = fb_it->second.ema_win_rate;
+                double blend = config_.suitability.feedback_blend_weight;
+                suit.signal_suitability = suit.signal_suitability * (1.0 - blend) + historical_score * blend;
+            }
         }
 
-        // Итоговый suitability = min(signal × execution × risk) для безопасности
+        const bool dangerous_microstructure =
+            state == WorldState::LiquidityVacuum ||
+            state == WorldState::ToxicMicrostructure ||
+            state == WorldState::ExhaustionSpike;
+
+        if (dangerous_microstructure && suit.strategy_id.get() == "scalp_engine") {
+            suit.vetoed = true;
+            suit.suitability = 0.0;
+            suit.reason += " | VETO: скальпинг запрещён в опасной микроструктуре";
+            result.push_back(std::move(suit));
+            continue;
+        }
+
+        // Итоговый suitability = signal × execution × risk.
         suit.suitability = suit.signal_suitability * suit.execution_suitability * suit.risk_suitability;
 
         // Veto
@@ -1126,34 +1142,40 @@ std::vector<std::pair<std::string, double>> RuleBasedWorldModelEngine::compute_t
 
     std::vector<std::pair<std::string, double>> drivers;
 
+    // Все значения нормализуются в [0,1] для сопоставимости масштабов.
+    // Нормализация: threshold-relative (насколько близко к порогу классификации).
+
     if (snap.technical.adx_valid)
-        drivers.emplace_back("ADX", snap.technical.adx);
+        drivers.emplace_back("ADX", snap.technical.adx / 100.0);
     if (snap.technical.rsi_valid)
-        drivers.emplace_back("RSI", snap.technical.rsi_14);
+        drivers.emplace_back("RSI_deviation", std::abs(snap.technical.rsi_14 - 50.0) / 50.0);
     if (snap.technical.bb_valid) {
-        drivers.emplace_back("BB%B", snap.technical.bb_percent_b);
-        drivers.emplace_back("BB_BW", snap.technical.bb_bandwidth);
+        drivers.emplace_back("BB%B", std::abs(snap.technical.bb_percent_b - 0.5) * 2.0);
+        drivers.emplace_back("BB_BW", std::min(1.0, snap.technical.bb_bandwidth / 0.10));
     }
     if (snap.technical.volatility_valid) {
-        drivers.emplace_back("Vol5", snap.technical.volatility_5);
-        drivers.emplace_back("Vol20", snap.technical.volatility_20);
+        drivers.emplace_back("Vol5", std::min(1.0, snap.technical.volatility_5 / 0.05));
+        double vol_ratio = (snap.technical.volatility_20 > 0.001)
+            ? std::abs(snap.technical.volatility_5 - snap.technical.volatility_20) / snap.technical.volatility_20
+            : 0.0;
+        drivers.emplace_back("VolAccel", std::min(1.0, vol_ratio));
     }
     if (snap.technical.momentum_valid)
-        drivers.emplace_back("Momentum", snap.technical.momentum_5);
+        drivers.emplace_back("Momentum", std::min(1.0, std::abs(snap.technical.momentum_5) / 0.05));
     if (snap.microstructure.spread_valid)
-        drivers.emplace_back("Spread_bps", snap.microstructure.spread_bps);
+        drivers.emplace_back("Spread_bps", std::min(1.0, snap.microstructure.spread_bps / 50.0));
     if (snap.microstructure.instability_valid)
         drivers.emplace_back("BookInstability", snap.microstructure.book_instability);
     if (snap.microstructure.trade_flow_valid)
         drivers.emplace_back("AggressiveFlow", snap.microstructure.aggressive_flow);
     if (snap.microstructure.liquidity_valid)
-        drivers.emplace_back("LiquidityRatio", snap.microstructure.liquidity_ratio);
+        drivers.emplace_back("LiqImbalance", std::clamp(1.0 - snap.microstructure.liquidity_ratio, 0.0, 1.0));
     if (snap.microstructure.vpin_valid)
         drivers.emplace_back("VPIN", snap.microstructure.vpin);
 
-    // Сортируем по абсолютной значимости (descending)
+    // Сортируем по нормализованной значимости (descending)
     std::sort(drivers.begin(), drivers.end(),
-              [](const auto& a, const auto& b) { return std::abs(a.second) > std::abs(b.second); });
+              [](const auto& a, const auto& b) { return a.second > b.second; });
 
     // Top-5
     if (drivers.size() > 5) drivers.resize(5);
@@ -1198,17 +1220,22 @@ std::string RuleBasedWorldModelEngine::generate_summary(
 // ============================================================
 
 double RuleBasedWorldModelEngine::assess_data_quality(const features::FeatureSnapshot& snap) const {
+    // Те же 12 индикаторов, что используются в classify_immediate
     int available = 0;
-    int total = 8;
+    constexpr int total = 12;
 
-    if (snap.technical.sma_valid)        ++available;
-    if (snap.technical.rsi_valid)        ++available;
-    if (snap.technical.adx_valid)        ++available;
-    if (snap.technical.bb_valid)         ++available;
-    if (snap.technical.volatility_valid) ++available;
-    if (snap.microstructure.spread_valid) ++available;
+    if (snap.technical.sma_valid)          ++available;
+    if (snap.technical.rsi_valid)          ++available;
+    if (snap.technical.bb_valid)           ++available;
+    if (snap.technical.atr_valid)          ++available;
+    if (snap.technical.adx_valid)          ++available;
+    if (snap.technical.volatility_valid)   ++available;
+    if (snap.technical.momentum_valid)     ++available;
+    if (snap.microstructure.spread_valid)  ++available;
     if (snap.microstructure.instability_valid) ++available;
-    if (snap.microstructure.vpin_valid)  ++available;
+    if (snap.microstructure.trade_flow_valid)  ++available;
+    if (snap.microstructure.liquidity_valid)   ++available;
+    if (snap.microstructure.vpin_valid)        ++available;
 
     double base_quality = static_cast<double>(available) / total;
 
@@ -1224,12 +1251,22 @@ double RuleBasedWorldModelEngine::assess_data_quality(const features::FeatureSna
 // state_quality() — ранг для tendency
 // ============================================================
 
+// state_quality() — ранг для tendency (USDT-M скальпинг perspective)
+//
+// Ранги отражают «торгопригодность» состояния для фьючерсного скальпинга:
+//   3 = идеально (стабильный тренд)
+//   2 = хорошо (чёткий боковик для mean_reversion/скальпинга)
+//   1 = приемлемо (сжатие, пост-шок)
+//   0 = неопределённо
+//  -1..-3 = опасно / неторгуемо
+// ============================================================
+
 int RuleBasedWorldModelEngine::state_quality(WorldState s) {
     switch (s) {
         case WorldState::StableTrendContinuation:    return 3;
         case WorldState::ChopNoise:                  return 2;
-        case WorldState::PostShockStabilization:      return 2;
         case WorldState::CompressionBeforeExpansion:  return 1;
+        case WorldState::PostShockStabilization:      return 1;
         case WorldState::FragileBreakout:             return 0;
         case WorldState::ExhaustionSpike:             return -1;
         case WorldState::ToxicMicrostructure:         return -2;
@@ -1244,6 +1281,8 @@ int RuleBasedWorldModelEngine::state_quality(WorldState s) {
 // ============================================================
 
 void RuleBasedWorldModelEngine::record_feedback(const WorldStateFeedback& feedback) {
+    if (!config_.feedback.enabled) return;
+
     std::lock_guard lock(mutex_);
 
     std::string key = std::to_string(state_index(feedback.state)) + ":" + feedback.strategy_id.get();

@@ -22,7 +22,7 @@ struct RawTrade {
     std::string trade_id;
     std::string price;
     std::string size;
-    std::string side;  // "buy" или "sell"
+    std::string side;  // "Buy" или "Sell" (v2 USDT-M), "buy"/"sell" (v1 legacy)
     int64_t ts;
 };
 

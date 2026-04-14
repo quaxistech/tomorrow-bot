@@ -14,14 +14,25 @@
 
 namespace tb::ml {
 
+/// Конфигурация фильтра энтропии.
+///
+/// Научное обоснование дефолтов:
+/// - window_size=50: ~5 с при 10 тиков/с — достаточно для устойчивой оценки
+///   информационной энтропии (Cover & Thomas, "Elements of Information Theory").
+/// - num_bins=10: правило Sturges (k ≈ 1 + 3.3·log10(n)) для n=50 даёт ~7;
+///   10 бинов даёт чуть большую чувствительность без переобучения.
+/// - noise_threshold=0.85: H/H_max > 0.85 означает распределение в пределах
+///   15% от равномерного (чистый шум) — стандартный порог в теории информации.
+/// - Веса (0.3/0.2/0.2/0.3): returns и order flow — основные источники alpha
+///   в скальпинге (Hasbrouck 1991); volume и spread — вспомогательные.
 struct EntropyConfig {
-    size_t window_size{50};            ///< Окно для расчёта энтропии
-    size_t num_bins{10};               ///< Количество бинов для дискретизации
-    double noise_threshold{0.85};      ///< Энтропия > порога = шумный сигнал (0-1 нормализованная)
-    double quality_weight_returns{0.3}; ///< Вес энтропии доходностей
+    size_t window_size{50};            ///< Окно для расчёта энтропии (тики)
+    size_t num_bins{10};               ///< Количество бинов для дискретизации (Sturges rule)
+    double noise_threshold{0.85};      ///< Энтропия > порога = шумный сигнал (H/H_max)
+    double quality_weight_returns{0.3}; ///< Вес энтропии доходностей (Hasbrouck 1991)
     double quality_weight_volume{0.2};  ///< Вес энтропии объёмов
     double quality_weight_spread{0.2};  ///< Вес энтропии спредов
-    double quality_weight_flow{0.3};    ///< Вес энтропии потока ордеров
+    double quality_weight_flow{0.3};    ///< Вес энтропии потока ордеров (Hasbrouck 1991)
     int64_t stale_threshold_ns{5'000'000'000LL}; ///< Порог устаревания данных (5с)
     size_t min_samples{10};            ///< Минимальное кол-во тиков для вычисления
 };

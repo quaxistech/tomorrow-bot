@@ -54,10 +54,6 @@ std::vector<double> IndicatorEngine::ema_series(const std::vector<double>& price
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::sma(const std::vector<double>& prices, int period) const {
-    return sma_builtin(prices, period);
-}
-
-IndicatorResult IndicatorEngine::sma_builtin(const std::vector<double>& prices, int period) const {
     IndicatorResult result;
     result.name = "SMA";
     const auto n = static_cast<int>(prices.size());
@@ -98,10 +94,6 @@ IndicatorResult IndicatorEngine::sma_builtin(const std::vector<double>& prices, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::ema(const std::vector<double>& prices, int period) const {
-    return ema_builtin(prices, period);
-}
-
-IndicatorResult IndicatorEngine::ema_builtin(const std::vector<double>& prices, int period) const {
     IndicatorResult result;
     result.name = "EMA";
     const auto n = static_cast<int>(prices.size());
@@ -138,10 +130,6 @@ IndicatorResult IndicatorEngine::ema_builtin(const std::vector<double>& prices, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::rsi(const std::vector<double>& prices, int period) const {
-    return rsi_builtin(prices, period);
-}
-
-IndicatorResult IndicatorEngine::rsi_builtin(const std::vector<double>& prices, int period) const {
     IndicatorResult result;
     result.name = "RSI";
     const auto n = static_cast<int>(prices.size());
@@ -200,12 +188,7 @@ IndicatorResult IndicatorEngine::rsi_builtin(const std::vector<double>& prices, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 MacdResult IndicatorEngine::macd(const std::vector<double>& prices,
-                                  int fast_period, int slow_period, int signal_period) const {
-    return macd_builtin(prices, fast_period, slow_period, signal_period);
-}
-
-MacdResult IndicatorEngine::macd_builtin(const std::vector<double>& prices,
-                                          int fast, int slow, int signal) const {
+                                  int fast, int slow, int signal) const {
     MacdResult result;
     const auto n = static_cast<int>(prices.size());
     const int min_bars = slow + signal - 1;
@@ -263,11 +246,6 @@ MacdResult IndicatorEngine::macd_builtin(const std::vector<double>& prices,
 
 BollingerResult IndicatorEngine::bollinger(const std::vector<double>& prices,
                                             int period, double stddev_mult) const {
-    return bollinger_builtin(prices, period, stddev_mult);
-}
-
-BollingerResult IndicatorEngine::bollinger_builtin(const std::vector<double>& prices,
-                                                    int period, double stddev_mult) const {
     BollingerResult result;
     const auto n = static_cast<int>(prices.size());
 
@@ -332,13 +310,6 @@ IndicatorResult IndicatorEngine::atr(const std::vector<double>& high,
                                       const std::vector<double>& low,
                                       const std::vector<double>& close,
                                       int period) const {
-    return atr_builtin(high, low, close, period);
-}
-
-IndicatorResult IndicatorEngine::atr_builtin(const std::vector<double>& high,
-                                              const std::vector<double>& low,
-                                              const std::vector<double>& close,
-                                              int period) const {
     IndicatorResult result;
     result.name = "ATR";
     const auto n = static_cast<int>(high.size());
@@ -400,13 +371,6 @@ AdxResult IndicatorEngine::adx(const std::vector<double>& high,
                                  const std::vector<double>& low,
                                  const std::vector<double>& close,
                                  int period) const {
-    return adx_builtin(high, low, close, period);
-}
-
-AdxResult IndicatorEngine::adx_builtin(const std::vector<double>& high,
-                                         const std::vector<double>& low,
-                                         const std::vector<double>& close,
-                                         int period) const {
     AdxResult result;
     const auto n = static_cast<int>(high.size());
     const int min_bars = 2 * period + 1;
@@ -509,11 +473,6 @@ AdxResult IndicatorEngine::adx_builtin(const std::vector<double>& high,
 
 IndicatorResult IndicatorEngine::obv(const std::vector<double>& prices,
                                       const std::vector<double>& volumes) const {
-    return obv_builtin(prices, volumes);
-}
-
-IndicatorResult IndicatorEngine::obv_builtin(const std::vector<double>& prices,
-                                              const std::vector<double>& volumes) const {
     IndicatorResult result;
     result.name = "OBV";
     const auto n = static_cast<int>(prices.size());
@@ -557,61 +516,24 @@ IndicatorResult IndicatorEngine::obv_builtin(const std::vector<double>& prices,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VWAP (rolling window, default last min(n, 50) bars)
+// VWAP (scalar, delegates to rolling_vwap for DRY)
 // ─────────────────────────────────────────────────────────────────────────────
 
 IndicatorResult IndicatorEngine::vwap(const std::vector<double>& high,
                                        const std::vector<double>& low,
                                        const std::vector<double>& close,
-                                       const std::vector<double>& volume) const {
+                                       const std::vector<double>& volume,
+                                       int window) const {
+    // Delegate to rolling_vwap with band_stddev=0 (bands not needed for scalar result).
+    auto rv = rolling_vwap(high, low, close, volume, window, 0.0);
+
     IndicatorResult result;
     result.name = "VWAP";
-    const auto n = static_cast<int>(high.size());
-
-    if (n == 0) {
-        result.status = IndicatorStatus::InsufficientData;
-        result.warmup_remaining = 1;
-        return result;
-    }
-    if (high.size() != low.size() || high.size() != close.size() || high.size() != volume.size()) {
-        result.status = IndicatorStatus::InvalidInput;
-        if (logger_) logger_->warn("IndicatorEngine", "VWAP: series length mismatch");
-        return result;
-    }
-    if (!validate_price_series(high) || !validate_price_series(low) || !validate_price_series(close)) {
-        result.status = IndicatorStatus::InvalidInput;
-        if (logger_) logger_->warn("IndicatorEngine", "VWAP: invalid price data detected");
-        return result;
-    }
-    for (const auto& v : volume) {
-        if (!is_valid_volume(v)) {
-            result.status = IndicatorStatus::InvalidInput;
-            if (logger_) logger_->warn("IndicatorEngine", "VWAP: invalid volume data detected");
-            return result;
-        }
-    }
-
-    const std::size_t window = std::min(static_cast<std::size_t>(n), std::size_t{50});
-    const std::size_t start  = static_cast<std::size_t>(n) - window;
-
-    double sum_tpv = 0.0, sum_vol = 0.0;
-    for (std::size_t i = start; i < static_cast<std::size_t>(n); ++i) {
-        const double typical = (high[i] + low[i] + close[i]) / 3.0;
-        sum_tpv += typical * volume[i];
-        sum_vol += volume[i];
-    }
-
-    if (sum_vol < kEpsilon) {
-        result.status = IndicatorStatus::InvalidInput;
-        if (logger_) logger_->warn("IndicatorEngine", "VWAP: zero total volume");
-        return result;
-    }
-
-    result.valid = true;
-    result.value = safe_div(sum_tpv, sum_vol);
-    result.status = IndicatorStatus::Ok;
-    result.sample_count = n;
-    result.warmup_remaining = 0;
+    result.valid = rv.valid;
+    result.value = rv.vwap;
+    result.status = rv.status;
+    result.sample_count = rv.sample_count;
+    result.warmup_remaining = rv.warmup_remaining;
     return result;
 }
 
@@ -745,9 +667,9 @@ IndicatorResult IndicatorEngine::z_score(const std::vector<double>& prices, int 
     result.name = "ZSCORE";
     const auto n = static_cast<int>(prices.size());
 
-    if (period <= 0) {
+    if (period < 2) {
         result.status = IndicatorStatus::InvalidInput;
-        if (logger_) logger_->warn("IndicatorEngine", "Z-Score: invalid period", {{"period", std::to_string(period)}});
+        if (logger_) logger_->warn("IndicatorEngine", "Z-Score: period must be >= 2", {{"period", std::to_string(period)}});
         return result;
     }
     if (n < period) {
@@ -777,6 +699,120 @@ IndicatorResult IndicatorEngine::z_score(const std::vector<double>& prices, int 
 
     result.valid = true;
     result.value = safe_div(prices.back() - mean, stddev);
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Realized Volatility (sample std-dev of log-returns)
+//
+// Reference: Hull (2018), "Options, Futures, and Other Derivatives".
+// Log-returns are preferred over simple returns in financial econometrics
+// because they are time-additive and approximately normally distributed.
+// Bessel correction (n-1) gives an unbiased variance estimator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+IndicatorResult IndicatorEngine::volatility(const std::vector<double>& prices, int period) const {
+    IndicatorResult result;
+    result.name = "VOLATILITY";
+    const auto n = static_cast<int>(prices.size());
+    const int min_bars = period + 1;  // need period+1 prices → period returns
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Volatility: invalid period",
+            {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Volatility: invalid price data detected");
+        return result;
+    }
+
+    // Compute log-returns over the last `period` bars
+    const std::size_t start = prices.size() - static_cast<std::size_t>(min_bars);
+    double sum = 0.0;
+    std::size_t count = 0;
+
+    // First pass: compute mean of log-returns
+    for (std::size_t i = start; i < prices.size() - 1; ++i) {
+        if (prices[i] <= 0.0 || prices[i + 1] <= 0.0) continue;
+        sum += std::log(prices[i + 1] / prices[i]);
+        ++count;
+    }
+
+    if (count < 2) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = 2 - static_cast<int>(count);
+        return result;
+    }
+
+    const double mean_ret = sum / static_cast<double>(count);
+
+    // Second pass: compute variance with Bessel correction (n-1)
+    double var = 0.0;
+    for (std::size_t i = start; i < prices.size() - 1; ++i) {
+        if (prices[i] <= 0.0 || prices[i + 1] <= 0.0) continue;
+        const double r = std::log(prices[i + 1] / prices[i]);
+        const double d = r - mean_ret;
+        var += d * d;
+    }
+    var /= static_cast<double>(count - 1);  // Bessel correction
+
+    result.valid = true;
+    result.value = safe_sqrt(var);
+    result.status = IndicatorStatus::Ok;
+    result.sample_count = n;
+    result.warmup_remaining = 0;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Momentum: (price_now − price_n_ago) / price_n_ago  [fraction]
+//
+// Simple rate-of-change as a decimal fraction.
+// Distinct from rate_of_change() which returns percentage (×100).
+// ─────────────────────────────────────────────────────────────────────────────
+
+IndicatorResult IndicatorEngine::momentum(const std::vector<double>& prices, int period) const {
+    IndicatorResult result;
+    result.name = "MOMENTUM";
+    const auto n = static_cast<int>(prices.size());
+    const int min_bars = period + 1;
+
+    if (period <= 0) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Momentum: invalid period",
+            {{"period", std::to_string(period)}});
+        return result;
+    }
+    if (n < min_bars) {
+        result.status = IndicatorStatus::InsufficientData;
+        result.sample_count = n;
+        result.warmup_remaining = min_bars - n;
+        return result;
+    }
+    if (!validate_price_series(prices)) {
+        result.status = IndicatorStatus::InvalidInput;
+        if (logger_) logger_->warn("IndicatorEngine", "Momentum: invalid price data detected");
+        return result;
+    }
+
+    const double current = prices.back();
+    const double past = prices[prices.size() - 1 - static_cast<std::size_t>(period)];
+
+    result.valid = true;
+    result.value = safe_div(current - past, past);
     result.status = IndicatorStatus::Ok;
     result.sample_count = n;
     result.warmup_remaining = 0;

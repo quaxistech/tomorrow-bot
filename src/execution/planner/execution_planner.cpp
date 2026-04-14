@@ -122,7 +122,7 @@ ExecutionAction ExecutionPlanner::classify_action(const strategy::TradeIntent& i
             return ExecutionAction::ReducePosition;
 
         case SI::Hold:
-            return ExecutionAction::OpenPosition;  // Hold не создаёт ордеров — будет отфильтрован выше
+            return ExecutionAction::NoAction;
     }
 
     // Fallback: по trade_side
@@ -152,9 +152,8 @@ PlannedExecutionStyle ExecutionPlanner::choose_style(
         case ES::Aggressive:
             return PlannedExecutionStyle::AggressiveMarket;
         case ES::PostOnly:
-            if (config_.enable_post_only_entries) {
-                return PlannedExecutionStyle::PostOnlyLimit;
-            }
+            // USDT-M Futures scalping: post-only не поддерживается в текущем
+            // runtime (все ордера Market+IOC). Классифицируем как passive.
             return PlannedExecutionStyle::PassiveLimit;
         case ES::NoExecution:
             // Не должен дойти сюда (отфильтровано выше), но на всякий случай

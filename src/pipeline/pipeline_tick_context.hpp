@@ -17,11 +17,11 @@
 #include "risk/risk_types.hpp"
 #include "execution_alpha/execution_alpha_types.hpp"
 #include "common/types.hpp"
+#include "clock/timestamp_utils.hpp"
 #include <optional>
 #include <vector>
 #include <string>
 #include <cstdint>
-#include <time.h>
 
 namespace tb::pipeline {
 
@@ -50,17 +50,6 @@ struct StageLatency {
     /// Длительность в микросекундах
     int64_t duration_us{0};
 };
-
-// ============================================================
-// Вспомогательные функции для монотонного времени
-// ============================================================
-
-/// Получить текущее монотонное время в наносекундах
-[[nodiscard]] inline int64_t monotonic_now_ns() noexcept {
-    struct timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
-}
 
 // ============================================================
 // Единый контекст тика
@@ -122,12 +111,12 @@ struct PipelineTickContext {
 
     /// Зафиксировать начало стадии; возвращает монотонное время старта (нс)
     [[nodiscard]] int64_t begin_stage() const noexcept {
-        return monotonic_now_ns();
+        return clock::steady_now_ns();
     }
 
     /// Завершить стадию: вычислить длительность и добавить запись
     void end_stage(const char* name, int64_t start_ns) {
-        int64_t dur_us = (monotonic_now_ns() - start_ns) / 1'000;
+        int64_t dur_us = (clock::steady_now_ns() - start_ns) / 1'000;
         stage_latencies.push_back({name, dur_us});
     }
 

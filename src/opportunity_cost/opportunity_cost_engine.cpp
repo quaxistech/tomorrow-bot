@@ -282,7 +282,7 @@ OpportunityCostFactors RuleBasedOpportunityCost::build_factors(
         portfolio_ctx.strategy_exposure_pct > config_.max_strategy_concentration;
     f.capital_limited =
         portfolio_ctx.gross_exposure_pct > config_.capital_exhaustion_threshold;
-    f.drawdown_penalized = portfolio_ctx.current_drawdown_pct > 5.0;
+    f.drawdown_penalized = portfolio_ctx.current_drawdown_pct > 0.0;
 
     return f;
 }
@@ -295,15 +295,20 @@ double RuleBasedOpportunityCost::effective_conviction_threshold(
 {
     double threshold = base_threshold;
 
-    // Penalty за просадку: +scale за каждые 5% drawdown
+    // Penalty за просадку: +drawdown_penalty_scale за каждые 5% drawdown от пика.
+    // current_drawdown_pct приходит как fraction [0,1] (pipeline нормализует).
+    // 0.05 = 5% drawdown step в fraction-единицах.
+    // Обоснование: Thorp 2006, half-Kelly при drawdown — снижение risk appetite
+    // пропорционально глубине просадки.
     if (portfolio_ctx.current_drawdown_pct > 0.0) {
         threshold += config_.drawdown_penalty_scale *
-                     (portfolio_ctx.current_drawdown_pct / 5.0);
+                     (portfolio_ctx.current_drawdown_pct / 0.05);
     }
 
-    // Penalty за серию убытков: +0.02 за каждый убыточный трейд подряд
+    // Penalty за серию убытков: behavioral tilt protection.
+    // После серии убытков повышаем планку для входа.
     if (portfolio_ctx.consecutive_losses > 0) {
-        threshold += 0.02 * portfolio_ctx.consecutive_losses;
+        threshold += config_.consecutive_loss_penalty * portfolio_ctx.consecutive_losses;
     }
 
     return std::clamp(threshold, 0.0, 0.95);

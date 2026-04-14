@@ -1,4 +1,5 @@
 #include "execution/cancel/cancel_manager.hpp"
+#include "execution/execution_utils.hpp"
 
 namespace tb::execution {
 
@@ -131,7 +132,7 @@ bool CancelManager::do_cancel(const OrderId& order_id) {
 }
 
 void CancelManager::release_cash_if_needed(const OrderRecord& order) {
-    if (order.side == Side::Buy && portfolio_ && order.trade_side != TradeSide::Close) {
+    if (portfolio_ && requires_margin_reserve(order)) {
         portfolio_->release_cash(order.order_id);
     }
 }

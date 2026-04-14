@@ -3,7 +3,9 @@
  * @brief Реализация Write-Ahead Logger
  */
 #include "persistence/wal_writer.hpp"
+#include <boost/json.hpp>
 #include <format>
+#include <unordered_set>
 
 namespace tb::persistence {
 
@@ -190,11 +192,64 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
     std::lock_guard lock(mutex_);
 
     std::vector<WalEntry> uncommitted;
-    uncommitted.reserve(pending_entries_.size());
 
+    // 1. Из in-memory pending (для normal runtime)
     for (const auto& [seq, entry] : pending_entries_) {
         if (!entry.committed) {
             uncommitted.push_back(entry);
+        }
+    }
+
+    // 2. Сканируем journal на диске — ищем WAL записи с committed=false,
+    //    у которых НЕТ последующего commit или rollback.
+    //    Это критично для crash-recovery: после рестарта pending_entries_ пуст.
+    if (uncommitted.empty()) {
+        auto all_entries = journal_->query(
+            Timestamp(0), Timestamp(std::numeric_limits<int64_t>::max()),
+            std::nullopt);
+        if (all_entries.has_value()) {
+            // Собираем committed и rolled-back sequences
+            std::unordered_set<uint64_t> resolved_seqs;
+            for (const auto& je : all_entries.value()) {
+                if (je.payload_json.empty()) continue;
+                try {
+                    auto json = boost::json::parse(je.payload_json);
+                    auto& obj = json.as_object();
+                    if (!obj.contains("wal_seq")) continue;
+                    uint64_t seq = static_cast<uint64_t>(obj.at("wal_seq").as_int64());
+                    bool is_committed = obj.contains("committed") && obj.at("committed").as_bool();
+                    bool is_rollback = obj.contains("rollback") && obj.at("rollback").as_bool();
+                    if (is_committed || is_rollback) {
+                        resolved_seqs.insert(seq);
+                    }
+                } catch (...) {}
+            }
+            // Теперь ищем uncommitted без resolved
+            for (const auto& je : all_entries.value()) {
+                if (je.payload_json.empty()) continue;
+                try {
+                    auto json = boost::json::parse(je.payload_json);
+                    auto& obj = json.as_object();
+                    if (!obj.contains("wal_seq") || !obj.contains("wal_type")) continue;
+                    uint64_t seq = static_cast<uint64_t>(obj.at("wal_seq").as_int64());
+                    bool is_committed = obj.contains("committed") && obj.at("committed").as_bool();
+                    bool is_rollback = obj.contains("rollback") && obj.at("rollback").as_bool();
+                    if (!is_committed && !is_rollback && resolved_seqs.find(seq) == resolved_seqs.end()) {
+                        WalEntry entry;
+                        entry.wal_sequence = seq;
+                        entry.committed = false;
+                        entry.payload_json = je.payload_json;
+                        if (obj.contains("data") && obj.at("data").is_object()) {
+                            auto& d = obj.at("data").as_object();
+                            if (d.contains("symbol"))
+                                entry.symbol = Symbol(std::string(d.at("symbol").as_string()));
+                            if (d.contains("order_id"))
+                                entry.order_id = OrderId(std::string(d.at("order_id").as_string()));
+                        }
+                        uncommitted.push_back(std::move(entry));
+                    }
+                } catch (...) {}
+            }
         }
     }
 

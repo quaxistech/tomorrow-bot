@@ -19,7 +19,7 @@ enum class ExecutionStyle {
 struct ExecutionQualityEstimate {
     double spread_cost_bps{0.0};         ///< Стоимость спреда (базисные пункты)
     double estimated_slippage_bps{0.0};  ///< Ожидаемое проскальзывание
-    double fill_probability{0.5};        ///< Вероятность заполнения [0,1] — data-driven
+    double fill_probability{0.5};        ///< Вероятность заполнения [0,1]
     double adverse_selection_risk{0.0};  ///< Риск неблагоприятного отбора [0,1]
     double total_cost_bps{0.0};          ///< Полная стоимость исполнения
 };

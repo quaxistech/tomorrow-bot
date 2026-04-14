@@ -31,8 +31,6 @@ std::string to_string(RiskAction action) {
         case RiskAction::DenyDayLock:          return "DenyDayLock";
         case RiskAction::DenyAccountLock:      return "DenyAccountLock";
         case RiskAction::EmergencyHalt:        return "EmergencyHalt";
-        case RiskAction::ForceReduce:          return "ForceReduce";
-        case RiskAction::ForceLiquidate:       return "ForceLiquidate";
     }
     return "Unknown";
 }

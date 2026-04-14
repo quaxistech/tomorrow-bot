@@ -7,6 +7,24 @@
 
 namespace tb::portfolio_allocator {
 
+namespace {
+
+double compute_effective_available_notional(
+    const portfolio::PortfolioSnapshot& portfolio,
+    double max_leverage)
+{
+    const double capital_base = (portfolio.available_capital > 0.0)
+        ? portfolio.available_capital
+        : portfolio.total_capital;
+    // Используем 80% от max_leverage для оценки доступного нотионала.
+    // На микро-счетах с min_leverage=10+ реальное плечо близко к max,
+    // поэтому 50% слишком консервативно и блокирует min_notional.
+    double effective_lev = std::max(max_leverage * 0.8, 1.0);
+    return capital_base * effective_lev;
+}
+
+} // namespace
+
 HierarchicalAllocator::HierarchicalAllocator(
     Config config,
     std::shared_ptr<logging::ILogger> logger)
@@ -37,9 +55,9 @@ SizingResult HierarchicalAllocator::compute_size(
 
     if (qty <= 0.0) {
         // Стратегия не указала объём — вычисляем из доступного капитала.
-        // ИСПРАВЛЕНИЕ: используем total_capital (согласованно с compute_budget_limit)
-        // С учётом leverage: total_capital × leverage = максимальный нотионал.
-        double leveraged_capital = portfolio.total_capital * config_.max_leverage;
+        // Для нового входа используем реально доступный капитал, а не полный equity.
+        double leveraged_capital = compute_effective_available_notional(
+            portfolio, config_.max_leverage);
         double max_notional = leveraged_capital * config_.max_concentration_pct;
         qty = max_notional / price;
     }
@@ -133,9 +151,9 @@ SizingResult HierarchicalAllocator::compute_size(
         }
     }
 
-    // Шаг 6: Ограничить доступным капиталом (с учётом плеча)
-    // ИСПРАВЛЕНИЕ: используем total_capital согласованно с compute_budget_limit
-    double effective_capital = portfolio.total_capital * config_.max_leverage;
+    // Шаг 6: Ограничить реально доступным капиталом (с учётом плеча)
+    double effective_capital = compute_effective_available_notional(
+        portfolio, config_.max_leverage);
     double final_notional = qty * price;
     if (effective_capital <= 0.0) {
         result.approved = false;
@@ -152,10 +170,9 @@ SizingResult HierarchicalAllocator::compute_size(
     qty = std::max(qty, 0.0);
     final_notional = qty * price;
 
-    // Enforce minimum order notional ($1.10 USDT — above Bitget's $1 minimum)
-    constexpr double kMinOrderNotional = 1.10;
-    if (final_notional > 0.0 && final_notional < kMinOrderNotional && price > 0.0) {
-        double min_qty = kMinOrderNotional / price;
+    // Enforce minimum order notional (Bitget USDT-M futures)
+    if (final_notional > 0.0 && final_notional < common::exchange_limits::kMinBitgetNotionalUsdt && price > 0.0) {
+        double min_qty = common::exchange_limits::kMinBitgetNotionalUsdt / price;
         if (min_qty * price <= effective_capital) {
             qty = min_qty;
             final_notional = qty * price;
@@ -231,6 +248,12 @@ void HierarchicalAllocator::set_market_context(
     current_regime_ = current_regime;
     win_rate_ = std::clamp(win_rate, 0.0, 1.0);
     avg_win_loss_ratio_ = std::max(avg_win_loss_ratio, 0.0);
+}
+
+void HierarchicalAllocator::update_global_budget(double new_budget) {
+    if (new_budget > 0.0) {
+        config_.budget.global_budget = new_budget;
+    }
 }
 
 double HierarchicalAllocator::compute_volatility_multiplier() const {
@@ -385,8 +408,8 @@ void HierarchicalAllocator::apply_exchange_filters(
         }
     }
 
-    // Ограничить max_quantity
-    if (qty > filters.max_quantity) {
+    // Ограничить max_quantity (0 означает "не задан" — пропускаем)
+    if (filters.max_quantity > 0.0 && qty > filters.max_quantity) {
         qty = filters.max_quantity;
     }
 
@@ -397,10 +420,22 @@ void HierarchicalAllocator::apply_exchange_filters(
         double min_qty_for_notional = filters.min_notional / price;
         min_qty_for_notional = std::ceil(min_qty_for_notional / std::max(filters.quantity_step, 1e-15))
                              * std::max(filters.quantity_step, 1e-15);
-        if (min_qty_for_notional * price <= available_capital &&
-            min_qty_for_notional <= filters.max_quantity) {
+        double bump_notional = min_qty_for_notional * price;
+        if (bump_notional <= available_capital &&
+            (filters.max_quantity <= 0.0 || min_qty_for_notional <= filters.max_quantity)) {
             qty = min_qty_for_notional;
         } else {
+            if (logger_) {
+                logger_->warn("PortfolioAllocator", "min_notional check failed",
+                    {{"qty_before", std::to_string(qty)},
+                     {"notional", std::to_string(notional)},
+                     {"min_notional", std::to_string(filters.min_notional)},
+                     {"min_qty_for_notional", std::to_string(min_qty_for_notional)},
+                     {"bump_notional", std::to_string(bump_notional)},
+                     {"available_capital", std::to_string(available_capital)},
+                     {"price", std::to_string(price)},
+                     {"quantity_step", std::to_string(filters.quantity_step)}});
+            }
             result.approved = false;
             result.reduction_reason = "Недостаточно капитала для минимального нотионала биржи";
             qty = 0.0;
@@ -444,7 +479,9 @@ SizingResult HierarchicalAllocator::compute_size_v2(
     // Шаг 2: Определить начальный объём
     double qty = intent.suggested_quantity.get();
     if (qty <= 0.0) {
-        double max_notional = portfolio.available_capital * config_.max_concentration_pct;
+        double leveraged_capital = compute_effective_available_notional(
+            portfolio, config_.max_leverage);
+        double max_notional = leveraged_capital * config_.max_concentration_pct;
         qty = max_notional / price;
     }
     if (qty <= 0.0) {
@@ -596,8 +633,9 @@ SizingResult HierarchicalAllocator::compute_size_v2(
         result.constraint_audit.push_back(std::move(cd));
     }
 
-    // Шаг 11: Ограничить доступным капиталом
-    double max_from_capital = portfolio.available_capital;
+    // Шаг 11: Ограничить доступным капиталом (с учётом плеча)
+    double max_from_capital = compute_effective_available_notional(
+        portfolio, config_.max_leverage);
     double final_notional = qty * price;
     if (max_from_capital <= 0.0) {
         result.approved = false;
@@ -618,20 +656,14 @@ SizingResult HierarchicalAllocator::compute_size_v2(
                                max_from_capital, result);
         if (!result.approved) return result;
     } else {
-        // Fallback: min notional $1.10 (как в compute_size)
-        final_notional = qty * price;
-        constexpr double kMinOrderNotional = 1.10;
-        if (final_notional > 0.0 && final_notional < kMinOrderNotional && price > 0.0) {
-            double min_qty = kMinOrderNotional / price;
-            if (min_qty * price <= max_from_capital) {
-                qty = min_qty;
-                result.reduction_reason = "Увеличен до минимального ордера биржи";
-            } else {
-                result.approved = false;
-                result.reduction_reason = "Недостаточно капитала для минимального ордера биржи";
-                return result;
-            }
-        }
+        // Exchange filters отсутствуют — блокируем вход.
+        // Безопасный вход невозможен без знания per-symbol min notional/quantity step.
+        result.approved = false;
+        result.reduction_reason = "Exchange filters отсутствуют — вход заблокирован";
+        logger_->warn("PortfolioAllocator",
+            "Вход заблокирован: exchange filters не установлены для символа",
+            {{"symbol", intent.symbol.get()}});
+        return result;
     }
 
     // Шаг 13: Комиссия

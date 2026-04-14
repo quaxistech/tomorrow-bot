@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <unordered_map>
 
 namespace tb::decision {
 
@@ -11,7 +12,7 @@ struct ScoredIntent {
     double weighted_score;
     double weight;
     double aged_conviction;       // conviction after time decay
-    double regime_conviction;     // conviction after regime adjustment
+    double effective_conviction;  // conviction after execution-cost penalty
     double cost_penalty;          // execution cost penalty
 };
 
@@ -88,7 +89,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     if (!record.global_vetoes.empty()) {
         record.trade_approved = false;
         record.rejection_reason = record.global_vetoes.front().reason_code;
-        record.rationale = rationale.str();
+        record.set_rationale(rationale.str());
         for (const auto& intent : intents) {
             StrategyContribution contrib;
             contrib.strategy_id = intent.strategy_id;
@@ -121,7 +122,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
             record.global_vetoes.push_back(veto);
             record.trade_approved = false;
             record.rejection_reason = RejectionReason::ExecutionCostTooHigh;
-            record.rationale = veto.reason;
+            record.set_rationale(veto.reason);
             for (const auto& intent : intents) {
                 StrategyContribution contrib;
                 contrib.strategy_id = intent.strategy_id;
@@ -142,13 +143,14 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     // ─── 3. Обработка каждого интента ───────────────────────────────────────
 
+    auto alloc_map = std::unordered_map<std::string, const strategy_allocator::StrategyAllocation*>{};
+    for (const auto& a : allocation.allocations) {
+        alloc_map[a.strategy_id.get()] = &a;
+    }
+
     auto find_allocation = [&](const StrategyId& sid) -> const strategy_allocator::StrategyAllocation* {
-        for (const auto& a : allocation.allocations) {
-            if (a.strategy_id == sid) {
-                return &a;
-            }
-        }
-        return nullptr;
+        auto it = alloc_map.find(sid.get());
+        return (it != alloc_map.end()) ? it->second : nullptr;
     };
 
     std::vector<ScoredIntent> scored;
@@ -176,7 +178,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         double aged_conviction = intent.conviction;
         if (advanced_.enable_time_decay) {
             if (intent.generated_at.get() > 0) {
-                int64_t signal_age_ns = record.decided_at.get() - intent.generated_at.get();
+                int64_t signal_age_ns = std::max(int64_t{0}, static_cast<int64_t>(record.decided_at.get() - intent.generated_at.get()));
                 double decay = compute_time_decay(signal_age_ns);
                 aged_conviction = intent.conviction * decay;
             } else {
@@ -195,7 +197,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         effective_conviction -= cost_estimate.conviction_penalty;
         effective_conviction = std::max(effective_conviction, 0.0);
 
-        contrib.regime_adjusted_conviction = effective_conviction;
+        contrib.cost_adjusted_conviction = effective_conviction;
 
         double weighted_score = effective_conviction * alloc->weight;
 
@@ -221,10 +223,12 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         double dominance = std::max(buy_total, sell_total) /
                           (buy_total + sell_total + 1e-10);
 
-        // Regime-adaptive dominance threshold
+        // Regime-adaptive dominance threshold (multiplicative composition)
         double effective_dominance_thr = dominance_threshold_;
         if (advanced_.enable_regime_dominance_scaling) {
-            effective_dominance_thr = compute_regime_dominance_threshold(regime.detailed);
+            double regime_thr = compute_regime_dominance_threshold(regime.detailed);
+            double regime_factor = regime_thr / dominance_threshold_;
+            effective_dominance_thr *= regime_factor;
         }
 
         if (dominance < effective_dominance_thr) {
@@ -237,7 +241,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
             record.global_vetoes.push_back(conflict_veto);
             record.trade_approved = false;
             record.rejection_reason = RejectionReason::SignalConflict;
-            record.rationale = conflict_veto.reason;
+            record.set_rationale(conflict_veto.reason);
             for (auto& c : record.contributions) {
                 c.was_vetoed = true;
                 c.veto_reasons.push_back(conflict_veto);
@@ -271,7 +275,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     if (scored.empty()) {
         record.trade_approved = false;
         record.rejection_reason = RejectionReason::NoValidIntents;
-        record.rationale = "Нет подходящих торговых намерений";
+        record.set_rationale("Нет подходящих торговых намерений");
         logger_->debug("Decision", record.rationale, {{"symbol", symbol.get()}});
         return record;
     }
@@ -297,15 +301,31 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     // 6c. Drawdown-aware threshold boost
     record.drawdown_threshold_boost = 0.0;
+    bool drawdown_boost_applied = false;
     if (advanced_.enable_portfolio_awareness && portfolio.has_value()) {
         record.drawdown_threshold_boost = compute_drawdown_boost(*portfolio);
         threshold += record.drawdown_threshold_boost;
+        drawdown_boost_applied = (record.drawdown_threshold_boost > 0.0);
+    }
+
+    // 6d. World model state_probabilities — повышаем порог при высокой
+    //     вероятности опасных состояний (toxic, vacuum, exhaustion, chop)
+    if (world.state_probabilities.valid) {
+        using WS = world_model::WorldState;
+        double danger_prob =
+            world.state_probabilities.probability(WS::ToxicMicrostructure)
+          + world.state_probabilities.probability(WS::LiquidityVacuum)
+          + world.state_probabilities.probability(WS::ExhaustionSpike)
+          + world.state_probabilities.probability(WS::ChopNoise);
+        // Плавный буст: P(danger)=0.5 → +10% threshold, P(danger)=1.0 → +20%
+        double world_boost = danger_prob * 0.20;
+        threshold += world_boost;
     }
 
     record.effective_threshold = threshold;
 
     // Используем aged conviction (после time decay + execution cost)
-    double base_conviction = best.regime_conviction;
+    double base_conviction = best.effective_conviction;
 
     // ─── 8. Ensemble conviction bonus ───────────────────────────────────────
 
@@ -331,7 +351,13 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     if (adjusted_conviction < threshold) {
         record.trade_approved = false;
-        record.rejection_reason = RejectionReason::LowConviction;
+        // DrawdownProtection если без drawdown boost прошли бы, иначе LowConviction
+        double threshold_without_dd = threshold - record.drawdown_threshold_boost;
+        if (drawdown_boost_applied && adjusted_conviction >= threshold_without_dd) {
+            record.rejection_reason = RejectionReason::DrawdownProtection;
+        } else {
+            record.rejection_reason = RejectionReason::LowConviction;
+        }
         rationale << "Лучший кандидат (" << best.intent->strategy_id.get()
                   << ") conviction=" << best.intent->conviction;
         if (best.aged_conviction != best.intent->conviction) {
@@ -348,7 +374,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         if (record.drawdown_threshold_boost > 0.0) {
             rationale << " (dd+" << record.drawdown_threshold_boost << ")";
         }
-        record.rationale = rationale.str();
+        record.set_rationale(rationale.str());
         logger_->debug("Decision", record.rationale, {{"symbol", symbol.get()}});
         return record;
     }
@@ -377,7 +403,7 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     if (cost_estimate.total_cost_bps > 0.0) {
         rationale << " exec_cost=" << cost_estimate.total_cost_bps << "bps";
     }
-    record.rationale = rationale.str();
+    record.set_rationale(rationale.str());
 
     logger_->debug("Decision", "Торговля одобрена: " + best.intent->strategy_id.get(),
                   {{"symbol", symbol.get()},
@@ -405,7 +431,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
 
         case DR::WeakUptrend:
         case DR::WeakDowntrend:
-            return advanced_.regime_trending_factor; // same as strong trend for micro-cap
+            return advanced_.regime_trending_factor;
 
         case DR::MeanReversion:
             return advanced_.regime_mean_reversion_factor;
@@ -414,7 +440,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
             return advanced_.regime_volatile_factor;
 
         case DR::LowVolCompression:
-            return 1.0; // micro-cap: compression is normal, don't inflate
+            return advanced_.regime_low_vol_factor;
 
         case DR::LiquidityStress:
         case DR::SpreadInstability:
@@ -422,7 +448,7 @@ double CommitteeDecisionEngine::compute_regime_threshold_factor(
             return advanced_.regime_stress_factor;
 
         case DR::AnomalyEvent:
-            return 1.0; // anomaly — micro-cap markets are naturally noisy, don't inflate
+            return advanced_.regime_anomaly_factor;
 
         case DR::Chop:
             return advanced_.regime_choppy_factor;
@@ -485,7 +511,9 @@ ExecutionCostEstimate CommitteeDecisionEngine::compute_execution_cost(
     }
 
     est.total_cost_bps = est.spread_bps + est.estimated_slippage_bps;
-    est.conviction_penalty = (est.total_cost_bps / 10000.0) * advanced_.execution_cost_conviction_penalty;
+    // Нормализация к 100 bps: 100 bps стоимости → penalty_factor пенальти.
+    // Для скальпинга с таргетом 5–20 bps это даёт ощутимую коррекцию.
+    est.conviction_penalty = (est.total_cost_bps / 100.0) * advanced_.execution_cost_conviction_penalty;
 
     if (est.total_cost_bps > advanced_.max_acceptable_cost_bps) {
         est.vetoed_by_cost = true;
@@ -498,8 +526,8 @@ double CommitteeDecisionEngine::compute_drawdown_boost(
     const portfolio::PortfolioSnapshot& portfolio) const
 {
     double dd_pct = std::abs(portfolio.pnl.current_drawdown_pct);
-    // Линейная шкала: за каждые 5% просадки +drawdown_boost_scale к порогу
-    double boost = (dd_pct / 5.0) * advanced_.drawdown_boost_scale;
+    // Линейная шкала: за каждые drawdown_reference_pct% просадки +drawdown_boost_scale к порогу
+    double boost = (dd_pct / advanced_.drawdown_reference_pct) * advanced_.drawdown_boost_scale;
 
     // Бонус за серию убытков
     double loss_boost = portfolio.pnl.consecutive_losses * advanced_.consecutive_loss_boost;
@@ -518,7 +546,7 @@ EnsembleMetrics CommitteeDecisionEngine::compute_ensemble_metrics(
     if (scored.empty()) return m;
 
     // Лидер — первый в sorted списке (max weighted_score)
-    m.leading_conviction = scored.front().regime_conviction;
+    m.leading_conviction = scored.front().effective_conviction;
 
     // Подсчёт согласных стратегий (те же направления)
     double weighted_consensus = 0.0;
@@ -529,7 +557,7 @@ EnsembleMetrics CommitteeDecisionEngine::compute_ensemble_metrics(
     for (const auto& s : scored) {
         if (s.intent->side == winning_side) {
             ++aligned;
-            weighted_consensus += s.regime_conviction * s.weight;
+            weighted_consensus += s.effective_conviction * s.weight;
 
             // Бонус за каждую дополнительную согласную стратегию (после первой)
             if (aligned > 1) {
@@ -564,8 +592,7 @@ int64_t CommitteeDecisionEngine::detect_time_skew(
     };
 
     check(regime.computed_at.get());
-    // UncertaintySnapshot может не иметь computed_at — проверяем через aggregate_score > 0
-    // (если score посчитан, значит snap был создан)
+    check(uncertainty.computed_at.get());
 
     return max_skew;
 }

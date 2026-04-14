@@ -3,14 +3,31 @@
 
 namespace tb::order_book {
 
-// Состояние качества стакана
+// Состояние качества L2-стакана (USDT-M futures)
+//
+// State machine:
+//   Uninitialized ──snapshot──► Valid
+//   Valid ──sequence gap──► Desynced
+//   Valid ──staleness──► Stale
+//   Stale ──snapshot/delta──► Valid
+//   Desynced ──request_resync──► Uninitialized
 enum class BookQuality {
-    Valid,
-    Stale,
-    Desynced,
-    Resyncing,
-    Uninitialized
+    Valid,          ///< Книга синхронизирована и актуальна
+    Stale,          ///< Книга не обновлялась дольше порога свежести
+    Desynced,       ///< Обнаружен разрыв последовательности дельт
+    Uninitialized   ///< Начальный snapshot ещё не получен
 };
+
+/// Строковое представление BookQuality (для метрик и логирования)
+inline const char* to_string(BookQuality q) {
+    switch (q) {
+        case BookQuality::Valid:         return "valid";
+        case BookQuality::Stale:         return "stale";
+        case BookQuality::Desynced:      return "desynced";
+        case BookQuality::Uninitialized: return "uninitialized";
+    }
+    return "unknown";
+}
 
 // Сводка вершины стакана
 struct TopOfBook {
@@ -33,7 +50,7 @@ struct DepthSummary {
     tb::Quantity ask_depth_10{0.0};
     double imbalance_5{0.0};
     double imbalance_10{0.0};
-    double weighted_mid{0.0};
+    double weighted_mid{0.0};   ///< Depth-weighted microprice (Stoikov 2018)
     tb::Timestamp computed_at{0};
 };
 

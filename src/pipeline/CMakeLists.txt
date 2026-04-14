@@ -33,6 +33,7 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_execution
     tb_exchange_bitget
     tb_persistence
+    tb_recovery
     tb_ml
     tb_reconciliation
 )

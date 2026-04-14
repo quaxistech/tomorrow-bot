@@ -22,6 +22,7 @@ struct RestResponse {
     std::string body;
     bool success{false};
     std::string error_message;
+    std::string error_code;   ///< Bitget API error code (поле "code" из JSON)
 };
 
 /**

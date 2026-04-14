@@ -2,7 +2,6 @@
 
 add_library(tb_clock STATIC
     wall_clock.cpp
-    monotonic_clock.cpp
 )
 
 target_include_directories(tb_clock

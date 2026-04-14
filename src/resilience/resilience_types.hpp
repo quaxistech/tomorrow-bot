@@ -18,12 +18,19 @@ namespace tb::resilience {
 // ============================================================
 
 /// @brief Конфигурация retry policy
+///
+/// Научное обоснование дефолтов:
+///   max_retries=3        — AWS SDK / Google Cloud SDK default (Google SRE Book §22)
+///   base_delay_ms=100    — стандартный initial delay (AWS/GCP SDKs: 100ms)
+///   max_delay_ms=5000    — потолок для скальпинга USDT-M futures (5s max)
+///   jitter_factor=0.5    — "Equal Jitter" подход (Brooker, AWS Architecture Blog 2015)
+///   rate_limit_multiplier — множитель backoff для 429 (Stripe best practice: 2-4x)
 struct RetryConfig {
     int max_retries{3};
-    int64_t base_delay_ms{200};
-    int64_t max_delay_ms{10000};
-    double jitter_factor{0.3};          ///< Случайная добавка до 30% от delay
-    bool retry_on_timeout{true};
+    int64_t base_delay_ms{100};
+    int64_t max_delay_ms{5000};
+    double jitter_factor{0.5};
+    int rate_limit_backoff_multiplier{3};
 };
 
 // ============================================================
@@ -31,10 +38,15 @@ struct RetryConfig {
 // ============================================================
 
 /// @brief Конфигурация circuit breaker
+///
+/// Научное обоснование дефолтов:
+///   failure_threshold=5       — Fowler Circuit Breaker pattern: 5-10 consecutive
+///   recovery_timeout_ms=30000 — Microsoft Polly / Resilience4j default: 30s
+///   half_open_max_attempts=3  — Resilience4j permittedNumberOfCallsInHalfOpenState
 struct CircuitBreakerConfig {
-    int failure_threshold{5};           ///< Переход Open после N отказов
-    int64_t recovery_timeout_ms{30000}; ///< Время в Open перед HalfOpen
-    int half_open_max_attempts{2};      ///< Попытки в HalfOpen
+    int failure_threshold{5};
+    int64_t recovery_timeout_ms{30000};
+    int half_open_max_attempts{3};
 };
 
 // ============================================================
@@ -98,10 +110,11 @@ struct ExecutionAttempt {
 // ============================================================
 
 /// @brief Конфигурация идемпотентности ордеров
+///
+/// dedup_window_ms=300000 — 5 мин, стандартное окно TTL exchange order (Bitget USDT-M)
 struct IdempotencyConfig {
-    bool enabled{true};
     std::string client_id_prefix{"tb"};
-    int64_t dedup_window_ms{300000};    ///< 5 минут — окно дедупликации
+    int64_t dedup_window_ms{300000};
 };
 
 } // namespace tb::resilience

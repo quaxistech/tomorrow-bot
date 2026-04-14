@@ -51,6 +51,9 @@ public:
     /// Уведомить о закрытии позиции
     void notify_position_closed();
 
+    /// Уведомить, что вход отклонён pipeline (sizing/risk/exchange)
+    void notify_entry_rejected();
+
     /// Текущее состояние state machine
     SymbolState current_state() const;
 
@@ -94,6 +97,8 @@ private:
 
     std::atomic<bool> active_{true};
     std::vector<std::string> last_reasons_;
+    uint64_t diag_skip_count_{0};
+    bool exit_signal_sent_{false};
 };
 
 } // namespace tb::strategy

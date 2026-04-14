@@ -33,7 +33,6 @@
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
-#include "exchange/bitget/bitget_order_submitter.hpp"
 #include "exchange/bitget/bitget_futures_order_submitter.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
@@ -47,15 +46,16 @@
 #include "pipeline/pipeline_latency_tracker.hpp"
 #include "pipeline/order_watchdog.hpp"
 #include "reconciliation/reconciliation_engine.hpp"
-#include "exchange/bitget/bitget_exchange_query_adapter.hpp"
 #include "leverage/leverage_engine.hpp"
 #include "exchange/bitget/bitget_futures_query_adapter.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <deque>
 #include <unordered_map>
 #include <string>
+#include <limits>
 
 namespace tb::pipeline {
 
@@ -63,13 +63,16 @@ class TradingPipeline {
 public:
     /// @param symbol Торговый символ (например "BTCUSDT").
     ///        Если пустой — используется "BTCUSDT" по умолчанию.
+    /// @param shared_portfolio Общий движок портфеля (для account-level state).
+    ///        Если nullptr — создаётся локальный (backward compat).
     TradingPipeline(
         const config::AppConfig& config,
         std::shared_ptr<security::ISecretProvider> secret_provider,
         std::shared_ptr<logging::ILogger> logger,
         std::shared_ptr<clock::IClock> clock,
         std::shared_ptr<metrics::IMetricsRegistry> metrics,
-        const std::string& symbol = ""
+        const std::string& symbol = "",
+        std::shared_ptr<portfolio::IPortfolioEngine> shared_portfolio = nullptr
     );
 
     ~TradingPipeline();
@@ -203,6 +206,22 @@ private:
 
     /// Счётчик последовательных отклонений ордеров (для экспоненциального backoff)
     int consecutive_rejections_{0};
+
+    /// Последнее установленное плечо на бирже (для debounce)
+    int last_applied_leverage_long_{0};
+    int last_applied_leverage_short_{0};
+
+    /// Диагностика: счётчики блокировок для каждого gate (логируем первые N)
+    int diag_thompson_block_{0};
+    int diag_htf_block_{0};
+    int diag_cooldown_block_{0};
+    int diag_opp_cost_block_{0};
+    int diag_sizing_block_{0};
+    int diag_risk_block_{0};
+    int diag_pnl_gate_block_{0};
+    int diag_leverage_block_{0};
+    int diag_slow_tick_breakdown_{0};
+    static constexpr int kDiagLogLimit = 10; ///< Логируем первые N блокировок каждого gate
     /// Максимальный backoff между ордерами: 2 минуты (120 секунд)
     static constexpr int64_t kMaxRejectionBackoffNs = 120'000'000'000LL;
 
@@ -217,8 +236,8 @@ private:
     /// REST клиент для запроса баланса (только production/testnet)
     std::shared_ptr<exchange::bitget::BitgetRestClient> rest_client_;
 
-    /// Ссылка на BitgetOrderSubmitter для настройки precision (nullptr в paper mode)
-    std::shared_ptr<exchange::bitget::BitgetOrderSubmitter> bitget_submitter_;
+    /// Paper submitter с биржевыми rules для честной симуляции фьючерсных ордеров
+    std::shared_ptr<execution::PaperOrderSubmitter> paper_submitter_;
 
     /// Ссылка на BitgetFuturesOrderSubmitter (для USDT-M фьючерсов, nullptr если futures.enabled=false)
     std::shared_ptr<exchange::bitget::BitgetFuturesOrderSubmitter> futures_submitter_;
@@ -226,13 +245,11 @@ private:
     /// Правила инструмента для текущего символа (из exchange info)
     ExchangeSymbolRules exchange_rules_;
 
-    // ==================== Phase 0: Unified Context ========================
-    /// Счётчик тиков обработанных через новый staged pipeline (диагностика)
-    uint64_t staged_tick_count_{0};
-
     // ==================== Phase 1: Latency SLA ============================
     /// Трекер латентности по стадиям pipeline (P50/P95/P99)
     std::unique_ptr<PipelineLatencyTracker> latency_tracker_;
+    /// Timestamp последнего экспорта latency-метрик
+    int64_t last_latency_emit_ns_{0};
 
     // ==================== Phase 2: Order Watchdog =========================
     /// Непрерывный монитор жизненного цикла ордеров
@@ -245,15 +262,17 @@ private:
     // ==================== Phase 4: Continuous Reconciliation ==============
     /// Движок reconciliation для непрерывной проверки состояния ордеров/позиций
     std::shared_ptr<reconciliation::ReconciliationEngine> reconciliation_engine_;
-    /// Адаптер Bitget REST → IExchangeQueryService
-    std::shared_ptr<exchange::bitget::BitgetExchangeQueryAdapter> exchange_query_adapter_;
-    /// Адаптер Bitget REST для фьючерсов (nullptr если futures.enabled=false)
+    /// Адаптер Bitget REST для фьючерсов
     std::shared_ptr<exchange::bitget::BitgetFuturesQueryAdapter> futures_query_adapter_;
 
     /// Timestamp последней reconciliation в runtime
     int64_t last_reconciliation_ns_{0};
+    /// Timestamp последней позиционной/балансовой reconciliation
+    int64_t last_pos_balance_reconciliation_ns_{0};
     /// Интервал runtime reconciliation: 60 секунд
     static constexpr int64_t kReconciliationIntervalNs = 60'000'000'000LL;
+    /// Флаг: reconciliation обнаружила расхождение, нужна ресинхронизация с биржей
+    bool reconciliation_needs_resync_{false};
 
     /// Timestamp последней периодической синхронизации баланса
     int64_t last_balance_sync_ns_{0};
@@ -265,9 +284,6 @@ private:
 
     /// Загрузить точность ордеров (quantity/price) для текущего символа с биржи
     void fetch_symbol_precision();
-
-    /// Запросить актуальный баланс конкретного ассета (BTC/USDT) перед ордером
-    double query_asset_balance(const std::string& coin);
 
     /// Загрузить исторические свечи через REST API для прогрева индикаторов.
     /// Загружает 168 часовых свечей (7 дней) + 200 минутных свечей.
@@ -285,12 +301,6 @@ private:
     /// Блокирует торговлю пока HTF-анализ не подтвердит безопасные условия.
     /// @return true если рынок готов, false — ждём лучших условий
     bool check_market_readiness(const features::FeatureSnapshot& snapshot);
-
-    /// Максимальный убыток на одну сделку (% от капитала). По умолчанию 1%.
-    static constexpr double kMaxLossPerTradePct = 1.0;
-
-    /// ATR-множитель для динамического стоп-лосса (2.0 = 2×ATR)
-    static constexpr double kAtrStopMultiplier = 2.0;
 
     /// Минимальное количество тиков перед началом торговли.
     /// 200 тиков ≈ 3-5 минут live данных — индикаторы стабилизируются.
@@ -356,23 +366,21 @@ private:
     /// Максимальная цена с момента входа в позицию (для trailing stop BUY)
     double highest_price_since_entry_{0.0};
     /// Минимальная цена с момента входа (для trailing stop SELL)
-    double lowest_price_since_entry_{1e18};
+    double lowest_price_since_entry_{std::numeric_limits<double>::max()};
     /// Текущий уровень стоп-лосса (динамически обновляется)
     double current_stop_level_{0.0};
     /// Стоп был перенесён в breakeven (вход + комиссия)
     bool breakeven_activated_{false};
     /// Первый partial take-profit выполнен
     bool partial_tp_taken_{false};
+    /// Закрытие позиции ожидает исполнения — блокирует новые входы
+    bool close_order_pending_{false};
     /// Начальный размер позиции (для расчёта partial close)
     double initial_position_size_{0.0};
     /// Текущий ATR-множитель для trailing stop (адаптивный)
     double current_trail_mult_{2.0};
     /// Время входа в позицию (nanoseconds) — для time-based exit
     int64_t position_entry_time_ns_{0};
-    /// Максимальное время удержания убыточной позиции: 15 минут
-    static constexpr int64_t kMaxHoldLossNs = 15LL * 60 * 1'000'000'000LL;
-    /// Максимальное время удержания любой позиции: 60 минут
-    static constexpr int64_t kMaxHoldAbsoluteNs = 60LL * 60 * 1'000'000'000LL;
 
     /// Обновить trailing stop для текущей позиции
     void update_trailing_stop(const features::FeatureSnapshot& snapshot);
@@ -391,6 +399,9 @@ private:
     /// Thompson action при открытии текущей позиции (для корректной записи reward)
     ml::EntryAction current_entry_thompson_action_{ml::EntryAction::EnterNow};
 
+    /// A4 fix: мировое состояние при открытии позиции (для feedback в world model)
+    world_model::WorldState current_entry_world_state_{world_model::WorldState::Unknown};
+
     /// Проскальзывание при входе в текущую позицию (бп)
     double current_position_slippage_bps_{0.0};
 
@@ -400,22 +411,41 @@ private:
     /// Последний результат execution alpha — нужен для C/C fee estimation при закрытии позиции
     std::optional<execution_alpha::ExecutionAlphaResult> last_exec_alpha_;
 
+    // ==================== Daily Reset ====================
+    /// Последний UTC-день, в который произошёл daily reset (YYYYMMDD)
+    int last_daily_reset_day_{0};
+
     // ==================== Futures Management ====================
     /// Текущий funding rate для активного символа (обновляется периодически)
     double current_funding_rate_{0.0};
     /// Timestamp последнего обновления funding rate
     int64_t last_funding_rate_update_ns_{0};
-    /// Интервал обновления funding rate: 5 минут (300 секунд)
+    /// Interval for funding rate updates: 5 minutes (300 seconds)
     static constexpr int64_t kFundingRateUpdateIntervalNs = 300'000'000'000LL;
 
-    /// Минимальный порог conviction для открытия новой позиции
-    static constexpr double kDefaultConvictionThreshold = 0.3;
+    // ==================== Rolling Trade Statistics ====================
+    // Compute live win_rate and win/loss ratio from recent trades
+    // for Kelly fraction and portfolio allocator adaptation.
+    static constexpr size_t kTradeStatsWindowSize = 100;
+
+    struct TradeOutcome {
+        double pnl_pct{0.0};   ///< Percentage return of the trade
+        bool   won{false};     ///< Whether the trade was profitable
+    };
+
+    std::deque<TradeOutcome> trade_history_;  ///< Rolling window of recent trades
+
+    /// Record a closed trade for rolling statistics
+    void record_trade_for_stats(double pnl_pct);
+
+    /// Compute current rolling win rate from trade_history_
+    [[nodiscard]] double rolling_win_rate() const;
+
+    /// Compute current rolling win/loss ratio from trade_history_
+    [[nodiscard]] double rolling_win_loss_ratio() const;
 
     /// Обновить MAE для текущей позиции на текущем тике
     void update_current_mae(double current_price, bool is_long);
-
-    /// Проверить свежесть котировки (Phase 1)
-    FreshnessResult check_quote_freshness(const features::FeatureSnapshot& snapshot) const;
 
     /// Запустить периодические фоновые задачи (Phase 1/2/4)
     void run_periodic_tasks(int64_t now_ns);
@@ -425,6 +455,53 @@ private:
 
     /// Запустить непрерывную reconciliation (Phase 4)
     void run_continuous_reconciliation(int64_t now_ns);
+
+    // ==================== Correlation Monitor Reference Feeds ==============
+    /// Периодически запрашивать цены BTC/ETH для CorrelationMonitor
+    void update_reference_prices();
+    /// Timestamp последнего обновления reference prices
+    int64_t last_reference_price_update_ns_{0};
+    /// Флаг фонового запроса reference prices (не блокирует hot path)
+    std::shared_ptr<std::atomic<bool>> reference_price_fetch_in_flight_{
+        std::make_shared<std::atomic<bool>>(false)};
+    /// Интервал обновления reference prices: 30 секунд
+    static constexpr int64_t kReferencePriceIntervalNs = 30'000'000'000LL;
+
+    // ==================== Hedge Recovery ====================
+    // Хеджирование убыточных позиций: при глубоком убытке открываем
+    // противоположную позицию (locked), затем закрываем проигрышную ногу.
+
+    /// Хедж активен (есть locked position: long + short одновременно)
+    bool hedge_active_{false};
+    /// Сторона хедж-позиции (противоположная основной)
+    PositionSide hedge_position_side_{PositionSide::Short};
+    /// Цена входа хедж-позиции
+    double hedge_entry_price_{0.0};
+    /// Размер хедж-позиции
+    double hedge_size_{0.0};
+    /// Время открытия хеджа (ns)
+    int64_t hedge_entry_time_ns_{0};
+    /// Убыток основной позиции в момент открытия хеджа (USDT)
+    double original_loss_at_hedge_{0.0};
+    /// Был ли хедж уже использован для текущей позиции (не хеджируем повторно)
+    bool hedge_already_used_{false};
+
+    /// Проверить и управлять хедж-позицией.
+    /// @return true если хедж активен (блокировать обычный stop-loss)
+    bool check_hedge_recovery(const features::FeatureSnapshot& snapshot);
+
+    /// Оценить рыночную ситуацию для принятия решения о выходе.
+    /// Возвращает score [-1.0 .. +1.0]: отрицательный = неблагоприятно, положительный = благоприятно.
+    /// @param for_side сторона позиции (Long/Short) — индикаторы оцениваются относительно неё
+    double evaluate_exit_score(const features::FeatureSnapshot& snapshot, PositionSide for_side) const;
+
+    /// Закрыть одну ногу хедж-позиции
+    bool close_hedge_leg(const features::FeatureSnapshot& snapshot,
+                         PositionSide leg_side, double qty,
+                         const std::string& reason);
+
+    /// Сбросить состояние хеджа
+    void reset_hedge_state();
 };
 
 

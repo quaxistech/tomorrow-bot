@@ -1,9 +1,9 @@
 #pragma once
 /**
  * @file recovery_service.hpp
- * @brief Сервис восстановления состояния после рестарта
+ * @brief Сервис восстановления состояния USDT-M Futures после рестарта
  *
- * Синхронизирует внутреннее состояние бота (позиции, ордера, баланс)
+ * Синхронизирует внутреннее состояние бота (позиции, баланс)
  * с данными биржи. Вызывается ДО запуска торговых pipeline.
  */
 
@@ -20,7 +20,10 @@
 
 namespace tb::recovery {
 
-/// @brief Сервис восстановления состояния после рестарта
+/// @brief Сервис восстановления состояния USDT-M Futures после рестарта.
+///
+/// Гарантирует, что локальный портфель корректно отражает реальное
+/// состояние фьючерсных позиций и маржевого баланса на бирже.
 class RecoveryService {
 public:
     RecoveryService(
@@ -36,20 +39,20 @@ public:
     /// Вызывается ДО запуска торговых pipeline.
     RecoveryResult recover_on_startup();
 
-    /// @brief Восстановить только позиции (e.g. после reconnect)
+    /// @brief Восстановить только позиции и баланс (e.g. после reconnect)
     RecoveryResult recover_positions();
 
     /// @brief Восстановить состояние из WAL (event journal)
     RecoveryResult recover_from_journal();
 
-    /// @brief Получить последний результат восстановления
-    [[nodiscard]] const RecoveryResult& last_result() const;
+    /// @brief Получить последний результат восстановления (потокобезопасная копия)
+    [[nodiscard]] RecoveryResult last_result() const;
 
     /// @brief Статус последнего recovery
     [[nodiscard]] RecoveryStatus status() const;
 
 private:
-    /// Загрузить позиции с биржи и сравнить с портфелем.
+    /// Загрузить фьючерсные позиции с биржи и сравнить с портфелем.
     /// Возвращает также кэшированные балансы для повторного использования.
     std::vector<RecoveredPosition> sync_positions_from_exchange(
         std::vector<reconciliation::ExchangePositionInfo>& out_balances);

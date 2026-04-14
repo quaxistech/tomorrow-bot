@@ -26,9 +26,7 @@ enum class RiskAction {
     DenyStrategyLock,
     DenyDayLock,
     DenyAccountLock,
-    EmergencyHalt,
-    ForceReduce,
-    ForceLiquidate
+    EmergencyHalt
 };
 
 /// Фаза оценки риска
@@ -150,90 +148,86 @@ struct IntraTradeAssessment {
     Timestamp assessed_at{Timestamp(0)};
 };
 
-/// Конфигурация лимитов риска (полная)
+/// Конфигурация лимитов риска (USDT-M futures scalping)
+///
+/// Значения по умолчанию основаны на:
+/// - Стандарты управления рисками для алгоритмической торговли (2% правило Kelly-fraction)
+/// - Эмпирические параметры ликвидности USDT-M perpetual futures на Bitget
+/// - Регуляторные рекомендации по макс. плечу для ритейл-фьючерсов
 struct ExtendedRiskConfig {
     // === Per-trade ===
-    double max_position_notional{10000.0};
-    double max_risk_per_trade_pct{2.0};
-    double max_risk_per_trade_abs{200.0};
-    double max_loss_per_trade_pct{1.0};
-    double max_leverage{3.0};
-    double max_slippage_bps{30.0};
+    double max_position_notional{10000.0};      ///< Макс. номинал одной позиции (USDT)
+    double max_loss_per_trade_pct{1.0};         ///< Макс. убыток по 1 сделке как % капитала (Kelly ½f*)
+    double max_leverage{20.0};                  ///< Макс. кредитное плечо (Bitget limit: 125x, conservative: 20x)
+    double max_slippage_bps{30.0};              ///< Макс. проскальзывание (30 bps = 0.3%, empirical top-20 pairs)
 
     // === Per-symbol ===
-    double max_position_notional_per_symbol{10000.0};
-    double max_daily_loss_per_symbol_abs{500.0};
-    double max_daily_loss_per_symbol_pct{3.0};
-    int max_consecutive_losses_per_symbol{3};
-    int64_t symbol_cooldown_after_stopouts_ns{120'000'000'000LL}; // 2 мин
+    double max_daily_loss_per_symbol_pct{3.0};  ///< Макс. дневной убыток по 1 символу (% капитала)
+    int max_consecutive_losses_per_symbol{3};   ///< Серия стопаутов по символу до cooldown
+    int64_t symbol_cooldown_after_stopouts_ns{120'000'000'000LL}; ///< Cooldown после серии (2 мин)
 
     // === Per-strategy ===
-    double max_strategy_daily_loss_pct{1.5};
-    double max_strategy_drawdown_pct{5.0};
-    double max_strategy_exposure_pct{30.0};
-    int max_positions_per_strategy{3};
+    double max_strategy_daily_loss_pct{1.5};    ///< Макс. gross-loss бюджет стратегии за день (% капитала)
 
     // === Daily ===
-    double max_daily_loss_pct{2.0};
-    double max_daily_loss_abs{500.0};
-    double max_realized_daily_loss_pct{1.5};
-    int max_daily_stopouts{5};
+    double max_daily_loss_pct{2.0};             ///< Макс. дневной убыток total PnL (% капитала, Kelly: 2%)
+    double max_realized_daily_loss_pct{1.5};    ///< Макс. реализованный дневной убыток (% капитала)
 
     // === Drawdown ===
-    double max_drawdown_pct{5.0};
-    double max_intraday_drawdown_pct{3.0};
-    double drawdown_hard_stop_pct{10.0};
+    double max_drawdown_pct{5.0};               ///< Макс. drawdown от peak equity (% — стандарт: 5-10%)
+    double max_intraday_drawdown_pct{3.0};      ///< Макс. внутридневная просадка (%)
+    double drawdown_hard_stop_pct{10.0};        ///< Emergency halt при критической просадке (%)
 
     // === Positions ===
-    int max_concurrent_positions{5};
-    int max_simultaneous_long_positions{3};
-    int max_simultaneous_short_positions{3};
+    int max_concurrent_positions{5};            ///< Макс. одновременных позиций
+    int max_simultaneous_long_positions{3};     ///< Макс. одновременных long
+    int max_simultaneous_short_positions{3};    ///< Макс. одновременных short
 
     // === Exposure ===
-    double max_gross_exposure_pct{50.0};
-    double max_net_directional_exposure_pct{30.0};
-    double max_symbol_concentration_pct{35.0};
+    double max_gross_exposure_pct{50.0};        ///< Макс. gross exposure как % капитала (post-trade projected)
+    double max_symbol_concentration_pct{35.0};  ///< Макс. концентрация 1 символа (post-trade projected, %)
 
     // === Consecutive losses ===
-    int max_consecutive_losses{5};
-    int cooldown_after_n_losses{3};
-    int64_t loss_cooldown_ns{60'000'000'000LL};  // 60с
-    int halt_after_n_losses{8};
+    int max_consecutive_losses{5};              ///< Порог серии убытков → deny
+    int cooldown_after_n_losses{3};             ///< Глобальный cooldown после N подряд убытков
+    int64_t loss_cooldown_ns{60'000'000'000LL}; ///< Длительность глобального cooldown (60с)
+    int halt_after_n_losses{8};                 ///< DayLock после N подряд убытков
 
     // === Market conditions ===
-    double max_spread_bps{50.0};
-    double min_liquidity_depth{100.0};
-    int64_t max_feed_age_ns{5'000'000'000LL};  // 5с
+    double max_spread_bps{50.0};                ///< Макс. спред (50 bps, P95 для top-20 USDT-M pairs)
+    double min_liquidity_depth{100.0};          ///< Мин. суммарная L5 depth (USDT)
+    int64_t max_feed_age_ns{5'000'000'000LL};   ///< Макс. возраст market data (5с)
 
     // === Rate limiting ===
-    int max_orders_per_minute{10};
-    int max_trades_per_hour{8};
-    int64_t min_trade_interval_ns{30'000'000'000LL}; // 30с
+    int max_orders_per_minute{10};              ///< Макс. ордеров/мин (Bitget rate limit: 20/s)
+    int max_trades_per_hour{8};                 ///< Макс. сделок/час (overtrading protection)
+    int64_t min_trade_interval_ns{30'000'000'000LL}; ///< Мин. интервал между сделками по символу (30с)
 
     // === Regime-aware ===
     bool regime_aware_limits_enabled{true};
-    double stress_regime_scale{0.5};
-    double trending_regime_scale{1.2};
-    double chop_regime_scale{0.7};
+    double stress_regime_scale{0.5};            ///< Scaling factor при stress-режиме (0.5 = -50% size)
+    double trending_regime_scale{1.2};          ///< Scaling при trending (1.2 = +20% size)
+    double chop_regime_scale{0.7};              ///< Scaling при чоппи-рынке (0.7 = -30% size)
 
     // === Intra-trade ===
-    double max_adverse_excursion_pct{3.0};
-    int64_t max_position_hold_ns{3'600'000'000'000LL}; // 1 час
-    int64_t post_loss_cooldown_ns{60'000'000'000LL};   // 60с
+    double max_adverse_excursion_pct{3.0};      ///< MAE: макс. неблагоприятное отклонение (% капитала)
+    int64_t max_position_hold_ns{3'600'000'000'000LL}; ///< Макс. время удержания (1 час, scalping)
+    int64_t post_loss_cooldown_ns{60'000'000'000LL};   ///< Cooldown после убытка (60с)
 
     // === Kill switch ===
     bool kill_switch_enabled{true};
-    bool kill_switch_on_data_stale{true};
-    bool kill_switch_on_position_mismatch{true};
 
     // === Directional / same-direction ===
-    int max_same_direction_positions{3};
+    int max_same_direction_positions{3};        ///< Макс. позиций в одном направлении
+
+    // === Liquidation safety ===
+    double liquidation_buffer_pct{5.0};         ///< Буфер до ликвидации для MaxLeverageCheck (%)
+
+    // === Funding rate cost (USDT-M perpetual futures) ===
+    double max_annual_funding_cost_pct{30.0};   ///< Макс. годовая стоимость фандинга (%)
 
     // === UTC cutoff ===
-    int utc_cutoff_hour{-1};
-
-    // === Fail-safe ===
-    bool allow_reduce_only_in_halt{true};
+    int utc_cutoff_hour{-1};                    ///< Час UTC для прекращения торговли (-1 = отключено)
 };
 
 // ═══════════════════════════════════════════════════════════════

@@ -16,13 +16,14 @@
 namespace tb::market_data {
 
 using FeatureSnapshotCallback = std::function<void(features::FeatureSnapshot)>;
+using TradeCallback = std::function<void(double price, double volume, bool is_buy)>;
 
-// Конфигурация шлюза рыночных данных
+// Конфигурация шлюза рыночных данных (USDT-M фьючерсы)
 struct GatewayConfig {
     exchange::bitget::WsClientConfig ws_config;
     std::vector<tb::Symbol> symbols;
     std::vector<std::string> intervals{"1m", "5m", "1h"};
-    std::string inst_type{"SPOT"};  ///< "SPOT" или "USDT-FUTURES"
+    std::string inst_type{"USDT-FUTURES"};  ///< Bitget instrument type (USDT-M futures only)
     bool subscribe_tickers{true};
     bool subscribe_trades{true};
     bool subscribe_order_book{true};
@@ -41,7 +42,8 @@ public:
         std::shared_ptr<tb::logging::ILogger> logger,
         std::shared_ptr<tb::metrics::IMetricsRegistry> metrics,
         std::shared_ptr<tb::clock::IClock> clock,
-        FeatureSnapshotCallback on_snapshot = nullptr
+        FeatureSnapshotCallback on_snapshot = nullptr,
+        TradeCallback on_trade = nullptr
     );
     ~MarketDataGateway();
 
@@ -68,6 +70,7 @@ private:
     std::shared_ptr<tb::metrics::IMetricsRegistry> metrics_;
     std::shared_ptr<tb::clock::IClock> clock_;
     FeatureSnapshotCallback on_snapshot_;
+    TradeCallback on_trade_;
 
     std::unique_ptr<exchange::bitget::BitgetWsClient> ws_client_;
     std::unique_ptr<normalizer::BitgetNormalizer> normalizer_;

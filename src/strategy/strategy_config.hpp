@@ -35,17 +35,17 @@ struct ScalpStrategyConfig {
     bool block_counter_trend{true};
 
     // ─── Микроструктура (§13) ────────────────────────────────────────────
-    double imbalance_threshold{0.15};
-    double buy_sell_ratio_buy{1.15};
-    double buy_sell_ratio_sell{0.87};
-    double adx_min{20.0};
+    double imbalance_threshold{0.08};
+    double buy_sell_ratio_buy{1.08};
+    double buy_sell_ratio_sell{0.92};
+    double adx_min{15.0};
     double vpin_toxic_threshold{0.7};
 
     // ─── RSI / Bollinger Guards ──────────────────────────────────────────
-    double rsi_upper_guard{72.0};
-    double rsi_lower_guard{28.0};
-    double bb_max_buy{0.90};
-    double bb_min_sell{0.10};
+    double rsi_upper_guard{80.0};
+    double rsi_lower_guard{20.0};
+    double bb_max_buy{1.50};
+    double bb_min_sell{-0.50};
     double momentum_min_buy{-0.003};
     double momentum_max_sell{0.003};
 

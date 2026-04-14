@@ -66,8 +66,8 @@ public:
         const std::string& operation_name,
         std::function<std::pair<int, std::string>()> operation);
 
-    /// @brief Получить историю попыток последней операции
-    [[nodiscard]] const std::vector<ExecutionAttempt>& last_attempts() const;
+    /// @brief Получить историю попыток последней операции (потокобезопасная копия)
+    [[nodiscard]] std::vector<ExecutionAttempt> last_attempts() const;
 
     /// @brief Классифицировать HTTP ошибку
     [[nodiscard]] static ErrorClassification classify_error(
@@ -282,9 +282,9 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
         // Вычисляем задержку
         int64_t delay = compute_delay(attempt);
 
-        // Для RateLimit увеличиваем backoff в 3 раза
+        // Для RateLimit увеличиваем backoff (конфигурируемый множитель)
         if (error_class == ErrorClassification::RateLimit) {
-            delay *= 3;
+            delay *= config_.rate_limit_backoff_multiplier;
         }
 
         logger_->warn(kComponent, "Retry после ошибки",

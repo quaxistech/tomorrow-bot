@@ -172,7 +172,7 @@ TEST_CASE("ExecutionAlpha: to_string работает корректно", "[exe
 
 // ========== Новые тесты: VPIN, имбаланс, PostOnly, валидация фич ==========
 
-TEST_CASE("ExecutionAlpha: VPIN токсичен → NoExecution", "[execution_alpha]") {
+TEST_CASE("ExecutionAlpha: VPIN токсичен → Passive", "[execution_alpha]") {
     auto engine = make_engine();
     auto intent = make_intent(0.3, 0.6);
     auto features = make_features(5.0, 0.3, 0.2);
@@ -184,8 +184,9 @@ TEST_CASE("ExecutionAlpha: VPIN токсичен → NoExecution", "[execution_a
 
     auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
-    REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
-    REQUIRE_FALSE(result.should_execute);
+    // Softened: Passive instead of NoExecution — regime scaling handles size reduction
+    REQUIRE(result.recommended_style == ExecutionStyle::Passive);
+    REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.vpin_used);
     REQUIRE(result.decision_factors.vpin_toxicity > 0.8);
 }
@@ -391,5 +392,106 @@ TEST_CASE("ExecutionAlpha: weighted_mid используется при нали
 
     REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.weighted_mid_used);
+}
+
+// ========== Тесты: DefensiveOnly для USDT-M futures (Long + Short) ==========
+
+TEST_CASE("ExecutionAlpha: DefensiveOnly блокирует LongEntry (Buy+Open)", "[execution_alpha]") {
+    auto engine = make_engine();
+    auto intent = make_intent(0.3, 0.6);
+    intent.side = Side::Buy;
+    intent.trade_side = TradeSide::Open;
+    intent.signal_intent = strategy::SignalIntent::LongEntry;
+    auto features = make_features(5.0);
+
+    uncertainty::UncertaintySnapshot unc{};
+    unc.execution_mode = uncertainty::ExecutionModeRecommendation::DefensiveOnly;
+
+    auto result = engine.evaluate(intent, features, unc);
+
+    REQUIRE_FALSE(result.should_execute);
+    REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
+}
+
+TEST_CASE("ExecutionAlpha: DefensiveOnly блокирует ShortEntry (Sell+Open)", "[execution_alpha]") {
+    auto engine = make_engine();
+    auto intent = make_intent(0.3, 0.6);
+    intent.side = Side::Sell;
+    intent.trade_side = TradeSide::Open;
+    intent.signal_intent = strategy::SignalIntent::ShortEntry;
+    auto features = make_features(5.0);
+
+    uncertainty::UncertaintySnapshot unc{};
+    unc.execution_mode = uncertainty::ExecutionModeRecommendation::DefensiveOnly;
+
+    auto result = engine.evaluate(intent, features, unc);
+
+    REQUIRE_FALSE(result.should_execute);
+    REQUIRE(result.recommended_style == ExecutionStyle::NoExecution);
+}
+
+TEST_CASE("ExecutionAlpha: DefensiveOnly разрешает LongExit (Sell+Close)", "[execution_alpha]") {
+    auto engine = make_engine();
+    auto intent = make_intent(0.3, 0.6);
+    intent.side = Side::Sell;
+    intent.trade_side = TradeSide::Close;
+    intent.signal_intent = strategy::SignalIntent::LongExit;
+    auto features = make_features(5.0);
+
+    uncertainty::UncertaintySnapshot unc{};
+    unc.execution_mode = uncertainty::ExecutionModeRecommendation::DefensiveOnly;
+
+    auto result = engine.evaluate(intent, features, unc);
+
+    REQUIRE(result.should_execute);
+}
+
+TEST_CASE("ExecutionAlpha: DefensiveOnly разрешает ShortExit (Buy+Close)", "[execution_alpha]") {
+    auto engine = make_engine();
+    auto intent = make_intent(0.3, 0.6);
+    intent.side = Side::Buy;
+    intent.trade_side = TradeSide::Close;
+    intent.signal_intent = strategy::SignalIntent::ShortExit;
+    auto features = make_features(5.0);
+
+    uncertainty::UncertaintySnapshot unc{};
+    unc.execution_mode = uncertainty::ExecutionModeRecommendation::DefensiveOnly;
+
+    auto result = engine.evaluate(intent, features, unc);
+
+    REQUIRE(result.should_execute);
+}
+
+// ========== Тесты: стоимость исполнения включает комиссии ==========
+
+TEST_CASE("ExecutionAlpha: cost model включает taker fee для Aggressive", "[execution_alpha]") {
+    RuleBasedExecutionAlpha::Config cfg;
+    cfg.taker_fee_bps = 6.0;
+    cfg.maker_fee_bps = 2.0;
+    auto engine = make_engine(cfg);
+
+    auto intent = make_intent(0.95, 0.9); // → Aggressive
+    auto features = make_features(5.0);
+
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
+
+    REQUIRE(result.recommended_style == ExecutionStyle::Aggressive);
+    // total_cost_bps должен включать taker fee (6 bps) + spread (5 bps) + slippage + adverse
+    REQUIRE(result.quality.total_cost_bps >= cfg.taker_fee_bps);
+}
+
+TEST_CASE("ExecutionAlpha: cost model включает maker fee для Passive", "[execution_alpha]") {
+    RuleBasedExecutionAlpha::Config cfg;
+    cfg.taker_fee_bps = 6.0;
+    cfg.maker_fee_bps = 2.0;
+    auto engine = make_engine(cfg);
+
+    auto intent = make_intent(0.2, 0.5); // → Passive
+    auto features = make_features(5.0);
+
+    auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
+
+    // Для passive total_cost_bps = spread*0.30 + maker_fee + adverse_penalty
+    REQUIRE(result.quality.total_cost_bps >= cfg.maker_fee_bps);
 }
 

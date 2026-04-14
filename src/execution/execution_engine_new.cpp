@@ -1,10 +1,12 @@
 #include "execution/execution_engine.hpp"
+#include "execution/execution_utils.hpp"
 #include "execution/orders/client_order_id.hpp"
 #include "uncertainty/uncertainty_types.hpp"
 #include "common/enums.hpp"
 #include "common/constants.hpp"
 #include <sstream>
 #include <chrono>
+#include <thread>
 
 namespace tb::execution {
 
@@ -16,14 +18,50 @@ using tb::common::fees::kDefaultTakerFeePct;
 
 OrderSubmitResult PaperOrderSubmitter::submit_order(const OrderRecord& order) {
     OrderSubmitResult result;
-    result.success = true;
     result.order_id = order.order_id;
+
+    const auto& sym_rules = get_rules(order.symbol);
+    const double submitted_qty = sym_rules.floor_quantity(order.original_quantity.get());
+    if (!sym_rules.is_quantity_valid(submitted_qty)) {
+        result.success = false;
+        result.error_message = "Paper reject: quantity invalid after exchange floor";
+        return result;
+    }
+
+    const double reference_price = sym_rules.round_price(order.price.get());
+    if (reference_price > 0.0 &&
+        !sym_rules.is_notional_valid(submitted_qty * reference_price)) {
+        result.success = false;
+        result.error_message = "Paper reject: order below exchange minimum notional";
+        return result;
+    }
+
+    result.success = true;
     result.exchange_order_id = OrderId("PAPER-" + std::to_string(next_exchange_id_++));
+    result.submitted_quantity = Quantity(submitted_qty);
     return result;
 }
 
 bool PaperOrderSubmitter::cancel_order(const OrderId& /*order_id*/, const Symbol& /*symbol*/) {
     return true;
+}
+
+void PaperOrderSubmitter::set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules) {
+    std::lock_guard lock(rules_mutex_);
+    rules_by_symbol_[symbol.get()] = rules;
+}
+
+const ExchangeSymbolRules& PaperOrderSubmitter::rules(const Symbol& symbol) const {
+    return get_rules(symbol);
+}
+
+const ExchangeSymbolRules& PaperOrderSubmitter::get_rules(const Symbol& symbol) const {
+    std::lock_guard lock(rules_mutex_);
+    auto it = rules_by_symbol_.find(symbol.get());
+    if (it != rules_by_symbol_.end()) {
+        return it->second;
+    }
+    return default_rules_;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -96,6 +134,14 @@ Result<OrderId> ExecutionEngine::execute(
 
     ExecutionPlan plan = planner_.plan(intent, risk_decision, exec_alpha, market, uncertainty);
 
+    // NoAction: Hold-сигнал или отсутствие торгового намерения — не создаём ордер
+    if (plan.action == ExecutionAction::NoAction) {
+        logger_->debug("Execution", "NoAction — ордер не требуется",
+            {{"symbol", intent.symbol.get()},
+             {"signal_intent", to_string(intent.signal_intent)}});
+        return std::unexpected(TbError::ExecutionFailed);
+    }
+
     // §15: Создать запись ордера
     auto order = create_order_record(intent, risk_decision, exec_alpha, plan);
 
@@ -138,8 +184,8 @@ Result<OrderId> ExecutionEngine::execute(
         return std::unexpected(TbError::ExecutionFailed);
     }
 
-    // Cash reservation для BUY-ордера
-    if (!try_reserve_cash(order)) {
+    // Margin reservation для открывающего ордера (Long или Short)
+    if (!try_reserve_margin(order)) {
         registry_.transition(order.order_id, OrderState::Rejected, "Insufficient cash");
         order.state = OrderState::Rejected;
         order.rejection_reason = "Insufficient cash for reserve";
@@ -155,10 +201,10 @@ Result<OrderId> ExecutionEngine::execute(
     try {
         submit_result = submitter_->submit_order(order);
     } catch (...) {
-        if (order.side == Side::Buy && portfolio_) {
+        if (portfolio_ && requires_margin_reserve(order)) {
             portfolio_->release_cash(order.order_id);
         }
-        // Можно не удалять из registry — ордер остаётся в PendingAck для recovery
+        // Ордер остаётся в PendingAck для recovery
         throw;
     }
 
@@ -168,7 +214,7 @@ Result<OrderId> ExecutionEngine::execute(
         order.rejection_reason = submit_result.error_message;
         registry_.update_order(order);
 
-        if (order.side == Side::Buy && portfolio_) {
+        if (portfolio_ && requires_margin_reserve(order)) {
             portfolio_->release_cash(order.order_id);
         }
 
@@ -200,41 +246,122 @@ Result<OrderId> ExecutionEngine::execute(
 
     // §16: Для market ордеров — немедленный fill
     if (order.order_type == OrderType::Market) {
-        auto fill_price = market_fill_price;
+        // ИСПРАВЛЕНИЕ C2: Не предполагаем полное исполнение market ордера.
+        // Запрашиваем реальный статус fill с биржи через REST order/detail.
+        // Если запрос не удался — fallback к оптимистичной оценке (как раньше).
 
-        // Запросить реальную цену с биржи
-        auto real_price = submitter_->query_order_fill_price(
+        auto fill_detail = submitter_->query_order_fill_detail(
             order.exchange_order_id, order.symbol);
-        if (real_price.get() > 0.0) {
-            fill_price = real_price;
-            logger_->debug("Execution", "Реальная fill price с биржи",
-                {{"order_id", order_id_str},
-                 {"estimated", std::to_string(market_fill_price.get())},
-                 {"actual", std::to_string(real_price.get())}});
-        }
 
-        // Determine filled quantity
-        Quantity filled_qty = (submit_result.submitted_quantity.get() > 0.0)
+        Price confirmed_price = market_fill_price;
+        Quantity confirmed_qty = (submit_result.submitted_quantity.get() > 0.0)
             ? submit_result.submitted_quantity
             : order.original_quantity;
 
-        // §17: Обработать fill через FillProcessor
+        if (fill_detail.success) {
+            // Биржа подтвердила fill — используем реальные данные
+            if (fill_detail.fill_price.get() > 0.0) {
+                confirmed_price = fill_detail.fill_price;
+            }
+            if (fill_detail.filled_qty.get() > 0.0) {
+                confirmed_qty = fill_detail.filled_qty;
+            }
+
+            if (fill_detail.is_partially_filled()) {
+                // Частичное исполнение: обрабатываем только исполненную часть
+                logger_->warn("Execution", "Market ордер исполнен частично!",
+                    {{"order_id", order_id_str},
+                     {"filled", std::to_string(confirmed_qty.get())},
+                     {"requested", std::to_string(order.original_quantity.get())},
+                     {"status", fill_detail.status}});
+            }
+
+            if (fill_detail.filled_qty.get() <= 0.0) {
+                // Ордер не исполнен (отменён биржей) — не обрабатываем fill
+                logger_->error("Execution", "Market ордер НЕ исполнен биржей",
+                    {{"order_id", order_id_str},
+                     {"status", fill_detail.status}});
+                registry_.transition(order.order_id, OrderState::Cancelled,
+                    "Exchange reported no fill: " + fill_detail.status);
+                if (portfolio_ && requires_margin_reserve(order)) {
+                    portfolio_->release_cash(order.order_id);
+                }
+                return OrderId(order_id_str);
+            }
+        } else {
+            // A6 fix: вместо оптимистичного fill — retry с backoff,
+            // и если обе попытки провалились — не финализируем fill локально.
+            // Ордер остаётся в состоянии Open, reconciliation подхватит реальный статус.
+            logger_->warn("Execution",
+                "Не удалось подтвердить fill с биржи, повторяем запрос...",
+                {{"order_id", order_id_str}});
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            fill_detail = submitter_->query_order_fill_detail(
+                order.exchange_order_id, order.symbol);
+
+            if (fill_detail.success) {
+                if (fill_detail.fill_price.get() > 0.0) {
+                    confirmed_price = fill_detail.fill_price;
+                }
+                if (fill_detail.filled_qty.get() > 0.0) {
+                    confirmed_qty = fill_detail.filled_qty;
+                }
+                if (fill_detail.filled_qty.get() <= 0.0) {
+                    logger_->error("Execution", "Market ордер НЕ исполнен биржей (retry)",
+                        {{"order_id", order_id_str},
+                         {"status", fill_detail.status}});
+                    registry_.transition(order.order_id, OrderState::Cancelled,
+                        "Exchange reported no fill on retry: " + fill_detail.status);
+                    if (portfolio_ && requires_margin_reserve(order)) {
+                        portfolio_->release_cash(order.order_id);
+                    }
+                    return OrderId(order_id_str);
+                }
+                logger_->info("Execution",
+                    "Fill подтверждён при повторном запросе",
+                    {{"order_id", order_id_str},
+                     {"filled_qty", std::to_string(confirmed_qty.get())},
+                     {"fill_price", std::to_string(confirmed_price.get())}});
+            } else {
+                // Обе попытки провалились — НЕ обрабатываем fill оптимистично.
+                // Переводим ордер в Open: reconciliation подхватит реальный статус
+                // с биржи на следующем цикле сверки.
+                logger_->error("Execution",
+                    "Не удалось подтвердить fill после retry — ордер NOT finalized. "
+                    "Reconciliation разрешит состояние.",
+                    {{"order_id", order_id_str},
+                     {"exchange_id", order.exchange_order_id.get()}});
+                registry_.transition(order.order_id, OrderState::Open,
+                    "Fill confirmation failed — awaiting reconciliation");
+                return OrderId(order_id_str);
+            }
+        }
+
+        // §17: Обработать fill через FillProcessor с подтверждёнными данными
         fill_processor_.process_market_fill(
-            order.order_id, filled_qty, fill_price, order.exchange_order_id);
+            order.order_id, confirmed_qty, confirmed_price, order.exchange_order_id);
 
         // §23: Slippage tracking
         if (order.execution_info.expected_fill_price.get() > 0.0) {
             exec_metrics_.record_slippage(order.symbol,
                 order.execution_info.expected_fill_price.get(),
-                fill_price.get(), order.side);
+                confirmed_price.get(), order.side);
         }
 
-        exec_metrics_.record_fill(order, fill_price, 0);
+        // Вычисляем реальную задержку исполнения
+        int64_t fill_latency_ms = 0;
+        if (order.created_at.get() > 0) {
+            fill_latency_ms = (clock_->now().get() - order.created_at.get()) / 1'000'000;
+        }
+        double fill_fee = confirmed_qty.get() * confirmed_price.get() * kDefaultTakerFeePct;
+        exec_metrics_.record_fill(order, confirmed_price, fill_latency_ms, fill_fee);
 
         logger_->info("Execution", "Рыночный ордер исполнен",
             {{"order_id", order_id_str},
-             {"filled_qty", std::to_string(filled_qty.get())},
-             {"fill_price", std::to_string(fill_price.get())}});
+             {"filled_qty", std::to_string(confirmed_qty.get())},
+             {"fill_price", std::to_string(confirmed_price.get())},
+             {"confirmed_by_exchange", fill_detail.success ? "true" : "false"}});
     }
 
     return OrderId(order_id_str);
@@ -268,8 +395,96 @@ VoidResult ExecutionEngine::emergency_flatten_symbol(const Symbol& symbol) {
     // Cancel all active orders for symbol
     cancel_manager_.cancel_all_for_symbol(symbol);
 
-    // TODO: Submit reduce-only close order for open position
-    return {};
+    if (!portfolio_) {
+        logger_->warn("Execution", "EMERGENCY FLATTEN пропущен: portfolio не подключён",
+            {{"symbol", symbol.get()}});
+        return {};
+    }
+
+    // A2 fix: в hedge mode могут быть обе ноги одновременно.
+    // Закрываем каждую ногу отдельно, а не только первую найденную.
+    std::optional<TbError> flatten_error;
+    bool found_any = false;
+    for (auto ps : {PositionSide::Long, PositionSide::Short}) {
+        auto pos = portfolio_->get_position(symbol, ps);
+        if (!pos || pos->size.get() <= 0.0) continue;
+        found_any = true;
+
+        strategy::TradeIntent intent;
+        intent.strategy_id = StrategyId{"emergency_flatten"};
+        intent.strategy_version = StrategyVersion{1};
+        intent.symbol = symbol;
+        intent.position_side = ps;
+        intent.side = (ps == PositionSide::Long) ? Side::Sell : Side::Buy;
+        intent.signal_intent = (ps == PositionSide::Long)
+            ? strategy::SignalIntent::LongExit
+            : strategy::SignalIntent::ShortExit;
+        intent.trade_side = TradeSide::Close;
+        intent.exit_reason = strategy::ExitReason::EmergencyExit;
+        intent.signal_type = strategy::StrategySignalType::EmergencyExit;
+        intent.signal_name = "EmergencyFlatten";
+        intent.suggested_quantity = pos->size;
+        intent.generated_at = clock_->now();
+        intent.snapshot_mid_price = (pos->current_price.get() > 0.0)
+            ? pos->current_price
+            : pos->avg_entry_price;
+        intent.limit_price = intent.snapshot_mid_price;
+        intent.conviction = 1.0;
+        intent.urgency = 1.0;
+        intent.correlation_id = CorrelationId{
+            "emergency_flatten:" + symbol.get() + ":" +
+            (ps == PositionSide::Long ? "long" : "short") + ":" +
+            std::to_string(clock_->now().get())};
+
+        risk::RiskDecision risk_decision;
+        risk_decision.verdict = risk::RiskVerdict::Approved;
+        risk_decision.allowed = true;
+        risk_decision.action = risk::RiskAction::Allow;
+        risk_decision.phase = risk::RiskPhase::IntraTrade;
+        risk_decision.approved_quantity = pos->size;
+        risk_decision.original_size = pos->size;
+        risk_decision.decided_at = clock_->now();
+        risk_decision.summary = "Emergency flatten approved";
+
+        execution_alpha::ExecutionAlphaResult exec_alpha;
+        exec_alpha.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
+        exec_alpha.should_execute = true;
+        exec_alpha.urgency_score = 1.0;
+        exec_alpha.recommended_limit_price = intent.snapshot_mid_price;
+        exec_alpha.quality.fill_probability = 1.0;
+        exec_alpha.rationale = "Emergency flatten uses aggressive close";
+        exec_alpha.computed_at = clock_->now();
+
+        uncertainty::UncertaintySnapshot uncertainty;
+        uncertainty.level = UncertaintyLevel::Low;
+        uncertainty.aggregate_score = 0.0;
+        uncertainty.size_multiplier = 1.0;
+        uncertainty.threshold_multiplier = 1.0;
+        uncertainty.execution_mode = uncertainty::ExecutionModeRecommendation::Normal;
+        uncertainty.computed_at = clock_->now();
+        uncertainty.symbol = symbol;
+
+        auto result = execute(intent, risk_decision, exec_alpha, uncertainty);
+        if (!result) {
+            logger_->error("Execution", "EMERGENCY FLATTEN не отправлен",
+                {{"symbol", symbol.get()},
+                 {"side", ps == PositionSide::Long ? "Long" : "Short"}});
+            flatten_error = result.error();
+        } else {
+            logger_->warn("Execution", "EMERGENCY FLATTEN ордер отправлен",
+                {{"symbol", symbol.get()},
+                 {"side", ps == PositionSide::Long ? "Long" : "Short"},
+                 {"order_id", result->get()},
+                 {"qty", std::to_string(pos->size.get())}});
+        }
+    }
+
+    if (!found_any) {
+        logger_->info("Execution", "EMERGENCY FLATTEN: открытые позиции не найдены",
+            {{"symbol", symbol.get()}});
+    }
+
+    return flatten_error.has_value() ? VoidResult(std::unexpected(*flatten_error)) : VoidResult{};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -298,7 +513,7 @@ void ExecutionEngine::on_order_update(
     // Release cash on terminal states without fill
     if ((new_state == OrderState::Cancelled || new_state == OrderState::Rejected ||
          new_state == OrderState::Expired)) {
-        if (opt->side == Side::Buy && portfolio_) {
+        if (portfolio_ && requires_margin_reserve(*opt)) {
             portfolio_->release_cash(order_id);
         }
         exec_metrics_.record_cancel(*opt);
@@ -309,8 +524,9 @@ void ExecutionEngine::on_order_update(
         fill_processor_.process_order_fill(order_id, filled_qty, fill_price);
     }
 
-    if (new_state == OrderState::Filled) {
-        exec_metrics_.record_fill(*opt, fill_price, 0);
+    if (new_state == OrderState::Filled && filled_qty.get() > 0.0 && fill_price.get() > 0.0) {
+        double fee = filled_qty.get() * fill_price.get() * kDefaultTakerFeePct;
+        exec_metrics_.record_fill(*opt, fill_price, 0, fee);
     }
 
     logger_->debug("Execution", "Обновление ордера",
@@ -455,14 +671,14 @@ OrderRecord ExecutionEngine::create_order_record(
     return record;
 }
 
-bool ExecutionEngine::try_reserve_cash(const OrderRecord& order) {
-    // Cash reservation only for opening positions
-    if (order.side != Side::Buy || !portfolio_ || order.trade_side == TradeSide::Close) {
+bool ExecutionEngine::try_reserve_margin(OrderRecord& order) {
+    // Margin reservation only for opening positions (Long или Short)
+    if (!portfolio_ || !requires_margin_reserve(order)) {
         return true;
     }
 
-    double notional = order.original_quantity.get() *
-        (order.price.get() > 0.0 ? order.price.get() : 0.0);
+    double price = order.price.get() > 0.0 ? order.price.get() : 0.0;
+    double notional = order.original_quantity.get() * price;
 
     if (notional <= 0.0) return true;
 
@@ -478,8 +694,44 @@ bool ExecutionEngine::try_reserve_cash(const OrderRecord& order) {
     }
 
     double estimated_fee = notional * kDefaultTakerFeePct;
+    if (portfolio_->reserve_cash(order.order_id, order.symbol,
+                                  order.side, reserve_amount, estimated_fee,
+                                  order.strategy_id)) {
+        return true;
+    }
+
+    // Авто-уменьшение: пересчитываем размер под доступный cash
+    auto snap = portfolio_->snapshot();
+    double available = snap.available_capital;
+    if (available <= 0.0 || price <= 0.0) return false;
+
+    // max_notional: при leverage_ с запасом 5% на комиссии
+    double max_notional = available * leverage_ * 0.95;
+    if (max_notional < config_.min_notional_usdt) {
+        logger_->warn("Execution", "Недостаточно cash даже для минимального ордера",
+            {{"order_id", order.order_id.get()},
+             {"available", std::to_string(available)},
+             {"leverage", std::to_string(leverage_)},
+             {"max_notional", std::to_string(max_notional)},
+             {"min_notional", std::to_string(config_.min_notional_usdt)}});
+        return false;
+    }
+
+    double new_qty = max_notional / price;
+    order.original_quantity = Quantity(new_qty);
+
+    double new_notional = new_qty * price;
+    double new_reserve = new_notional / leverage_;
+    double new_fee = new_notional * kDefaultTakerFeePct;
+
+    logger_->info("Execution", "Авто-уменьшение ордера под доступный cash",
+        {{"order_id", order.order_id.get()},
+         {"old_notional", std::to_string(notional)},
+         {"new_notional", std::to_string(new_notional)},
+         {"available", std::to_string(available)}});
+
     return portfolio_->reserve_cash(order.order_id, order.symbol,
-                                     reserve_amount, estimated_fee,
+                                     order.side, new_reserve, new_fee,
                                      order.strategy_id);
 }
 

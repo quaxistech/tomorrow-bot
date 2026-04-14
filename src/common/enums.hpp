@@ -9,8 +9,6 @@
 #pragma once
 
 #include "types.hpp"
-#include "errors.hpp"
-#include "result.hpp"
 #include <string_view>
 #include <optional>
 
@@ -81,8 +79,6 @@ namespace tb {
 [[nodiscard]] constexpr std::string_view to_string(TradingMode v) noexcept {
     switch (v) {
         case TradingMode::Paper:      return "paper";
-        case TradingMode::Shadow:     return "shadow";
-        case TradingMode::Testnet:    return "testnet";
         case TradingMode::Production: return "production";
     }
     return "unknown";
@@ -124,8 +120,6 @@ namespace tb {
 
 [[nodiscard]] inline std::optional<TradingMode> trading_mode_from_string(std::string_view s) noexcept {
     if (s == "paper")      return TradingMode::Paper;
-    if (s == "shadow")     return TradingMode::Shadow;
-    if (s == "testnet")    return TradingMode::Testnet;
     if (s == "production") return TradingMode::Production;
     return std::nullopt;
 }

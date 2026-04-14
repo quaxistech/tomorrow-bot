@@ -24,7 +24,8 @@ void ExecutionMetrics::record_submission(const OrderRecord& order) {
 }
 
 void ExecutionMetrics::record_fill(const OrderRecord& order,
-                                    Price fill_price, int64_t latency_ms) {
+                                    Price fill_price, int64_t latency_ms,
+                                    double fee_usdt) {
     std::lock_guard lock(mutex_);
     stats_.filled_orders++;
 
@@ -32,6 +33,8 @@ void ExecutionMetrics::record_fill(const OrderRecord& order,
     latency_count_++;
     stats_.avg_submit_to_fill_ms = (latency_count_ > 0)
         ? latency_sum_ms_ / static_cast<double>(latency_count_) : 0.0;
+
+    stats_.total_fees_usdt += fee_usdt;
 
     // Update fill rate
     if (stats_.total_orders > 0) {

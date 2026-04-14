@@ -11,7 +11,12 @@
 
 namespace tb::order_book {
 
-// Локальный стакан заявок с проверкой целостности
+// Локальный L2-стакан USDT-M futures с проверкой целостности.
+//
+// Принимает нормализованные snapshot/delta от MarketDataGateway,
+// поддерживает bid/ask книгу в отсортированных map,
+// контролирует sequence continuity и экспортирует агрегаты
+// для downstream FeatureEngine / Risk / Uncertainty.
 class LocalOrderBook {
 public:
     explicit LocalOrderBook(tb::Symbol symbol,
@@ -21,6 +26,11 @@ public:
     void apply_snapshot(const normalizer::NormalizedOrderBook& snap);
     bool apply_delta(const normalizer::NormalizedOrderBook& delta);
     void request_resync();
+
+    /// Проверяет свежесть книги по внешнему времени.
+    /// Если quality == Valid и (now − last_updated) > stale_threshold_ns, ставит Stale.
+    /// Возвращает true если книга стала или осталась stale.
+    bool check_staleness(tb::Timestamp now, int64_t stale_threshold_ns);
 
     BookQuality quality() const;
     std::optional<TopOfBook> top_of_book() const;
@@ -34,10 +44,7 @@ public:
 
 private:
     void update_quality(BookQuality q);
-    void apply_levels(std::map<tb::Price, tb::Quantity, std::greater<tb::Price>>& side,
-                      const std::vector<normalizer::BookLevel>& levels);
-    void apply_levels(std::map<tb::Price, tb::Quantity>& side,
-                      const std::vector<normalizer::BookLevel>& levels);
+    bool detect_crossed_book();
 
     tb::Symbol symbol_;
     std::map<tb::Price, tb::Quantity, std::greater<tb::Price>> bids_;
@@ -48,6 +55,14 @@ private:
     std::shared_ptr<tb::logging::ILogger> logger_;
     std::shared_ptr<tb::metrics::IMetricsRegistry> metrics_;
     mutable std::mutex mutex_;
+
+    // Метрики (инициализируются в конструкторе)
+    std::shared_ptr<tb::metrics::ICounter> snapshots_counter_;
+    std::shared_ptr<tb::metrics::ICounter> deltas_counter_;
+    std::shared_ptr<tb::metrics::ICounter> desyncs_counter_;
+    std::shared_ptr<tb::metrics::ICounter> crossed_counter_;
+    std::shared_ptr<tb::metrics::IGauge> bid_levels_gauge_;
+    std::shared_ptr<tb::metrics::IGauge> ask_levels_gauge_;
 };
 
 } // namespace tb::order_book

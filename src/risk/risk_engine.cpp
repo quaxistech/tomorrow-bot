@@ -25,7 +25,6 @@ ProductionRiskEngine::ProductionRiskEngine(
     , logger_(std::move(logger))
     , clock_(std::move(clock))
     , metrics_(std::move(metrics))
-    , sizer_(config_)
 {
     init_checks();
 }
@@ -84,8 +83,8 @@ void ProductionRiskEngine::init_checks() {
     checks_.push_back(std::make_unique<UncertaintyCooldownCheck>());        // 31
     checks_.push_back(std::make_unique<UncertaintyExecutionModeCheck>());   // 32
 
-    // === Spot semantics ===
-    checks_.push_back(std::make_unique<SpotSellCheck>());                   // 33
+    // === Funding cost ===
+    checks_.push_back(std::make_unique<FundingRateCostCheck>(config_));     // 33
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -119,9 +118,20 @@ RiskDecision ProductionRiskEngine::evaluate(
     decision.phase = RiskPhase::PreTrade;
 
     // Собрать контекст
-    RiskContext ctx{intent, sizing, portfolio, features, exec_alpha, uncertainty};
+    RiskContext ctx{intent, sizing, portfolio, features, exec_alpha, uncertainty,
+                    current_funding_rate_.load(std::memory_order_acquire),
+                    min_notional_usdt_.load(std::memory_order_acquire)};
 
-    // Прогнать все 33 проверки в порядке приоритета
+    // Фьючерсная безопасность: закрытие позиций НИКОГДА не блокируется risk engine.
+    // В leveraged futures блокировка выхода опаснее любого нарушения entry-лимитов.
+    // Pipeline управляет close-safety отдельно (синхронизация с биржей, anti-dust).
+    if (intent.trade_side == TradeSide::Close) {
+        decision.summary = "Close bypasses risk checks (futures exit safety)";
+        finalize_decision(decision, intent, sizing, portfolio);
+        return decision;
+    }
+
+    // Прогнать все 33 проверки в порядке приоритета (только для Open)
     for (auto& check : checks_) {
         check->evaluate(ctx, decision);
     }
@@ -153,19 +163,24 @@ void ProductionRiskEngine::finalize_decision(
     const portfolio_allocator::SizingResult& sizing,
     const portfolio::PortfolioSnapshot& portfolio)
 {
+    // Per-symbol min notional: используем реальный минимум, если задан, иначе fallback
+    const double min_notional = min_notional_usdt_.load(std::memory_order_acquire) > 0.0
+        ? min_notional_usdt_.load(std::memory_order_acquire)
+        : common::exchange_limits::kMinBitgetNotionalUsdt;
+
     // Min notional guard: если ReduceSize уменьшил объём ниже биржевого минимума
     if (decision.verdict == RiskVerdict::ReduceSize &&
         sizing.approved_quantity.get() > 0.0) {
         double price_per_unit = sizing.approved_notional.get() / sizing.approved_quantity.get();
         double reduced_notional = decision.approved_quantity.get() * price_per_unit;
-        if (reduced_notional < common::exchange_limits::kMinBitgetNotionalUsdt) {
+        if (reduced_notional < min_notional) {
             decision.verdict = RiskVerdict::Denied;
             decision.allowed = false;
             decision.action = RiskAction::Deny;
             decision.reasons.push_back(RiskReasonCode{
                 "REDUCE_BELOW_MIN_NOTIONAL",
                 "Уменьшенный объём " + std::to_string(reduced_notional) +
-                " USDT ниже минимума " + std::to_string(common::exchange_limits::kMinBitgetNotionalUsdt),
+                " USDT ниже минимума " + std::to_string(min_notional),
                 1.0
             });
         }
@@ -259,12 +274,10 @@ void ProductionRiskEngine::record_order_sent() {
     state_.rates.record_order(clock_->now());
 }
 
-void ProductionRiskEngine::record_trade_result(bool is_loss) {
-    std::lock_guard lock(mutex_);
-    if (is_loss) {
-        // Streak tracking делегируется в record_trade_close с деталями
-        logger_->trace("Risk", "Зафиксирован убыточный результат сделки");
-    }
+void ProductionRiskEngine::record_trade_result(bool /*is_loss*/) {
+    // Намеренно пустой: реальный учёт выполняется в record_trade_close()
+    // с полными деталями (strategy_id, symbol, realized_pnl).
+    // Этот метод сохранён для обратной совместимости IRiskEngine.
 }
 
 void ProductionRiskEngine::record_trade_close(const StrategyId& strategy_id,
@@ -408,6 +421,14 @@ void ProductionRiskEngine::set_current_regime(regime::DetailedRegime regime) {
     regime_scale_factor_.store(scale, std::memory_order_release);
 }
 
+void ProductionRiskEngine::set_funding_rate(double rate) {
+    current_funding_rate_.store(rate, std::memory_order_release);
+}
+
+void ProductionRiskEngine::set_min_notional_usdt(double value) {
+    min_notional_usdt_.store(value, std::memory_order_release);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Observability
 // ═══════════════════════════════════════════════════════════════
@@ -421,8 +442,12 @@ RiskSnapshot ProductionRiskEngine::get_risk_snapshot() const {
     snap.regime_scaling_factor = regime_scale_factor_.load(std::memory_order_acquire);
     snap.global_state = state_.locks.compute_global_state();
     snap.active_locks = state_.locks.active_locks();
-    snap.daily_loss_pct = 0.0; // Will be populated from portfolio in pipeline
     snap.current_drawdown_pct = state_.drawdown.account_drawdown_pct();
+    snap.open_positions = 0;  // Заполняется pipeline из portfolio
+    snap.daily_loss_pct = 0.0; // Заполняется pipeline из portfolio
+    snap.gross_exposure_pct = 0.0; // Заполняется pipeline из portfolio
+    snap.total_risk_utilization = 0.0; // Заполняется pipeline из portfolio
+    snap.rules_triggered = 0;  // Заполняется при evaluate()
 
     for (const auto& [key, budget] : state_.strategy_budgets) {
         snap.strategy_budgets.push_back(budget);

@@ -40,8 +40,9 @@ public:
     /// Записать отправку ордера
     void record_submission(const OrderRecord& order);
 
-    /// Записать fill
-    void record_fill(const OrderRecord& order, Price fill_price, int64_t latency_ms);
+    /// Записать fill (с latency и fee)
+    void record_fill(const OrderRecord& order, Price fill_price,
+                     int64_t latency_ms, double fee_usdt = 0.0);
 
     /// Записать reject
     void record_rejection(const OrderRecord& order, const std::string& reason);

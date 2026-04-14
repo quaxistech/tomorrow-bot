@@ -4,10 +4,18 @@
  *
  * Расчёт: effective_leverage = base_regime × vol_mult × dd_mult × conv_mult × fund_mult × adv_mult × unc_mult
  * Каждый множитель ∈ (0, 1] понижает плечо. Только conviction_mult может быть > 1.
- * Результат клемпится в [1, max_leverage].
+ * Результат ограничен сверху Kelly Criterion и сглажен через EMA.
  *
- * Все множители используют плавные (линейно-интерполированные) функции
- * для предотвращения резких скачков плеча при граничных значениях параметров.
+ * Научное обоснование:
+ * - Kelly Criterion (J.L. Kelly, 1956): оптимальная доля капитала f* = (bp-q)/b
+ *   где p=win_rate, q=1-p, b=win_loss_ratio. Максимальное плечо = 1/f* для полного Kelly,
+ *   мы используем Half-Kelly (Thorp, 2006) для снижения дисперсии при неизвестном распределении.
+ * - Сигмоидная просадка: tanh-кривая обеспечивает C∞-гладкость (vs линейная/экспоненциальная),
+ *   предотвращая резкие скачки плеча при пересечении пороговых значений.
+ * - Экспоненциальный funding: exp(-k·excess) обеспечивает монотонное затухание с
+ *   асимптотической нижней границей, естественную для стоимости удержания позиции.
+ * - EMA smoothing: предотвращает ping-pong эффект на границах режимов, что важно
+ *   для scalping где тики приходят каждые ~1-2 секунды.
  */
 
 #include "leverage/leverage_engine.hpp"
@@ -43,6 +51,48 @@ LeverageDecision LeverageEngine::compute_leverage(const LeverageContext& ctx) co
         ctx.funding_rate, ctx.position_side, ctx.entry_price);
 }
 
+// ==================== update_edge_stats ====================
+
+void LeverageEngine::update_edge_stats(double win_rate, double win_loss_ratio) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    win_rate_ = std::clamp(win_rate, 0.01, 0.99);
+    win_loss_ratio_ = std::max(0.01, win_loss_ratio);
+}
+
+// ==================== Kelly Criterion ====================
+
+double LeverageEngine::kelly_max_leverage() const {
+    // Kelly fraction: f* = (b·p - q) / b
+    //   p = win_rate, q = 1-p, b = win_loss_ratio (avg_win / avg_loss)
+    // Half-Kelly: f = f*/2 (Thorp 2006 — снижает дисперсию на ~75% при потере ~25% ожидаемого роста)
+    //
+    // f* ∈ [0, 1] — доля капитала, которой оптимально рисковать.
+    // Большая f* = сильный edge = можно рисковать бо́льшей долей = разрешено бо́льшее плечо.
+    // Маппинг на плечо: kelly_lev = half_kelly × max_leverage.
+    // Если edge отрицательный (f* <= 0), Kelly говорит "не торгуй" → возвращаем min_leverage.
+
+    double p = win_rate_;
+    double q = 1.0 - p;
+    double b = win_loss_ratio_;
+
+    double full_kelly = (b * p - q) / b;
+
+    if (full_kelly <= 0.0) {
+        // Отрицательный edge — минимальное плечо
+        return static_cast<double>(std::max(1, config_.min_leverage));
+    }
+
+    // Half-Kelly для консервативности
+    double half_kelly = full_kelly * 0.5;
+
+    // Линейный маппинг: half_kelly ∈ (0, 0.5] → плечо ∈ (0, max_leverage].
+    // Сильный edge → больше half_kelly → больше допустимое плечо.
+    // Clamp снизу min_leverage, сверху max_leverage.
+    double kelly_lev = half_kelly * static_cast<double>(config_.max_leverage);
+    return std::clamp(kelly_lev, static_cast<double>(std::max(1, config_.min_leverage)),
+                      static_cast<double>(config_.max_leverage));
+}
+
 // ==================== compute_leverage ====================
 
 LeverageDecision LeverageEngine::compute_leverage(
@@ -56,7 +106,6 @@ LeverageDecision LeverageEngine::compute_leverage(
     PositionSide position_side,
     double entry_price) const
 {
-    // ИСПРАВЛЕНИЕ: Защита от гонки с update_config()
     std::lock_guard<std::mutex> lock(mutex_);
 
     LeverageDecision decision;
@@ -72,7 +121,7 @@ LeverageDecision LeverageEngine::compute_leverage(
     decision.adversarial_factor  = adversarial_multiplier(adversarial_severity);
     decision.uncertainty_factor  = uncertainty_multiplier(uncertainty);
 
-    // 3. Композитный расчёт
+    // 3. Композитный расчёт (double precision до финального округления)
     double raw = static_cast<double>(decision.base_leverage)
         * decision.volatility_factor
         * decision.drawdown_factor
@@ -81,37 +130,50 @@ LeverageDecision LeverageEngine::compute_leverage(
         * decision.adversarial_factor
         * decision.uncertainty_factor;
 
-    // 4. Клемпинг в допустимый диапазон [min_leverage, max_leverage]
+    // 4. Kelly Criterion upper bound — не превышаем Half-Kelly оптимум
+    double kelly_cap = kelly_max_leverage();
+    raw = std::min(raw, kelly_cap);
+
+    // 5. EMA smoothing — предотвращаем осцилляцию плеча между тиками
+    const double ema_alpha = config_.leverage_engine.ema_alpha;
+    if (!ema_initialized_) {
+        ema_leverage_ = raw;
+        ema_initialized_ = true;
+    } else {
+        ema_leverage_ = ema_alpha * raw + (1.0 - ema_alpha) * ema_leverage_;
+    }
+
+    // 6. Финальное округление и клемпинг
     decision.leverage = std::clamp(
-        static_cast<int>(std::round(raw)),
+        static_cast<int>(std::round(ema_leverage_)),
         std::max(1, config_.min_leverage),
         config_.max_leverage);
 
-    // 5. Ликвидационная цена
+    // 7. Ликвидационная цена
     if (entry_price > 0.0) {
         LiquidationParams liq_params;
         liq_params.entry_price = entry_price;
         liq_params.position_side = position_side;
         liq_params.leverage = decision.leverage;
         liq_params.maintenance_margin_rate = config_.maintenance_margin_rate;
+        liq_params.taker_fee_rate = config_.leverage_engine.taker_fee_rate;
 
         decision.liquidation_price = compute_liquidation_price(liq_params);
 
-        // 6. Расчёт буфера и проверка безопасности
+        // 8. Расчёт буфера и проверка безопасности
         decision.is_safe = is_liquidation_safe(
             entry_price,
             decision.liquidation_price,
             position_side,
             config_.liquidation_buffer_pct);
 
-        // Буфер в процентах
         if (entry_price > 0.0 && decision.liquidation_price > 0.0) {
             decision.liquidation_buffer_pct =
                 std::abs(entry_price - decision.liquidation_price) / entry_price * 100.0;
         }
     }
 
-    // 7. Обоснование
+    // 9. Обоснование
     std::ostringstream oss;
     oss << "regime=" << to_string(regime)
         << " base=" << decision.base_leverage
@@ -121,6 +183,8 @@ LeverageDecision LeverageEngine::compute_leverage(
         << " fund×" << decision.funding_factor
         << " adv×" << decision.adversarial_factor
         << " unc×" << decision.uncertainty_factor
+        << " kelly_cap=" << std::setprecision(1) << kelly_cap
+        << " ema=" << std::setprecision(2) << ema_leverage_
         << " → lev=" << decision.leverage;
     if (!decision.is_safe) {
         oss << " [UNSAFE: liq_buffer=" << std::setprecision(1) << decision.liquidation_buffer_pct << "%]";
@@ -141,16 +205,14 @@ double LeverageEngine::compute_liquidation_price(const LiquidationParams& params
     double inv_lev = 1.0 / static_cast<double>(params.leverage);
 
     // Bitget USDT-M isolated margin формулы:
-    //   Long:  liq = entry × (1 - 1/leverage + mmr)
-    //   Short: liq = entry × (1 + 1/leverage - mmr)
-    // Дополнительно учитываем комиссии на открытие (~0.06% maker / ~0.1% taker).
-    // Используем 0.1% (taker) как worst-case для безопасности.
-    constexpr double kTakerFeeRate = 0.001;
+    //   Long:  liq = entry × (1 - 1/leverage + mmr + taker_fee)
+    //   Short: liq = entry × (1 + 1/leverage - mmr - taker_fee)
+    // Taker fee учитывается как worst-case cost закрытия позиции при ликвидации.
 
     if (params.position_side == PositionSide::Long) {
-        return params.entry_price * (1.0 - inv_lev + params.maintenance_margin_rate + kTakerFeeRate);
+        return params.entry_price * (1.0 - inv_lev + params.maintenance_margin_rate + params.taker_fee_rate);
     } else {
-        return params.entry_price * (1.0 + inv_lev - params.maintenance_margin_rate - kTakerFeeRate);
+        return params.entry_price * (1.0 + inv_lev - params.maintenance_margin_rate - params.taker_fee_rate);
     }
 }
 
@@ -181,9 +243,9 @@ bool LeverageEngine::is_liquidation_safe(
 // ==================== update_config ====================
 
 void LeverageEngine::update_config(const config::FuturesConfig& new_config) {
-    // ИСПРАВЛЕНИЕ: Защита от гонки с compute_leverage()
     std::lock_guard<std::mutex> lock(mutex_);
     config_ = new_config;
+    ema_initialized_ = false;
 }
 
 // ==================== Базовое плечо по режиму ====================
@@ -193,81 +255,65 @@ int LeverageEngine::base_leverage_for_regime(RegimeLabel regime) const {
         case RegimeLabel::Trending: return config_.leverage_trending;
         case RegimeLabel::Ranging:  return config_.leverage_ranging;
         case RegimeLabel::Volatile: return config_.leverage_volatile;
-        case RegimeLabel::Unclear:  return config_.leverage_stress;  // Conservative
+        case RegimeLabel::Unclear:  return config_.default_leverage;  // Use default, not stress
     }
     return config_.default_leverage;
 }
 
 // ==================== Множитель от волатильности ====================
 
-double LeverageEngine::volatility_multiplier(double atr_normalized) {
-    // Плавная линейная интерполяция по ATR/price ratio:
-    //   ≤ 0.5% (low vol)   → 1.0
-    //   0.5% - 2%           → плавно от 1.0 до 0.7
-    //   2% - 4% (high)      → плавно от 0.7 до 0.4
-    //   4% - 8% (extreme)   → плавно от 0.4 до 0.20
-    //   > 8% (crisis)       → плавно от 0.20 до 0.10
+double LeverageEngine::volatility_multiplier(double atr_normalized) const {
+    const auto& lc = config_.leverage_engine;
 
-    if (atr_normalized <= 0.005) return 1.0;
-    if (atr_normalized <= 0.02) {
-        double t = (atr_normalized - 0.005) / (0.02 - 0.005);
+    if (atr_normalized <= lc.vol_low_atr) return 1.0;
+    if (atr_normalized <= lc.vol_mid_atr) {
+        double t = (atr_normalized - lc.vol_low_atr) / (lc.vol_mid_atr - lc.vol_low_atr);
         return lerp(1.0, 0.7, t);
     }
-    if (atr_normalized <= 0.04) {
-        double t = (atr_normalized - 0.02) / (0.04 - 0.02);
+    if (atr_normalized <= lc.vol_high_atr) {
+        double t = (atr_normalized - lc.vol_mid_atr) / (lc.vol_high_atr - lc.vol_mid_atr);
         return lerp(0.7, 0.4, t);
     }
-    if (atr_normalized <= 0.08) {
-        double t = (atr_normalized - 0.04) / (0.08 - 0.04);
+    if (atr_normalized <= lc.vol_extreme_atr) {
+        double t = (atr_normalized - lc.vol_high_atr) / (lc.vol_extreme_atr - lc.vol_high_atr);
         return lerp(0.4, 0.20, t);
     }
-    // > 8%: продолжаем снижение до 0.10
-    double t = std::min(1.0, (atr_normalized - 0.08) / 0.04);
-    return lerp(0.20, 0.10, t);
+    double t = std::min(1.0, (atr_normalized - lc.vol_extreme_atr) / 0.04);
+    return lerp(0.20, lc.vol_floor, t);
 }
 
-// ==================== Множитель от просадки ====================
+// ==================== Множитель от просадки (сигмоидный) ====================
 
 double LeverageEngine::drawdown_multiplier(double drawdown_pct) const {
-    // Экспоненциальное затухание:
-    // drawdown_pct = 0%  → 1.0
-    // drawdown_pct = 5%  → ~0.71 (scale^0.5)
-    // drawdown_pct = 10% → ~0.50 (scale^1.0)
-    // drawdown_pct = 20% → ~0.25 (scale^2.0)
-    // drawdown_pct ≥ 30% → clamped to 0.10
-
     if (drawdown_pct <= 0.0) return 1.0;
 
-    // scale = config_.max_leverage_drawdown_scale (default 0.5)
-    // Каждые 10% просадки → плечо × scale
-    double exponent = drawdown_pct / 10.0;
-    double mult = std::pow(config_.max_leverage_drawdown_scale, exponent);
+    const auto& lc = config_.leverage_engine;
+    const double kFloor = lc.drawdown_floor_mult;
+    const double kRange = 1.0 - kFloor;
+    const double kDdHalf = lc.drawdown_halfpoint_pct;
+    constexpr double kScale = 0.5493;         // atanh(0.5)
 
-    return std::max(0.10, mult);
+    double normalized_dd = drawdown_pct / kDdHalf;
+    double mult = kFloor + kRange * (1.0 - std::tanh(kScale * normalized_dd));
+
+    return std::clamp(mult, kFloor, 1.0);
 }
 
 // ==================== Множитель от conviction ====================
 
-double LeverageEngine::conviction_multiplier(double conviction) {
-    // Плавная линейная интерполяция:
-    //   conviction = 0.0 → 0.40 (минимум: крайне слабый сигнал)
-    //   conviction = 0.3 → 0.60
-    //   conviction = 0.5 → 0.80
-    //   conviction = 0.7 → 1.00
-    //   conviction = 0.85 → 1.15
-    //   conviction = 1.0 → 1.30 (максимум: бонус за идеальный сигнал)
-
+double LeverageEngine::conviction_multiplier(double conviction) const {
     conviction = std::clamp(conviction, 0.0, 1.0);
+    const auto& lc = config_.leverage_engine;
+    const double min_mult = lc.conviction_min_mult;
 
-    if (conviction <= 0.7) {
-        // 0.0 → 0.40, 0.7 → 1.00
-        return lerp(0.40, 1.00, conviction / 0.7);
+    if (conviction <= lc.conviction_breakpoint) {
+        return lerp(min_mult, 1.00, conviction / lc.conviction_breakpoint);
     }
-    // 0.7 → 1.00, 1.0 → 1.30
-    return lerp(1.00, 1.30, (conviction - 0.7) / 0.3);
+    return lerp(1.00, lc.conviction_max_mult,
+                (conviction - lc.conviction_breakpoint) / (1.0 - lc.conviction_breakpoint));
 }
 
-// ==================== Множитель от funding rate ====================
+// ==================== Множитель от funding rate (экспоненциальный) ====================
 
 double LeverageEngine::funding_multiplier(double funding_rate, PositionSide side) const {
     // Если funding rate высокий и мы на стороне, которая платит:
@@ -288,15 +334,21 @@ double LeverageEngine::funding_multiplier(double funding_rate, PositionSide side
         return 1.0;  // Мы получаем — не снижаем
     }
 
-    // Линейное снижение: плавно от 1.0 до 0.25 при росте abs_rate
-    // penalty = config_.funding_rate_penalty (default 0.5)
-    // При rate = threshold → 1.0
-    // При rate = 2×threshold → 1.0 - penalty = 0.5
-    // При rate = 3×threshold → 1.0 - 2×penalty = 0.0 → clamped to 0.25
+    // Экспоненциальное затухание: mult = exp(-k × excess)
+    //   excess = (abs_rate - threshold) / threshold
+    //   k = -ln(1 - penalty) ≈ penalty для малых penalty
+    //
+    // При penalty=0.5: k ≈ 0.693
+    //   excess=1 (rate=2×threshold) → mult ≈ 0.50
+    //   excess=2 (rate=3×threshold) → mult ≈ 0.25
+    //   excess=3 → mult ≈ 0.125 → clamped to 0.15
+    //
+    // Преимущество перед линейным: нет точки, где mult обращается в 0 или уходит в отрицательные
     double excess = (abs_rate - config_.funding_rate_threshold) / config_.funding_rate_threshold;
-    double mult = 1.0 - config_.funding_rate_penalty * excess;
+    double k = -std::log(1.0 - std::clamp(config_.funding_rate_penalty, 0.01, 0.95));
+    double mult = std::exp(-k * excess);
 
-    return std::max(0.25, mult);
+    return std::max(0.15, mult);
 }
 
 // ==================== Множитель от adversarial severity ====================

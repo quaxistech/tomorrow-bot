@@ -13,6 +13,7 @@ TEST_CASE("FeatureSnapshot: is_complete возвращает false при пус
 TEST_CASE("FeatureSnapshot: is_complete возвращает true при наличии данных") {
     tb::features::FeatureSnapshot snap;
     snap.technical.sma_valid = true;
+    snap.technical.atr_valid = true;
     snap.microstructure.spread_valid = true;
     REQUIRE(snap.is_complete());
 }

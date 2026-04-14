@@ -47,26 +47,24 @@ enum class OpportunityReason {
     DefaultDefer                 ///< Ни одно правило не привело к Execute/Suppress
 };
 
-// ─── Портфельный контекст ────────────────────────────────────────────────────
+// ─── Портфельный контекст (USDT-M futures margin accounting) ─────────────────
 
-/// Контекст портфеля, передаваемый в движок для portfolio-aware решений
+/// Контекст портфеля для portfolio-aware решений.
+/// Все доли выражены как fraction [0, 1], не как проценты.
+/// Pipeline отвечает за нормализацию из процентных в дольные единицы.
 struct PortfolioContext {
-    double gross_exposure_pct{0.0};     ///< Валовая экспозиция как % от капитала
-    double net_exposure_pct{0.0};       ///< Чистая экспозиция
-    double available_capital{0.0};      ///< Свободный капитал (USD)
-    double total_capital{0.0};          ///< Общий капитал (USD)
-    int open_positions_count{0};        ///< Кол-во открытых позиций
-    double current_drawdown_pct{0.0};   ///< Текущая просадка (%)
-    int consecutive_losses{0};          ///< Серия убыточных сделок
+    double gross_exposure_pct{0.0};     ///< Валовая маржинальная экспозиция [0,1] от капитала
+    double current_drawdown_pct{0.0};   ///< Текущая просадка от пика [0,1]
+    int consecutive_losses{0};          ///< Серия подряд убыточных сделок
 
-    // ── Контекст по символу/стратегии ──
-    double symbol_exposure_pct{0.0};    ///< Экспозиция по данному символу [0,1]
-    double strategy_exposure_pct{0.0};  ///< Экспозиция по данной стратегии [0,1]
+    // ── Концентрация по символу/стратегии [0,1] ──
+    double symbol_exposure_pct{0.0};    ///< Маржинальная экспозиция по данному символу
+    double strategy_exposure_pct{0.0};  ///< Маржинальная экспозиция по данной стратегии
 
     // ── Худшая позиция (для Upgrade) ──
+    /// Pipeline должен вычислить worst position из snapshot позиций.
     bool has_worst_position{false};
-    double worst_position_net_bps{0.0}; ///< Net edge худшей позиции (для сравнения)
-    Symbol worst_position_symbol{Symbol("")};
+    double worst_position_net_bps{0.0}; ///< Unrealized P&L худшей позиции (bps)
 };
 
 // ─── Факторы решения (аудит) ─────────────────────────────────────────────────

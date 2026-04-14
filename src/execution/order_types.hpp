@@ -57,8 +57,8 @@ struct OrderRecord {
     Side side{Side::Buy};
     PositionSide position_side{PositionSide::Long};  ///< Сторона позиции (Long/Short) для фьючерсов
     TradeSide trade_side{TradeSide::Open};            ///< Открытие/закрытие (для фьючерсов)
-    OrderType order_type{OrderType::Limit};
-    TimeInForce tif{TimeInForce::GoodTillCancel};
+    OrderType order_type{OrderType::Market};          ///< USDT-M Futures: Market по умолчанию
+    TimeInForce tif{TimeInForce::ImmediateOrCancel};  ///< USDT-M Futures: IOC по умолчанию
     Price price{Price(0.0)};
     Quantity original_quantity{Quantity(0.0)};
     Quantity filled_quantity{Quantity(0.0)};
@@ -104,6 +104,17 @@ struct OrderSubmitResult {
     OrderId exchange_order_id{OrderId("")};
     std::string error_message;
     Quantity submitted_quantity{Quantity(0.0)};  ///< Фактическое кол-во после floor (отправлено на биржу)
+};
+
+/// Результат запроса деталей исполнения ордера с биржи
+struct OrderFillDetail {
+    bool success{false};             ///< Удалось ли получить данные
+    Price fill_price{Price(0.0)};    ///< Средняя цена исполнения
+    Quantity filled_qty{Quantity(0.0)}; ///< Фактически исполненное количество
+    Quantity original_qty{Quantity(0.0)}; ///< Объём ордера
+    std::string status;              ///< Статус ордера на бирже ("filled", "partially_filled", "cancelled" и пр.)
+    bool is_fully_filled() const { return success && filled_qty.get() > 0.0 && filled_qty.get() >= original_qty.get(); }
+    bool is_partially_filled() const { return success && filled_qty.get() > 0.0 && filled_qty.get() < original_qty.get(); }
 };
 
 /// Преобразование состояния ордера в строку

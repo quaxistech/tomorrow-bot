@@ -23,10 +23,7 @@ namespace tb::ml { struct MlSignalSnapshot; }
 namespace tb::uncertainty {
 
 // ===========================================================================
-/// Интерфейс движка оценки неопределённости (v2)
-///
-/// Обратно-совместим с v1: трёхаргументный `assess()` остаётся виртуальным.
-/// Новый пятиаргументный `assess()` добавляет портфельный и ML-контекст.
+/// Интерфейс движка оценки неопределённости для USDT-M futures scalp-бота
 // ===========================================================================
 class IUncertaintyEngine {
 public:
@@ -34,13 +31,14 @@ public:
 
     // --- v1 overload (backward-compatible) --------------------------------
 
-    /// Оценка неопределённости на основе рыночных данных, режима и мировой модели
+    /// Оценка неопределённости на основе рыночных данных, режима и мировой модели.
+    /// Делегирует в полный assess() с нейтральными portfolio/ML снэпшотами.
     virtual UncertaintySnapshot assess(
         const features::FeatureSnapshot& features,
         const regime::RegimeSnapshot& regime,
         const world_model::WorldModelSnapshot& world) = 0;
 
-    // --- v2 overload (full context) ---------------------------------------
+    // --- v2 overload (full context) — основной production path -------------
 
     /// Полная оценка неопределённости с портфельным и ML-контекстом
     virtual UncertaintySnapshot assess(
@@ -52,16 +50,10 @@ public:
 
     // --- queries ----------------------------------------------------------
 
-    /// Текущая оценка неопределённости для символа (кэшированная)
-    virtual std::optional<UncertaintySnapshot> current(const Symbol& symbol) const = 0;
-
     /// Диагностическая информация о внутреннем состоянии движка
     virtual UncertaintyDiagnostics diagnostics() const = 0;
 
-    // --- feedback / lifecycle ---------------------------------------------
-
-    /// Записать обратную связь (фактический исход) для калибровки
-    virtual void record_feedback(const UncertaintyFeedback& feedback) = 0;
+    // --- lifecycle --------------------------------------------------------
 
     /// Сброс внутреннего состояния (символы, счётчики, кулдауны)
     virtual void reset_state() = 0;
@@ -83,7 +75,7 @@ struct SymbolState {
 };
 
 // ===========================================================================
-/// Реализация оценки неопределённости на основе правил (v2)
+/// Реализация оценки неопределённости на основе правил для USDT-M futures
 ///
 /// Поддерживает оба пути — v1 (три аргумента) и v2 (пять аргументов).
 /// v1 делегирует в v2, подставляя нейтральные портфельный/ML снэпшоты.
@@ -91,21 +83,19 @@ struct SymbolState {
 class RuleBasedUncertaintyEngine final : public IUncertaintyEngine {
 public:
     /// @param config  Конфигурация порогов, весов, кулдаунов
-    /// @param logger  Логгер (nullable — допускается no-op)
-    /// @param clock   Часы для таймстемпов (обязательно)
+    /// @param logger  Логгер (обязательно, не nullptr)
+    /// @param clock   Часы для таймстемпов (обязательно, не nullptr)
     RuleBasedUncertaintyEngine(UncertaintyConfig config,
                                 std::shared_ptr<logging::ILogger> logger,
                                 std::shared_ptr<clock::IClock> clock);
 
     // --- IUncertaintyEngine -----------------------------------------------
 
-    /// v1 overload — делегирует в полный assess с нейтральными снэпшотами
     UncertaintySnapshot assess(
         const features::FeatureSnapshot& features,
         const regime::RegimeSnapshot& regime,
         const world_model::WorldModelSnapshot& world) override;
 
-    /// v2 overload — полная оценка с портфелем и ML-сигналами
     UncertaintySnapshot assess(
         const features::FeatureSnapshot& features,
         const regime::RegimeSnapshot& regime,
@@ -113,70 +103,43 @@ public:
         const portfolio::PortfolioSnapshot& portfolio,
         const ml::MlSignalSnapshot& ml_signals) override;
 
-    std::optional<UncertaintySnapshot> current(const Symbol& symbol) const override;
-
     UncertaintyDiagnostics diagnostics() const override;
-
-    void record_feedback(const UncertaintyFeedback& feedback) override;
 
     void reset_state() override;
 
 private:
     // --- dimension computors ----------------------------------------------
 
-    /// Неопределённость режима: инверсия confidence + штраф за вероятность перехода
     double compute_regime_uncertainty(const regime::RegimeSnapshot& regime) const;
-
-    /// Неопределённость сигналов: конфликтующие технические индикаторы
     double compute_signal_uncertainty(const features::FeatureSnapshot& features) const;
-
-    /// Неопределённость качества данных: gaps, stale quotes, book anomalies
     double compute_data_quality_uncertainty(const features::FeatureSnapshot& features) const;
-
-    /// Неопределённость исполнения: latency, fill rate, slippage
     double compute_execution_uncertainty(const features::FeatureSnapshot& features) const;
-
-    /// Портфельная неопределённость: concentration, drawdown, exposure imbalance
     double compute_portfolio_uncertainty(const portfolio::PortfolioSnapshot& portfolio) const;
-
-    /// ML-неопределённость: качество сигнала, вероятность каскада
     double compute_ml_uncertainty(const ml::MlSignalSnapshot& ml_signals) const;
-
-    /// Корреляционная неопределённость: break probability, risk multiplier
     double compute_correlation_uncertainty(const ml::MlSignalSnapshot& ml_signals) const;
-
-    /// Транзиционная неопределённость: вероятность смены режима
     double compute_transition_uncertainty(const regime::RegimeSnapshot& regime) const;
-
-    /// Операционная неопределённость: инфра-метрики из execution context
     double compute_operational_uncertainty(const features::FeatureSnapshot& features) const;
 
     // --- aggregation & stateful logic -------------------------------------
 
-    /// Агрегация размерностей в скалярный скор с учётом режимных весов
     double aggregate(const UncertaintyDimensions& dims,
                      const regime::RegimeSnapshot& regime) const;
 
-    /// Гистерезис: предотвращает осцилляцию уровня вокруг порога
     UncertaintyLevel apply_hysteresis(double score, const SymbolState& state) const;
 
-    /// Обновление per-symbol состояния после оценки
     void update_state(SymbolState& state,
                       double raw_score,
                       UncertaintyLevel new_level,
                       int64_t now_ns);
 
-    /// Расчёт рекомендации по кулдауну на основе текущего состояния
     CooldownRecommendation compute_cooldown(const SymbolState& state,
                                             int64_t now_ns) const;
 
-    /// Определение рекомендуемого режима исполнения
     ExecutionModeRecommendation determine_execution_mode(
         UncertaintyLevel level,
         double score,
         const SymbolState& state) const;
 
-    /// Вычисление ключевых драйверов неопределённости (топ-N)
     std::vector<UncertaintyDriver> compute_drivers(
         const UncertaintyDimensions& dims) const;
 
@@ -190,7 +153,6 @@ private:
     std::unordered_map<std::string, SymbolState> states_;
 
     UncertaintyDiagnostics diagnostics_;
-    std::vector<UncertaintyFeedback> feedback_buffer_;
 
     mutable std::mutex mutex_;
 };

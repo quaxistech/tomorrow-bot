@@ -54,12 +54,13 @@ struct LeverageContext {
     double entry_price{0.0};            ///< Планируемая цена входа
 };
 
-/// Параметры для расчёта ликвидационной цены
+/// Параметры для расчёта ликвидационной цены (Bitget USDT-M isolated margin)
 struct LiquidationParams {
     double entry_price{0.0};
     PositionSide position_side{PositionSide::Long};
     int leverage{1};
     double maintenance_margin_rate{0.004};  ///< Bitget default 0.4%
+    double taker_fee_rate{0.0006};          ///< Bitget futures taker 0.06%
 };
 
 /// Движок управления кредитным плечом
@@ -96,6 +97,12 @@ public:
     [[nodiscard]] LeverageDecision compute_leverage(const LeverageContext& ctx) const;
 
     /**
+     * @brief Обновить win_rate и win/loss ratio из rolling статистик pipeline.
+     *        Используется для Kelly Criterion ограничения плеча.
+     */
+    void update_edge_stats(double win_rate, double win_loss_ratio);
+
+    /**
      * @brief Рассчитать цену ликвидации
      *
      * Для isolated margin USDT-M:
@@ -127,15 +134,15 @@ private:
     [[nodiscard]] int base_leverage_for_regime(RegimeLabel regime) const;
 
     /// Множитель от волатильности (ATR/price)
-    [[nodiscard]] static double volatility_multiplier(double atr_normalized);
+    [[nodiscard]] double volatility_multiplier(double atr_normalized) const;
 
-    /// Множитель от просадки портфеля
+    /// Множитель от просадки портфеля (сигмоидная кривая)
     [[nodiscard]] double drawdown_multiplier(double drawdown_pct) const;
 
     /// Множитель от conviction
-    [[nodiscard]] static double conviction_multiplier(double conviction);
+    [[nodiscard]] double conviction_multiplier(double conviction) const;
 
-    /// Множитель от funding rate
+    /// Множитель от funding rate (экспоненциальный штраф)
     [[nodiscard]] double funding_multiplier(double funding_rate, PositionSide side) const;
 
     /// Множитель от adversarial severity
@@ -144,8 +151,21 @@ private:
     /// Множитель от уровня неопределённости
     [[nodiscard]] static double uncertainty_multiplier(UncertaintyLevel level);
 
+    /// Kelly Criterion: оптимальная доля капитала → максимальное плечо
+    [[nodiscard]] double kelly_max_leverage() const;
+
     config::FuturesConfig config_;
     mutable std::mutex mutex_;  ///< Защита config_ от гонок при hot reload
+
+    // === Kelly Criterion state ===
+    // Нейтральная инициализация: f* = (1.5×0.50 - 0.50)/1.5 = 0.167
+    // Half-Kelly = 0.083 → kelly_cap ≈ 12x (разумный дефолт до накопления статистики)
+    double win_rate_{0.50};          ///< Текущий win rate из rolling stats
+    double win_loss_ratio_{1.5};     ///< Текущий avg_win/avg_loss ratio
+
+    // === EMA smoothing state ===
+    mutable double ema_leverage_{0.0};  ///< Сглаженное плечо (EMA)
+    mutable bool   ema_initialized_{false}; ///< Первый тик — инициализация
 };
 
 } // namespace tb::leverage

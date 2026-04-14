@@ -18,23 +18,27 @@ bool StrategyStateMachine::transition_to(SymbolState new_state, int64_t now_ns) 
             break;
         case SymbolState::Candidate:
             valid = (new_state == SymbolState::SetupForming ||
+                     new_state == SymbolState::PositionOpen ||  // восстановление после fill/recovery
                      new_state == SymbolState::Idle ||
                      new_state == SymbolState::Blocked);
             break;
         case SymbolState::SetupForming:
             valid = (new_state == SymbolState::SetupPendingConfirmation ||
+                     new_state == SymbolState::PositionOpen ||  // позиция появилась до завершения setup lifecycle
                      new_state == SymbolState::Idle ||  // отмена
                      new_state == SymbolState::Cooldown ||
                      new_state == SymbolState::Blocked);
             break;
         case SymbolState::SetupPendingConfirmation:
             valid = (new_state == SymbolState::EntryReady ||
+                     new_state == SymbolState::PositionOpen ||  // recovery/sync после fill
                      new_state == SymbolState::Idle ||  // отмена
                      new_state == SymbolState::Cooldown ||
                      new_state == SymbolState::Blocked);
             break;
         case SymbolState::EntryReady:
             valid = (new_state == SymbolState::EntrySent ||
+                     new_state == SymbolState::PositionOpen ||  // fill может быть подтверждён раньше feedback
                      new_state == SymbolState::Idle ||
                      new_state == SymbolState::Cooldown ||
                      new_state == SymbolState::Blocked);

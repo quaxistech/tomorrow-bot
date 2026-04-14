@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 namespace tb::numeric {
 
@@ -26,16 +25,6 @@ inline constexpr double kMaxReasonableVolume = 1e15;
 /// Returns true only if value is finite (not NaN, not Inf)
 [[nodiscard]] inline bool is_finite(double v) noexcept {
     return std::isfinite(v);
-}
-
-/// Returns true if value is NaN or Inf
-[[nodiscard]] inline bool is_bad(double v) noexcept {
-    return !std::isfinite(v);
-}
-
-/// Sanitize: return value if finite, else fallback
-[[nodiscard]] inline double sanitize(double v, double fallback = 0.0) noexcept {
-    return std::isfinite(v) ? v : fallback;
 }
 
 // ─── Safe arithmetic ─────────────────────────────────────────────────────────
@@ -75,29 +64,6 @@ inline constexpr double kMaxReasonableVolume = 1e15;
 /// Validate volume: finite, non-negative
 [[nodiscard]] inline bool is_valid_volume(double v) noexcept {
     return std::isfinite(v) && v >= 0.0 && v < kMaxReasonableVolume;
-}
-
-/// Validate a spread in basis points: finite, non-negative
-[[nodiscard]] inline bool is_valid_spread_bps(double s) noexcept {
-    return std::isfinite(s) && s >= 0.0;
-}
-
-/// Validate a probability value: finite, in [0, 1]
-[[nodiscard]] inline bool is_valid_probability(double p) noexcept {
-    return std::isfinite(p) && p >= 0.0 && p <= 1.0;
-}
-
-/// Validate a correlation value: finite, in [-1, 1]
-[[nodiscard]] inline bool is_valid_correlation(double c) noexcept {
-    return std::isfinite(c) && c >= -1.0 && c <= 1.0;
-}
-
-/// Check if a vector of doubles contains any NaN/Inf
-[[nodiscard]] inline bool has_bad_values(const double* data, std::size_t n) noexcept {
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(data[i])) return true;
-    }
-    return false;
 }
 
 /// Validate an entire price series
