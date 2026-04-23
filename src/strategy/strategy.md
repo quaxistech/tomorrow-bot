@@ -175,24 +175,21 @@
 
 После открытия позиции работает `PositionManager`.
 
-Активные exit/reduce правила:
+Все exit/reduce решения централизованы в `PositionExitOrchestrator` (pipeline).
+`PositionManager::evaluate()` всегда возвращает Hold — стратегия НЕ имеет собственных exit-решений.
 
-1. `VPIN toxic` -> `EmergencyExit`
-- самый жёсткий и полезный защитный выход.
+Виды выходов (orchestrator):
+1. **Hard risk stop** — capital% или price% от entry
+2. **Trailing stop** — Chandelier Exit с адаптивным ATR множителем
+3. **Quick profit** — fee-aware, gated by continuation value
+4. **Partial take-profit** — profit >= N×ATR, anti-dust protected
+5. **Toxic flow exit** — VPIN + adverse pressure
+6. **Structural failure** — EMA cross + momentum reversal
+7. **Liquidity deterioration** — book thinning + spread widening
+8. **Continuation value exit** — 10-component model (time = hazard, not hard trigger)
+9. **Funding carry exit** — funding rate penalty
 
-2. `Time stop`
-- если позиция висит дольше `max_hold_time_ms`, стратегия закрывает её.
-
-3. `Target reached`
-- цель: ход в `2 * ATR` от входа.
-
-4. `Structure failure`
-- EMA-разворот + adverse momentum.
-- Срабатывает только если уже есть ощутимый убыток.
-
-5. `Quality degradation -> Reduce`
-- сильное расширение спреда или падение ликвидности.
-- Тоже только если позиция уже в минусе.
+Каждый выход имеет ExitExplanation: primary_driver, secondary_drivers, counterfactual.
 
 6. `Order book deterioration`
 - сильный adverse imbalance, но только при крупном убытке.

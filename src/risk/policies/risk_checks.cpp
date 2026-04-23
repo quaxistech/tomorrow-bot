@@ -6,6 +6,7 @@
 #include "common/enums.hpp"
 #include <cmath>
 #include <algorithm>
+#include <unordered_set>
 
 namespace tb::risk {
 
@@ -174,10 +175,28 @@ void MaxPositionsCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
 
 void SameDirectionCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     int long_count = 0, short_count = 0;
+
+    // Pair-aware counting: if both a long and short exist on the same symbol
+    // (hedge pair), count them as one net position rather than two independent ones.
+    // This prevents hedge pairs from consuming two position slots.
+    std::unordered_set<std::string> long_symbols, short_symbols;
     for (const auto& pos : ctx.portfolio.positions) {
-        if (pos.side == Side::Buy) ++long_count;
-        else ++short_count;
+        if (pos.side == Side::Buy) {
+            long_symbols.insert(pos.symbol.get());
+            ++long_count;
+        } else {
+            short_symbols.insert(pos.symbol.get());
+            ++short_count;
+        }
     }
+
+    // Subtract hedge pairs: each symbol with both long+short is a pair, not 2 positions
+    int hedge_pairs = 0;
+    for (const auto& sym : long_symbols) {
+        if (short_symbols.count(sym)) ++hedge_pairs;
+    }
+    long_count -= hedge_pairs;
+    short_count -= hedge_pairs;
 
     if (ctx.intent.side == Side::Buy && long_count >= cfg_.max_simultaneous_long_positions) {
         deny(d, "MAX_LONG_POSITIONS",
@@ -190,7 +209,7 @@ void SameDirectionCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
              std::to_string(cfg_.max_simultaneous_short_positions), 0.7);
     }
 
-    // Legacy same_direction check
+    // Legacy same_direction check (also pair-aware)
     int same_dir = (ctx.intent.side == Side::Buy) ? long_count : short_count;
     if (same_dir >= cfg_.max_same_direction_positions) {
         deny(d, "SAME_DIRECTION",
@@ -597,6 +616,112 @@ void FundingRateCostCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
              "Годовая стоимость фандинга " + std::to_string(annual_cost_pct) +
              "% > лимит " + std::to_string(cfg_.max_annual_funding_cost_pct) + "%",
              0.7);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 34. Venue Health — Phase 5: venue-risk protection
+// Reacts to REST/WS degradation, reject storms, clock drift,
+// fill gaps, inconsistent position snapshots.
+// ═══════════════════════════════════════════════════════════════
+
+void VenueHealthCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const auto& vh = ctx.venue_health;
+
+    // REST latency degradation: P99 > 3000ms → block
+    if (vh.rest_p99_latency_ms > 3000.0) {
+        deny(d, "VENUE_REST_DEGRADED",
+             "REST P99 latency " + std::to_string(vh.rest_p99_latency_ms) +
+             "ms exceeds 3000ms threshold",
+             0.9);
+        return;
+    }
+
+    // WebSocket instability: >3 reconnects/hour → block
+    if (vh.ws_reconnect_count_last_hour > 3) {
+        deny(d, "VENUE_WS_UNSTABLE",
+             "WS reconnects " + std::to_string(vh.ws_reconnect_count_last_hour) +
+             " in last hour (>3)",
+             0.85);
+        return;
+    }
+
+    // Reject storm: >20% reject rate → block
+    if (vh.reject_rate_last_minute > 0.20) {
+        deny(d, "VENUE_REJECT_STORM",
+             "Reject rate " + std::to_string(vh.reject_rate_last_minute * 100.0) +
+             "% exceeds 20% threshold",
+             0.9);
+        return;
+    }
+
+    // Clock drift: >500ms → block
+    if (vh.clock_drift_ms > 500.0) {
+        deny(d, "VENUE_CLOCK_DRIFT",
+             "Clock drift " + std::to_string(vh.clock_drift_ms) +
+             "ms exceeds 500ms threshold",
+             0.85);
+        return;
+    }
+
+    // Position snapshot stale → warn + reduce
+    if (vh.position_snapshot_stale) {
+        reduce(d, 0.5, "VENUE_STALE_POSITIONS",
+               "Position snapshot is stale — reducing size 50%");
+    }
+
+    // High cancel-to-fill ratio → warn
+    if (vh.cancel_fill_ratio > 5.0) {
+        reduce(d, 0.7, "VENUE_HIGH_CANCEL_RATIO",
+               "Cancel/fill ratio " + std::to_string(vh.cancel_fill_ratio) +
+               " exceeds 5.0 — possible venue issue");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 35. Margin Distance — Phase 5: margin-aware and liquidation-aware sizing
+// Ensures position sizing respects real liquidation distance and margin ratio.
+// ═══════════════════════════════════════════════════════════════
+
+void MarginDistanceCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const auto& m = ctx.margin;
+
+    // Skip if margin data not available (distance defaults to 100%)
+    if (m.distance_to_liquidation_pct >= 99.0) return;
+
+    // Hard block: distance to liquidation < liquidation_buffer_pct (5% default)
+    if (m.distance_to_liquidation_pct < cfg_.liquidation_buffer_pct) {
+        deny(d, "MARGIN_LIQUIDATION_CLOSE",
+             "Distance to liquidation " + std::to_string(m.distance_to_liquidation_pct) +
+             "% < buffer " + std::to_string(cfg_.liquidation_buffer_pct) + "%",
+             1.0);
+        return;
+    }
+
+    // Reduce size if distance_to_liquidation < 2× buffer
+    double warn_threshold = cfg_.liquidation_buffer_pct * 2.0;
+    if (m.distance_to_liquidation_pct < warn_threshold) {
+        double ratio = m.distance_to_liquidation_pct / warn_threshold;
+        reduce(d, std::clamp(ratio, 0.3, 0.8), "MARGIN_DISTANCE_LOW",
+               "Liquidation distance " + std::to_string(m.distance_to_liquidation_pct) +
+               "% < " + std::to_string(warn_threshold) + "% warn threshold");
+    }
+
+    // Combined margin check for hedge pairs
+    if (m.hedge_active && m.combined_margin_usage_pct > 80.0) {
+        reduce(d, 0.5, "MARGIN_PAIR_USAGE_HIGH",
+               "Combined pair margin usage " +
+               std::to_string(m.combined_margin_usage_pct) + "% exceeds 80%");
+    }
+
+    // Available margin too low for the order
+    double order_notional = d.approved_quantity.get() * m.mark_price;
+    double required_margin = order_notional * m.maintenance_margin_rate * 2.0;
+    if (m.available_margin > 0.0 && required_margin > m.available_margin * 0.7) {
+        double safe_ratio = (m.available_margin * 0.7) / std::max(required_margin, 0.01);
+        reduce(d, std::clamp(safe_ratio, 0.3, 0.9), "MARGIN_AVAILABLE_LOW",
+               "Required margin " + std::to_string(required_margin) +
+               " USDT > 70% of available " + std::to_string(m.available_margin) + " USDT");
     }
 }
 

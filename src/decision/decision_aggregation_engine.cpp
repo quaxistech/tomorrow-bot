@@ -317,10 +317,16 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
           + world.state_probabilities.probability(WS::LiquidityVacuum)
           + world.state_probabilities.probability(WS::ExhaustionSpike)
           + world.state_probabilities.probability(WS::ChopNoise);
+        // H-11 fix: clamp to [0,1] — sum of 4 probs can exceed 1.0
+        danger_prob = std::clamp(danger_prob, 0.0, 1.0);
         // Плавный буст: P(danger)=0.5 → +10% threshold, P(danger)=1.0 → +20%
         double world_boost = danger_prob * 0.20;
         threshold += world_boost;
     }
+
+    // Hard cap: threshold не может быть > 0.90, иначе вход невозможен
+    // (conviction максимально ~0.95 от стратегий)
+    threshold = std::min(threshold, 0.90);
 
     record.effective_threshold = threshold;
 

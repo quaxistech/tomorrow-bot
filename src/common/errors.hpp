@@ -48,9 +48,6 @@ enum class TbError {
     PersistenceError,           ///< Ошибка сохранения данных
     ReplayError,                ///< Ошибка воспроизведения данных
 
-    // --- Shadow ---
-    ShadowDisabled,             ///< Shadow-режим отключён или заблокирован kill switch
-
     // --- Reconciliation ---
     ReconciliationFailed,           ///< Ошибка reconciliation
     ReconciliationMismatch,         ///< Обнаружено расхождение
@@ -74,6 +71,9 @@ enum class TbError {
 
     // --- Production safety ---
     ProductionGuardFailed,          ///< Нет подтверждения production режима
+
+    // --- Shadow/offline ---
+    ShadowDisabled,                 ///< Теневой режим отключён
 };
 
 // ============================================================
@@ -123,8 +123,6 @@ public:
                 return "Ошибка персистентности данных";
             case TbError::ReplayError:
                 return "Ошибка воспроизведения данных";
-            case TbError::ShadowDisabled:
-                return "Shadow-режим отключён";
             case TbError::ReconciliationFailed:
                 return "Ошибка reconciliation";
             case TbError::ReconciliationMismatch:
@@ -149,6 +147,8 @@ public:
                 return "Превышен глобальный лимит";
             case TbError::ProductionGuardFailed:
                 return "Нет подтверждения production режима";
+            case TbError::ShadowDisabled:
+                return "Теневой режим отключён";
             default:
                 return "Неизвестная ошибка TomorrowBot";
         }

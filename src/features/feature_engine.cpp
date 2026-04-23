@@ -118,9 +118,11 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
         tf.sma_valid = sma.valid;
         tf.sma_20 = sma.value;
 
+        auto ema_ultra_fast = indicators_->ema(close, config_.ema_ultra_fast_period);
         auto ema_fast = indicators_->ema(close, config_.ema_fast_period);
         auto ema_slow = indicators_->ema(close, config_.ema_slow_period);
         tf.ema_valid = ema_fast.valid && ema_slow.valid;
+        tf.ema_8 = ema_ultra_fast.valid ? ema_ultra_fast.value : 0.0;
         tf.ema_20 = ema_fast.value;
         tf.ema_50 = ema_slow.value;
     }
@@ -200,7 +202,7 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
             }
             const double mean_vol = sum_vol / static_cast<double>(norm_window);
             const double denominator = mean_vol * static_cast<double>(norm_window);
-            tf.obv_normalized = (denominator > 0.0)
+            tf.directional_volume_proxy = (denominator > 0.0)
                 ? std::clamp(obv_recent / denominator, -1.0, 1.0)
                 : 0.0;
         }
@@ -307,8 +309,22 @@ ExecutionContextFeatures FeatureEngine::compute_execution_context(
         ec.immediate_liquidity = std::min(tob->bid_size.get(), tob->ask_size.get());
     }
 
-    // Простая оценка проскальзывания: половина спреда в bps
-    ec.estimated_slippage_bps = ticker.spread_bps * 0.5;
+    // M-11 fix: depth-aware slippage model
+    // Base: half-spread + depth impact estimator
+    double base_slippage = ticker.spread_bps * 0.5;
+    double depth_impact = 0.0;
+    if (ec.immediate_liquidity > 0.0) {
+        // Thin book → higher slippage. Uses inverse-depth scaling.
+        // At 1000 USD depth: ~0 extra impact. At 100 USD: +2-3 bps.
+        double mid_px = (ticker.bid.get() + ticker.ask.get()) * 0.5;
+        if (mid_px > 0.0) {
+            double depth_usd = ec.immediate_liquidity * mid_px;
+            if (depth_usd < 1000.0 && depth_usd > 0.0) {
+                depth_impact = std::min(5.0, (1000.0 / depth_usd - 1.0) * 1.5);
+            }
+        }
+    }
+    ec.estimated_slippage_bps = base_slippage + depth_impact;
     ec.slippage_valid = (ticker.spread_bps > 0.0);
 
     // Криптовалютные рынки работают 24/7 — всегда открыты

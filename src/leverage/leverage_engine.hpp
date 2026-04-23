@@ -166,6 +166,7 @@ private:
     // === EMA smoothing state ===
     mutable double ema_leverage_{0.0};  ///< Сглаженное плечо (EMA)
     mutable bool   ema_initialized_{false}; ///< Первый тик — инициализация
+    mutable RegimeLabel last_regime_{RegimeLabel::Unclear}; ///< Предыдущий режим (для EMA reset)
 };
 
 } // namespace tb::leverage

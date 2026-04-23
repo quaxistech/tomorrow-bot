@@ -63,13 +63,23 @@ void RecoveryManager::recover_unknown_orders() {
                 {{"order_id", order.order_id.get()},
                  {"fill_price", std::to_string(fill_price.get())}});
         } else {
-            // Не удалось подтвердить → безопасно считаем отменённым
-            // (§6.5: fail-safe behavior)
-            registry_.force_transition(order.order_id, OrderState::Cancelled,
-                                       "Recovery: unable to confirm → cancel");
-            logger_->warn("RecoveryManager", "Ордер восстановлен как Cancelled (fail-safe)",
-                {{"order_id", order.order_id.get()},
-                 {"symbol", order.symbol.get()}});
+            // Unable to confirm fill — attempt actual cancel on exchange first.
+            // Only transition to Cancelled after successful cancel_order() call.
+            bool cancelled = submitter_->cancel_order(order.exchange_order_id, order.symbol);
+            if (cancelled) {
+                registry_.force_transition(order.order_id, OrderState::Cancelled,
+                                           "Recovery: confirmed cancelled on exchange");
+                logger_->info("RecoveryManager", "Ордер отменён на бирже и восстановлен как Cancelled",
+                    {{"order_id", order.order_id.get()},
+                     {"symbol", order.symbol.get()}});
+            } else {
+                // Cancel failed — keep in UnknownRecovery for manual resolution.
+                // Do NOT assume cancelled without exchange confirmation.
+                logger_->warn("RecoveryManager",
+                    "Ордер остаётся в UnknownRecovery: cancel не подтверждён биржей",
+                    {{"order_id", order.order_id.get()},
+                     {"symbol", order.symbol.get()}});
+            }
         }
     }
 
@@ -113,7 +123,10 @@ ReconciliationResult RecoveryManager::run_reconciliation() {
         }
     }
 
-    // Step 3 — resolve stale CancelPending
+    // Step 3 — resolve stale CancelPending.
+    // 3× multiplier: initial cancel_confirmation_timeout covers normal round-trip,
+    // plus 2 additional round-trips to account for exchange processing delay and
+    // network jitter. Orders stuck beyond 3× are assumed lost and force-cancelled.
     int stale_resolved = force_resolve_stale_cancels(
         config_.cancel_confirmation_timeout_ms * 3);
     result.orders_force_cancelled += stale_resolved;

@@ -90,6 +90,19 @@ private:
     PairRanker pair_ranker_;
     BiasDetector bias_detector_;
 
+    // ── Circuit breaker ──
+    int consecutive_api_failures_{0};
+    int64_t circuit_breaker_tripped_at_ms_{0};
+    bool is_circuit_breaker_open() const;
+    void record_api_failure();
+    void record_api_success();
+
+    // ── Diversification ──
+    void diversify_basket(std::vector<SymbolAnalysis>& ranked,
+                          const std::vector<MarketSnapshot>& snapshots) const;
+    static double compute_return_correlation(const std::vector<CandleData>& a,
+                                              const std::vector<CandleData>& b);
+
     // ── State ──
     mutable std::mutex mutex_;
     ScannerResult last_result_;

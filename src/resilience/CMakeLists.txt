@@ -2,6 +2,7 @@ add_library(tb_resilience STATIC
     circuit_breaker.cpp
     retry_executor.cpp
     idempotency_manager.cpp
+    operational_guard.cpp
 )
 target_include_directories(tb_resilience PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(tb_resilience PUBLIC

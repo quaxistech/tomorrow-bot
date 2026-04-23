@@ -49,6 +49,13 @@ public:
     /// Получить статус конкретного ордера
     virtual Result<ExchangeOrderInfo>
     get_order_status(const OrderId& order_id, const Symbol& symbol) = 0;
+
+    /// Получить trigger-ордера (TP/SL protective). По умолчанию — пустой список.
+    virtual Result<std::vector<ExchangeOrderInfo>>
+    get_trigger_orders(const Symbol& symbol = Symbol("")) {
+        (void)symbol;
+        return std::vector<ExchangeOrderInfo>{};
+    }
 };
 
 // ============================================================

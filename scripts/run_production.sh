@@ -39,25 +39,14 @@ if [[ "${TOMORROW_BOT_PRODUCTION_CONFIRM:-}" != "I_UNDERSTAND_LIVE_TRADING" ]]; 
     exit 1
 fi
 
-# Поиск бинарника (release > debug)
-BINARY=""
-if [[ -x "build-release/src/app/tomorrow-bot" ]]; then
-    BINARY="build-release/src/app/tomorrow-bot"
-    echo "✓ Используется Release-сборка"
-elif [[ -x "build/src/app/tomorrow-bot" ]]; then
-    BINARY="build/src/app/tomorrow-bot"
-    echo "⚠ Используется сборка из build/ (рекомендуется Release)"
-elif [[ -x "build-check/src/app/tomorrow-bot" ]]; then
-    BINARY="build-check/src/app/tomorrow-bot"
-    echo "⚠ Используется Debug-сборка (рекомендуется Release для production)"
-elif [[ -x "build-debug/src/app/tomorrow-bot" ]]; then
-    BINARY="build-debug/src/app/tomorrow-bot"
-    echo "⚠ Используется Debug-сборка (рекомендуется Release для production)"
-else
-    echo "✗ ОШИБКА: Бинарник не найден. Соберите проект:"
-    echo "  cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j\$(nproc)"
+# Production запускается только на release binary.
+BINARY="${TOMORROW_BOT_BINARY:-build-release/src/app/tomorrow-bot}"
+if [[ ! -x "$BINARY" ]]; then
+    echo "✗ ОШИБКА: Release-бинарник не найден: $BINARY"
+    echo "  Соберите проект: ./scripts/build_release.sh"
     exit 1
 fi
+echo "✓ Используется Release-сборка: $BINARY"
 
 # Создание директории для логов
 mkdir -p logs
@@ -76,4 +65,4 @@ echo ""
 echo "Запуск через 3 секунды... (Ctrl+C для отмены)"
 sleep 3
 
-exec "$BINARY" -c "$CONFIG"
+exec "$BINARY" --config "$CONFIG"

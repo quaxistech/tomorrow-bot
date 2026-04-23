@@ -114,6 +114,18 @@ public:
 
     /// Проверить инвариант: available_cash >= 0, reserves match pending orders
     virtual bool check_invariants() const { return true; }
+
+    /// Синхронизировать ногу позиции с exchange-truth (qty, entry, timestamps).
+    /// Если позиция уже существует — обновить поля. Иначе — открыть новую.
+    /// Это единственный корректный способ привести локальную позицию
+    /// в полное соответствие с биржей при recovery.
+    virtual void sync_position_from_exchange(const Symbol& symbol, PositionSide ps,
+                                              Quantity size, Price avg_entry_price,
+                                              Price current_price, double unrealized_pnl,
+                                              Timestamp opened_at) {
+        (void)symbol; (void)ps; (void)size; (void)avg_entry_price;
+        (void)current_price; (void)unrealized_pnl; (void)opened_at;
+    }
 };
 
 /// Реализация портфеля в памяти (потокобезопасная)
@@ -155,6 +167,10 @@ public:
     std::vector<PendingOrderInfo> pending_orders() const override;
     std::vector<PortfolioEvent> recent_events(size_t max_count = 100) const override;
     bool check_invariants() const override;
+    void sync_position_from_exchange(const Symbol& symbol, PositionSide ps,
+                                      Quantity size, Price avg_entry_price,
+                                      Price current_price, double unrealized_pnl,
+                                      Timestamp opened_at) override;
 
 private:
     /// Пересчитать нереализованную P&L для позиции
@@ -174,6 +190,7 @@ private:
     double total_capital_;
     double leverage_{1.0};
     double peak_equity_;
+    bool capital_synced_from_exchange_{false};
     double realized_pnl_today_{0.0};
     int trades_today_{0};
     int consecutive_losses_{0};

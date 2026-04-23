@@ -412,9 +412,14 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange(
                 rec.resolution = "Position matches (within tolerance)";
             }
 
-            if (current_price > 0.0) {
-                portfolio_->update_price(info.symbol, Price(current_price));
-            }
+            // Всегда синхронизировать полное состояние с биржей (exchange-truth).
+            // Даже при совпадении количества — entry, price и timestamps
+            // могут быть стейлнутыми после прошлого рестарта.
+            portfolio_->sync_position_from_exchange(
+                info.symbol, ps,
+                info.size, info.entry_price,
+                Price(current_price), info.unrealized_pnl,
+                local_pos->opened_at);  // сохраняем реальный opened_at из существующей позиции
         } else {
             // Orphan: позиция есть на бирже, но нет в локальном портфеле
             // (или направления не совпадают)
@@ -426,21 +431,13 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange(
                 ++last_result_.warnings;
             } else {
                 // Синхронизировать orphan в локальный портфель для отслеживания
-                portfolio::Position new_pos;
-                new_pos.symbol = info.symbol;
-                new_pos.side = info.side;
-                new_pos.size = info.size;
-                new_pos.avg_entry_price = info.entry_price;
-                new_pos.current_price = Price(current_price);
-                new_pos.notional = NotionalValue(notional);
-                new_pos.unrealized_pnl = info.unrealized_pnl;
-                new_pos.unrealized_pnl_pct = 0.0;
-                new_pos.strategy_id = StrategyId{"recovery"};
-                new_pos.opened_at = clock_->now();
-                new_pos.updated_at = clock_->now();
-
-                portfolio_->open_position(new_pos);
-                rec.resolution = "Orphan futures position synced into portfolio";
+                // Используем exchange-truth API: qty, entry, price, timestamps
+                portfolio_->sync_position_from_exchange(
+                    info.symbol, ps,
+                    info.size, info.entry_price,
+                    Price(current_price), info.unrealized_pnl,
+                    clock_->now());  // orphan: первое обнаружение, opened_at = now
+                rec.resolution = "Orphan futures position synced into portfolio (exchange-truth)";
                 ++last_result_.warnings;
             }
         }
@@ -463,11 +460,22 @@ double RecoveryService::extract_usdt_balance(
     const std::vector<reconciliation::ExchangePositionInfo>& balances) {
 
     double usdt_balance = 0.0;
+    bool found_usdt = false;
     for (const auto& info : balances) {
         if (info.symbol.get() == kUsdtSymbol) {
             usdt_balance = info.available.get() + info.frozen.get();
+            found_usdt = true;
             break;
         }
+    }
+
+    if (!found_usdt) {
+        logger_->error(kComponent,
+            "USDT баланс не найден в ответе биржи — capital sync пропущен (safe mode)");
+        last_result_.messages.emplace_back(
+            "USDT balance NOT FOUND in exchange response — refusing to set capital to 0");
+        ++last_result_.errors;
+        return 0.0;  // Не трогаем портфель если USDT отсутствует
     }
 
     auto snap = portfolio_->snapshot();
@@ -564,7 +572,17 @@ bool RecoveryService::restore_from_snapshot() {
                 pos.strategy_id = pos_obj.contains("strategy_id")
                     ? StrategyId(std::string(pos_obj.at("strategy_id").as_string()))
                     : StrategyId("snapshot_recovery");
-                pos.opened_at = clock_->now();
+
+                // Восстановить реальный opened_at из snapshot; fallback на now() только если не записан
+                if (pos_obj.contains("opened_at_ns")) {
+                    pos.opened_at = Timestamp(pos_obj.at("opened_at_ns").as_int64());
+                } else if (pos_obj.contains("opened_at")) {
+                    pos.opened_at = Timestamp(pos_obj.at("opened_at").as_int64());
+                } else {
+                    pos.opened_at = clock_->now();
+                    logger_->warn(kComponent, "Snapshot не содержит opened_at — используется now()",
+                        {{"symbol", sym}});
+                }
                 pos.updated_at = clock_->now();
 
                 portfolio_->open_position(pos);
@@ -704,12 +722,30 @@ bool RecoveryService::replay_journal_after_snapshot(Timestamp snapshot_time) {
                 if (d.contains("strategy_id")) {
                     pos.strategy_id = StrategyId(std::string(d.at("strategy_id").as_string()));
                 }
-                pos.opened_at = clock_->now();
+                // Восстановить реальный opened_at из журнала
+                if (d.contains("opened_at_ns")) {
+                    pos.opened_at = Timestamp(d.at("opened_at_ns").as_int64());
+                } else if (d.contains("timestamp")) {
+                    pos.opened_at = entry.timestamp;
+                } else {
+                    pos.opened_at = clock_->now();
+                }
                 pos.updated_at = clock_->now();
                 portfolio_->open_position(pos);
             } else if (event_type == "PositionClosed" && !sym.empty()) {
                 double pnl = d.contains("pnl") ? d.at("pnl").as_double() : 0.0;
-                portfolio_->close_position(Symbol(sym), Price(price), pnl);
+                // Leg-aware close: используем side из записи, если указан
+                if (d.contains("position_side") || d.contains("side")) {
+                    std::string ps_str = d.contains("position_side")
+                        ? std::string(d.at("position_side").as_string())
+                        : std::string(d.at("side").as_string());
+                    PositionSide ps = (ps_str == "short" || ps_str == "Sell" || ps_str == "Short")
+                        ? PositionSide::Short : PositionSide::Long;
+                    portfolio_->close_position(Symbol(sym), ps, Price(price), pnl);
+                } else {
+                    // Legacy fallback: close by symbol (first found leg)
+                    portfolio_->close_position(Symbol(sym), Price(price), pnl);
+                }
             } else if (event_type == "FeeCharged" && !sym.empty()) {
                 portfolio_->record_fee(Symbol(sym), amount);
             } else if (event_type == "CashReserved") {
@@ -750,6 +786,188 @@ bool RecoveryService::replay_journal_after_snapshot(Timestamp snapshot_time) {
         " skipped, " + std::to_string(replay_errors) + " errors");
 
     return replay_errors == 0;
+}
+
+// ============================================================
+// recover_full_state — deterministic recovery (Phase 6)
+//
+// Выполняет:
+//   1. Базовое восстановление позиций (recover_on_startup)
+//   2. Обнаружение pending (working) ордеров
+//   3. Обнаружение protective TP/SL ордеров
+//   4. Вывод pair-state из обнаруженных позиций
+// ============================================================
+
+ExtendedRecoveryResult RecoveryService::recover_full_state() {
+    // Шаг 1: стандартное восстановление
+    auto base = recover_on_startup();
+
+    ExtendedRecoveryResult ext;
+    ext.base = std::move(base);
+
+    if (ext.base.status == RecoveryStatus::Failed) {
+        std::lock_guard lock(mutex_);
+        last_extended_result_ = ext;
+        return ext;
+    }
+
+    // Шаг 2: обнаружение pending orders через exchange query
+    auto pending_result = exchange_query_->get_open_orders(config_.symbol_filter);
+    if (pending_result.has_value()) {
+        for (const auto& ord : pending_result.value()) {
+            RecoveredPendingOrder rpo;
+            rpo.order_id = ord.order_id;
+            rpo.symbol = ord.symbol;
+            rpo.side = ord.side;
+            rpo.position_side = (ord.trade_side == TradeSide::Open)
+                ? ((ord.side == Side::Buy) ? PositionSide::Long : PositionSide::Short)
+                : ((ord.side == Side::Buy) ? PositionSide::Short : PositionSide::Long);
+            rpo.price = ord.price.get();
+            rpo.remaining_qty = ord.original_quantity.get() - ord.filled_quantity.get();
+            rpo.exchange_order_id = ord.client_order_id.get();
+            rpo.is_reduce_only = (ord.trade_side == TradeSide::Close);
+
+            // Adopt if reduce-only (protective closing), mark for cancel if stale open
+            if (rpo.is_reduce_only) {
+                rpo.resolution = "adopted";
+                ext.pending_orders_adopted++;
+            } else {
+                // Working open orders from previous session — mark as needs_cancel.
+                // Actual cancel_order() must be called by pipeline/execution layer
+                // which has the IOrderSubmitter. Recovery layer is read-only.
+                rpo.resolution = "needs_cancel";
+                ext.pending_orders_cancelled++;
+            }
+
+            logger_->info(kComponent, "Pending order discovered", {
+                {"order_id", rpo.order_id.get()},
+                {"symbol", rpo.symbol.get()},
+                {"remaining", std::to_string(rpo.remaining_qty)},
+                {"resolution", rpo.resolution}
+            });
+
+            ext.pending_orders.push_back(std::move(rpo));
+        }
+    } else {
+        logger_->warn(kComponent, "Failed to query pending orders from exchange");
+        ext.base.warnings++;
+    }
+
+    // Шаг 3: обнаружение protective TP/SL trigger orders
+    auto trigger_result = exchange_query_->get_trigger_orders(config_.symbol_filter);
+    if (trigger_result.has_value()) {
+        for (const auto& trig : trigger_result.value()) {
+            RecoveredProtectiveOrder rpr;
+            rpr.order_id = trig.order_id;
+            rpr.symbol = trig.symbol;
+            rpr.position_side = (trig.side == Side::Sell)
+                ? PositionSide::Long : PositionSide::Short;
+            rpr.trigger_price = trig.price.get();
+            rpr.still_active = true;
+
+            // Determine TP vs SL from trigger direction vs position direction
+            bool is_closing_long = (trig.side == Side::Sell &&
+                                    rpr.position_side == PositionSide::Long);
+            bool is_closing_short = (trig.side == Side::Buy &&
+                                     rpr.position_side == PositionSide::Short);
+
+            if (is_closing_long || is_closing_short) {
+                // Check if trigger is above entry (TP) or below (SL) for long
+                // We can't determine exactly without entry price here,
+                // so mark as protective and adopt
+                rpr.is_tp = false;  // Conservative: treat as SL
+                rpr.resolution = "verified_active";
+                ext.protective_orders_verified++;
+            } else {
+                rpr.resolution = "orphan_trigger";
+                rpr.still_active = true;
+                ext.base.warnings++;
+            }
+
+            logger_->info(kComponent, "Protective trigger order discovered", {
+                {"order_id", rpr.order_id.get()},
+                {"symbol", rpr.symbol.get()},
+                {"trigger_price", std::to_string(rpr.trigger_price)},
+                {"resolution", rpr.resolution}
+            });
+
+            ext.protective_orders.push_back(std::move(rpr));
+        }
+    } else {
+        logger_->warn(kComponent, "Failed to query trigger orders from exchange");
+        ext.base.warnings++;
+    }
+
+    // Шаг 4: выведение pair-state из восстановленных позиций
+    // Группируем позиции по символу — если у символа есть и long, и short → pair
+    std::unordered_map<std::string, std::vector<const RecoveredPosition*>> by_symbol;
+    for (const auto& pos : ext.base.recovered_positions) {
+        by_symbol[pos.symbol.get()].push_back(&pos);
+    }
+
+    for (auto& [sym, positions] : by_symbol) {
+        RecoveredPairState rps;
+        rps.symbol = Symbol(sym);
+
+        for (const auto* p : positions) {
+            if (p->side == Side::Buy) {
+                rps.has_primary = true;
+                rps.primary_side = Side::Buy;
+                rps.primary_size = p->size.get();
+                rps.primary_entry_price = p->avg_entry_price.get();
+            } else {
+                // Second leg: could be hedge or primary short
+                if (rps.has_primary) {
+                    // Already have a long → this is hedge
+                    rps.has_hedge = true;
+                    rps.hedge_size = p->size.get();
+                    rps.hedge_entry_price = p->avg_entry_price.get();
+                } else {
+                    rps.has_primary = true;
+                    rps.primary_side = Side::Sell;
+                    rps.primary_size = p->size.get();
+                    rps.primary_entry_price = p->avg_entry_price.get();
+                }
+            }
+        }
+
+        // Infer state
+        if (rps.has_primary && rps.has_hedge) {
+            rps.inferred_state = "PrimaryPlusHedge";
+        } else if (rps.has_primary) {
+            rps.inferred_state = "PrimaryOnly";
+        } else {
+            rps.inferred_state = "Unknown";
+        }
+
+        rps.resolution = "inferred_from_positions";
+        ext.pair_states.push_back(std::move(rps));
+        ext.pair_states_restored++;
+    }
+
+    logger_->info(kComponent, "Full state recovery completed", {
+        {"positions", std::to_string(ext.base.recovered_positions.size())},
+        {"pending_adopted", std::to_string(ext.pending_orders_adopted)},
+        {"pending_cancelled", std::to_string(ext.pending_orders_cancelled)},
+        {"protective_verified", std::to_string(ext.protective_orders_verified)},
+        {"protective_missing", std::to_string(ext.protective_orders_missing)},
+        {"pair_states", std::to_string(ext.pair_states_restored)}
+    });
+
+    ext.base.status = finalize_status(ext.base.errors, ext.base.warnings);
+
+    std::lock_guard lock(mutex_);
+    last_extended_result_ = ext;
+    return ext;
+}
+
+// ============================================================
+// last_extended_result
+// ============================================================
+
+ExtendedRecoveryResult RecoveryService::last_extended_result() const {
+    std::lock_guard lock(mutex_);
+    return last_extended_result_;
 }
 
 } // namespace tb::recovery

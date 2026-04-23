@@ -447,6 +447,15 @@ std::optional<NormalizedOrderBook> BitgetNormalizer::parse_order_book(
         book.asks.push_back({tb::Price{p}, tb::Quantity{s}});
     }
 
+    // Crossed book validation: best_bid must be < best_ask
+    if (!book.bids.empty() && !book.asks.empty()) {
+        const double best_bid = book.bids.front().price.get();
+        const double best_ask = book.asks.front().price.get();
+        if (best_bid >= best_ask) {
+            return std::nullopt;  // crossed/locked book — discard
+        }
+    }
+
     return book;
 }
 

@@ -72,14 +72,11 @@ public:
                           double realized_pnl);
     void reset_daily();
 
-    [[nodiscard]] double daily_realized_pnl() const { return daily_realized_pnl_; }
+    /// Per-symbol/strategy breakdowns (unique to risk — not duplicated in portfolio)
     [[nodiscard]] double symbol_daily_pnl(const std::string& symbol) const;
     [[nodiscard]] double strategy_daily_pnl(const std::string& strategy_id) const;
-    [[nodiscard]] int trades_today() const { return trades_today_; }
 
 private:
-    double daily_realized_pnl_{0.0};
-    int trades_today_{0};
     std::unordered_map<std::string, double> symbol_pnl_;
     std::unordered_map<std::string, double> strategy_pnl_;
 };

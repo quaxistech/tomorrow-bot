@@ -172,6 +172,42 @@ TEST_CASE("Risk: Правило 3 — Макс просадка → Denied", "[r
     REQUIRE(found);
 }
 
+TEST_CASE("Risk: Intraday drawdown считает текущий equity, а не базовый капитал", "[risk][regression]") {
+    auto cfg = default_risk_config();
+    cfg.max_daily_loss_pct = 20.0;
+    cfg.max_realized_daily_loss_pct = 20.0;
+    cfg.max_drawdown_pct = 100.0;
+    cfg.max_intraday_drawdown_pct = 5.0;
+    cfg.drawdown_hard_stop_pct = 100.0;
+    auto engine = make_risk_engine(cfg);
+
+    auto baseline = make_clean_portfolio();
+    baseline.total_capital = 100000.0;
+    baseline.pnl.total_pnl = 0.0;
+    baseline.pnl.realized_pnl_today = 0.0;
+    baseline.pnl.current_drawdown_pct = 0.0;
+
+    auto first = engine->evaluate(
+        make_intent(), make_sizing(), baseline,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+    REQUIRE(first.verdict == RiskVerdict::Approved);
+
+    auto losing = baseline;
+    losing.pnl.total_pnl = -6000.0; // 6% от equity baseline
+
+    auto second = engine->evaluate(
+        make_intent(), make_sizing(), losing,
+        make_clean_features(), make_clean_exec_alpha(), uncertainty::UncertaintySnapshot{});
+
+    bool found_intraday = false;
+    for (const auto& r : second.reasons) {
+        if (r.code == "INTRADAY_DRAWDOWN") {
+            found_intraday = true;
+        }
+    }
+    REQUIRE(found_intraday);
+}
+
 TEST_CASE("Risk: Правило 4 — Макс позиций → Denied", "[risk]") {
     auto engine = make_risk_engine();
     auto portfolio = make_clean_portfolio();
@@ -593,26 +629,33 @@ TEST_CASE("Risk: Правило 22 — Интервал сделок → Throttl
     REQUIRE(found);
 }
 
-TEST_CASE("Risk: Intra-trade — Макс удержание → should_close", "[risk]") {
+TEST_CASE("Risk: Intra-trade — Deadman watchdog fires on degraded execution", "[risk]") {
     auto cfg = default_risk_config();
-    cfg.max_position_hold_ns = 3'600'000'000'000LL; // 1 час
+    cfg.operational_deadman_ns = 3'600'000'000'000LL; // 1 hour
     auto clock = std::make_shared<TestClock>();
-    clock->current_time = 7'200'000'000'000LL; // 2 часа
+    clock->current_time = 7'200'000'000'000LL; // 2 hours (> max_hold)
     auto engine = make_risk_engine_with_clock(cfg, clock);
 
     portfolio::Position pos;
     pos.symbol = Symbol("BTCUSDT");
     pos.side = Side::Buy;
-    pos.opened_at = Timestamp(0LL); // Открыта в начале — 2 часа назад
-    pos.unrealized_pnl = 100.0;
+    pos.opened_at = Timestamp(0LL); // Opened 2 hours ago
+    pos.unrealized_pnl = -2500.0;   // -2.5% loss (near MAE of 3%)
+
+    // Create features with degradation signals: stale feed + VPIN toxic
+    auto feats = make_clean_features();
+    feats.execution_context.is_feed_fresh = false;            // degradation #1
+    feats.microstructure.vpin_valid = true;
+    feats.microstructure.vpin_toxic = true;                   // degradation #2
 
     auto assessment = engine->evaluate_position(
-        pos, make_clean_portfolio(), make_clean_features());
+        pos, make_clean_portfolio(), feats);
 
     REQUIRE(assessment.should_close);
+    REQUIRE(assessment.is_safety_exit);
     bool found = false;
     for (const auto& r : assessment.reasons) {
-        if (r.code == "MAX_HOLD_TIME") found = true;
+        if (r.code == "DEADMAN_WATCHDOG") found = true;
     }
     REQUIRE(found);
 }

@@ -695,7 +695,8 @@ IndicatorResult IndicatorEngine::z_score(const std::vector<double>& prices, int 
         const double d = prices[i] - mean;
         var += d * d;
     }
-    const double stddev = safe_sqrt(safe_div(var, static_cast<double>(period)));
+    // Bessel correction: sample stddev uses N-1 (consistent with volatility())
+    const double stddev = safe_sqrt(safe_div(var, static_cast<double>(period - 1)));
 
     result.valid = true;
     result.value = safe_div(prices.back() - mean, stddev);

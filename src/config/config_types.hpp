@@ -24,12 +24,14 @@ using uncertainty::UncertaintyConfig;
 
 /// Настройки подключения к бирже
 struct ExchangeConfig {
-    std::string endpoint_rest;      ///< URL REST API биржи
-    std::string endpoint_ws;        ///< URL WebSocket API биржи
-    std::string api_key_ref;        ///< Имя переменной окружения с API ключом (НЕ сам ключ!)
-    std::string api_secret_ref;     ///< Имя переменной окружения с API секретом
-    std::string passphrase_ref;     ///< Имя переменной окружения с пассфразой
-    int         timeout_ms{5000};   ///< Таймаут HTTP запросов в миллисекундах
+    std::string endpoint_rest;          ///< URL REST API биржи
+    std::string endpoint_ws;            ///< URL WebSocket API биржи (public)
+    std::string endpoint_ws_private;    ///< URL WebSocket API биржи (private, authenticated)
+    std::string api_key_ref;            ///< Имя переменной окружения с API ключом (НЕ сам ключ!)
+    std::string api_secret_ref;         ///< Имя переменной окружения с API секретом
+    std::string passphrase_ref;         ///< Имя переменной окружения с пассфразой
+    int         timeout_ms{5000};       ///< Таймаут HTTP запросов в миллисекундах
+    bool        use_private_ws{true};   ///< Использовать private WS для заказов/fills
 };
 
 /// Настройки логирования
@@ -84,50 +86,12 @@ enum class PairSelectionMode {
 
 /// Параметризованные веса скоринга (замена magic numbers)
 struct ScorerConfig {
-    /// Версия алгоритма скоринга
-    std::string version{"v4"};
-
-    // --- Веса компонентов (сумма = 100) ---
-    double momentum_max{40.0};
-    double trend_max{25.0};
-    double tradability_max{25.0};
-    double quality_max{10.0};
-
-    // --- Momentum параметры ---
-    double momentum_log_multiplier{14.5};
-    double acceleration_log_multiplier{14.0};
-    double fresh_start_multiplier{2.5};
-    double fresh_start_roc_24h_cap{10.0};
-    double fresh_start_roc_4h_min{0.5};
-
-    // --- Trend параметры ---
-    double adx_weak_threshold{15.0};
-    double adx_moderate_threshold{25.0};
-    double adx_strong_threshold{50.0};
-    double bullish_ratio_min{0.50};
-    double roc_normalization_factor{5.0};
-
-    // --- Tradability параметры ---
-    double volume_tier_excellent{5'000'000.0};
-    double volume_tier_good{1'000'000.0};
-    double volume_tier_acceptable{500'000.0};
-    double volume_tier_minimal{100'000.0};
-    double spread_decay_constant{15.0};
-    double volatility_low_threshold{0.5};
-    double volatility_high_threshold{20.0};
-
-    // --- Hard filters ---
-    double filter_min_change_24h{-1.0};
-    double filter_max_change_24h{20.0};
-    double filter_exhausted_pump_24h{10.0};
-    double filter_exhausted_pump_ratio{0.25};
-    double stagnation_threshold{1.0};
-    double stagnation_penalty{0.3};
-    double steady_gainer_min{2.0};
-    double steady_gainer_max{10.0};
-    double steady_gainer_bonus{8.0};
-    double negative_change_penalty{0.5};
-
+    // --- Пороги фильтрации, реально используемые в runtime (ScannerConfig) ---
+    double volume_tier_minimal{100'000.0};      ///< Мин. объём для допуска (перезаписывает min_volume_usdt)
+    double volatility_low_threshold{0.5};       ///< Мин. реализованная vol % на 5m (мёртвый инструмент)
+    double volatility_high_threshold{20.0};     ///< Макс. реализованная vol % на 5m (опасный шум)
+    double filter_min_change_24h{-1.0};         ///< Мин. 24ч изменение % для прохождения фильтра
+    double filter_max_change_24h{20.0};         ///< Макс. 24ч изменение % (фильтр экстремальных pump)
 };
 
 /// Настройки системы выбора торговых пар
@@ -142,8 +106,6 @@ struct PairSelectionConfig {
 
     // --- Расширенные настройки сканера (professional-grade) ---
     int max_candidates_for_candles{30};          ///< Макс. кандидатов для загрузки свечей
-    int candle_fetch_concurrency{5};             ///< Параллельных загрузок свечей
-    int candle_history_hours{48};                ///< Глубина истории свечей
     int scan_timeout_ms{60'000};                 ///< Таймаут всего сканирования (мс)
     int api_retry_max{3};                        ///< Макс. повторных попыток API
     int api_retry_base_delay_ms{200};            ///< Базовая задержка retry (мс)
@@ -153,7 +115,6 @@ struct PairSelectionConfig {
     int max_pairs_per_sector{2};                 ///< Макс. пар из одного сектора
     double min_liquidity_depth_usdt{50'000.0};   ///< Мин. глубина ликвидности
     bool enable_diversification{true};           ///< Включить диверсификацию корзины
-    bool persist_scan_results{true};             ///< Сохранять результаты в persistence
     ScorerConfig scorer;                         ///< Конфигурация scorer-а (вложенный)
 };
 
@@ -210,21 +171,16 @@ struct TradingParamsConfig {
     double partial_tp_atr_threshold{2.0};
     /// Доля позиции для TP (0.5 = 50%). При 1.0 = полное закрытие.
     double partial_tp_fraction{0.5};
-    /// Макс. удержание убыточной позиции (минуты). 15 мин — стандарт для HFT/скальпинга.
-    int max_hold_loss_minutes{15};
-    /// Макс. удержание любой позиции (минуты). 60 мин = верхний предел для скальпинга.
-    int max_hold_absolute_minutes{60};
     /// Мин. удержание позиции до стратегического закрытия (минуты).
-    /// Для скальпинга: 1 мин позволяет быстрый выход при смене условий.
-    int min_hold_minutes{1};
+    /// Operational guard: не закрывать только что открытую позицию на слабый сигнал (anti-whipsaw).
+    /// NOTE: Removed from alpha-path. Only infra watchdog remains.
+    /// int min_hold_minutes — REMOVED (time-based exits prohibited)
     /// Кулдаун между ордерами (секунды). 10–15 с предотвращает спам API.
     int order_cooldown_seconds{10};
     /// Кулдаун после стоп-лосса (секунды). 3 мин — не входить в тот же чопающий рынок.
     int stop_loss_cooldown_seconds{180};
     /// Минимальный нотионал для определения пылевой позиции (USDT).
     double dust_threshold_usdt{0.50};
-    /// Минимальное время удержания для quick profit (секунды). 60 с = 1 мин.
-    int quick_profit_min_hold_seconds{60};
     /// Мин. профит в round-trip fees для quick profit (множитель). 5× = значимая прибыль.
     double quick_profit_fee_multiplier{5.0};
     /// Порог убытка для PnL gate (% от капитала). Ниже — не закрываем по сигналу.
@@ -235,12 +191,20 @@ struct TradingParamsConfig {
     bool hedge_recovery_enabled{false};
     /// Порог убытка для активации хеджа (% от капитала). При 20x leverage 1.5% = серьёзный drawdown.
     double hedge_trigger_loss_pct{1.5};
-    /// Мин. удержание позиции до активации хеджа (секунды). Не хеджировать раннюю волатильность.
-    int hedge_min_hold_seconds{30};
-    /// Макс. удержание хеджа (минуты). Если за это время не удалось выйти — закрыть обе ноги.
-    int hedge_max_hold_minutes{5};
     /// Мин. чистая прибыль (множитель от round-trip fees) для закрытия обеих ног.
     double hedge_profit_close_fee_mult{2.0};
+};
+
+/// Operational safety parameters — NOT alpha/trading logic.
+/// These control system health gates, deadman watchdogs, and recovery behavior.
+struct OperationalSafetyConfig {
+    int feed_stale_ms{1200};                    ///< Market data считается stale после N мс
+    int private_ws_gap_ms{2500};                ///< Private WS heartbeat gap threshold (мс)
+    int order_state_desync_ms{5000};            ///< Порог рассинхронизации ордеров (мс)
+    int orphan_leg_grace_ms{250};               ///< Grace window для unhedged leg (мс)
+    bool block_trade_until_full_sync{true};     ///< Блокировать торговлю до полной синхронизации
+    int venue_degraded_flatten_ms{8000};        ///< Flatten при деградации биржи (мс)
+    int operational_deadman_minutes{45};         ///< Operational deadman: порог для проверки деградации (минуты)
 };
 
 /// Настройки модуля исполнительной альфы
@@ -280,6 +244,12 @@ struct ExecutionAlphaConfig {
     // ── Комиссии биржи (USDT-M futures) ──
     double taker_fee_bps{6.0};   ///< Taker комиссия [bps] (Bitget standard: 0.06%)
     double maker_fee_bps{2.0};   ///< Maker комиссия [bps] (Bitget standard: 0.02%)
+
+    // ── EV-based style selection ──
+    double opportunity_cost_bps{30.0};     ///< Edge lost (bps) when limit order doesn't fill
+    double queue_depletion_penalty{0.08};  ///< Fill prob reduction when our-side queue depleting fast
+    double churn_penalty{0.06};            ///< Fill prob reduction when top-of-book is unstable
+    double feedback_weight{0.30};          ///< Weight for historical passive_fill_rate feedback
 };
 
 /// Настройки модуля opportunity cost
@@ -403,6 +373,7 @@ struct AppConfig {
     WorldModelConfig     world_model;      ///< Настройки мировой модели
     FuturesConfig        futures;          ///< Настройки фьючерсной торговли
     UncertaintyConfig    uncertainty;      ///< Настройки модуля неопределённости
+    OperationalSafetyConfig operational_safety; ///< Operational safety (deadman, sync gates)
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

@@ -236,9 +236,9 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                               tech.rsi_14 > config_.stress.rsi_extreme_high);
         bool rsi_low  = check("RSI", tech.rsi_14, config_.stress.rsi_extreme_low, "<",
                               tech.rsi_14 < config_.stress.rsi_extreme_low);
-        bool obv_ext  = check("OBV_norm", std::abs(tech.obv_normalized),
+        bool obv_ext  = check("OBV_norm", std::abs(tech.directional_volume_proxy),
                               config_.stress.obv_norm_extreme, ">",
-                              std::abs(tech.obv_normalized) > config_.stress.obv_norm_extreme);
+                              std::abs(tech.directional_volume_proxy) > config_.stress.obv_norm_extreme);
 
         if ((rsi_high || rsi_low) && obv_ext) {
             return DetailedRegime::AnomalyEvent;
@@ -355,11 +355,13 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                 }
             }
 
-            // WeakUptrend: EMA20 > EMA50, ADX >= adx_weak_min (covers both weak and strong ADX
-            // when RSI doesn't confirm strong directional bias)
+            // WeakUptrend: EMA20 > EMA50, ADX >= adx_weak_min, RSI >= 45
+            // RSI filter prevents classifying bearish-momentum as uptrend
             if (check("ADX", tech.adx, config_.trend.adx_weak_min, ">=",
                       tech.adx >= config_.trend.adx_weak_min)) {
-                return DetailedRegime::WeakUptrend;
+                if (!tech.rsi_valid || tech.rsi_14 >= 45.0) {
+                    return DetailedRegime::WeakUptrend;
+                }
             }
         }
 
@@ -379,11 +381,13 @@ DetailedRegime RuleBasedRegimeEngine::classify_immediate(
                 }
             }
 
-            // WeakDowntrend: EMA20 < EMA50, ADX >= adx_weak_min (covers both weak and strong ADX
-            // when RSI doesn't confirm strong directional bias)
+            // WeakDowntrend: EMA20 < EMA50, ADX >= adx_weak_min, RSI <= 55
+            // RSI filter prevents classifying bullish-momentum as downtrend
             if (check("ADX", tech.adx, config_.trend.adx_weak_min, ">=",
                       tech.adx >= config_.trend.adx_weak_min)) {
-                return DetailedRegime::WeakDowntrend;
+                if (!tech.rsi_valid || tech.rsi_14 <= 55.0) {
+                    return DetailedRegime::WeakDowntrend;
+                }
             }
         }
     }

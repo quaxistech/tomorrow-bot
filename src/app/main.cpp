@@ -15,16 +15,19 @@
  */
 #include "app_bootstrap.hpp"
 #include "http_server.hpp"
+#include "runtime_manifest.hpp"
 #include "supervisor/supervisor.hpp"
 #include "pipeline/trading_pipeline.hpp"
 #include "portfolio/portfolio_engine.hpp"
 #include "scanner/scanner_engine.hpp"
+#include "common/constants.hpp"
 #include "common/exchange_rules.hpp"
 #include "exchange/bitget/bitget_futures_query_adapter.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "security/secret_provider.hpp"
 #include "common/enums.hpp"
 #include <boost/json.hpp>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -116,6 +119,18 @@ int main(int argc, const char* argv[]) {
          {"mode",   std::string(tb::to_string(config.trading.mode))},
          {"config_hash", config.config_hash}});
 
+    // ---- 3b. Immutable runtime manifest ----
+    auto manifest = tb::app::RuntimeManifest::build(
+        config.config_hash,
+        config.exchange.endpoint_rest,
+        comp.clock->now().get());
+    logger->info("main", "Runtime manifest",
+        {{"git_sha", manifest.git_sha},
+         {"version", manifest.version},
+         {"build_type", manifest.build_type},
+         {"config_hash", manifest.config_hash},
+         {"exchange", manifest.exchange_endpoint}});
+
     std::unique_ptr<tb::app::HttpEndpointServer> metrics_server;
     if (config.metrics.enabled) {
         metrics_server = std::make_unique<tb::app::HttpEndpointServer>(
@@ -182,6 +197,18 @@ int main(int argc, const char* argv[]) {
     scanner_cfg.max_spread_bps = config.pair_selection.max_spread_bps;
     scanner_cfg.max_candidates_detailed = config.pair_selection.max_candidates_for_candles;
     scanner_cfg.api_retry_max = config.pair_selection.api_retry_max;
+    scanner_cfg.api_retry_base_delay_ms = config.pair_selection.api_retry_base_delay_ms;
+    scanner_cfg.min_orderbook_depth_usdt = config.pair_selection.min_liquidity_depth_usdt;
+
+    // ── Scan timeout & circuit breaker ──
+    scanner_cfg.scan_timeout_ms = config.pair_selection.scan_timeout_ms;
+    scanner_cfg.circuit_breaker_threshold = config.pair_selection.circuit_breaker_threshold;
+    scanner_cfg.circuit_breaker_reset_ms = config.pair_selection.circuit_breaker_reset_ms;
+
+    // ── Basket diversification ──
+    scanner_cfg.enable_diversification = config.pair_selection.enable_diversification;
+    scanner_cfg.max_correlation_in_basket = config.pair_selection.max_correlation_in_basket;
+    scanner_cfg.max_pairs_per_sector = config.pair_selection.max_pairs_per_sector;
 
     // ИСПРАВЛЕНИЕ H10: пробросить scorer-настройки из YAML в ScannerConfig
     scanner_cfg.filter_min_change_24h = config.pair_selection.scorer.filter_min_change_24h;
@@ -191,7 +218,9 @@ int main(int argc, const char* argv[]) {
     // чтобы YAML-параметры реально влияли на runtime фильтрацию и ранжирование.
     const auto& sc = config.pair_selection.scorer;
     scanner_cfg.min_volume_usdt = std::max(scanner_cfg.min_volume_usdt, sc.volume_tier_minimal);
-    scanner_cfg.min_volatility_pct = sc.volatility_low_threshold;
+    constexpr double kScannerRoundTripFeePct = tb::common::fees::kDefaultTakerFeePct * 2.0 * 100.0;
+    constexpr double kScannerEconomicMinVolPct = kScannerRoundTripFeePct * 1.25;
+    scanner_cfg.min_volatility_pct = std::max(sc.volatility_low_threshold, kScannerEconomicMinVolPct);
     scanner_cfg.max_volatility_pct = sc.volatility_high_threshold;
 
     // Микро-аккаунт: ослабляем фильтры сканера (нам не нужна глубина $50K для $5 ордеров)
@@ -357,6 +386,53 @@ int main(int argc, const char* argv[]) {
         symbol_rules[sa.symbol] = rules;
     }
 
+    // ---- 4.5. Проверка доступности пар по капиталу ----
+    // Используем per-pipeline бюджет (капитал / N_пар * плечо * 0.8),
+    // отфильтровываем пары, для которых минимальный ордер превышает бюджет.
+    // Итеративно пересчитываем, т.к. удаление пары увеличивает бюджет остальных.
+    {
+        const double total_capital = config.trading.initial_capital;
+        const int max_leverage = config.futures.max_leverage;
+
+        bool changed = true;
+        while (changed && !active_symbols.empty()) {
+            changed = false;
+            int n = static_cast<int>(active_symbols.size());
+            double per_pipeline_budget = (total_capital / n) * max_leverage * 0.8;
+
+            for (auto it = active_symbols.begin(); it != active_symbols.end(); ) {
+                const auto& sym = *it;
+                auto rules_it = symbol_rules.find(sym);
+                if (rules_it == symbol_rules.end()) { ++it; continue; }
+                const auto& rules = rules_it->second;
+                double step = std::pow(10.0, -rules.quantity_precision);
+                double min_qty = std::max(rules.min_quantity, step);
+                double price = 0.0;
+                for (const auto& sa : scanner_result.top_pairs) {
+                    if (sa.symbol == sym) { price = sa.last_price; break; }
+                }
+                if (price <= 0.0) { ++it; continue; }
+                double min_notional = min_qty * price;
+                if (min_notional > per_pipeline_budget) {
+                    logger->warn("main", "Пара отфильтрована: минимальный ордер превышает бюджет",
+                        {{"symbol", sym},
+                         {"min_qty", std::to_string(min_qty)},
+                         {"price", std::to_string(price)},
+                         {"min_notional", std::to_string(min_notional)},
+                         {"per_pipeline_budget", std::to_string(per_pipeline_budget)}});
+                    it = active_symbols.erase(it);
+                    changed = true;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (active_symbols.empty()) {
+            logger->error("main", "Нет доступных по капиталу пар! Завершение.");
+            return 1;
+        }
+    }
+
     // ---- 5. Создание и запуск супервизора ----
     tb::supervisor::Supervisor supervisor{
         comp.logger,
@@ -433,9 +509,9 @@ int main(int argc, const char* argv[]) {
     // (нет торговли > 30 мин) и нет открытых позиций — пересканировать рынок
     // и заменить pipeline на новые символы.
     const bool rotation_enabled = (config.pair_selection.mode != tb::config::PairSelectionMode::Manual);
-    constexpr int64_t kIdleThresholdNs = 30LL * 60 * 1'000'000'000LL;  // 30 мин простоя перед ротацией
-    constexpr int kIdleCheckIntervalSec = 300;                          // 5 мин между проверками
-    constexpr int64_t kMinRescanIntervalNs = 30LL * 60 * 1'000'000'000LL; // 30 мин между ресканами
+    constexpr int64_t kIdleThresholdNs = 10LL * 60 * 1'000'000'000LL;  // 10 мин простоя перед ротацией
+    constexpr int kIdleCheckIntervalSec = 120;                          // 2 мин между проверками
+    constexpr int64_t kMinRescanIntervalNs = 10LL * 60 * 1'000'000'000LL; // 10 мин между ресканами
 
     std::atomic<bool> idle_monitor_running{true};
     int64_t last_rescan_ns = comp.clock->now().get();
@@ -550,15 +626,7 @@ int main(int argc, const char* argv[]) {
                     const auto& old_sym = active_symbols[pi];
                     const auto& new_sym = new_candidates[replaced];
 
-                    // Если idle pipeline и так на хорошем символе из нового скана — пропускаем
-                    bool still_good = false;
-                    for (const auto& s : rescan_syms) {
-                        if (s == old_sym) { still_good = true; break; }
-                    }
-                    if (still_good) {
-                        kept_symbols.insert(old_sym);
-                        continue;
-                    }
+                    // Idle pipeline \u0437\u0430\u043c\u0435\u043d\u044f\u0435\u0442\u0441\u044f \u0432\u0441\u0435\u0433\u0434\u0430 \u2014 \u0434\u0430\u0436\u0435 \u0435\u0441\u043b\u0438 \u0441\u0438\u043c\u0432\u043e\u043b \u0432 \u0442\u043e\u043f\u0435 \u0441\u043a\u0430\u043d\u0430.\n                    // \u0415\u0441\u043b\u0438 pipeline \u043f\u0440\u043e\u0441\u0442\u0430\u0438\u0432\u0430\u0435\u0442, \u0437\u043d\u0430\u0447\u0438\u0442 \u0441\u0438\u043c\u0432\u043e\u043b \u043d\u0435 \u0434\u0430\u0451\u0442 \u0441\u0435\u0442\u0430\u043f\u043e\u0432 \u2014 \u043f\u0435\u0440\u0435\u0445\u043e\u0434\u0438\u043c \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439.
 
                     // Двойная проверка: new_sym не должен совпадать с другим активным pipeline
                     if (all_active_symbols.count(new_sym)) {

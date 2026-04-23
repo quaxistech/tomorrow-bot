@@ -352,7 +352,7 @@ TEST_CASE("Regime: AnomalyEvent — extreme RSI + volume anomaly", "[regime][str
     auto snap = make_snapshot();
     snap.technical.rsi_14 = 90.0;  // > 85 threshold
     snap.technical.rsi_valid = true;
-    snap.technical.obv_normalized = 3.0;  // > 2.0 threshold
+    snap.technical.directional_volume_proxy = 3.0;  // > 2.0 threshold
     snap.technical.obv_valid = true;
     snap.technical.adx_valid = true;
     snap.technical.adx = 10.0;

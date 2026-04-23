@@ -38,6 +38,9 @@ public:
     /// Получить ордер по ID (thread-safe copy)
     std::optional<OrderRecord> get_order(const OrderId& order_id) const;
 
+    /// Получить ордер по exchange order ID (reverse lookup, thread-safe)
+    std::optional<OrderRecord> get_order_by_exchange_id(const OrderId& exchange_id) const;
+
     /// Обновить запись ордера (заменяет полностью)
     void update_order(const OrderRecord& order);
 
@@ -75,6 +78,14 @@ public:
     /// Пометить fill как применённый
     void mark_fill_applied(const OrderId& order_id);
 
+    // ─── TradeId dedup (Fill Channel) ───────────────────────────────────
+
+    /// Проверить, был ли tradeId уже обработан (для Fill Channel dedup)
+    [[nodiscard]] bool is_trade_id_seen(const std::string& trade_id) const;
+
+    /// Зарегистрировать tradeId как обработанный
+    void mark_trade_id_seen(const std::string& trade_id);
+
     // ─── Intent dedup (§22) ─────────────────────────────────────────────
 
     /// Проверить, является ли intent дубликатом
@@ -109,6 +120,7 @@ private:
     std::unordered_map<std::string, OrderRecord> orders_;
     std::unordered_map<std::string, OrderFSM> fsms_;
     std::unordered_set<std::string> fill_applied_;
+    std::unordered_set<std::string> seen_trade_ids_;           ///< Fill dedup by tradeId
     std::unordered_map<std::string, int64_t> recent_intents_;  // key → timestamp_ns
 };
 

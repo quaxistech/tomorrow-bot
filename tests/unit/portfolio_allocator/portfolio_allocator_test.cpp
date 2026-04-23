@@ -263,6 +263,64 @@ TEST_CASE("Allocator v2: fee_adjusted_notional включает комиссию
     REQUIRE(result.expected_fee > 0.0);
 }
 
+TEST_CASE("Allocator v2: risk budget уменьшает размер до защитного стопа", "[allocator][v2][risk]") {
+    HierarchicalAllocator::Config cfg;
+    cfg.max_concentration_pct = 1.0;
+    cfg.max_strategy_allocation_pct = 1.0;
+    cfg.budget.symbol_budget_pct = 1.0;
+    cfg.max_leverage = 1.0;
+    auto allocator = HierarchicalAllocator(cfg, std::make_shared<TestLogger>());
+
+    auto intent = make_intent("BTCUSDT", 100.0, 10.0);  // $1000 notional
+    auto snap = make_snapshot(1000.0, 1000.0);
+    auto ctx = make_context(0.01);
+    ctx.win_rate = 0.80;
+    ctx.avg_win_loss_ratio = 2.0;
+    ctx.max_loss_per_trade_pct = 1.0;
+    ctx.estimated_stop_distance_pct = 5.0;
+    ctx.exchange_filters->min_quantity = 0.1;
+    ctx.exchange_filters->quantity_step = 0.1;
+    ctx.exchange_filters->min_notional = 1.0;
+
+    auto result = allocator.compute_size_v2(intent, snap, ctx, 1.0);
+
+    REQUIRE(result.approved);
+    REQUIRE(result.was_reduced);
+    REQUIRE(result.approved_notional.get() < 196.0);
+
+    bool has_risk_cap = false;
+    for (const auto& cd : result.constraint_audit) {
+        if (cd.constraint_name == "capital_risk_cap") {
+            has_risk_cap = true;
+            REQUIRE(cd.was_binding);
+        }
+    }
+    REQUIRE(has_risk_cap);
+}
+
+TEST_CASE("Allocator v2: risk budget отклоняет min-notional который не помещается в риск", "[allocator][v2][risk]") {
+    HierarchicalAllocator::Config cfg;
+    cfg.max_concentration_pct = 1.0;
+    cfg.max_strategy_allocation_pct = 1.0;
+    cfg.budget.symbol_budget_pct = 1.0;
+    cfg.max_leverage = 1.0;
+    auto allocator = HierarchicalAllocator(cfg, std::make_shared<TestLogger>());
+
+    auto intent = make_intent("BTCUSDT", 1.0, 10.0);  // $10 notional
+    auto snap = make_snapshot(100.0, 100.0);
+    auto ctx = make_context();
+    ctx.max_loss_per_trade_pct = 1.0;
+    ctx.estimated_stop_distance_pct = 25.0;
+    ctx.exchange_filters->min_quantity = 0.5;
+    ctx.exchange_filters->quantity_step = 0.1;
+    ctx.exchange_filters->min_notional = 5.0;
+
+    auto result = allocator.compute_size_v2(intent, snap, ctx, 1.0);
+
+    REQUIRE_FALSE(result.approved);
+    REQUIRE(result.reduction_reason.find("риск") != std::string::npos);
+}
+
 // ==================== Utility functions ====================
 
 TEST_CASE("round_quantity_down округляет корректно", "[allocator][utils]") {
@@ -308,8 +366,8 @@ TEST_CASE("Allocator: set_market_context влияет на compute_size", "[allo
     allocator.set_market_context(0.05, regime::DetailedRegime::StrongUptrend, 0.6, 2.0);
     auto result_low_vol = allocator.compute_size(intent, snap, 1.0);
 
-    // High vol → should decrease size
-    allocator.set_market_context(0.80, regime::DetailedRegime::VolatilityExpansion, 0.45, 1.0);
+    // High vol → should decrease size (win_rate=0.55 ensures positive Kelly edge)
+    allocator.set_market_context(0.80, regime::DetailedRegime::VolatilityExpansion, 0.55, 1.2);
     auto result_high_vol = allocator.compute_size(intent, snap, 1.0);
 
     REQUIRE(result_low_vol.approved);

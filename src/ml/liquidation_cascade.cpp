@@ -162,14 +162,14 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     // 4. Adaptive velocity threshold based on rolling volatility
     double adapted_velocity_threshold = config_.velocity_threshold;
     if (rolling_volatility_ > numeric::kEpsilon && config_.velocity_adaptation_factor > 0.0) {
-        // Scale threshold: higher current vol → higher threshold (more tolerant).
-        // Clamp [0.5, 3.0] prevents threshold from expanding beyond 3× base,
-        // which would disable cascade detection entirely.
+        // Scale threshold: higher current vol → LOWER threshold (more sensitive).
+        // During cascades, volatility spikes → we need earlier detection.
+        // Clamp [0.5, 3.0] prevents runaway scaling.
         const double vol_scale = std::clamp(
             rolling_volatility_ / std::max(config_.velocity_threshold, numeric::kEpsilon)
             * config_.velocity_adaptation_factor,
             0.5, 3.0);
-        adapted_velocity_threshold = config_.velocity_threshold * vol_scale;
+        adapted_velocity_threshold = config_.velocity_threshold / vol_scale;
     }
 
     // 5. Нормализованные скоры [0..1]

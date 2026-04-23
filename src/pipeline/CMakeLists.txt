@@ -3,6 +3,13 @@
 add_library(tb_pipeline STATIC
     trading_pipeline.cpp
     order_watchdog.cpp
+    exit_orchestrator.cpp
+    hedge_pair_manager.cpp
+    market_reaction_engine.cpp
+    pair_economics.cpp
+    dual_leg_manager.cpp
+    pair_lifecycle_engine.cpp
+    pair_execution_coordinator.cpp
 )
 
 target_include_directories(tb_pipeline PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -36,4 +43,5 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_recovery
     tb_ml
     tb_reconciliation
+    tb_telemetry
 )

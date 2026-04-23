@@ -5,14 +5,16 @@
 
 trading:
   mode: production
-  initial_capital: 9.80             # Фактический капитал ($9.80 USDT)
+  initial_capital: 0.662947         # Фактический капитал, синхронизировано с биржей 2026-04-21
 
 exchange:
   endpoint_rest: "https://api.bitget.com"
   endpoint_ws: "wss://ws.bitget.com/v2/ws/public"
+  endpoint_ws_private: "wss://ws.bitget.com/v2/ws/private"
   api_key_ref: "BITGET_API_KEY"
   api_secret_ref: "BITGET_API_SECRET"
   passphrase_ref: "BITGET_PASSPHRASE"
+  use_private_ws: true
   timeout_ms: 3000
 
 logging:
@@ -26,12 +28,12 @@ metrics:
   path: "/metrics"
 
 risk:
-  max_position_notional: 196.0     # $9.80 × 20x = $196 max leveraged capital
-  max_daily_loss_pct: 5.0          # 5% daily loss — conservative production limit
-  max_drawdown_pct: 8.0            # Max drawdown 8%
-  max_intraday_drawdown_pct: 5.0   # Intraday drawdown 5%
+  max_position_notional: 10.0      # Консервативный потолок нотионала для sub-$1 micro-account
+  max_daily_loss_pct: 15.0         # Один минимальный стоп теперь должен помещаться в дневной бюджет с запасом
+  max_drawdown_pct: 25.0           # Drawdown 25% — микросчёт: $0.33 max loss
+  max_intraday_drawdown_pct: 15.0  # Не блокировать торговлю после одного минимального стопа
   kill_switch_enabled: true        # Safety net
-  max_strategy_daily_loss_pct: 4.0        # Each strategy can lose up to 4%
+  max_strategy_daily_loss_pct: 12.0       # Один минимальный стоп должен помещаться в strategy budget
   max_strategy_exposure_pct: 80.0         # 80% max exposure per strategy
   max_symbol_concentration_pct: 50.0      # Max 50% per symbol with 3 pairs
   max_same_direction_positions: 3         # One position per pair (3 pairs)
@@ -42,55 +44,61 @@ risk:
   max_trades_per_hour: 12                # Max 12 trades/hour — quality > quantity
   min_trade_interval_sec: 10.0           # 10 sec between trades — меньше fee drain
   max_adverse_excursion_pct: 5.0         # 5% adverse excursion w/ leverage
-  max_realized_daily_loss_pct: 10.0      # Match daily loss limit
+  max_realized_daily_loss_pct: 15.0      # Match daily loss limit
   utc_cutoff_hour: -1                    # Trade 24/7
 
-# === Decision engine: HIGH thresholds = QUALITY trades only ===
+# === Decision engine: BALANCED — входить при хорошей уверенности ===
+# Было 0.68 — effective threshold после uncertainty×regime×dd доходил до 0.997 (невозможно!)
+# Формула: 0.50 × uncertainty_mult(≤1.3) × regime(≤1.1) + dd(≤0.03) ≈ 0.745 — реалистично
 decision:
-  min_conviction_threshold: 0.68    # Строже: effective ~0.78-0.83 — только высококачественные входы
-  conflict_dominance_threshold: 0.60 # Higher dominance needed
+  min_conviction_threshold: 0.50    # Сбалансированный: 0.50 → effective ~0.65-0.75 после множителей
+  conflict_dominance_threshold: 0.55 # Разумный (было 0.60)
   max_acceptable_cost_bps: 300       # Allow higher cost for speed
-  drawdown_boost_scale: 0.01         # Minimal drawdown penalty
-  drawdown_max_boost: 0.05           # Cap drawdown boost low
-  consecutive_loss_boost: 0.005      # Tiny loss-series penalty
+  drawdown_boost_scale: 0.005        # Мизерный: при 5% DD → +0.005 (было 0.01 → +0.01)
+  drawdown_max_boost: 0.03           # Потолок 3% (было 5%)
+  consecutive_loss_boost: 0.003      # 0.3% на серию (было 0.5%)
 
-# === Position management: HIGH WIN RATE scalping (90%+ target) ===
+# === Position management: ПРОФИТНАЯ торговля — R:R ≥ 1.0 ===
+# ПРОБЛЕМА: R:R был 1.5/2.0=0.75 → losses были в 3-5x больше profits
+# РЕШЕНИЕ: TP=2.0×ATR, Stop=1.5×ATR → R:R = 2.0/1.5 = 1.33 → при WR 50% уже прибыль
 trading_params:
-  atr_stop_multiplier: 2.0          # 2.0×ATR stop: R:R = 1.5/2.0 = 0.75 (tighter for micro)
-  max_loss_per_trade_pct: 2.5       # 2.5% max loss per trade — tighter для micro-счёта
+  atr_stop_multiplier: 1.5          # 1.5×ATR stop (было 2.0) — теснее, меньше убыток
+  max_loss_per_trade_pct: 10.0      # На текущем балансе нужен двузначный риск-бюджет, чтобы честно пройти min_notional=5 USDT
   breakeven_atr_threshold: 0.5      # Breakeven at 0.5×ATR — не слишком рано
-  partial_tp_atr_threshold: 1.5     # Take profit at 1.5×ATR — фиксируем прибыль быстрее
-  partial_tp_fraction: 0.70          # Close 70% at TP — keep runner for trend
-  min_risk_reward_ratio: 0.50       # Minimum R:R 0.5 — reject bad setups
-  max_hold_loss_minutes: 15         # 15 min emergency exit (дать больше времени)
-  max_hold_absolute_minutes: 60     # 60 min max (для больших движений)
-  order_cooldown_seconds: 30        # 30 sec between trades — меньше churning
-  stop_loss_cooldown_seconds: 300   # 300 sec (5 мин) after stop loss — без revenge trading
-  min_hold_minutes: 1               # 1 min min hold
-  price_stop_loss_pct: 2.0          # Safety net: 2.0% price move = emergency exit (было 1.5%)
-  quick_profit_min_hold_seconds: 30  # 30 сек — фиксируем быструю прибыль (default 60)
-  quick_profit_fee_multiplier: 3.0   # 3× fees = порог quick exit (default 5.0)
+  partial_tp_atr_threshold: 2.0     # Take profit at 2.0×ATR (было 1.5) — даём прибыли расти
+  partial_tp_fraction: 0.50          # Close 50% at TP (было 70%) — оставляем runner
+  min_risk_reward_ratio: 1.00       # Minimum R:R 1.0 (было 0.5) — не входим в плохие R:R
+  price_stop_loss_pct: 1.0          # 1.0% price move = emergency exit — нужен tighter stop для текущего micro-account
+  quick_profit_fee_multiplier: 2.5   # 2.5× fees = порог quick exit (было 3.0) — быстрее фиксация
   # Hedge Recovery: открыть встречную позицию при глубоком убытке
   hedge_recovery_enabled: true       # Включить хеджирование
-  hedge_trigger_loss_pct: 1.5        # Активировать при убытке > 1.5% капитала
-  hedge_min_hold_seconds: 30         # Не хеджировать первые 30 сек
-  hedge_max_hold_minutes: 5          # Максимум 5 мин на хедж
+  hedge_trigger_loss_pct: 4.0        # На micro-account 1.5% срабатывает почти на любом шуме min-notional позиции
   hedge_profit_close_fee_mult: 2.0   # Закрыть обе когда net PnL > 2× комиссий
+
+# === Operational Safety: infrastructure guards (not alpha!) ===
+operational_safety:
+  feed_stale_ms: 1200                # Market data stale threshold
+  private_ws_gap_ms: 2500            # Private WS heartbeat gap limit
+  order_state_desync_ms: 5000        # Order state sync timeout
+  orphan_leg_grace_ms: 250           # Grace period for hedge leg matching
+  block_trade_until_full_sync: true  # Block new trades until state synced
+  venue_degraded_flatten_ms: 8000    # Flatten on venue degradation
+  operational_deadman_minutes: 45    # Deadman watchdog (45 min, only with degradation)
+
+
 
 pair_selection:
   mode: auto                       # Auto: сканер выбирает лучшие пары и ротирует
   symbols: ""                      # Пусто: сканер сам найдёт
-  top_n: 1                         # 1 пара — весь капитал на одну позицию (микро-счёт)
-  min_volume_usdt: 5000000         # $5M+ volume — покрывает ~50-80 пар (ранее $30M = только ~15)
-  max_spread_bps: 20               # 20bps max spread (стандарт для скальпинга, Cartea §4.3)
-  rotation_interval_hours: 2       # Ротация каждые 2ч — чаще ищет свежие тренды
+  top_n: 1                         # На балансе < 1 USDT одновременно можно поддерживать только один live pipeline
+  min_volume_usdt: 1000000         # $1M+ volume — достаточно ликвидности для $5 ордеров микро-счёта
+  max_spread_bps: 50               # 50bps max spread — реалистично для альткоинов (20bps отсеивало всех)
+  rotation_interval_hours: 1       # Ротация каждый час — быстрее ищет свежие тренды
   blacklist: "BTCUSDT,ETHUSDT,XAGUSDT,XAUUSDT"     # BTC/ETH: too expensive; XAG/XAU: commodities, low vol = always compression
-  # Futures bidirectional scoring: bearish trends score equally (short = profit)
-  scorer_futures_mode: true
+  # Futures bidirectional scoring: допускаем как рост, так и падение (short = profit)
   scorer_filter_min_change_24h: -20.0    # Allow coins dropping up to 20% (amazing for short)
-  scorer_negative_change_penalty: 1.0    # NO penalty for falling coins in futures
-  scorer_steady_gainer_min: 2.0          # 2-10% absolute movement = ideal
-  scorer_steady_gainer_max: 10.0
+  scorer_volatility_low_threshold: 0.15  # 0.15% min vol: выше round-trip taker fee, иначе scanner выберет fee-negative churn
+  scorer_volatility_high_threshold: 20.0 # 20% max vol (ОК для futures)
 
 # ── Execution Alpha: AGGRESSIVE execution for scalping ────────────────────────
 execution_alpha:
@@ -118,6 +126,11 @@ execution_alpha:
   postonly_spread_threshold_bps: 8.0    # Wider threshold
   postonly_urgency_max: 0.40
   postonly_adverse_max: 0.40
+  # EV-based maker/taker switching (Almgren-Chriss framework)
+  opportunity_cost_bps: 30.0            # Typical setup edge: missed fill costs ~30 bps
+  queue_depletion_penalty: 0.08         # Fill prob reduction when our-side queue depleting
+  churn_penalty: 0.06                   # Fill prob reduction when top-of-book unstable
+  feedback_weight: 0.30                 # Blend with historical passive_fill_rate
 
 # ── Opportunity Cost: USDT-M futures scalping gating ────────────────────────
 # Научные основания:
@@ -129,18 +142,18 @@ opportunity_cost:
   min_net_expected_bps: 1.0              # > avg half-spread (~0.5 bps на BTCUSDT)
   execute_min_net_bps: 3.0               # ~3× half-spread: cost-to-edge ratio 1:3
   high_exposure_threshold: 0.70          # 70% margin util → 30% reserve для maintenance
-  high_exposure_min_conviction: 0.60     # Высокий порог при загрузке капитала
-  max_symbol_concentration: 1.00         # Single symbol mode: 100% on one pair
+  high_exposure_min_conviction: 0.50     # Снижен с 0.60 — не блокировать при загруженности
+  max_symbol_concentration: 0.50         # 50% макс на один символ (3 пары — диверсификация)
   max_strategy_concentration: 1.00       # Single-strategy prod: no blocking
-  capital_exhaustion_threshold: 0.85     # 15% buffer для maintenance margin
+  capital_exhaustion_threshold: 0.90     # 10% buffer (было 0.85) — микро-аккаунт не может позволить большие резервы
   weight_conviction: 0.35               # Главный драйвер composite score
   weight_net_edge: 0.35                 # Чистый edge — второй драйвер
   weight_capital_efficiency: 0.15       # Вторичный фактор
   weight_urgency: 0.15                  # Вторичный фактор
   conviction_to_bps_scale: 100.0        # conviction 1.0 → 100 bps (leveraged scalp returns)
   upgrade_min_edge_advantage_bps: 5.0   # > 2× round-trip cost (~4 bps maker fees)
-  drawdown_penalty_scale: 0.30          # +0.30 к порогу за каждые 5% drawdown
-  consecutive_loss_penalty: 0.015       # +0.015 за каждый consecutive loss
+  drawdown_penalty_scale: 0.05          # +0.05 к порогу за каждые 5% DD (было 0.30 — блокировало всё!)
+  consecutive_loss_penalty: 0.005       # +0.005 за каждый consecutive loss (было 0.015)
 
 # ── Regime Classification ─────────────────────────────────────────────────────
 # Настройки классификатора рыночных режимов: пороги, гистерезис, политика
@@ -353,7 +366,7 @@ uncertainty:
 
   # Лимиты size/threshold multiplier
   size_floor: 0.10              # Минимум 10% от номинала
-  threshold_ceiling: 2.5        # Максимальный множитель порога
+  threshold_ceiling: 1.3        # Макс множитель (было 2.5 — 0.50×2.5=1.25, невозможный порог!)
 
   # Cooldown: серия Extreme оценок → пауза
   consecutive_extreme_for_cooldown: 3

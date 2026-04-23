@@ -23,6 +23,7 @@ public:
     // (см. IndicatorEngine для ссылок на Wilder, Bollinger, Appel).
     struct Config {
         int sma_period{20};            ///< Bollinger (2002): 20-bar SMA — стандартное окно
+        int ema_ultra_fast_period{8};   ///< EMA-8: быстрая реакция на краткосрочные движения
         int ema_fast_period{20};       ///< Быстрая EMA = 20 (совпадает с BB/SMA lookback)
         int ema_slow_period{50};       ///< Медленная EMA = 50 — трендовый benchmark (Murphy, 1999)
         int rsi_period{14};            ///< Wilder (1978): RSI(14) — оригинальная спецификация

@@ -270,6 +270,7 @@ struct SymbolAnalysis {
     int price_precision{2};
     double min_trade_usdt{5.0};
     double min_quantity{0.0};
+    double last_price{0.0};
 };
 
 /// Результат сканирования (§14)

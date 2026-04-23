@@ -218,11 +218,11 @@ TEST_CASE("OpportunityCost: Consecutive losses повышают threshold", "[op
     auto intent = make_intent(0.35);
     auto exec_alpha = make_exec_alpha(5.0);
     auto portfolio = make_portfolio(0.2);
-    portfolio.consecutive_losses = 5;  // +0.10 к порогу
+    portfolio.consecutive_losses = 30;  // +0.15 к порогу (0.005 × 30)
 
     auto result = engine.evaluate(intent, exec_alpha, portfolio, 0.3);
 
-    // Effective threshold = 0.3 + 0.02*5 = 0.40 > 0.35
+    // Effective threshold = 0.3 + 0.005*30 = 0.45 > 0.35
     REQUIRE(result.action == OpportunityAction::Suppress);
     REQUIRE(result.reason == OpportunityReason::ConvictionBelowThreshold);
 }

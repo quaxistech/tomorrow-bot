@@ -45,6 +45,15 @@ public:
     Price query_order_fill_price(const OrderId& exchange_order_id, const Symbol& symbol) override;
     execution::OrderFillDetail query_order_fill_detail(const OrderId& exchange_order_id, const Symbol& symbol) override;
 
+    /// Отправить plan/trigger ордер (exchange-level TP/SL).
+    /// Endpoint: POST /api/v2/mix/order/place-plan
+    /// Используется для StopMarket и StopLimit ордеров.
+    execution::OrderSubmitResult submit_plan_order(const execution::OrderRecord& order);
+
+    /// Отменить plan/trigger ордер.
+    /// Endpoint: POST /api/v2/mix/order/cancel-plan-order
+    bool cancel_plan_order(const OrderId& order_id, const Symbol& symbol);
+
     /// Установить правила инструмента (precision, min notional, min qty)
     void set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules);
 
@@ -70,6 +79,9 @@ public:
 private:
     /// Построить JSON тело запроса для размещения фьючерсного ордера
     std::string build_place_order_json(const execution::OrderRecord& order) const;
+
+    /// Построить JSON тело запроса для plan/trigger ордера
+    std::string build_plan_order_json(const execution::OrderRecord& order) const;
 
     /// Получить правила символа или fallback
     [[nodiscard]] const ExchangeSymbolRules& get_rules(const Symbol& symbol) const;

@@ -7,6 +7,7 @@
 #include "common/enums.hpp"
 #include "common/types.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <sstream>
 
@@ -85,6 +86,10 @@ void ProductionRiskEngine::init_checks() {
 
     // === Funding cost ===
     checks_.push_back(std::make_unique<FundingRateCostCheck>(config_));     // 33
+
+    // === Phase 5: Venue-risk and margin-aware ===
+    checks_.push_back(std::make_unique<VenueHealthCheck>(config_));        // 34
+    checks_.push_back(std::make_unique<MarginDistanceCheck>(config_));     // 35
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -102,7 +107,8 @@ RiskDecision ProductionRiskEngine::evaluate(
     std::lock_guard lock(mutex_);
 
     // Обновить equity в drawdown tracker
-    state_.drawdown.update_equity(portfolio.total_capital, clock_->now());
+    const double current_equity = portfolio.total_capital + portfolio.pnl.total_pnl;
+    state_.drawdown.update_equity(current_equity, clock_->now());
 
     // Очистить истёкшие блокировки
     state_.locks.clear_expired(clock_->now());
@@ -122,11 +128,26 @@ RiskDecision ProductionRiskEngine::evaluate(
                     current_funding_rate_.load(std::memory_order_acquire),
                     min_notional_usdt_.load(std::memory_order_acquire)};
 
-    // Фьючерсная безопасность: закрытие позиций НИКОГДА не блокируется risk engine.
-    // В leveraged futures блокировка выхода опаснее любого нарушения entry-лимитов.
-    // Pipeline управляет close-safety отдельно (синхронизация с биржей, anti-dust).
+    // Фьючерсная безопасность: закрытие позиций НЕ блокируется risk engine,
+    // но safety-критичные проверки выполняются для мониторинга.
     if (intent.trade_side == TradeSide::Close) {
-        decision.summary = "Close bypasses risk checks (futures exit safety)";
+        // Белый список: rate limit, slippage, stale feed
+        static constexpr std::array<std::string_view, 3> close_check_names = {
+            "order_rate_check", "max_slippage_check", "stale_feed_check"
+        };
+        for (auto& check : checks_) {
+            for (auto allowed_name : close_check_names) {
+                if (check->name() == allowed_name) {
+                    check->evaluate(ctx, decision);
+                    break;
+                }
+            }
+        }
+        // Close всегда разрешён — не блокируем выход из позиции
+        decision.verdict = RiskVerdict::Approved;
+        decision.action = RiskAction::Allow;
+        decision.allowed = true;
+        decision.summary = "Close: safety checks executed, exit not blocked (futures safety)";
         finalize_decision(decision, intent, sizing, portfolio);
         return decision;
     }
@@ -345,13 +366,13 @@ void ProductionRiskEngine::record_trade_close(const StrategyId& strategy_id,
 IntraTradeAssessment ProductionRiskEngine::evaluate_position(
     const portfolio::Position& position,
     const portfolio::PortfolioSnapshot& portfolio,
-    const features::FeatureSnapshot& /*features*/)
+    const features::FeatureSnapshot& features)
 {
     IntraTradeAssessment assessment;
     assessment.symbol = position.symbol;
     assessment.assessed_at = clock_->now();
 
-    // max_adverse_excursion_pct
+    // max_adverse_excursion_pct — safety exit (RiskKill category)
     if (portfolio.total_capital > 0.0 && position.unrealized_pnl < 0.0) {
         const double adverse_pct =
             std::abs(position.unrealized_pnl) / portfolio.total_capital * 100.0;
@@ -359,23 +380,90 @@ IntraTradeAssessment ProductionRiskEngine::evaluate_position(
             assessment.should_close = true;
             assessment.reasons.push_back({
                 "MAX_ADVERSE_EXCURSION",
-                "Неблагоприятное отклонение " + std::to_string(adverse_pct) +
-                "% превышает лимит " + std::to_string(config_.max_adverse_excursion_pct) + "%",
+                "Adverse excursion " + std::to_string(adverse_pct) +
+                "% >= limit " + std::to_string(config_.max_adverse_excursion_pct) + "%",
                 1.0
             });
         }
     }
 
-    // max_position_hold_ns
-    const int64_t hold_duration = clock_->now().get() - position.opened_at.get();
-    if (config_.max_position_hold_ns > 0 && hold_duration > config_.max_position_hold_ns) {
+    // Auto-trigger kill switch when portfolio drawdown breaches 2× max_adverse_excursion.
+    // This catches cascading losses across multiple positions that individual MAE checks miss.
+    // Once activated, no new trades can open; only exit/flatten orders are allowed through.
+    if (portfolio.pnl.current_drawdown_pct >= config_.max_adverse_excursion_pct * 2.0) {
+        if (!kill_switch_active_.load()) {
+            activate_kill_switch(
+                "AUTO: Portfolio drawdown " +
+                std::to_string(portfolio.pnl.current_drawdown_pct) +
+                "% >= liquidation buffer " +
+                std::to_string(config_.max_adverse_excursion_pct * 2.0) + "%");
+        }
         assessment.should_close = true;
         assessment.reasons.push_back({
-            "MAX_HOLD_TIME",
-            "Время удержания " + std::to_string(hold_duration / 1'000'000'000LL) +
-            "с превышает лимит " + std::to_string(config_.max_position_hold_ns / 1'000'000'000LL) + "с",
-            0.8
+            "LIQUIDATION_PROXIMITY",
+            "Portfolio drawdown " + std::to_string(portfolio.pnl.current_drawdown_pct) +
+            "% - kill switch auto-triggered",
+            1.0
         });
+    }
+
+    // Phase 5: Operational deadman watchdog
+    // Only fires when degradation conditions are present, not on pure elapsed time.
+    // Degradation = stale feed + runaway exposure + health check failure.
+    // Pure time-based exit is an alpha decision (handled by exit_orchestrator).
+    const int64_t hold_ns = clock_->now().get() - position.opened_at.get();
+    if (config_.operational_deadman_ns > 0 && hold_ns > config_.operational_deadman_ns) {
+        // Count degradation signals
+        int degradation_count = 0;
+        std::string degradation_detail;
+
+        // 1. Stale market data
+        if (features.execution_context.is_feed_fresh == false) {
+            ++degradation_count;
+            degradation_detail += "stale_feed ";
+        }
+
+        // 2. Wide spread = possible liquidity degradation
+        if (features.microstructure.spread_valid && features.microstructure.spread_bps > 50.0) {
+            ++degradation_count;
+            degradation_detail += "wide_spread(" + std::to_string(features.microstructure.spread_bps) + "bps) ";
+        }
+
+        // 3. Runaway loss — position losing more than expected
+        if (portfolio.total_capital > 0.0 && position.unrealized_pnl < 0.0) {
+            double loss_pct = std::abs(position.unrealized_pnl) / portfolio.total_capital * 100.0;
+            if (loss_pct > config_.max_adverse_excursion_pct * 0.8) {
+                ++degradation_count;
+                degradation_detail += "loss_near_mae(" + std::to_string(loss_pct) + "%) ";
+            }
+        }
+
+        // 4. VPIN toxicity = adverse flow environment
+        if (features.microstructure.vpin_valid && features.microstructure.vpin_toxic) {
+            ++degradation_count;
+            degradation_detail += "vpin_toxic ";
+        }
+
+        // Phase C: Fire only if structural degradation is confirmed (2+ signals).
+        // Pure time-based absolute_deadman removed — time alone is not alpha.
+        // Operational deadman requires at least 1 degradation signal.
+        bool structural_degradation = degradation_count >= 2;
+
+        if (structural_degradation) {
+            assessment.should_close = true;
+            assessment.reasons.push_back({
+                "DEADMAN_WATCHDOG",
+                "Degraded execution: "
+                + degradation_detail + "hold=" +
+                std::to_string(hold_ns / 1'000'000'000LL) + "s",
+                0.8
+            });
+        }
+    }
+
+    // All assessments from risk engine are safety exits (not alpha)
+    if (assessment.should_close) {
+        assessment.is_safety_exit = true;
     }
 
     return assessment;

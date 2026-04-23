@@ -49,6 +49,31 @@ struct OrderExecutionInfo {
     double realized_slippage{0.0};                 ///< Реальное проскальзывание
 };
 
+/// Тип триггера для plan/trigger ордеров (Bitget)
+enum class TriggerType {
+    FillPrice,    ///< Триггер по цене последней сделки (fill_price / last)
+    MarkPrice     ///< Триггер по mark price
+};
+
+/// Attached TP/SL цены (прикреплённые к основному ордеру)
+struct AttachedTpSl {
+    Price stop_surplus_price{Price(0.0)};  ///< Take-profit цена (0 = не задан)
+    Price stop_loss_price{Price(0.0)};     ///< Stop-loss цена (0 = не задан)
+    TriggerType trigger_type{TriggerType::MarkPrice};  ///< Тип триггера для TP/SL
+
+    [[nodiscard]] bool has_tp() const { return stop_surplus_price.get() > 0.0; }
+    [[nodiscard]] bool has_sl() const { return stop_loss_price.get() > 0.0; }
+    [[nodiscard]] bool has_any() const { return has_tp() || has_sl(); }
+};
+
+/// Параметры plan/trigger ордера (Bitget /api/v2/mix/order/place-plan)
+struct PlanOrderParams {
+    Price trigger_price{Price(0.0)};        ///< Цена срабатывания
+    TriggerType trigger_type{TriggerType::MarkPrice};
+    Price execute_price{Price(0.0)};        ///< Цена исполнения (0 = market)
+    /// plan_type определяется из контекста: profit_plan или loss_plan
+};
+
 /// Запись об ордере
 struct OrderRecord {
     OrderId order_id{OrderId("")};
@@ -75,6 +100,12 @@ struct OrderRecord {
     std::string rejection_reason;
     int retry_count{0};
     OrderExecutionInfo execution_info;  ///< Расширенная информация об исполнении
+
+    /// Attached TP/SL (отправляются вместе с основным ордером через place-order)
+    AttachedTpSl attached_tp_sl;
+
+    /// Параметры plan/trigger ордера (для StopMarket/StopLimit через place-plan)
+    PlanOrderParams plan_params;
 
     /// Проверка, является ли состояние терминальным
     bool is_terminal() const {
@@ -122,6 +153,15 @@ std::string to_string(OrderState state);
 
 /// Преобразование политики частичного исполнения в строку
 std::string to_string(PartialFillPolicy policy);
+
+/// Преобразование типа триггера в строку
+inline const char* to_string(TriggerType t) {
+    switch (t) {
+        case TriggerType::FillPrice: return "fill_price";
+        case TriggerType::MarkPrice: return "mark_price";
+    }
+    return "unknown";
+}
 
 /// Проверка допустимости перехода FSM
 bool is_valid_transition(OrderState from, OrderState to);

@@ -222,95 +222,101 @@ void AdvancedFeatureEngine::update_cusum(double return_val) {
 void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
     ++vpin_trade_count_;
 
-    // Периодическая рекалибровка размера бакета каждые 1000 трейдов.
-    // Адаптивная калибровка позволяет отслеживать изменения ликвидности рынка.
-    // Blend: 70% старое / 30% новое — эвристика для плавной адаптации
-    // без резких переключений (аналог EMA с α≈0.3).
-    if (vpin_trade_count_ % 1000 == 0 && bucket_target_volume_ > 0.0) {
-        // Пересчитываем bucket_target_volume на основе недавней истории
-        if (!vpin_buckets_.empty()) {
-            double recent_avg_volume = 0.0;
-            size_t count = std::min(size_t(10), vpin_buckets_.size());
-            for (size_t i = vpin_buckets_.size() - count; i < vpin_buckets_.size(); ++i) {
-                recent_avg_volume += vpin_buckets_[i].total_volume;
-            }
-            recent_avg_volume /= static_cast<double>(count);
-
-            // Обновляем target с сглаживанием (70% старое, 30% новое)
-            double new_target = recent_avg_volume;
-            bucket_target_volume_ = 0.7 * bucket_target_volume_ + 0.3 * new_target;
-        }
-    }
-
-    // Bulk Volume Classification
-    if (is_buy) {
-        current_bucket_.buy_volume += volume;
-    } else {
-        current_bucket_.sell_volume += volume;
-    }
-    current_bucket_.total_volume += volume;
-    accumulated_volume_ += volume;
-
-    // Авто-калибровка размера бакета из скользящего среднего объёма
-    if (bucket_target_volume_ <= 0.0) {
-        // Ждём 10 трейдов для надёжной оценки
+    // Initial calibration (shared): wait for 10 trades to estimate avg volume
+    if (!canonical_calibrated_) {
         volumes_calibration_.push_back(volume);
-        if (volumes_calibration_.size() < 10) {
-            return;
-        }
-        double avg_vol = std::accumulate(volumes_calibration_.begin(), volumes_calibration_.end(), 0.0)
+        if (volumes_calibration_.size() < 10) return;
+        double avg_vol = std::accumulate(volumes_calibration_.begin(),
+                                          volumes_calibration_.end(), 0.0)
                         / static_cast<double>(volumes_calibration_.size());
-        bucket_target_volume_ = avg_vol * static_cast<double>(vpin_cfg_.bucket_size);
+        const double target = avg_vol * static_cast<double>(vpin_cfg_.bucket_size);
+        canonical_bucket_target_ = target;
+        adaptive_bucket_target_ = target;
+        canonical_calibrated_ = true;
     }
 
-    // Заполняем бакет при достижении целевого объёма.
-    // Carry-over: если трейд переполняет бакет, остаток переносится в следующий.
-    while (bucket_target_volume_ > 0.0 && current_bucket_.total_volume >= bucket_target_volume_) {
-        // Рассчитываем переполнение
-        const double overflow = current_bucket_.total_volume - bucket_target_volume_;
+    // Helper: fill buckets with carry-over
+    auto fill_bucket = [&](VolumeBucket& current, double& accumulated,
+                           double target, std::deque<VolumeBucket>& buckets,
+                           double& vpin_out) {
+        if (is_buy) current.buy_volume += volume;
+        else current.sell_volume += volume;
+        current.total_volume += volume;
 
-        // Разделяем переполнение пропорционально buy/sell в текущем бакете
-        double buy_frac = (current_bucket_.total_volume > 0.0)
-            ? current_bucket_.buy_volume / current_bucket_.total_volume : 0.5;
-        double overflow_buy = overflow * buy_frac;
-        double overflow_sell = overflow - overflow_buy;
+        while (target > 0.0 && current.total_volume >= target) {
+            const double overflow = current.total_volume - target;
+            double buy_frac = (current.total_volume > 0.0)
+                ? current.buy_volume / current.total_volume : 0.5;
+            double overflow_buy = overflow * buy_frac;
+            double overflow_sell = overflow - overflow_buy;
 
-        // Завершаем текущий бакет (без переполнения)
-        VolumeBucket completed = current_bucket_;
-        completed.buy_volume -= overflow_buy;
-        completed.sell_volume -= overflow_sell;
-        completed.total_volume = bucket_target_volume_;
+            VolumeBucket completed = current;
+            completed.buy_volume -= overflow_buy;
+            completed.sell_volume -= overflow_sell;
+            completed.total_volume = target;
 
-        vpin_buckets_.push_back(completed);
-        if (vpin_buckets_.size() > vpin_cfg_.num_buckets) {
-            vpin_buckets_.pop_front();
+            buckets.push_back(completed);
+            if (buckets.size() > vpin_cfg_.num_buckets) {
+                buckets.pop_front();
+            }
+
+            current = {};
+            current.buy_volume = overflow_buy;
+            current.sell_volume = overflow_sell;
+            current.total_volume = overflow;
+
+            if (buckets.size() >= 10) {
+                vpin_out = compute_vpin_from_buckets(buckets);
+            }
+        }
+    };
+
+    // Canonical VPIN: fixed bucket target (never recalibrated)
+    fill_bucket(canonical_current_, canonical_accumulated_,
+                canonical_bucket_target_, vpin_canonical_buckets_,
+                vpin_canonical_);
+
+    // Adaptive VPIN: recalibrating bucket target
+    if (vpin_cfg_.enable_adaptive) {
+        // Periodic recalibration of adaptive bucket size
+        if (vpin_trade_count_ % vpin_cfg_.adaptive_recal_interval == 0 &&
+            adaptive_bucket_target_ > 0.0 && !vpin_adaptive_buckets_.empty()) {
+            double recent_avg = 0.0;
+            const size_t count = std::min(size_t(10), vpin_adaptive_buckets_.size());
+            for (size_t i = vpin_adaptive_buckets_.size() - count;
+                 i < vpin_adaptive_buckets_.size(); ++i) {
+                recent_avg += vpin_adaptive_buckets_[i].total_volume;
+            }
+            recent_avg /= static_cast<double>(count);
+            adaptive_bucket_target_ =
+                (1.0 - vpin_cfg_.adaptive_blend) * adaptive_bucket_target_ +
+                vpin_cfg_.adaptive_blend * recent_avg;
         }
 
-        // Новый бакет начинается с остатка
-        current_bucket_ = {};
-        current_bucket_.buy_volume = overflow_buy;
-        current_bucket_.sell_volume = overflow_sell;
-        current_bucket_.total_volume = overflow;
+        fill_bucket(adaptive_current_, adaptive_accumulated_,
+                    adaptive_bucket_target_, vpin_adaptive_buckets_,
+                    vpin_adaptive_);
+    }
 
-        // Пересчёт VPIN при достаточном количестве бакетов
-        if (vpin_buckets_.size() >= 10) {
-            double sum_abs_imbalance = 0.0;
-            double sum_volume = 0.0;
-            for (const auto& b : vpin_buckets_) {
-                sum_abs_imbalance += std::abs(b.buy_volume - b.sell_volume);
-                sum_volume += b.total_volume;
-            }
-            vpin_value_ = (sum_volume > 0.0) ? sum_abs_imbalance / sum_volume : 0.0;
-
-            // EMA VPIN для сглаживания (α = 0.1, Easley et al., 2012)
-            // Инициализация: первое значение — без сглаживания
-            if (vpin_ma_ <= 0.0) {
-                vpin_ma_ = vpin_value_;
-            } else {
-                vpin_ma_ = 0.9 * vpin_ma_ + 0.1 * vpin_value_;
-            }
+    // EMA over canonical VPIN (primary signal)
+    if (vpin_canonical_buckets_.size() >= 10) {
+        if (vpin_ma_ <= 0.0) {
+            vpin_ma_ = vpin_canonical_;
+        } else {
+            vpin_ma_ = 0.9 * vpin_ma_ + 0.1 * vpin_canonical_;
         }
     }
+}
+
+double AdvancedFeatureEngine::compute_vpin_from_buckets(
+    const std::deque<VolumeBucket>& buckets) const {
+    double sum_abs_imbalance = 0.0;
+    double sum_volume = 0.0;
+    for (const auto& b : buckets) {
+        sum_abs_imbalance += std::abs(b.buy_volume - b.sell_volume);
+        sum_volume += b.total_volume;
+    }
+    return (sum_volume > 0.0) ? sum_abs_imbalance / sum_volume : 0.0;
 }
 
 // ==================== Volume Profile ====================
@@ -407,11 +413,13 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
         snapshot.technical.cusum_valid = true;
     }
 
-    // VPIN
-    if (vpin_buckets_.size() >= 10) {
-        snapshot.microstructure.vpin = vpin_value_;
+    // VPIN — dual mode: canonical (fixed-bucket) + adaptive (recalibrated)
+    if (vpin_canonical_buckets_.size() >= 10) {
+        snapshot.microstructure.vpin = vpin_canonical_;
+        snapshot.microstructure.vpin_canonical = vpin_canonical_;
+        snapshot.microstructure.vpin_adaptive = vpin_adaptive_;
         snapshot.microstructure.vpin_ma = vpin_ma_;
-        snapshot.microstructure.vpin_toxic = vpin_value_ > vpin_cfg_.toxic_threshold;
+        snapshot.microstructure.vpin_toxic = vpin_canonical_ > vpin_cfg_.toxic_threshold;
         snapshot.microstructure.vpin_valid = true;
     }
 

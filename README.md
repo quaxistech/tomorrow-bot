@@ -102,7 +102,7 @@ cd build && ctest -j$(nproc) --output-on-failure
 
 ```bash
 # Бумажная торговля (production.yaml с mode: paper)
-./build/src/app/tomorrow-bot --config configs/production.yaml
+./build-release/src/app/tomorrow-bot --config configs/production.yaml
 
 # Production (требует secrets и подтверждение)
 ./run_prod.sh

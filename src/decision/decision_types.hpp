@@ -49,21 +49,20 @@ struct AdvancedDecisionConfig {
     // ── Regime-aware threshold scaling ───────────────────────────────────
     bool enable_regime_threshold_scaling{true};
     double regime_trending_factor{1.0};          ///< Множитель порога для trending (нейтральный)
-    double regime_choppy_factor{1.50};           ///< Множитель для choppy/noise (+50%, блокирует вход в шум)
+    double regime_choppy_factor{1.10};           ///< Множитель для choppy/noise (+10%, осторожнее но не блокируя)
     double regime_volatile_factor{0.90};         ///< Множитель для vol expansion (−10%, волатильность = возможность)
     /// Порог повышен при ликвидном стрессе: slippage и adverse selection растут
-    /// (Menkveld 2013, "HFT and the new market makers", J. Financial Markets)
-    double regime_stress_factor{1.10};           ///< Множитель для stress (+10%, не блокируя полностью)
+    double regime_stress_factor{1.05};           ///< Множитель для stress (+5%, лёгкая осторожность)
     double regime_mean_reversion_factor{1.0};    ///< Множитель для mean reversion (нейтральный)
     double regime_low_vol_factor{1.0};           ///< Множитель для low vol compression (нейтральный)
-    double regime_anomaly_factor{1.20};          ///< Множитель для anomaly event (+20%, осторожность)
+    double regime_anomaly_factor{1.10};          ///< Множитель для anomaly event (+10%, осторожность)
 
     // ── Regime-aware dominance scaling ───────────────────────────────────
     bool enable_regime_dominance_scaling{true};
-    double dominance_trending{0.55};             ///< В тренде достаточно 55%
-    double dominance_choppy{0.72};               ///< В шуме нужно 72%
-    double dominance_volatile{0.58};             ///< В расширении волатильности 58%
-    double dominance_stress{0.80};               ///< В стрессе нужно 80%
+    double dominance_trending{0.55};             ///< В тренде нужно 55% доминирования
+    double dominance_choppy{0.60};               ///< В шуме нужно 60% (было 72% — слишком строго)
+    double dominance_volatile{0.55};             ///< В расширении волатильности 55%
+    double dominance_stress{0.65};               ///< В стрессе нужно 65% (было 80% — блокировало)
 
     // ── Time decay ──────────────────────────────────────────────────────
     bool enable_time_decay{true};

@@ -22,7 +22,7 @@ struct ScalpStrategyConfig {
     int64_t setup_timeout_ms{15000};
     int64_t cooldown_after_exit_ms{5000};
     int64_t cooldown_after_failed_setup_ms{3000};
-    int64_t max_hold_time_ms{120000};   ///< 2 минуты для скальпинга
+    // max_hold_time_ms removed: all exits are market-driven via continuation value model
 
     // ─── Под-сценарии (§10) ──────────────────────────────────────────────
     bool enable_momentum_continuation{true};

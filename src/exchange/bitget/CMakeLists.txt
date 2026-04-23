@@ -2,6 +2,7 @@
 add_library(tb_exchange_bitget STATIC
     bitget_signing.cpp
     bitget_ws_client.cpp
+    bitget_private_ws_client.cpp
     bitget_rest_client.cpp
     bitget_futures_order_submitter.cpp
     bitget_futures_query_adapter.cpp

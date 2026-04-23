@@ -140,15 +140,13 @@ int LossStreakTracker::strategy_consecutive_losses(const std::string& strategy_i
 
 void PnlTracker::record_trade_pnl(const std::string& symbol, const std::string& strategy_id,
                                    double realized_pnl) {
-    daily_realized_pnl_ += realized_pnl;
-    ++trades_today_;
+    // Account-level daily PnL and trade count are tracked by Portfolio (single source of truth).
+    // Risk PnlTracker only tracks per-symbol and per-strategy breakdowns.
     symbol_pnl_[symbol] += realized_pnl;
     strategy_pnl_[strategy_id] += realized_pnl;
 }
 
 void PnlTracker::reset_daily() {
-    daily_realized_pnl_ = 0.0;
-    trades_today_ = 0;
     symbol_pnl_.clear();
     strategy_pnl_.clear();
 }

@@ -222,7 +222,11 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
                     if (is_committed || is_rollback) {
                         resolved_seqs.insert(seq);
                     }
-                } catch (...) {}
+                } catch (const std::exception& e) {
+                    logger_->warn("WAL", "Corrupted WAL entry during resolved-scan",
+                        {{"error", e.what()}, {"payload_size", std::to_string(je.payload_json.size())}});
+                    ++wal_corruption_count_;
+                }
             }
             // Теперь ищем uncommitted без resolved
             for (const auto& je : all_entries.value()) {
@@ -248,7 +252,11 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
                         }
                         uncommitted.push_back(std::move(entry));
                     }
-                } catch (...) {}
+                } catch (const std::exception& e) {
+                    logger_->warn("WAL", "Corrupted WAL entry during uncommitted-scan",
+                        {{"error", e.what()}, {"payload_size", std::to_string(je.payload_json.size())}});
+                    ++wal_corruption_count_;
+                }
             }
         }
     }

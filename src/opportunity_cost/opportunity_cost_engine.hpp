@@ -78,12 +78,13 @@ struct OpportunityCostConfig {
     // ── Drawdown penalty ──
     // Thorp 2006: half-Kelly при значительной просадке.
     // +scale к conviction threshold за каждые 5% drawdown от пика.
-    double drawdown_penalty_scale{0.5};        ///< Множитель: +X к порогу за каждые 5% просадки
+    // Было 0.5 — при 5% DD это +0.50 к порогу (0.68→1.18 — невозможный!)
+    // Теперь 0.05 — при 5% DD это +0.05 (0.50→0.55 — разумная осторожность)
+    double drawdown_penalty_scale{0.05};       ///< Множитель: +X к порогу за каждые 5% просадки
 
     // ── Consecutive loss penalty ──
     // Серия убытков повышает required conviction для входа.
-    // 0.02 на loss: после 5 подряд убытков +10% к порогу.
-    double consecutive_loss_penalty{0.02};     ///< +X к порогу за каждый убыточный трейд подряд
+    double consecutive_loss_penalty{0.005};    ///< +X к порогу за каждый убыточный трейд подряд
 };
 
 /// Реализация на основе правил (production-grade)

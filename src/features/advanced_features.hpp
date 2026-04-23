@@ -42,6 +42,9 @@ struct VpinConfig {
     size_t bucket_size{50};         ///< Трейдов на volume bucket (Easley et al., 2012)
     size_t num_buckets{50};         ///< Количество бакетов для расчёта VPIN
     double toxic_threshold{0.7};    ///< Порог токсичности (Easley et al., 2012, Fig. 3)
+    bool enable_adaptive{true};     ///< Включить adaptive recalibration (отдельно от canonical)
+    size_t adaptive_recal_interval{1000}; ///< Интервал рекалибровки (в трейдах)
+    double adaptive_blend{0.3};     ///< α для EMA blend при рекалибровке (0.3 = 30% новое)
 };
 
 /// Параметры Volume Profile.
@@ -129,22 +132,34 @@ private:
     double last_price_{0.0};                   ///< Последняя цена (для расчёта доходности)
 
     // === VPIN ===
-    void update_vpin(double volume, bool is_buy);
-    VpinConfig vpin_cfg_;                      ///< Конфигурация VPIN
     struct VolumeBucket {
-        double buy_volume{0.0};                ///< Объём покупок в бакете
-        double sell_volume{0.0};               ///< Объём продаж в бакете
-        double total_volume{0.0};              ///< Суммарный объём бакета
+        double buy_volume{0.0};
+        double sell_volume{0.0};
+        double total_volume{0.0};
     };
-    std::deque<VolumeBucket> vpin_buckets_;    ///< Завершённые volume-бакеты
-    VolumeBucket current_bucket_;              ///< Текущий незавершённый бакет
-    double accumulated_volume_{0.0};           ///< Текущий объём в бакете
-    double bucket_target_volume_{0.0};         ///< Целевой объём одного бакета
-    double vpin_value_{0.0};                   ///< Текущее значение VPIN
-    double vpin_ma_{0.0};                      ///< Скользящее среднее VPIN (EMA)
-    size_t vpin_trade_count_{0};               ///< Счётчик трейдов для периодической рекалибровки
+    void update_vpin(double volume, bool is_buy);
+    double compute_vpin_from_buckets(const std::deque<VolumeBucket>& buckets) const;
+    VpinConfig vpin_cfg_;                      ///< Конфигурация VPIN
 
-    std::vector<double> volumes_calibration_; ///< Буфер объёмов для калибровки бакетов VPIN
+    // Canonical VPIN: fixed bucket size (Easley et al. 2012 original)
+    std::deque<VolumeBucket> vpin_canonical_buckets_;
+    VolumeBucket canonical_current_;
+    double canonical_accumulated_{0.0};
+    double canonical_bucket_target_{0.0};      ///< Fixed after initial calibration
+    double vpin_canonical_{0.0};
+    bool canonical_calibrated_{false};
+
+    // Adaptive VPIN: recalibrating bucket size
+    std::deque<VolumeBucket> vpin_adaptive_buckets_;
+    VolumeBucket adaptive_current_;
+    double adaptive_accumulated_{0.0};
+    double adaptive_bucket_target_{0.0};
+    double vpin_adaptive_{0.0};
+
+    // Shared
+    double vpin_ma_{0.0};                      ///< EMA of canonical VPIN
+    size_t vpin_trade_count_{0};
+    std::vector<double> volumes_calibration_;
 
     // === Volume Profile ===
     void update_volume_profile(double price, double volume);

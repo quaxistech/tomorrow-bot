@@ -45,6 +45,8 @@ struct AllocationContext {
     // Контекст портфеля
     double current_drawdown_pct{0.0};         ///< Текущая просадка (%)
     int consecutive_losses{0};                ///< Серия убытков подряд
+    double max_loss_per_trade_pct{0.0};       ///< Макс. допустимый loss на сделку (% капитала)
+    double estimated_stop_distance_pct{0.0};  ///< Оценка дистанции до защитного стопа (% цены)
 
     // Exchange filters (если заданы)
     std::optional<ExchangeFilters> exchange_filters;

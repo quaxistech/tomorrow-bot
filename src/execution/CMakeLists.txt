@@ -10,6 +10,7 @@ add_library(tb_execution STATIC
     cancel/cancel_manager.cpp
     recovery/recovery_manager.cpp
     telemetry/execution_metrics.cpp
+    execution_quality_monitor.cpp
 )
 target_include_directories(tb_execution PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(tb_execution PUBLIC

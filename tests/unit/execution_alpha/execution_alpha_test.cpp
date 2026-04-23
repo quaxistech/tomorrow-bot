@@ -236,23 +236,29 @@ TEST_CASE("ExecutionAlpha: Благоприятный имбаланс стак�
              || result.recommended_style == ExecutionStyle::PostOnly));
 }
 
-TEST_CASE("ExecutionAlpha: Неблагоприятный имбаланс → переход к Hybrid", "[execution_alpha]") {
+TEST_CASE("ExecutionAlpha: Неблагоприятный имбаланс → влияет на fill probability", "[execution_alpha]") {
     auto engine = make_engine();
-    // Умеренная срочность в зоне Passive, но имбаланс стакана против нас
+
+    // Базовая ситуация без имбаланса
+    auto intent_neutral = make_intent(0.35, 0.6);
+    intent_neutral.side = Side::Buy;
+    auto features_neutral = make_features(8.0, 0.2, 0.2);
+    features_neutral.microstructure.book_imbalance_5 = 0.0;
+    features_neutral.microstructure.book_imbalance_valid = true;
+    auto result_neutral = engine.evaluate(intent_neutral, features_neutral, uncertainty::UncertaintySnapshot{});
+
+    // Та же ситуация но с сильным имбалансом стакана против нас
     auto intent = make_intent(0.35, 0.6);
     intent.side = Side::Buy;
     auto features = make_features(8.0, 0.2, 0.2);
-
-    // Отрицательный book_imbalance_5 для Buy = против нас (ask > bid = sell давление)
     features.microstructure.book_imbalance_5 = -0.60; // Сильно против нас
     features.microstructure.book_imbalance_valid = true;
-
     auto result = engine.evaluate(intent, features, uncertainty::UncertaintySnapshot{});
 
     REQUIRE(result.should_execute);
     REQUIRE(result.decision_factors.directional_imbalance < -0.30);
-    // Неблагоприятный имбаланс → не Passive, а Hybrid
-    REQUIRE(result.recommended_style != ExecutionStyle::Passive);
+    // Неблагоприятный имбаланс снижает fill probability (EV-based decision)
+    REQUIRE(result.quality.fill_probability < result_neutral.quality.fill_probability);
 }
 
 TEST_CASE("ExecutionAlpha: CUSUM сигнал увеличивает срочность", "[execution_alpha]") {

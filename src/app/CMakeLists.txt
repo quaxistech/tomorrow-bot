@@ -4,6 +4,7 @@ add_executable(tomorrow-bot
     main.cpp
     app_bootstrap.cpp
     http_server.cpp
+    runtime_manifest.cpp
 )
 
 target_include_directories(tomorrow-bot

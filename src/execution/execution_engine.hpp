@@ -168,6 +168,7 @@ private:
 
     double leverage_{1.0};
     PartialFillPolicy default_fill_policy_{PartialFillPolicy::WaitForFull};
+    mutable std::mutex execute_mutex_;  // H-4: serialize execute() to prevent dedup TOCTOU
 };
 
 } // namespace tb::execution

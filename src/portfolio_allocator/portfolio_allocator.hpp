@@ -130,7 +130,7 @@ private:
     /// Применить exchange filters к результату
     void apply_exchange_filters(double& qty, double price,
                                 const ExchangeFilters& filters,
-                                double available_capital,
+                                double max_affordable_notional,
                                 SizingResult& result) const;
 
     Config config_;                            ///< Конфигурация аллокатора

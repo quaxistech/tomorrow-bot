@@ -34,6 +34,7 @@
 #include "metrics/metrics_registry.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "exchange/bitget/bitget_futures_order_submitter.hpp"
+#include "exchange/bitget/bitget_private_ws_client.hpp"
 #include "ml/bayesian_adapter.hpp"
 #include "ml/entropy_filter.hpp"
 #include "ml/microstructure_fingerprint.hpp"
@@ -45,12 +46,22 @@
 #include "pipeline/pipeline_stage_result.hpp"
 #include "pipeline/pipeline_latency_tracker.hpp"
 #include "pipeline/order_watchdog.hpp"
+#include "pipeline/exit_orchestrator.hpp"
+#include "pipeline/hedge_pair_manager.hpp"
+#include "pipeline/market_reaction_engine.hpp"
+#include "pipeline/dual_leg_manager.hpp"
 #include "reconciliation/reconciliation_engine.hpp"
 #include "leverage/leverage_engine.hpp"
 #include "exchange/bitget/bitget_futures_query_adapter.hpp"
+#include "persistence/persistence_layer.hpp"
+#include "telemetry/research_telemetry.hpp"
+#include "telemetry/file_telemetry_sink.hpp"
+#include "telemetry/incident_detector.hpp"
+#include "telemetry/observability_panels.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <deque>
 #include <unordered_map>
@@ -189,7 +200,7 @@ private:
     /// Consecutive Wait1 actions from Thompson Sampling (triggers rotation when too many)
     int consecutive_wait1_count_{0};
     /// Threshold: if Thompson selects Wait1 this many times, force pipeline idle for rotation
-    static constexpr int kMaxConsecutiveWait1 = 50;
+    static constexpr int kMaxConsecutiveWait1 = 20;
 
     std::atomic<bool> running_{false};
     std::mutex pipeline_mutex_;
@@ -212,6 +223,7 @@ private:
     int last_applied_leverage_short_{0};
 
     /// Диагностика: счётчики блокировок для каждого gate (логируем первые N)
+    int diag_decision_block_{0};
     int diag_thompson_block_{0};
     int diag_htf_block_{0};
     int diag_cooldown_block_{0};
@@ -221,6 +233,10 @@ private:
     int diag_pnl_gate_block_{0};
     int diag_leverage_block_{0};
     int diag_slow_tick_breakdown_{0};
+    int diag_fingerprint_block_{0};
+    int diag_conviction_block_{0};
+    int diag_rr_block_{0};
+    int diag_rsi_extreme_block_{0};
     static constexpr int kDiagLogLimit = 10; ///< Логируем первые N блокировок каждого gate
     /// Максимальный backoff между ордерами: 2 минуты (120 секунд)
     static constexpr int64_t kMaxRejectionBackoffNs = 120'000'000'000LL;
@@ -233,13 +249,23 @@ private:
     /// Достаточно для предотвращения спама на биржу, но не блокирует экстренное закрытие.
     static constexpr int64_t kStopLossCooldownNs = 5'000'000'000LL;
 
-    /// REST клиент для запроса баланса (только production/testnet)
+    /// Timestamp of the most recent position-open fill (ns since epoch).
+    /// Used to suppress phantom-position cleanup for a grace period after fill,
+    /// giving the exchange API time to reflect the new position.
+    int64_t last_position_fill_ns_{0};
+    /// Grace period for phantom detection after a fill: 5 seconds.
+    static constexpr int64_t kPhantomGracePeriodNs = 5'000'000'000LL;
+
+    /// REST клиент для запроса баланса
     std::shared_ptr<exchange::bitget::BitgetRestClient> rest_client_;
 
-    /// Paper submitter с биржевыми rules для честной симуляции фьючерсных ордеров
-    std::shared_ptr<execution::PaperOrderSubmitter> paper_submitter_;
+    /// Authenticated private WebSocket client for event-driven fills
+    std::unique_ptr<exchange::bitget::BitgetPrivateWsClient> private_ws_client_;
 
-    /// Ссылка на BitgetFuturesOrderSubmitter (для USDT-M фьючерсов, nullptr если futures.enabled=false)
+    /// Handle incoming private WS messages (order fills, position updates)
+    void on_private_ws_message(const std::string& channel, const boost::json::value& data);
+
+    /// Ссылка на BitgetFuturesOrderSubmitter (для USDT-M фьючерсов)
     std::shared_ptr<exchange::bitget::BitgetFuturesOrderSubmitter> futures_submitter_;
 
     /// Правила инструмента для текущего символа (из exchange info)
@@ -254,6 +280,19 @@ private:
     // ==================== Phase 2: Order Watchdog =========================
     /// Непрерывный монитор жизненного цикла ордеров
     std::unique_ptr<OrderWatchdog> order_watchdog_;
+
+    // ==================== Phase 2: Exit Orchestrator =====================
+    /// Единый владелец всех exit-решений
+    std::unique_ptr<PositionExitOrchestrator> exit_orchestrator_;
+
+    /// Cached regime snapshot (updated every tick, used by build_exit_context)
+    regime::RegimeSnapshot cached_regime_snapshot_{};
+    /// Cached uncertainty snapshot (updated every tick, used by build_exit_context)
+    uncertainty::UncertaintySnapshot cached_uncertainty_snapshot_{};
+    /// Cached market state vector (Phase 4, updated every tick)
+    MarketStateVector cached_market_state_{};
+    /// Market reaction engine (Phase 4)
+    std::unique_ptr<MarketReactionEngine> market_reaction_engine_;
     /// Timestamp последней проверки watchdog
     int64_t last_watchdog_ns_{0};
     /// Интервал проверки watchdog: 10 секунд
@@ -379,13 +418,17 @@ private:
     double initial_position_size_{0.0};
     /// Текущий ATR-множитель для trailing stop (адаптивный)
     double current_trail_mult_{2.0};
-    /// Время входа в позицию (nanoseconds) — для time-based exit
+    /// Время входа в позицию (nanoseconds) — used for telemetry and hedge duration tracking
     int64_t position_entry_time_ns_{0};
 
     /// Обновить trailing stop для текущей позиции
     void update_trailing_stop(const features::FeatureSnapshot& snapshot);
     /// Сбросить все поля trailing stop при закрытии/открытии позиции
     void reset_trailing_state();
+
+    /// Собрать ExitContext для exit orchestrator из текущего состояния pipeline
+    ExitContext build_exit_context(const features::FeatureSnapshot& snapshot,
+                                  const portfolio::Position& pos) const;
 
     // ==================== Alpha Decay Feedback ====================
     // Мониторинг деградации альфа-сигнала и автоматическая корректировка
@@ -464,13 +507,48 @@ private:
     /// Флаг фонового запроса reference prices (не блокирует hot path)
     std::shared_ptr<std::atomic<bool>> reference_price_fetch_in_flight_{
         std::make_shared<std::atomic<bool>>(false)};
+    /// Background thread for reference price fetching (joinable for clean shutdown)
+    std::jthread ref_price_thread_;
     /// Интервал обновления reference prices: 30 секунд
     static constexpr int64_t kReferencePriceIntervalNs = 30'000'000'000LL;
 
-    // ==================== Hedge Recovery ====================
-    // Хеджирование убыточных позиций: при глубоком убытке открываем
-    // противоположную позицию (locked), затем закрываем проигрышную ногу.
+    // ==================== Persistence ====================
+    /// Персистентный слой для записи snapshot'ов и journal-событий
+    std::shared_ptr<persistence::PersistenceLayer> persistence_;
+    /// Timestamp последнего snapshot'а портфеля
+    int64_t last_snapshot_ns_{0};
+    /// Интервал записи snapshot'ов: 30 секунд
+    static constexpr int64_t kSnapshotIntervalNs = 30'000'000'000LL;
+    /// Записать snapshot портфеля в persistence (включая opened_at_ns)
+    void persist_portfolio_snapshot();
+    /// Записать событие открытия/закрытия позиции в journal
+    void persist_position_event(const std::string& event_type, const Symbol& symbol,
+                                PositionSide ps, double price, double pnl,
+                                double size, const std::string& strategy_id);
 
+    // ==================== Phase 8: Observability & Telemetry ==============
+    /// Decision chain telemetry (captures full TelemetryEnvelope per trade decision)
+    std::shared_ptr<telemetry::ResearchTelemetry> telemetry_;
+    /// Incident detector (6 playbook types)
+    std::unique_ptr<telemetry::IncidentDetector> incident_detector_;
+    /// Observability panel metrics (7 panels)
+    telemetry::ObservabilityPanels obs_panels_;
+    /// Monotonic sequence ID for telemetry envelopes
+    std::atomic<uint64_t> telemetry_seq_{0};
+    /// Timestamp of last incident check
+    int64_t last_incident_check_ns_{0};
+    /// Interval: check incidents every 10 seconds
+    static constexpr int64_t kIncidentCheckIntervalNs = 10'000'000'000LL;
+
+    // ==================== Hedge Recovery ====================
+    // Парная хедж-позиция управляется state machine (HedgePairManager).
+    // Решения основаны на market state, не на timeout.
+
+    /// State machine для парной хедж-позиции
+    std::unique_ptr<HedgePairManager> hedge_manager_;
+
+    /// DualLegManager — coordinated long+short pair entry, TPSL, reversal
+    std::unique_ptr<DualLegManager> dual_leg_manager_;
     /// Хедж активен (есть locked position: long + short одновременно)
     bool hedge_active_{false};
     /// Сторона хедж-позиции (противоположная основной)
@@ -483,16 +561,12 @@ private:
     int64_t hedge_entry_time_ns_{0};
     /// Убыток основной позиции в момент открытия хеджа (USDT)
     double original_loss_at_hedge_{0.0};
-    /// Был ли хедж уже использован для текущей позиции (не хеджируем повторно)
-    bool hedge_already_used_{false};
 
-    /// Проверить и управлять хедж-позицией.
+    /// Проверить и управлять хедж-позицией (delegated to HedgePairManager).
     /// @return true если хедж активен (блокировать обычный stop-loss)
     bool check_hedge_recovery(const features::FeatureSnapshot& snapshot);
 
     /// Оценить рыночную ситуацию для принятия решения о выходе.
-    /// Возвращает score [-1.0 .. +1.0]: отрицательный = неблагоприятно, положительный = благоприятно.
-    /// @param for_side сторона позиции (Long/Short) — индикаторы оцениваются относительно неё
     double evaluate_exit_score(const features::FeatureSnapshot& snapshot, PositionSide for_side) const;
 
     /// Закрыть одну ногу хедж-позиции

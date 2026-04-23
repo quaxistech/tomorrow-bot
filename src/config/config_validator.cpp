@@ -204,22 +204,11 @@ void ConfigValidator::validate_pair_selection(
     if (cfg.max_candidates_for_candles < 1) {
         result.add_error("pair_selection.max_candidates_for_candles должен быть >= 1");
     }
-    if (cfg.candle_fetch_concurrency < 1 || cfg.candle_fetch_concurrency > 20) {
-        result.add_error("pair_selection.candle_fetch_concurrency должен быть в диапазоне [1, 20]");
-    }
     if (cfg.scan_timeout_ms < 1000 || cfg.scan_timeout_ms > 300'000) {
         result.add_error("pair_selection.scan_timeout_ms должен быть в диапазоне [1000, 300000]");
     }
     if (cfg.max_correlation_in_basket <= 0.0 || cfg.max_correlation_in_basket > 1.0) {
         result.add_error("pair_selection.max_correlation_in_basket должен быть в (0, 1]");
-    }
-    // Scorer weights: должны суммироваться в 100 (±допуск)
-    double scorer_total = cfg.scorer.momentum_max + cfg.scorer.trend_max +
-                          cfg.scorer.tradability_max + cfg.scorer.quality_max;
-    if (std::abs(scorer_total - 100.0) > 1.0) {
-        result.add_warning(
-            std::format("pair_selection.scorer: сумма весов = {:.1f} (ожидается 100.0)",
-                        scorer_total));
     }
 }
 
@@ -243,15 +232,6 @@ void ConfigValidator::validate_trading_params(
     if (cfg.partial_tp_fraction <= 0.0 || cfg.partial_tp_fraction >= 1.0) {
         result.add_error("trading_params.partial_tp_fraction должен быть в диапазоне (0, 1)");
     }
-    if (cfg.max_hold_loss_minutes < 1 || cfg.max_hold_loss_minutes > 1440) {
-        result.add_error("trading_params.max_hold_loss_minutes должен быть в диапазоне [1, 1440]");
-    }
-    if (cfg.max_hold_absolute_minutes < 1 || cfg.max_hold_absolute_minutes > 10080) {
-        result.add_error("trading_params.max_hold_absolute_minutes должен быть в диапазоне [1, 10080]");
-    }
-    if (cfg.max_hold_absolute_minutes < cfg.max_hold_loss_minutes) {
-        result.add_error("trading_params.max_hold_absolute_minutes не может быть < max_hold_loss_minutes");
-    }
     if (cfg.order_cooldown_seconds < 0 || cfg.order_cooldown_seconds > 3600) {
         result.add_error("trading_params.order_cooldown_seconds должен быть в диапазоне [0, 3600]");
     }
@@ -262,10 +242,6 @@ void ConfigValidator::validate_trading_params(
     if (cfg.price_stop_loss_pct <= 0.0 || cfg.price_stop_loss_pct > 50.0) {
         result.add_error("trading_params.price_stop_loss_pct должен быть в диапазоне (0, 50]");
     }
-    // Минимальное удержание
-    if (cfg.min_hold_minutes < 0 || cfg.min_hold_minutes > cfg.max_hold_absolute_minutes) {
-        result.add_error("trading_params.min_hold_minutes должен быть в диапазоне [0, max_hold_absolute_minutes]");
-    }
     // Risk:Reward ratio
     if (cfg.min_risk_reward_ratio < 0.0 || cfg.min_risk_reward_ratio > 100.0) {
         result.add_error("trading_params.min_risk_reward_ratio должен быть в диапазоне [0, 100]");
@@ -275,9 +251,6 @@ void ConfigValidator::validate_trading_params(
         result.add_error("trading_params.dust_threshold_usdt должен быть >= 0");
     }
     // Quick profit
-    if (cfg.quick_profit_min_hold_seconds < 0) {
-        result.add_error("trading_params.quick_profit_min_hold_seconds должен быть >= 0");
-    }
     if (cfg.quick_profit_fee_multiplier < 1.0) {
         result.add_error("trading_params.quick_profit_fee_multiplier должен быть >= 1.0");
     }

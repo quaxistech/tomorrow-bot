@@ -33,27 +33,29 @@ TEST_CASE("ProductionGuard: Production без подтверждения зап�
     REQUIRE(result.api_keys_are_production);
 }
 
-TEST_CASE("ProductionGuard: Paper mode разрешён без подтверждения", "[security]") {
+TEST_CASE("ProductionGuard: Production без ключей запрещён", "[security]") {
     auto logger = std::make_shared<TestLogger>();
     ProductionGuard guard(logger);
 
-    ::unsetenv("TOMORROW_BOT_PRODUCTION_CONFIRM");
+    ::setenv("TOMORROW_BOT_PRODUCTION_CONFIRM", "I_UNDERSTAND_LIVE_TRADING", 1);
 
     auto result = guard.validate(
-        TradingMode::Paper,
+        TradingMode::Production,
         "",
         "",
         "",
         "https://api.bitget.com",
-        "config-hash-paper");
+        "config-hash-no-keys");
 
-    REQUIRE(result.allowed);
-    REQUIRE(result.detected_mode == TradingMode::Paper);
+    REQUIRE_FALSE(result.allowed);
+    REQUIRE(result.detected_mode == TradingMode::Production);
+
+    ::unsetenv("TOMORROW_BOT_PRODUCTION_CONFIRM");
 }
 
 TEST_CASE("ProductionGuard: определение production API URL", "[security]") {
     REQUIRE(ProductionGuard::is_production_api("https://api.bitget.com"));
     REQUIRE(ProductionGuard::is_production_api("https://api.bitget.com/api/v2"));
     REQUIRE_FALSE(ProductionGuard::is_production_api("https://testnet.bitget.com"));
-    REQUIRE(ProductionGuard::is_production_api("http://localhost:8080"));
+    REQUIRE_FALSE(ProductionGuard::is_production_api("http://localhost:8080"));
 }

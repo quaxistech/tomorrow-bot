@@ -83,8 +83,14 @@ TEST_CASE("RecoveryService: восстановление при чистом с�
     auto [logger, clk, met, exchange, portfolio, persistence] = make_recovery_deps();
 
     exchange->open_orders_ = {};
-    exchange->account_balances_ = {};
     exchange->open_positions_ = {};
+
+    // Чистый старт: нет позиций, но USDT баланс есть (аккаунт существует)
+    reconciliation::ExchangePositionInfo usdt;
+    usdt.symbol = Symbol("USDT");
+    usdt.available = Quantity(10000.0);
+    usdt.frozen = Quantity(0.0);
+    exchange->account_balances_ = {usdt};
 
     RecoveryService service(make_default_config(), exchange, portfolio,
                             persistence, logger, clk, met);

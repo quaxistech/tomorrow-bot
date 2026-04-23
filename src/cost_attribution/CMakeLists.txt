@@ -1,0 +1,4 @@
+add_library(tb_cost_attribution STATIC cost_attribution_engine.cpp)
+target_include_directories(tb_cost_attribution PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(tb_cost_attribution PUBLIC tb_common)
+target_compile_features(tb_cost_attribution PUBLIC cxx_std_23)

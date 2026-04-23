@@ -239,7 +239,7 @@ TEST_CASE("StrategyEngine: strategy layer does not emit time stop", "[strategy][
     auto clk = std::make_shared<TestClock>();
     clk->current_time = 10'000'000'000LL;
     ScalpStrategyConfig cfg;
-    cfg.max_hold_time_ms = 1000;  // 1 секунда для теста
+    // max_hold_time_ms removed — time exits centralized in PositionExitOrchestrator
     StrategyEngine engine(logger, clk, cfg);
 
     engine.notify_position_opened(50000.0, 0.1, Side::Buy, PositionSide::Long);

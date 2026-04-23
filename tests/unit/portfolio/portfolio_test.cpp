@@ -156,6 +156,27 @@ TEST_CASE("Portfolio: reset_daily очищает дневную статисти
     REQUIRE(pnl_after.consecutive_losses == 0);
 }
 
+TEST_CASE("Portfolio: первый sync капитала сбрасывает synthetic drawdown", "[portfolio][regression]") {
+    auto portfolio = make_portfolio(1.31);
+
+    portfolio->set_capital(1.145554);
+
+    auto pnl = portfolio->pnl();
+    REQUIRE_THAT(pnl.peak_equity, WithinAbs(1.145554, 1e-6));
+    REQUIRE_THAT(pnl.current_drawdown_pct, WithinAbs(0.0, 1e-6));
+}
+
+TEST_CASE("Portfolio: после первого sync реальный peak сохраняется для drawdown", "[portfolio][regression]") {
+    auto portfolio = make_portfolio(1.31);
+
+    portfolio->set_capital(1.145554);
+    portfolio->set_capital(1.000000);
+
+    auto pnl = portfolio->pnl();
+    REQUIRE_THAT(pnl.peak_equity, WithinAbs(1.145554, 1e-6));
+    REQUIRE(pnl.current_drawdown_pct > 12.0);
+}
+
 TEST_CASE("Portfolio: Снимок содержит все позиции", "[portfolio]") {
     auto portfolio = make_portfolio();
 

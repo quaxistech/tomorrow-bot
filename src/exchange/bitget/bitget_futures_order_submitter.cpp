@@ -14,20 +14,34 @@
 
 #include <boost/json.hpp>
 #include <cmath>
+#include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 
 namespace tb::exchange::bitget {
 
 static constexpr char kComp[] = "FuturesSubmitter";
 
+/// Anti-fingerprinting: random delay before order submission.
+/// Prevents timing pattern detection by introducing 20-150ms jitter.
+/// Thread-local RNG — no mutex needed.
+static void apply_submission_jitter() {
+    thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(20, 150);
+    int delay_ms = dist(rng);
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+}
+
 // Эндпоинты Bitget Mix v2 API (Futures)
-static constexpr char kPlaceOrderPath[]   = "/api/v2/mix/order/place-order";
-static constexpr char kCancelOrderPath[]  = "/api/v2/mix/order/cancel-order";
-static constexpr char kOrderDetailPath[]  = "/api/v2/mix/order/detail";
-static constexpr char kSetLeveragePath[]  = "/api/v2/mix/account/set-leverage";
-static constexpr char kSetMarginPath[]    = "/api/v2/mix/account/set-margin-mode";
-static constexpr char kSetHoldModePath[]  = "/api/v2/mix/account/set-position-mode";
+static constexpr char kPlaceOrderPath[]     = "/api/v2/mix/order/place-order";
+static constexpr char kPlacePlanOrderPath[] = "/api/v2/mix/order/place-plan-order";
+static constexpr char kCancelOrderPath[]    = "/api/v2/mix/order/cancel-order";
+static constexpr char kCancelPlanPath[]     = "/api/v2/mix/order/cancel-plan-order";
+static constexpr char kOrderDetailPath[]    = "/api/v2/mix/order/detail";
+static constexpr char kSetLeveragePath[]    = "/api/v2/mix/account/set-leverage";
+static constexpr char kSetMarginPath[]      = "/api/v2/mix/account/set-margin-mode";
+static constexpr char kSetHoldModePath[]    = "/api/v2/mix/account/set-position-mode";
 
 // ==================== Конструктор ====================
 
@@ -335,6 +349,24 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     // Long close: side=buy,  tradeSide=close
     // Short open: side=sell, tradeSide=open
     // Short close: side=sell, tradeSide=close
+
+    // Defensive validation: reject if position_side or trade_side are out of enum range.
+    // Prevents silent position inversion from uninitialized/corrupted enum values.
+    if (order.position_side != PositionSide::Long &&
+        order.position_side != PositionSide::Short) {
+        logger_->error(kComp, "Невалидный position_side enum — ордер отклонён",
+            {{"value", std::to_string(static_cast<int>(order.position_side))},
+             {"symbol", order.symbol.get()}});
+        return "{}";
+    }
+    if (order.trade_side != TradeSide::Open &&
+        order.trade_side != TradeSide::Close) {
+        logger_->error(kComp, "Невалидный trade_side enum — ордер отклонён",
+            {{"value", std::to_string(static_cast<int>(order.trade_side))},
+             {"symbol", order.symbol.get()}});
+        return "{}";
+    }
+
     std::string api_side;
     std::string api_trade_side;
 
@@ -367,7 +399,7 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     bool is_limit     = (order.order_type == OrderType::Limit);
 
     if (order.order_type == OrderType::StopMarket || order.order_type == OrderType::StopLimit) {
-        logger_->error(kComp, "Стоп-ордера отправляются через отдельный эндпоинт plan-order",
+        logger_->warn(kComp, "Стоп-ордера маршрутизируются через submit_plan_order()",
             {{"order_type", std::string(to_string(order.order_type))}});
         return "{}";
     }
@@ -413,6 +445,23 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
         obj["price"] = sym_rules.format_price(order.price.get());
     }
 
+    // === Attached TP/SL (Bitget exchange-level protection) ===
+    if (order.attached_tp_sl.has_any()) {
+        if (order.attached_tp_sl.has_tp()) {
+            obj["presetStopSurplusPrice"] =
+                sym_rules.format_price(order.attached_tp_sl.stop_surplus_price.get());
+        }
+        if (order.attached_tp_sl.has_sl()) {
+            obj["presetStopLossPrice"] =
+                sym_rules.format_price(order.attached_tp_sl.stop_loss_price.get());
+        }
+    }
+
+    // === Self-Trade Prevention (STP) ===
+    // Prevents matching against our own resting orders in paired execution.
+    // "cancel_taker" = incoming taker order is cancelled if it would self-trade.
+    obj["stpMode"] = "cancel_taker";
+
     return boost::json::serialize(obj);
 }
 
@@ -423,6 +472,11 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
 {
     execution::OrderSubmitResult result;
     result.order_id = order.order_id;
+
+    // Route StopMarket/StopLimit to plan order endpoint
+    if (order.order_type == OrderType::StopMarket || order.order_type == OrderType::StopLimit) {
+        return submit_plan_order(order);
+    }
 
     try {
         std::string body = build_place_order_json(order);
@@ -447,6 +501,9 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
              {"qty", std::to_string(order.original_quantity.get())},
              {"price", std::to_string(order.price.get())},
              {"product_type", futures_config_.product_type}});
+
+        // Anti-fingerprinting: randomize submission timing
+        apply_submission_jitter();
 
         auto response = rest_client_->post(kPlaceOrderPath, body);
 
@@ -482,9 +539,32 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
             result.success = false;
             result.error_message = "Bitget Futures API: [" + code + "] " + msg;
 
-            logger_->error(kComp, "Фьючерсный ордер отклонён биржей",
-                {{"code", code}, {"msg", msg},
-                 {"response", response.body.substr(0, 512)}});
+            // Classify API error for structured handling
+            if (code == "40768" || code == "40769") {
+                // Insufficient margin / would trigger liquidation — not retryable
+                logger_->error(kComp, "Ордер отклонён: недостаточная маржа",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else if (code == "40773") {
+                // Quantity too small — not retryable
+                logger_->error(kComp, "Ордер отклонён: количество слишком мало",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else if (code == "40780") {
+                // Position doesn't exist (trying to close non-existent position)
+                logger_->error(kComp, "Ордер отклонён: позиция не найдена",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else if (code == "40872") {
+                // Margin mode already set — treat as non-fatal
+                logger_->warn(kComp, "Margin mode уже установлен (не критично)",
+                    {{"code", code}, {"msg", msg}});
+            } else if (code == "45100" || code == "45101") {
+                // System/network busy — transient, logged for retry at caller level
+                logger_->warn(kComp, "Биржа занята, ордер не принят (transient)",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else {
+                logger_->error(kComp, "Фьючерсный ордер отклонён биржей",
+                    {{"code", code}, {"msg", msg},
+                     {"response", response.body.substr(0, 512)}});
+            }
         }
 
     } catch (const std::exception& ex) {
@@ -527,6 +607,15 @@ bool BitgetFuturesOrderSubmitter::cancel_order(const OrderId& order_id, const Sy
         if (code == "00000") {
             logger_->info(kComp, "Фьючерсный ордер отменён",
                 {{"order_id", order_id.get()}});
+            return true;
+        }
+
+        // M-25 fix: "already filled" or "order does not exist" is not a failure —
+        // the order is in a terminal state, treat cancel as success.
+        // Bitget codes: 43011 = order already filled/cancelled, 43012 = order not found
+        if (code == "43011" || code == "43012") {
+            logger_->info(kComp, "Ордер уже в терминальном состоянии, отмена не требуется",
+                {{"order_id", order_id.get()}, {"code", code}});
             return true;
         }
 
@@ -707,6 +796,216 @@ execution::OrderFillDetail BitgetFuturesOrderSubmitter::query_order_fill_detail(
         logger_->warn(kComp, "Исключение при запросе order fill detail",
             {{"error", ex.what()}, {"exchange_order_id", exchange_order_id.get()}});
         return result;
+    }
+}
+
+// ==================== build_plan_order_json ====================
+
+std::string BitgetFuturesOrderSubmitter::build_plan_order_json(
+    const execution::OrderRecord& order) const
+{
+    const auto& sym_rules = get_rules(order.symbol);
+
+    boost::json::object obj;
+
+    // Обязательные фьючерсные поля
+    obj["symbol"]      = order.symbol.get();
+    obj["productType"] = futures_config_.product_type;
+    obj["marginMode"]  = futures_config_.margin_mode;
+    obj["marginCoin"]  = futures_config_.margin_coin;
+
+    // Идемпотентный clientOid
+    if (!order.execution_info.client_order_id.empty()) {
+        obj["clientOid"] = order.execution_info.client_order_id;
+    }
+
+    // Направление (та же логика что и для place-order)
+    if (order.position_side == PositionSide::Long) {
+        obj["side"] = "buy";
+    } else {
+        obj["side"] = "sell";
+    }
+    obj["tradeSide"] = (order.trade_side == TradeSide::Open) ? "open" : "close";
+
+    // Plan type: profit_plan (TP) или loss_plan (SL)
+    // Определяем из типа ордера и контекста:
+    //   - StopMarket/StopLimit при закрытии Long с trigger ниже текущей = loss_plan
+    //   - StopMarket/StopLimit при закрытии Long с trigger выше текущей = profit_plan
+    // Для простоты: если trigger_price > 0 и order_type == StopMarket → market execution
+    //               если order_type == StopLimit → limit execution
+
+    // Trigger price
+    if (order.plan_params.trigger_price.get() <= 0.0) {
+        logger_->error(kComp, "Plan ордер без trigger price",
+            {{"order_id", order.order_id.get()}});
+        return "{}";
+    }
+    obj["triggerPrice"] = sym_rules.format_price(order.plan_params.trigger_price.get());
+
+    // Trigger type: fill_price (last trade) или mark_price
+    obj["triggerType"] = (order.plan_params.trigger_type == execution::TriggerType::MarkPrice)
+        ? "mark_price" : "fill_price";
+
+    // Размер ордера
+    double floored_qty = sym_rules.floor_quantity(order.original_quantity.get());
+    if (!sym_rules.is_quantity_valid(floored_qty)) {
+        logger_->error(kComp, "Plan ордер: quantity невалиден после округления",
+            {{"original_qty", std::to_string(order.original_quantity.get())},
+             {"floored_qty", std::to_string(floored_qty)},
+             {"symbol", order.symbol.get()}});
+        return "{}";
+    }
+    obj["size"] = sym_rules.format_quantity(floored_qty);
+
+    // Тип исполнения при срабатывании
+    if (order.order_type == OrderType::StopMarket) {
+        obj["orderType"] = "market";
+    } else if (order.order_type == OrderType::StopLimit) {
+        obj["orderType"] = "limit";
+        if (order.plan_params.execute_price.get() > 0.0) {
+            obj["executePrice"] = sym_rules.format_price(order.plan_params.execute_price.get());
+        } else if (order.price.get() > 0.0) {
+            obj["executePrice"] = sym_rules.format_price(order.price.get());
+        } else {
+            logger_->error(kComp, "StopLimit plan ордер без execute price",
+                {{"order_id", order.order_id.get()}});
+            return "{}";
+        }
+    } else {
+        logger_->error(kComp, "Некорректный тип ордера для plan order",
+            {{"order_type", std::string(to_string(order.order_type))}});
+        return "{}";
+    }
+
+    // Self-Trade Prevention for plan/TPSL orders
+    obj["stpMode"] = "cancel_taker";
+
+    return boost::json::serialize(obj);
+}
+
+// ==================== submit_plan_order ====================
+
+execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_plan_order(
+    const execution::OrderRecord& order)
+{
+    execution::OrderSubmitResult result;
+    result.order_id = order.order_id;
+
+    try {
+        std::string body = build_plan_order_json(order);
+
+        if (body == "{}") {
+            result.success = false;
+            result.error_message = "Ошибка формирования JSON plan ордера";
+            return result;
+        }
+
+        const auto& sym_rules = get_rules(order.symbol);
+        double floored = sym_rules.floor_quantity(order.original_quantity.get());
+        result.submitted_quantity = Quantity(floored);
+
+        logger_->info(kComp, "Отправка plan ордера на биржу",
+            {{"symbol", order.symbol.get()},
+             {"side", std::string(to_string(order.side))},
+             {"position_side", std::string(to_string(order.position_side))},
+             {"trade_side", std::string(to_string(order.trade_side))},
+             {"type", std::string(to_string(order.order_type))},
+             {"trigger_price", std::to_string(order.plan_params.trigger_price.get())},
+             {"qty", std::to_string(order.original_quantity.get())}});
+
+        auto response = rest_client_->post(kPlacePlanOrderPath, body);
+
+        if (!response.success) {
+            result.success = false;
+            result.error_message = "HTTP ошибка: " + response.error_message;
+            logger_->error(kComp, "Plan ордер не отправлен (HTTP)",
+                {{"error", response.error_message},
+                 {"body", response.body.substr(0, 512)}});
+            return result;
+        }
+
+        auto json = boost::json::parse(response.body);
+        auto& obj = json.as_object();
+
+        std::string code = std::string(obj.at("code").as_string());
+        std::string msg = obj.contains("msg")
+            ? std::string(obj.at("msg").as_string()) : "";
+
+        if (code == "00000") {
+            auto& data = obj.at("data").as_object();
+            std::string exchange_id = std::string(data.at("orderId").as_string());
+
+            result.success = true;
+            result.exchange_order_id = OrderId(exchange_id);
+
+            logger_->info(kComp, "Plan ордер принят биржей",
+                {{"exchange_order_id", exchange_id},
+                 {"internal_order_id", order.order_id.get()},
+                 {"trigger_price", std::to_string(order.plan_params.trigger_price.get())}});
+        } else {
+            result.success = false;
+            result.error_message = "Bitget Futures API: [" + code + "] " + msg;
+
+            logger_->error(kComp, "Plan ордер отклонён биржей",
+                {{"code", code}, {"msg", msg},
+                 {"response", response.body.substr(0, 512)}});
+        }
+
+    } catch (const std::exception& ex) {
+        result.success = false;
+        result.error_message = std::string("Исключение: ") + ex.what();
+        logger_->error(kComp, "Исключение при отправке plan ордера",
+            {{"error", ex.what()}});
+    }
+
+    return result;
+}
+
+// ==================== cancel_plan_order ====================
+
+bool BitgetFuturesOrderSubmitter::cancel_plan_order(
+    const OrderId& order_id, const Symbol& symbol)
+{
+    try {
+        boost::json::object obj;
+        obj["symbol"]      = symbol.get();
+        obj["productType"] = futures_config_.product_type;
+        obj["marginCoin"]  = futures_config_.margin_coin;
+        obj["orderId"]     = order_id.get();
+
+        std::string body = boost::json::serialize(obj);
+
+        logger_->info(kComp, "Запрос отмены plan ордера",
+            {{"order_id", order_id.get()}, {"symbol", symbol.get()}});
+
+        auto response = rest_client_->post(kCancelPlanPath, body);
+
+        if (!response.success) {
+            logger_->error(kComp, "Отмена plan ордера не выполнена (HTTP)",
+                {{"error", response.error_message}});
+            return false;
+        }
+
+        auto json = boost::json::parse(response.body);
+        auto& resp_obj = json.as_object();
+        std::string code = std::string(resp_obj.at("code").as_string());
+
+        if (code == "00000") {
+            logger_->info(kComp, "Plan ордер отменён",
+                {{"order_id", order_id.get()}});
+            return true;
+        }
+
+        std::string msg = resp_obj.contains("msg")
+            ? std::string(resp_obj.at("msg").as_string()) : "";
+        logger_->error(kComp, "Отмена plan ордера отклонена биржей",
+            {{"code", code}, {"msg", msg}});
+        return false;
+
+    } catch (const std::exception& ex) {
+        logger_->error(kComp, "Исключение при отмене plan ордера",
+            {{"error", ex.what()}, {"order_id", order_id.get()}});
+        return false;
     }
 }
 

@@ -15,6 +15,7 @@ target_include_directories(tb_security
 target_link_libraries(tb_security
     PUBLIC
         tb_common
+        tb_logging
 )
 
 target_compile_features(tb_security PUBLIC cxx_std_20)

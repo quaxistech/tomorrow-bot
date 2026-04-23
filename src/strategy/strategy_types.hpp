@@ -33,7 +33,6 @@ enum class ExitReason {
     VolatilitySpikeExit,
     InventoryRiskExit,
     SignalDecay,
-    TimeExit,
     RegimeChange,
     PartialReduction,
     SetupInvalidation,  ///< Сетап стал недействительным после входа
@@ -174,7 +173,6 @@ inline const char* to_string(ExitReason er) {
         case ExitReason::VolatilitySpikeExit:     return "VolatilitySpikeExit";
         case ExitReason::InventoryRiskExit:       return "InventoryRiskExit";
         case ExitReason::SignalDecay:             return "SignalDecay";
-        case ExitReason::TimeExit:                return "TimeExit";
         case ExitReason::RegimeChange:            return "RegimeChange";
         case ExitReason::PartialReduction:        return "PartialReduction";
         case ExitReason::SetupInvalidation:       return "SetupInvalidation";

@@ -4,6 +4,7 @@ api.txt
 
 # Сборка
 build/
+build-release/
 build-check/
 build-debug/
 a.out
@@ -17,6 +18,8 @@ a.out
 
 # Логи
 *.log
+/logs/
+/telemetry/
 /var/log/tomorrow-bot/
 
 # OS

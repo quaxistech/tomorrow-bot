@@ -16,8 +16,10 @@
 #include "execution/telemetry/execution_metrics.hpp"
 #include "portfolio/portfolio_engine.hpp"
 #include "uncertainty/uncertainty_types.hpp"
+#include "../../mocks/mock_order_submitter.hpp"
 
 using namespace tb;
+using MockOrderSubmitter = tb::testing::MockOrderSubmitter;
 using namespace tb::test;
 using namespace tb::execution;
 using namespace Catch::Matchers;
@@ -214,11 +216,11 @@ TEST_CASE("is_valid_transition: корректная таблица перехо
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PaperOrderSubmitter tests
+// MockOrderSubmitter tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("PaperOrderSubmitter: Немедленное подтверждение", "[execution][paper]") {
-    PaperOrderSubmitter submitter;
+TEST_CASE("MockOrderSubmitter: Немедленное подтверждение", "[execution][paper]") {
+    MockOrderSubmitter submitter;
     OrderRecord order;
     order.order_id = OrderId("ORD-1");
     order.symbol = Symbol("BTCUSDT");
@@ -232,8 +234,8 @@ TEST_CASE("PaperOrderSubmitter: Немедленное подтверждени�
     REQUIRE_FALSE(result.exchange_order_id.get().empty());
 }
 
-TEST_CASE("PaperOrderSubmitter: применяет exchange floor к quantity", "[execution][paper]") {
-    PaperOrderSubmitter submitter;
+TEST_CASE("MockOrderSubmitter: применяет exchange floor к quantity", "[execution][paper]") {
+    MockOrderSubmitter submitter;
 
     ExchangeSymbolRules rules;
     rules.symbol = Symbol("XAUUSDT");
@@ -256,8 +258,8 @@ TEST_CASE("PaperOrderSubmitter: применяет exchange floor к quantity", 
     REQUIRE_THAT(result.submitted_quantity.get(), WithinAbs(1.23, 1e-9));
 }
 
-TEST_CASE("PaperOrderSubmitter: отклоняет futures dust после floor", "[execution][paper]") {
-    PaperOrderSubmitter submitter;
+TEST_CASE("MockOrderSubmitter: отклоняет futures dust после floor", "[execution][paper]") {
+    MockOrderSubmitter submitter;
 
     ExchangeSymbolRules rules;
     rules.symbol = Symbol("XAUUSDT");
@@ -280,8 +282,8 @@ TEST_CASE("PaperOrderSubmitter: отклоняет futures dust после floor
     REQUIRE(result.error_message.find("quantity invalid") != std::string::npos);
 }
 
-TEST_CASE("PaperOrderSubmitter: Отмена всегда успешна", "[execution][paper]") {
-    PaperOrderSubmitter submitter;
+TEST_CASE("MockOrderSubmitter: Отмена всегда успешна", "[execution][paper]") {
+    MockOrderSubmitter submitter;
     REQUIRE(submitter.cancel_order(OrderId("ORD-1"), Symbol("BTCUSDT")));
 }
 
@@ -574,7 +576,7 @@ TEST_CASE("ExecutionMetrics: reset", "[execution][metrics]") {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("ExecutionEngine: full execute → market fill", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -601,7 +603,7 @@ TEST_CASE("ExecutionEngine: full execute → market fill", "[execution][engine]"
 }
 
 TEST_CASE("ExecutionEngine: risk denied → error", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -617,7 +619,7 @@ TEST_CASE("ExecutionEngine: risk denied → error", "[execution][engine]") {
 }
 
 TEST_CASE("ExecutionEngine: exec alpha blocked → error", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -632,7 +634,7 @@ TEST_CASE("ExecutionEngine: exec alpha blocked → error", "[execution][engine]"
 }
 
 TEST_CASE("ExecutionEngine: extreme uncertainty → error", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -647,7 +649,7 @@ TEST_CASE("ExecutionEngine: extreme uncertainty → error", "[execution][engine]
 }
 
 TEST_CASE("ExecutionEngine: duplicate intent → rejected (§22)", "[execution][engine][dedup]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -670,7 +672,7 @@ TEST_CASE("ExecutionEngine: duplicate intent → rejected (§22)", "[execution][
 }
 
 TEST_CASE("ExecutionEngine: zero quantity → rejected", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -683,7 +685,7 @@ TEST_CASE("ExecutionEngine: zero quantity → rejected", "[execution][engine]") 
 }
 
 TEST_CASE("ExecutionEngine: cancel non-existent → error", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -695,7 +697,7 @@ TEST_CASE("ExecutionEngine: cancel non-existent → error", "[execution][engine]
 }
 
 TEST_CASE("ExecutionEngine: active_orders returns only active", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -714,7 +716,7 @@ TEST_CASE("ExecutionEngine: active_orders returns only active", "[execution][eng
 }
 
 TEST_CASE("ExecutionEngine: cleanup_terminal_orders", "[execution][engine]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();
@@ -735,7 +737,7 @@ TEST_CASE("ExecutionEngine: cleanup_terminal_orders", "[execution][engine]") {
 }
 
 TEST_CASE("ExecutionEngine: execution_stats reflects submissions", "[execution][engine][metrics]") {
-    auto submitter = std::make_shared<PaperOrderSubmitter>();
+    auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();
     auto clk = make_clock();
     auto met = make_metrics();

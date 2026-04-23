@@ -73,6 +73,18 @@ public:
     ///         Возвращает 0.0 при ошибке запроса.
     [[nodiscard]] double get_current_funding_rate(const Symbol& symbol);
 
+    /// Получить историю ордеров (заполненные/отменённые) для reconciliation после рестарта.
+    /// Endpoint: GET /api/v2/mix/order/orders-history
+    /// @param symbol Фильтр по символу (пустой = все).
+    /// @param limit Максимальное количество ордеров (по умолчанию 100, макс 100).
+    /// @return Ордера, отсортированные от новых к старым.
+    Result<std::vector<reconciliation::ExchangeOrderInfo>>
+    get_order_history(const Symbol& symbol = Symbol(""), int limit = 100);
+
+    /// Получить серверное время Bitget (ms since epoch).
+    /// Прокси к BitgetRestClient::get_server_time_ms().
+    [[nodiscard]] int64_t get_server_time_ms();
+
 private:
     /// Разобрать JSON-объект ордера → ExchangeOrderInfo
     [[nodiscard]] static reconciliation::ExchangeOrderInfo

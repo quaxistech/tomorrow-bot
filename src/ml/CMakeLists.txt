@@ -8,6 +8,9 @@ add_library(tb_ml STATIC
     liquidation_cascade.cpp
     correlation_monitor.cpp
     thompson_sampler.cpp
+    meta_label.cpp
+    calibration.cpp
+    regime_ensemble.cpp
 )
 target_include_directories(tb_ml PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(tb_ml PUBLIC tb_common tb_features tb_logging)

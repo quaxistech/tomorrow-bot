@@ -1,0 +1,86 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# staged_rollout.yaml — Staged capital ramp with automatic stop criteria
+#
+# Philosophy: start tiny, prove stability, then scale carefully.
+# Each stage runs for minimum duration before auto-advancing.
+# Auto-stop halts advancement (not trading) if any threshold is breached.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+rollout:
+  # Auto-advance when stage_duration_hours is reached AND all criteria are green
+  auto_advance: false          # Manual confirmation required to advance by default
+
+  stages:
+    - name: "canary"
+      description: "Minimum viable position — proof of mechanism"
+      capital_pct: 10            # 10% of total allocated capital
+      max_position_notional: 5.0 # Absolute minimum ($5 USDT)
+      max_concurrent_pairs: 1    # Single pair only
+      leverage_cap: 5            # Conservative leverage
+      stage_duration_hours: 72   # 3 days minimum
+      advancement_criteria:
+        max_drawdown_pct: 3.0          # Halt advancement if DD > 3%
+        min_trade_count: 10            # At least 10 trades for statistical significance
+        max_reject_rate_pct: 5.0       # Reject rate must stay < 5%
+        max_position_divergence_pct: 0.5 # Tight reconciliation tolerance
+        min_uptime_pct: 99.0            # 99% uptime required
+
+    - name: "pilot"
+      description: "Dual pair validation — hedge mechanics proof"
+      capital_pct: 25
+      max_position_notional: 15.0
+      max_concurrent_pairs: 2
+      leverage_cap: 10
+      stage_duration_hours: 168  # 7 days minimum
+      advancement_criteria:
+        max_drawdown_pct: 5.0
+        min_trade_count: 30
+        max_reject_rate_pct: 3.0
+        max_position_divergence_pct: 0.5
+        min_uptime_pct: 99.5
+        hedge_pair_success_rate_pct: 80.0 # 80% of hedge pairs must close profitably
+
+    - name: "growth"
+      description: "Full pair rotation — all 3 pairs active"
+      capital_pct: 60
+      max_position_notional: 28.0
+      max_concurrent_pairs: 3
+      leverage_cap: 15
+      stage_duration_hours: 336  # 14 days minimum
+      advancement_criteria:
+        max_drawdown_pct: 8.0
+        min_trade_count: 100
+        max_reject_rate_pct: 2.0
+        max_position_divergence_pct: 0.3
+        min_uptime_pct: 99.9
+        min_sharpe_ratio: 0.5     # Risk-adjusted return must be positive
+        max_daily_loss_pct: 3.0    # Single-day loss cap
+
+    - name: "full"
+      description: "Full allocation — production target"
+      capital_pct: 100
+      max_position_notional: 50.0  # Scales with actual capital
+      max_concurrent_pairs: 3
+      leverage_cap: 20
+      stage_duration_hours: 0       # No time limit — permanent stage
+      advancement_criteria: {}       # N/A, final stage
+
+  # ─── Auto-stop criteria (apply to ALL stages) ────────────────────────────
+  # If ANY auto-stop fires, bot pauses and emits CRITICAL alert.
+  # Does NOT roll back — operator must investigate and resume manually.
+  auto_stop:
+    max_intraday_drawdown_pct: 5.0    # Single-session DD halts immediately
+    max_consecutive_losses: 8         # 8 consecutive losing trades → pause
+    max_position_divergence_pct: 2.0  # Hard divergence → immediate halt
+    max_exchange_reject_pct: 15.0     # Exchange reject storm → halt
+    ws_disconnect_max_seconds: 60     # WS down > 60s → halt entry (keep exits)
+    max_latency_ms: 5000              # Execution latency > 5s → pause entries
+
+  # ─── Rollback rules ──────────────────────────────────────────────────────
+  # Automatic stage demotion when criteria are breached during a stage
+  rollback:
+    enabled: true
+    demote_on_drawdown_breach: true       # If DD exceeds stage limit → drop one stage
+    demote_on_consecutive_losses: 10      # 10 consecutive losses → drop one stage
+    min_stage: "canary"                    # Never go below canary
+    cooldown_after_demote_hours: 24       # Wait 24h before attempting re-advance

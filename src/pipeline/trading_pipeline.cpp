@@ -42,6 +42,19 @@ double apply_quantity_noise(double qty, double noise_pct = 2.0) {
     return qty * (1.0 + noise);
 }
 
+double ceil_quantity_to_precision(double qty, int precision) {
+    if (qty <= 0.0) return 0.0;
+
+    const int prec = std::clamp(precision, 0, tb::kMaxPrecisionDigits);
+    double factor = 1.0;
+    for (int i = 0; i < prec; ++i) factor *= 10.0;
+
+    double ceiled = std::ceil((qty - 1e-12) * factor) / factor;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(prec) << ceiled;
+    return std::strtod(oss.str().c_str(), nullptr);
+}
+
 /// Сгенерировать случайную задержку [min_ms, max_ms] для order timing jitter.
 /// Предотвращает обнаружение паттернов по времени подачи ордеров.
 int generate_order_jitter_ms(int min_ms = 50, int max_ms = 300) {
@@ -288,6 +301,35 @@ TradingPipeline::TradingPipeline(
         }
     }
 
+    // Persistence layer — используется для snapshot'ов и journal-событий (позиции, сделки)
+    {
+        persistence::PersistenceConfig pcfg;
+        pcfg.enabled = (shared_pg_storage != nullptr);
+        auto adapter = shared_pg_storage
+            ? shared_pg_storage
+            : std::static_pointer_cast<persistence::IStorageAdapter>(
+                std::make_shared<persistence::MemoryStorageAdapter>());
+        persistence_ = std::make_shared<persistence::PersistenceLayer>(adapter, pcfg);
+    }
+
+    // 5.4. Telemetry & observability (Phase 8)
+    {
+        telemetry::FileSinkConfig sink_cfg;
+        sink_cfg.directory = "./telemetry/" + symbol_.get();
+        auto file_sink = std::make_shared<telemetry::FileTelemetrySink>(std::move(sink_cfg));
+        telemetry::TelemetryConfig tel_cfg;
+        tel_cfg.enabled = true;
+        tel_cfg.output_dir = "./telemetry/" + symbol_.get();
+        telemetry_ = std::make_shared<telemetry::ResearchTelemetry>(
+            std::move(file_sink), std::move(tel_cfg));
+
+        telemetry::IncidentDetectorConfig inc_cfg;
+        incident_detector_ = std::make_unique<telemetry::IncidentDetector>(
+            std::move(inc_cfg), logger_, metrics_);
+
+        obs_panels_ = telemetry::ObservabilityPanels::create(metrics_);
+    }
+
     // 5.5. Продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
     features::VpinConfig vpin_cfg;
     vpin_cfg.toxic_threshold = config_.execution_alpha.vpin_toxic_threshold;
@@ -381,6 +423,10 @@ TradingPipeline::TradingPipeline(
         ea_cfg.postonly_adverse_max            = config_.execution_alpha.postonly_adverse_max;
         ea_cfg.taker_fee_bps                   = config_.execution_alpha.taker_fee_bps;
         ea_cfg.maker_fee_bps                   = config_.execution_alpha.maker_fee_bps;
+        ea_cfg.opportunity_cost_bps            = config_.execution_alpha.opportunity_cost_bps;
+        ea_cfg.queue_depletion_penalty         = config_.execution_alpha.queue_depletion_penalty;
+        ea_cfg.churn_penalty                   = config_.execution_alpha.churn_penalty;
+        ea_cfg.feedback_weight                 = config_.execution_alpha.feedback_weight;
         execution_alpha_ = std::make_shared<execution_alpha::RuleBasedExecutionAlpha>(
             std::move(ea_cfg), logger_, clock_, metrics_);
     }
@@ -415,7 +461,7 @@ TradingPipeline::TradingPipeline(
     risk_cfg.max_drawdown_pct = config_.risk.max_drawdown_pct;
     risk_cfg.kill_switch_enabled = config_.risk.kill_switch_enabled;
     risk_cfg.max_loss_per_trade_pct = config_.trading_params.max_loss_per_trade_pct;
-    risk_cfg.max_position_hold_ns = static_cast<int64_t>(config_.trading_params.max_hold_absolute_minutes) * 60'000'000'000LL;
+    risk_cfg.operational_deadman_ns = static_cast<int64_t>(config_.operational_safety.operational_deadman_minutes) * 60'000'000'000LL;
     risk_cfg.post_loss_cooldown_ns = static_cast<int64_t>(config_.trading_params.stop_loss_cooldown_seconds) * 1'000'000'000LL;
     // Расширенные параметры из конфига
     risk_cfg.max_strategy_daily_loss_pct = config_.risk.max_strategy_daily_loss_pct;
@@ -455,33 +501,10 @@ TradingPipeline::TradingPipeline(
          {"margin_mode", config_.futures.margin_mode},
          {"liquidation_buffer_pct", std::to_string(config_.futures.liquidation_buffer_pct)}});
 
-    // 10. Исполнение — выбор submitter по режиму
+    // 10. Исполнение — production-only (USDT-M futures через Bitget)
     std::shared_ptr<execution::IOrderSubmitter> submitter;
 
-    if (config_.trading.mode == TradingMode::Paper) {
-        // Paper mode — имитация ордеров без реальных API вызовов
-        auto paper_submitter = std::make_shared<execution::PaperOrderSubmitter>();
-        paper_submitter_ = paper_submitter;
-        submitter = paper_submitter;
-        logger_->info("pipeline", "Режим исполнения: PAPER (ордера не отправляются)");
-
-        // Всё равно создаём REST клиент для получения рыночных данных
-        auto key_result = secret_provider_->get_secret(
-            security::SecretRef{config_.exchange.api_key_ref});
-        auto secret_result = secret_provider_->get_secret(
-            security::SecretRef{config_.exchange.api_secret_ref});
-        auto pass_result = secret_provider_->get_secret(
-            security::SecretRef{config_.exchange.passphrase_ref});
-
-        if (key_result && secret_result && pass_result) {
-            auto rest_client = std::make_shared<exchange::bitget::BitgetRestClient>(
-                config_.exchange.endpoint_rest,
-                *key_result, *secret_result, *pass_result,
-                logger_, config_.exchange.timeout_ms);
-            rest_client_ = rest_client;
-        }
-    } else {
-        // Production — реальная торговля, загружаем API ключи
+    {
         auto key_result = secret_provider_->get_secret(
             security::SecretRef{config_.exchange.api_key_ref});
         auto secret_result = secret_provider_->get_secret(
@@ -500,6 +523,20 @@ TradingPipeline::TradingPipeline(
             *key_result, *secret_result, *pass_result,
             logger_, config_.exchange.timeout_ms);
 
+        // Clock sync check — fail-fast if time drift exceeds 2 seconds
+        try {
+            int64_t offset_ms = rest_client->check_clock_sync();
+            if (std::abs(offset_ms) > 2000) {
+                throw std::runtime_error(
+                    "Clock drift too large: " + std::to_string(offset_ms)
+                    + "ms. Sync system clock before trading.");
+            }
+        } catch (const std::runtime_error& ex) {
+            logger_->critical("pipeline",
+                "Clock sync check failed: " + std::string(ex.what()));
+            throw;
+        }
+
         rest_client_ = rest_client;
 
         auto futures_sub = std::make_shared<exchange::bitget::BitgetFuturesOrderSubmitter>(
@@ -513,6 +550,39 @@ TradingPipeline::TradingPipeline(
     execution_engine_ = std::make_shared<execution::ExecutionEngine>(
         submitter, portfolio_, logger_, clock_, metrics_);
     execution_engine_->set_leverage(static_cast<double>(config_.futures.default_leverage));
+
+    // 10b. Private WebSocket — event-driven fill/order updates
+    if (config_.exchange.use_private_ws && rest_client_) {
+        auto key_result = secret_provider_->get_secret(
+            security::SecretRef{config_.exchange.api_key_ref});
+        auto secret_result = secret_provider_->get_secret(
+            security::SecretRef{config_.exchange.api_secret_ref});
+        auto pass_result = secret_provider_->get_secret(
+            security::SecretRef{config_.exchange.passphrase_ref});
+
+        if (key_result && secret_result && pass_result) {
+            exchange::bitget::PrivateWsConfig pw_cfg;
+            pw_cfg.url = config_.exchange.endpoint_ws_private;
+            pw_cfg.api_key = *key_result;
+            pw_cfg.api_secret = *secret_result;
+            pw_cfg.passphrase = *pass_result;
+
+            private_ws_client_ = std::make_unique<exchange::bitget::BitgetPrivateWsClient>(
+                std::move(pw_cfg),
+                [this](const std::string& channel, const boost::json::value& data) {
+                    on_private_ws_message(channel, data);
+                },
+                [this](bool connected, bool authenticated) {
+                    if (connected && authenticated) {
+                        logger_->info("pipeline", "Private WS authenticated — event-driven fills active");
+                    } else if (!connected) {
+                        logger_->warn("pipeline", "Private WS disconnected — falling back to REST polling");
+                    }
+                },
+                logger_);
+            logger_->info("pipeline", "Private WebSocket client инициализирован");
+        }
+    }
 
     // 10a. Smart TWAP — адаптивное нарезание крупных ордеров
     twap_executor_ = std::make_shared<execution::SmartTwapExecutor>(
@@ -554,6 +624,23 @@ TradingPipeline::TradingPipeline(
             {{"max_open_ms", "30000"}, {"max_partial_ms", "60000"}});
     }
 
+    // ==================== Phase 2: Exit Orchestrator ====================
+    exit_orchestrator_ = std::make_unique<PositionExitOrchestrator>(logger_, clock_);
+
+    // ==================== Phase 3: Hedge Pair Manager ====================
+    hedge_manager_ = std::make_unique<HedgePairManager>(logger_);
+
+    // ==================== Phase 5: DualLegManager ====================
+    if (futures_submitter_ && rest_client_) {
+        DualLegConfig dlc;
+        dual_leg_manager_ = std::make_unique<DualLegManager>(
+            dlc, futures_submitter_, rest_client_, logger_, clock_);
+        logger_->info("pipeline", "DualLegManager инициализирован (batch entry, TPSL, reversal)");
+    }
+
+    // ==================== Phase 4: Market Reaction Engine ====================
+    market_reaction_engine_ = std::make_unique<MarketReactionEngine>(logger_);
+
     // ==================== Phase 4: Reconciliation ====================
     // Инициализируем reconciliation только для production/testnet (нужен REST)
     if (rest_client_) {
@@ -575,26 +662,14 @@ TradingPipeline::TradingPipeline(
         // exchange_rules_.min_trade_usdt устанавливается из ScannerEngine данных.
         if (exchange_rules_.min_trade_usdt > 0.0) {
             recovery_cfg.min_position_value_usd = exchange_rules_.min_trade_usdt;
-        } else if (config_.trading.mode == TradingMode::Production) {
-            // ИСПРАВЛЕНИЕ H1 (аудит): в production нельзя запускать recovery
-            // без знания min_trade_usdt — используем безопасный fallback $5 (Bitget BTC minimum)
+        } else {
+            // Безопасный fallback $5 (Bitget BTC minimum) если exchange rules ещё не установлены
             recovery_cfg.min_position_value_usd = 5.0;
             logger_->warn("pipeline",
                 "Exchange rules не установлены при startup recovery — "
                 "используется безопасный fallback min_position_value=$5",
                 {{"symbol", symbol_.get()}});
         }
-
-        persistence::PersistenceConfig recovery_persistence_cfg;
-        // ИСПРАВЛЕНИЕ H2: persistence включена при наличии PostgreSQL storage.
-        // Если pg storage недоступен — используем memory adapter (persistence off по умолчанию).
-        recovery_persistence_cfg.enabled = (shared_pg_storage != nullptr);
-        auto recovery_storage = shared_pg_storage
-            ? shared_pg_storage
-            : std::static_pointer_cast<persistence::IStorageAdapter>(
-                std::make_shared<persistence::MemoryStorageAdapter>());
-        auto recovery_persistence = std::make_shared<persistence::PersistenceLayer>(
-            recovery_storage, recovery_persistence_cfg);
 
         std::shared_ptr<reconciliation::IExchangeQueryService> recovery_query =
             std::static_pointer_cast<reconciliation::IExchangeQueryService>(futures_query_adapter_);
@@ -604,7 +679,7 @@ TradingPipeline::TradingPipeline(
                 recovery_cfg,
                 recovery_query,
                 portfolio_,
-                recovery_persistence,
+                persistence_,
                 logger_,
                 clock_,
                 metrics_);
@@ -652,15 +727,7 @@ void TradingPipeline::set_exchange_rules(const ExchangeSymbolRules& rules) {
     exchange_rules_ = rules;
     if (futures_submitter_) {
         futures_submitter_->set_rules(rules.symbol, rules);
-        logger_->info("pipeline", "Exchange rules установлены (Futures)",
-            {{"symbol", rules.symbol.get()},
-             {"qty_precision", std::to_string(rules.quantity_precision)},
-             {"price_precision", std::to_string(rules.price_precision)},
-             {"min_trade_usdt", std::to_string(rules.min_trade_usdt)}});
-    }
-    if (paper_submitter_) {
-        paper_submitter_->set_rules(rules.symbol, rules);
-        logger_->info("pipeline", "Exchange rules установлены (Paper)",
+        logger_->info("pipeline", "Exchange rules установлены",
             {{"symbol", rules.symbol.get()},
              {"qty_precision", std::to_string(rules.quantity_precision)},
              {"price_precision", std::to_string(rules.price_precision)},
@@ -683,7 +750,7 @@ void TradingPipeline::set_exchange_rules(const ExchangeSymbolRules& rules) {
 // ==================== Загрузка точности ордеров ====================
 
 void TradingPipeline::fetch_symbol_precision() {
-    if (!rest_client_ || (!futures_submitter_ && !paper_submitter_)) return;
+    if (!rest_client_ || !futures_submitter_) return;
 
     try {
         std::string endpoint = "/api/v2/mix/market/contracts";
@@ -710,15 +777,20 @@ void TradingPipeline::fetch_symbol_precision() {
             double min_trade = 1.0;
             double min_qty = 0.0;
             // Futures API: volumePlace, pricePlace (fallback: quantityPrecision)
+            auto safe_parse_precision = [&](const boost::json::value& v, int fallback) -> int {
+                double raw = parse_json_double(v);
+                if (!std::isfinite(raw)) return fallback;
+                return std::clamp(static_cast<int>(raw), 0, 18);
+            };
             if (o.contains("quantityPrecision")) {
-                qty_prec = static_cast<int>(parse_json_double(o.at("quantityPrecision")));
+                qty_prec = safe_parse_precision(o.at("quantityPrecision"), qty_prec);
             } else if (o.contains("volumePlace")) {
-                qty_prec = static_cast<int>(parse_json_double(o.at("volumePlace")));
+                qty_prec = safe_parse_precision(o.at("volumePlace"), qty_prec);
             }
             if (o.contains("pricePrecision")) {
-                price_prec = static_cast<int>(parse_json_double(o.at("pricePrecision")));
+                price_prec = safe_parse_precision(o.at("pricePrecision"), price_prec);
             } else if (o.contains("pricePlace")) {
-                price_prec = static_cast<int>(parse_json_double(o.at("pricePlace")));
+                price_prec = safe_parse_precision(o.at("pricePlace"), price_prec);
             }
             if (o.contains("minTradeUSDT")) {
                 min_trade = parse_json_double(o.at("minTradeUSDT"));
@@ -845,26 +917,24 @@ void TradingPipeline::sync_balance_from_exchange() {
                 // Синхронизируем каждую ногу в портфель отдельно
                 auto sync_leg = [&](const LegInfo& leg) {
                     auto local = portfolio_->get_position(symbol_, leg.side);
+                    Timestamp opened = local.has_value() ? local->opened_at : clock_->now();
+                    portfolio_->sync_position_from_exchange(
+                        symbol_, leg.side,
+                        Quantity(leg.qty), Price(leg.entry),
+                        Price(leg.entry), // current_price будет обновлена при первом тике
+                        0.0, opened);
                     if (!local.has_value()) {
-                        portfolio::Position sync_pos;
-                        sync_pos.symbol = symbol_;
-                        sync_pos.side = (leg.side == PositionSide::Long) ? Side::Buy : Side::Sell;
-                        sync_pos.position_side = leg.side;
-                        sync_pos.size = Quantity(leg.qty);
-                        sync_pos.avg_entry_price = Price(leg.entry);
-                        sync_pos.opened_at = clock_->now();
-                        sync_pos.strategy_id = StrategyId("sync_from_exchange");
-                        portfolio_->open_position(sync_pos);
                         logger_->info("pipeline", "Восстановлена фьючерсная нога с биржи",
                             {{"symbol", symbol_.get()},
                              {"side", leg.side == PositionSide::Long ? "long" : "short"},
                              {"size", std::to_string(leg.qty)},
                              {"entry", std::to_string(leg.entry)}});
                     } else {
-                        logger_->info("pipeline", "Нога уже в портфеле (recovery)",
+                        logger_->info("pipeline", "Нога синхронизирована с биржей (recovery)",
                             {{"symbol", symbol_.get()},
                              {"side", leg.side == PositionSide::Long ? "long" : "short"},
-                             {"size", std::to_string(leg.qty)}});
+                             {"local_size", std::to_string(local->size.get())},
+                             {"exchange_size", std::to_string(leg.qty)}});
                     }
                 };
 
@@ -874,33 +944,43 @@ void TradingPipeline::sync_balance_from_exchange() {
                 if (has_long && has_short) {
                     // Обе ноги присутствуют → это хедж, восстанавливаем hedge state
                     hedge_active_ = true;
-                    hedge_already_used_ = true;
+                    if (hedge_manager_) {
+                        hedge_manager_->notify_hedge_opened();
+                    }
 
                     // Определяем: основная нога — та, что была первой (с большей позицией
                     // или long по умолчанию). Хедж — противоположная.
                     // Если размеры равны — принимаем long за основную.
+                    // Читаем реальные opened_at из портфеля (восстановлены из snapshot/journal)
+                    auto port_long = portfolio_->get_position(symbol_, PositionSide::Long);
+                    auto port_short = portfolio_->get_position(symbol_, PositionSide::Short);
+                    const auto long_opened = (port_long && port_long->opened_at.get() > 0)
+                        ? port_long->opened_at.get() : clock_->now().get();
+                    const auto short_opened = (port_short && port_short->opened_at.get() > 0)
+                        ? port_short->opened_at.get() : clock_->now().get();
+
                     if (long_leg->qty >= short_leg->qty) {
                         current_position_side_ = PositionSide::Long;
                         hedge_position_side_ = PositionSide::Short;
                         hedge_entry_price_ = short_leg->entry;
                         hedge_size_ = short_leg->qty;
-                        hedge_entry_time_ns_ = clock_->now().get();
+                        hedge_entry_time_ns_ = short_opened;
                         // trailing state по основной (long) ноге
                         reset_trailing_state();
                         highest_price_since_entry_ = long_leg->entry;
                         lowest_price_since_entry_ = long_leg->entry;
-                        position_entry_time_ns_ = clock_->now().get();
+                        position_entry_time_ns_ = long_opened;
                         initial_position_size_ = long_leg->qty;
                     } else {
                         current_position_side_ = PositionSide::Short;
                         hedge_position_side_ = PositionSide::Long;
                         hedge_entry_price_ = long_leg->entry;
                         hedge_size_ = long_leg->qty;
-                        hedge_entry_time_ns_ = clock_->now().get();
+                        hedge_entry_time_ns_ = long_opened;
                         reset_trailing_state();
                         highest_price_since_entry_ = short_leg->entry;
                         lowest_price_since_entry_ = short_leg->entry;
-                        position_entry_time_ns_ = clock_->now().get();
+                        position_entry_time_ns_ = short_opened;
                         initial_position_size_ = short_leg->qty;
                     }
 
@@ -917,10 +997,15 @@ void TradingPipeline::sync_balance_from_exchange() {
                     current_position_side_ = leg.side;
                     hedge_active_ = false;
 
+                    // Реальный opened_at из портфеля (восстановлен из snapshot/journal)
+                    auto port_pos = portfolio_->get_position(symbol_, leg.side);
+                    const auto real_opened = (port_pos && port_pos->opened_at.get() > 0)
+                        ? port_pos->opened_at.get() : clock_->now().get();
+
                     reset_trailing_state();
                     highest_price_since_entry_ = leg.entry;
                     lowest_price_since_entry_ = leg.entry;
-                    position_entry_time_ns_ = clock_->now().get();
+                    position_entry_time_ns_ = real_opened;
                     initial_position_size_ = leg.qty;
 
                     logger_->info("pipeline", "Синхронизация position_side с биржей",
@@ -1365,7 +1450,9 @@ void TradingPipeline::reset_trailing_state() {
     initial_position_size_ = 0.0;
     current_trail_mult_ = config_.trading_params.atr_stop_multiplier;
     position_entry_time_ns_ = 0;
-    hedge_already_used_ = false;
+    if (hedge_manager_) {
+        hedge_manager_->reset();
+    }
 }
 
 void TradingPipeline::reset_hedge_state() {
@@ -1516,7 +1603,7 @@ bool TradingPipeline::close_hedge_leg(const features::FeatureSnapshot& snapshot,
     ea.urgency_score = 1.0;
     ea.rationale = "HEDGE_RECOVERY: " + reason;
 
-    auto r = execution_engine_->execute(close_intent, rd, ea, uncertainty::UncertaintySnapshot{});
+    auto r = execution_engine_->execute(close_intent, rd, ea, cached_uncertainty_snapshot_);
     if (r) {
         risk_engine_->record_order_sent();
         logger_->info("pipeline", "HEDGE: нога закрыта",
@@ -1530,20 +1617,17 @@ bool TradingPipeline::close_hedge_leg(const features::FeatureSnapshot& snapshot,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HEDGE RECOVERY — профессиональное хеджирование с индикаторным анализом
+// HEDGE RECOVERY — state machine driven by HedgePairManager
 //
-// Стратегия (Lock → Analyze → Release):
-// 1. Позиция в убытке + индикаторы подтверждают тренд против → открыть хедж (lock)
-// 2. Мониторинг обеих ног: индикаторы показывают разворот → закрыть убыточную ногу
-// 3. Прибыльная нога растёт → закрыть по обычному trailing/TP
-//
-// Отличие от примитивного хеджа:
-// - Открытие: требуется подтверждение 3+ индикаторов что тренд против
-// - Управление: поэтапное закрытие ног по индикаторам (не обе сразу)
-// - Таймаут: аварийный, не основной механизм выхода
+// Phase 3: market-driven hedge decisions via explicit state machine.
+// Triggers based on regime change / indicator consensus, not just loss level.
+// No blind timeout — market-driven escalation.
+// Hedge ratio adapts to market conditions (not always 1:1).
+// Re-hedging allowed (up to 2× per position lifecycle).
 // ═══════════════════════════════════════════════════════════════════════════════
 bool TradingPipeline::check_hedge_recovery(const features::FeatureSnapshot& snapshot) {
     if (!config_.trading_params.hedge_recovery_enabled) return false;
+    if (!hedge_manager_) return false;
 
     auto port_snap = portfolio_->snapshot();
     if (port_snap.positions.empty()) {
@@ -1551,7 +1635,7 @@ bool TradingPipeline::check_hedge_recovery(const features::FeatureSnapshot& snap
         return false;
     }
 
-    // Найти обе ноги
+    // Find both legs
     const portfolio::Position* original_pos = nullptr;
     const portfolio::Position* hedge_pos = nullptr;
     for (const auto& pos : port_snap.positions) {
@@ -1578,296 +1662,276 @@ bool TradingPipeline::check_hedge_recovery(const features::FeatureSnapshot& snap
     int64_t now_ns = clock_->now().get();
     double price = snapshot.mid_price.get();
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ФАЗА 2: УПРАВЛЕНИЕ ХЕДЖЕМ (Lock активен)
-    // Индикаторный выход: оцениваем каждую ногу отдельно
-    // ═══════════════════════════════════════════════════════════════════
-    if (hedge_active_) {
-        if (close_order_pending_) return true;
+    // Build HedgePairInput from current market state
+    HedgePairInput input;
+    input.primary_side = current_position_side_;
+    input.primary_size = original_pos->size.get();
+    input.primary_pnl = original_pos->unrealized_pnl;
+    input.primary_pnl_pct = original_pos->unrealized_pnl_pct;
+    input.primary_hold_ns = (position_entry_time_ns_ > 0) ? (now_ns - position_entry_time_ns_) : 0;
 
-        double original_pnl = original_pos->unrealized_pnl;
-        double hedge_pnl = hedge_pos ? hedge_pos->unrealized_pnl : 0.0;
-        double net_pnl = original_pnl + hedge_pnl;
+    input.has_hedge = hedge_active_ && hedge_pos != nullptr;
+    if (input.has_hedge) {
+        input.hedge_size = hedge_pos->size.get();
+        input.hedge_pnl = hedge_pos->unrealized_pnl;
+        input.hedge_pnl_pct = hedge_pos->unrealized_pnl_pct;
+        input.hedge_hold_ns = (hedge_entry_time_ns_ > 0) ? (now_ns - hedge_entry_time_ns_) : 0;
+    }
 
-        double total_notional = original_pos->size.get() * price;
-        if (hedge_pos) total_notional += hedge_pos->size.get() * price;
-        double round_trip_fees = total_notional * common::fees::kDefaultTakerFeePct * 2.0;
-        double min_profit = round_trip_fees * config_.trading_params.hedge_profit_close_fee_mult;
+    // Market state from cached snapshots
+    input.regime_stability = cached_regime_snapshot_.stability;
+    input.regime_confidence = cached_regime_snapshot_.confidence;
+    input.cusum_regime_change = snapshot.technical.cusum_valid && snapshot.technical.cusum_regime_change;
+    input.uncertainty = cached_uncertainty_snapshot_.aggregate_score;
+    input.exit_score_primary = evaluate_exit_score(snapshot, current_position_side_);
+    input.exit_score_hedge = hedge_active_
+        ? evaluate_exit_score(snapshot, hedge_position_side_) : 0.0;
+    input.funding_rate = current_funding_rate_;
+    input.atr = snapshot.technical.atr_valid ? snapshot.technical.atr_14 : 0.0;
+    input.spread_bps = snapshot.microstructure.spread_valid ? snapshot.microstructure.spread_bps : 0.0;
+    input.depth_usd = snapshot.microstructure.liquidity_valid
+        ? (snapshot.microstructure.bid_depth_5_notional + snapshot.microstructure.ask_depth_5_notional)
+        : 10000.0;
+    input.vpin_toxic = snapshot.microstructure.vpin_valid && snapshot.microstructure.vpin_toxic;
+    input.momentum = snapshot.technical.momentum_valid ? snapshot.technical.momentum_5 : 0.0;
+    input.momentum_valid = snapshot.technical.momentum_valid;
 
-        int64_t hedge_hold_ns = now_ns - hedge_entry_time_ns_;
-        int64_t max_hedge_ns = static_cast<int64_t>(config_.trading_params.hedge_max_hold_minutes)
-                             * 60LL * 1'000'000'000LL;
-
-        // Оценка рыночной ситуации для обеих ног
-        double original_score = evaluate_exit_score(snapshot, current_position_side_);
-        double hedge_score = evaluate_exit_score(snapshot, hedge_position_side_);
-
-        // ── Стратегия 1: Чистая прибыль покрывает комиссии → закрыть обе ──
-        if (net_pnl > min_profit) {
-            logger_->warn("pipeline", "HEDGE: чистая прибыль — закрытие обеих ног",
-                {{"net_pnl", std::to_string(net_pnl)},
-                 {"min_profit", std::to_string(min_profit)},
-                 {"symbol", symbol_.get()}});
-
-            close_hedge_leg(snapshot, current_position_side_, original_pos->size.get(), "HEDGE_PROFIT_ORIG");
-            if (hedge_pos) {
-                close_hedge_leg(snapshot, hedge_position_side_, hedge_pos->size.get(), "HEDGE_PROFIT_HEDGE");
-            }
-            for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
-            close_order_pending_ = true;
-            last_order_time_ns_ = now_ns;
-            last_activity_ns_.store(now_ns, std::memory_order_relaxed);
-            reset_hedge_state();
-            reset_trailing_state();
-            return true;
+    input.total_capital = port_snap.total_capital;
+    input.mid_price = price;
+    input.taker_fee_pct = common::fees::kDefaultTakerFeePct * 100.0;  // fraction→percentage (0.0006→0.06)
+    input.hedge_profit_close_fee_mult = config_.trading_params.hedge_profit_close_fee_mult;
+    input.hedge_trigger_loss_pct = config_.trading_params.hedge_trigger_loss_pct;
+    if (current_stop_level_ > 0.0 && price > 0.0) {
+        double stop_gap_pct = std::numeric_limits<double>::infinity();
+        if (current_position_side_ == PositionSide::Long) {
+            stop_gap_pct = (price - current_stop_level_) / price * 100.0;
+        } else {
+            stop_gap_pct = (current_stop_level_ - price) / price * 100.0;
         }
 
-        // ── Стратегия 2: Индикаторы показали разворот → закрыть убыточную ногу ──
-        // Если score для оригинальной позиции стал положительным (> +0.15),
-        // значит рынок развернулся в нашу сторону → закрываем хедж-ногу (она убыточная)
-        // и оставляем оригинальную — она должна восстановиться.
-        if (original_score > 0.15 && hedge_pos && hedge_hold_ns > 5'000'000'000LL) {
-            // Дополнительная проверка: momentum реально развернулся в нашу сторону
-            bool momentum_confirms = false;
-            if (snapshot.technical.momentum_valid) {
-                bool is_orig_long = (current_position_side_ == PositionSide::Long);
-                momentum_confirms = is_orig_long
-                    ? (snapshot.technical.momentum_5 > 0.001)
-                    : (snapshot.technical.momentum_5 < -0.001);
-            }
+        input.stop_distance_pct = stop_gap_pct;
+        const double stop_pressure_threshold_pct = std::max(
+            0.15,
+            config_.trading_params.price_stop_loss_pct * 0.20);
+        input.protective_stop_imminent = stop_gap_pct <= stop_pressure_threshold_pct;
+    }
 
-            if (momentum_confirms) {
-                logger_->warn("pipeline", "HEDGE: разворот по индикаторам — закрытие хедж-ноги",
-                    {{"original_score", std::to_string(original_score)},
-                     {"hedge_score", std::to_string(hedge_score)},
-                     {"hedge_pnl", std::to_string(hedge_pnl)},
-                     {"momentum", std::to_string(snapshot.technical.momentum_5)},
-                     {"rsi", std::to_string(snapshot.technical.rsi_14)},
-                     {"symbol", symbol_.get()}});
+    // Evaluate via state machine
+    auto decision = hedge_manager_->evaluate(input);
 
-                close_hedge_leg(snapshot, hedge_position_side_, hedge_pos->size.get(), "HEDGE_REVERSAL_CLOSE");
-                close_order_pending_ = true;
-                last_order_time_ns_ = now_ns;
-                last_activity_ns_.store(now_ns, std::memory_order_relaxed);
-                reset_hedge_state();
-                // НЕ сбрасываем trailing — оригинальная позиция продолжает жить
-                return false;  // Позволяем обычному stop-loss управлять оставшейся ногой
-            }
-        }
-
-        // ── Стратегия 3: Индикаторы ещё сильнее против оригинальной → закрыть её ──
-        // Если hedge_score > +0.15 и original_score < -0.15,
-        // рынок ушёл ещё дальше → закрываем оригинальную (убыточную),
-        // оставляем хедж-ногу (прибыльную) работать.
-        if (hedge_score > 0.15 && original_score < -0.15 && hedge_pos
-            && hedge_hold_ns > 10'000'000'000LL) {
-            logger_->warn("pipeline", "HEDGE: тренд усилился — закрытие оригинальной ноги",
-                {{"original_score", std::to_string(original_score)},
-                 {"hedge_score", std::to_string(hedge_score)},
-                 {"original_pnl", std::to_string(original_pnl)},
-                 {"symbol", symbol_.get()}});
-
-            close_hedge_leg(snapshot, current_position_side_, original_pos->size.get(), "HEDGE_TREND_CUT_LOSS");
-            // Хедж-нога становится новой "основной"
-            current_position_side_ = hedge_position_side_;
-            close_order_pending_ = true;
-            last_order_time_ns_ = now_ns;
-            last_activity_ns_.store(now_ns, std::memory_order_relaxed);
-            reset_hedge_state();
-            // Пересчитываем trailing для новой (хедж) позиции
-            highest_price_since_entry_ = price;
-            lowest_price_since_entry_ = price;
-            position_entry_time_ns_ = hedge_entry_time_ns_;
-            return false;  // Обычный stop-loss для оставшейся ноги
-        }
-
-        // ── Стратегия 4: Аварийный таймаут — закрыть обе ноги ──
-        if (hedge_hold_ns >= max_hedge_ns) {
-            logger_->warn("pipeline", "HEDGE TIMEOUT — аварийное закрытие обеих ног",
-                {{"hold_min", std::to_string(hedge_hold_ns / 60'000'000'000LL)},
-                 {"net_pnl", std::to_string(net_pnl)},
-                 {"original_score", std::to_string(original_score)},
-                 {"hedge_score", std::to_string(hedge_score)},
-                 {"symbol", symbol_.get()}});
-
-            close_hedge_leg(snapshot, current_position_side_, original_pos->size.get(), "HEDGE_TIMEOUT_ORIG");
-            if (hedge_pos) {
-                close_hedge_leg(snapshot, hedge_position_side_, hedge_pos->size.get(), "HEDGE_TIMEOUT_HEDGE");
-            }
-            for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
-            close_order_pending_ = true;
-            last_order_time_ns_ = now_ns;
-            last_activity_ns_.store(now_ns, std::memory_order_relaxed);
-            reset_hedge_state();
-            reset_trailing_state();
-            return true;
-        }
-
-        // Логирование состояния хеджа каждые 100 тиков
-        if (tick_count_ % 100 == 0) {
+    if (decision.action == HedgeAction::None) {
+        // Status logging every 100 ticks when hedge is active
+        if (hedge_active_ && tick_count_ % 100 == 0) {
             logger_->info("pipeline", "HEDGE STATUS",
-                {{"original_pnl", std::to_string(original_pnl)},
-                 {"hedge_pnl", std::to_string(hedge_pnl)},
-                 {"net_pnl", std::to_string(net_pnl)},
-                 {"original_score", std::to_string(original_score)},
-                 {"hedge_score", std::to_string(hedge_score)},
-                 {"hold_sec", std::to_string(hedge_hold_ns / 1'000'000'000LL)},
+                {{"state", to_string(hedge_manager_->state())},
+                 {"primary_pnl", std::to_string(input.primary_pnl)},
+                 {"hedge_pnl", std::to_string(input.has_hedge ? input.hedge_pnl : 0.0)},
+                 {"score_primary", std::to_string(input.exit_score_primary)},
+                 {"score_hedge", std::to_string(input.exit_score_hedge)},
                  {"symbol", symbol_.get()}});
         }
-
-        return true;  // Хедж активен — блокировать обычный stop-loss
+        return hedge_active_;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ФАЗА 1: ПРИНЯТИЕ РЕШЕНИЯ О ХЕДЖИРОВАНИИ
-    // Не просто по убытку — требуется подтверждение индикаторов
-    // ═══════════════════════════════════════════════════════════════════
-    if (close_order_pending_) return false;
-    if (hedge_already_used_) return false;  // Не хеджируем повторно
+    // Execute the decision
+    switch (decision.action) {
+    case HedgeAction::OpenHedge: {
+        if (close_order_pending_) return hedge_active_;
 
-    double unrealized = original_pos->unrealized_pnl;
-    if (unrealized >= 0.0) return false;
+        hedge_position_side_ = (current_position_side_ == PositionSide::Long)
+            ? PositionSide::Short : PositionSide::Long;
+        Side hedge_side = (hedge_position_side_ == PositionSide::Long) ? Side::Buy : Side::Sell;
+        double hedge_qty = original_pos->size.get() * decision.hedge_ratio;
 
-    double loss_pct_of_capital = std::abs(unrealized) / std::max(port_snap.total_capital, 0.01) * 100.0;
-    if (loss_pct_of_capital < config_.trading_params.hedge_trigger_loss_pct) return false;
+        // Validate minimum notional
+        const double min_notional = exchange_rules_.min_trade_usdt > 0.0
+            ? exchange_rules_.min_trade_usdt
+            : common::exchange_limits::kMinBitgetNotionalUsdt;
+        const double min_exchange_qty = std::max(exchange_rules_.min_quantity, 0.0);
+        const double min_qty_for_notional = min_notional / std::max(price, 1e-9);
+        const double min_hedge_qty = ceil_quantity_to_precision(
+            std::max(min_exchange_qty, min_qty_for_notional),
+            exchange_rules_.quantity_precision);
 
-    // Минимальное время удержания
-    int64_t hold_ns = (position_entry_time_ns_ > 0) ? (now_ns - position_entry_time_ns_) : 0;
-    int64_t min_hold_ns = static_cast<int64_t>(config_.trading_params.hedge_min_hold_seconds)
-                        * 1'000'000'000LL;
-    if (hold_ns < min_hold_ns) return false;
-
-    // ── ИНДИКАТОРНАЯ ПРОВЕРКА: тренд действительно против нас? ──
-    // Оцениваем ситуацию для нашей стороны. Если score < -0.15,
-    // значит минимум 3 индикатора показывают что рынок против.
-    double our_score = evaluate_exit_score(snapshot, current_position_side_);
-
-    if (our_score >= -0.10) {
-        // Индикаторы не подтверждают — возможно временный откат, не хеджируем
-        if (tick_count_ % 200 == 0) {
-            logger_->debug("pipeline", "HEDGE: убыток есть, но индикаторы не подтверждают",
-                {{"loss_pct", std::to_string(loss_pct_of_capital)},
-                 {"exit_score", std::to_string(our_score)},
-                 {"symbol", symbol_.get()}});
-        }
-        return false;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // ОТКРЫТИЕ ХЕДЖА: индикаторы подтвердили — тренд против нас
-    // ═══════════════════════════════════════════════════════════════════
-    hedge_position_side_ = (current_position_side_ == PositionSide::Long)
-        ? PositionSide::Short : PositionSide::Long;
-    Side hedge_side = (hedge_position_side_ == PositionSide::Long) ? Side::Buy : Side::Sell;
-    double hedge_qty = original_pos->size.get();
-
-    double hedge_notional = hedge_qty * price;
-    const double min_notional = exchange_rules_.min_trade_usdt > 0.0
-        ? exchange_rules_.min_trade_usdt
-        : common::exchange_limits::kMinBitgetNotionalUsdt;
-    if (hedge_notional < min_notional) return false;
-
-    // ИСПРАВЛЕНИЕ H4: синхронизация плеча для хедж-ноги перед ордером.
-    // В Bitget hedge-mode плечо задаётся PER-SIDE (long/short отдельно).
-    // Если плечо хедж-стороны != текущего — биржа может отклонить ордер или
-    // использовать неверный margin → неконтролируемый риск ликвидации.
-    if (futures_submitter_) {
-        std::string hedge_hold_side = (hedge_position_side_ == PositionSide::Long)
-            ? "long" : "short";
-        int& hedge_last_applied = (hedge_position_side_ == PositionSide::Long)
-            ? last_applied_leverage_long_ : last_applied_leverage_short_;
-        // Для хеджа используем минимальное плечо из конфига — консервативно.
-        // Хедж — защитная позиция, не спекулятивная.
-        int hedge_lev = std::max(1, config_.futures.min_leverage);
-        if (leverage_engine_) {
-            // Используем текущее плечо основной позиции как потолок
-            auto main_hold_side = (current_position_side_ == PositionSide::Long)
-                ? "long" : "short";
-            hedge_lev = std::max(1, last_applied_leverage_long_);
-            if (current_position_side_ == PositionSide::Short) {
-                hedge_lev = std::max(1, last_applied_leverage_short_);
-            }
-        }
-        if (hedge_lev != hedge_last_applied) {
-            bool set_ok = futures_submitter_->set_leverage(symbol_, hedge_lev, hedge_hold_side);
-            if (!set_ok) {
-                logger_->error("pipeline",
-                    "HEDGE: Не удалось установить плечо для хедж-ноги — пропуск хеджа",
-                    {{"leverage", std::to_string(hedge_lev)},
-                     {"hold_side", hedge_hold_side},
+        double hedge_notional = hedge_qty * price;
+        if (hedge_qty < min_hedge_qty || hedge_notional < min_notional) {
+            if (exchange_rules_.max_quantity > 0.0 && min_hedge_qty > exchange_rules_.max_quantity) {
+                logger_->warn("pipeline", "HEDGE skipped: exchange minimum exceeds max quantity",
+                    {{"requested_qty", std::to_string(hedge_qty)},
+                     {"requested_notional", std::to_string(hedge_notional)},
+                     {"required_qty", std::to_string(min_hedge_qty)},
+                     {"min_notional", std::to_string(min_notional)},
                      {"symbol", symbol_.get()}});
                 return false;
             }
-            hedge_last_applied = hedge_lev;
-            logger_->info("pipeline", "HEDGE: плечо синхронизировано для хедж-ноги",
-                {{"leverage", std::to_string(hedge_lev)},
-                 {"hold_side", hedge_hold_side},
+
+            logger_->warn("pipeline", "HEDGE: quantity bumped to exchange minimum",
+                {{"requested_qty", std::to_string(hedge_qty)},
+                 {"requested_notional", std::to_string(hedge_notional)},
+                 {"required_qty", std::to_string(min_hedge_qty)},
+                 {"min_notional", std::to_string(min_notional)},
                  {"symbol", symbol_.get()}});
+
+            hedge_qty = min_hedge_qty;
+            hedge_notional = hedge_qty * price;
         }
+
+        const double effective_hedge_ratio = original_pos->size.get() > 0.0
+            ? hedge_qty / original_pos->size.get()
+            : decision.hedge_ratio;
+
+        // Sync leverage for hedge side
+        if (futures_submitter_) {
+            std::string hedge_hold_side = (hedge_position_side_ == PositionSide::Long)
+                ? "long" : "short";
+            int& hedge_last_applied = (hedge_position_side_ == PositionSide::Long)
+                ? last_applied_leverage_long_ : last_applied_leverage_short_;
+            int hedge_lev = std::max(1, config_.futures.min_leverage);
+            if (leverage_engine_) {
+                hedge_lev = (current_position_side_ == PositionSide::Long)
+                    ? std::max(1, last_applied_leverage_long_)
+                    : std::max(1, last_applied_leverage_short_);
+            }
+            if (hedge_lev != hedge_last_applied) {
+                bool set_ok = futures_submitter_->set_leverage(symbol_, hedge_lev, hedge_hold_side);
+                if (!set_ok) {
+                    logger_->error("pipeline",
+                        "HEDGE: leverage sync failed — skipping",
+                        {{"leverage", std::to_string(hedge_lev)},
+                         {"hold_side", hedge_hold_side}});
+                    return false;
+                }
+                hedge_last_applied = hedge_lev;
+            }
+        }
+
+        logger_->warn("pipeline", "HEDGE OPEN via state machine",
+            {{"reason", decision.reason},
+             {"ratio", std::to_string(effective_hedge_ratio)},
+             {"qty", std::to_string(hedge_qty)},
+             {"state", to_string(hedge_manager_->state())},
+             {"symbol", symbol_.get()}});
+
+        strategy::TradeIntent hedge_intent;
+        hedge_intent.symbol = symbol_;
+        hedge_intent.side = hedge_side;
+        hedge_intent.conviction = 1.0;
+        hedge_intent.urgency = decision.urgency;
+        hedge_intent.strategy_id = StrategyId("hedge_recovery");
+        hedge_intent.limit_price = snapshot.mid_price;
+        hedge_intent.snapshot_mid_price = snapshot.mid_price;
+        hedge_intent.suggested_quantity = Quantity(hedge_qty);
+        hedge_intent.trade_side = TradeSide::Open;
+        hedge_intent.position_side = hedge_position_side_;
+        hedge_intent.signal_intent = (hedge_position_side_ == PositionSide::Long)
+            ? strategy::SignalIntent::LongEntry : strategy::SignalIntent::ShortEntry;
+        hedge_intent.correlation_id = CorrelationId("HEDGE-" + std::to_string(now_ns));
+
+        risk::RiskDecision rd;
+        rd.decided_at = clock_->now();
+        rd.approved_quantity = Quantity(hedge_qty);
+        rd.verdict = risk::RiskVerdict::Approved;
+        rd.summary = decision.reason;
+
+        // Evaluate execution alpha properly for hedge orders:
+        // spread toxicity, adverse selection, fill probability all apply
+        auto ea = execution_alpha_->evaluate(
+            hedge_intent, snapshot, cached_uncertainty_snapshot_);
+        // Override: hedge must execute even if conditions are suboptimal,
+        // but we keep the quality estimate for cost tracking.
+        // Force Aggressive style for hedges — fill certainty > fee savings.
+        ea.should_execute = true;
+        ea.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
+        ea.urgency_score = std::max(ea.urgency_score, decision.urgency);
+
+        last_order_time_ns_ = now_ns;
+        last_activity_ns_.store(now_ns, std::memory_order_relaxed);
+
+        auto order_result = execution_engine_->execute(
+            hedge_intent, rd, ea, cached_uncertainty_snapshot_);
+        if (order_result) {
+            hedge_active_ = true;
+            hedge_entry_price_ = price;
+            hedge_size_ = hedge_qty;
+            hedge_entry_time_ns_ = now_ns;
+            original_loss_at_hedge_ = original_pos->unrealized_pnl;
+            hedge_manager_->notify_hedge_opened();
+            risk_engine_->record_order_sent();
+
+            logger_->warn("pipeline", "HEDGE ORDER SENT",
+                {{"order_id", order_result->get()},
+                 {"side", hedge_side == Side::Buy ? "BUY" : "SELL"},
+                 {"qty", std::to_string(hedge_qty)},
+                 {"ratio", std::to_string(effective_hedge_ratio)},
+                 {"symbol", symbol_.get()}});
+            return true;
+        }
+        logger_->error("pipeline", "HEDGE order failed", {{"symbol", symbol_.get()}});
+        return false;
     }
 
-    logger_->warn("pipeline", "HEDGE RECOVERY — индикаторы подтвердили, открытие хеджа",
-        {{"loss_pct", std::to_string(loss_pct_of_capital)},
-         {"exit_score", std::to_string(our_score)},
-         {"momentum", std::to_string(snapshot.technical.momentum_5)},
-         {"rsi", std::to_string(snapshot.technical.rsi_14)},
-         {"adx", std::to_string(snapshot.technical.adx)},
-         {"macd_h", std::to_string(snapshot.technical.macd_histogram)},
-         {"hedge_side", hedge_side == Side::Buy ? "BUY" : "SELL"},
-         {"hedge_qty", std::to_string(hedge_qty)},
-         {"symbol", symbol_.get()}});
-
-    strategy::TradeIntent hedge_intent;
-    hedge_intent.symbol = symbol_;
-    hedge_intent.side = hedge_side;
-    hedge_intent.conviction = 1.0;
-    hedge_intent.urgency = 1.0;
-    hedge_intent.strategy_id = StrategyId("hedge_recovery");
-    hedge_intent.limit_price = snapshot.mid_price;
-    hedge_intent.snapshot_mid_price = snapshot.mid_price;
-    hedge_intent.suggested_quantity = Quantity(hedge_qty);
-    hedge_intent.trade_side = TradeSide::Open;
-    hedge_intent.position_side = hedge_position_side_;
-    hedge_intent.signal_intent = (hedge_position_side_ == PositionSide::Long)
-        ? strategy::SignalIntent::LongEntry : strategy::SignalIntent::ShortEntry;
-    hedge_intent.correlation_id = CorrelationId("HEDGE-" + std::to_string(now_ns));
-
-    risk::RiskDecision rd;
-    rd.decided_at = clock_->now();
-    rd.approved_quantity = Quantity(hedge_qty);
-    rd.verdict = risk::RiskVerdict::Approved;
-    rd.summary = "HEDGE_OPEN: loss=" + std::to_string(loss_pct_of_capital)
-               + "% score=" + std::to_string(our_score);
-
-    execution_alpha::ExecutionAlphaResult ea;
-    ea.should_execute = true;
-    ea.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
-    ea.urgency_score = 1.0;
-    ea.rationale = "HEDGE_RECOVERY: confirmed by indicators";
-
-    last_order_time_ns_ = now_ns;
-    last_activity_ns_.store(now_ns, std::memory_order_relaxed);
-
-    auto order_result = execution_engine_->execute(hedge_intent, rd, ea, uncertainty::UncertaintySnapshot{});
-    if (order_result) {
-        hedge_active_ = true;
-        hedge_already_used_ = true;
-        hedge_entry_price_ = price;
-        hedge_size_ = hedge_qty;
-        hedge_entry_time_ns_ = now_ns;
-        original_loss_at_hedge_ = unrealized;
-        risk_engine_->record_order_sent();
-
-        logger_->warn("pipeline", "HEDGE ОРДЕР ОТПРАВЛЕН",
-            {{"order_id", order_result->get()},
-             {"hedge_side", hedge_side == Side::Buy ? "BUY" : "SELL"},
-             {"qty", std::to_string(hedge_qty)},
-             {"exit_score", std::to_string(our_score)},
+    case HedgeAction::CloseBoth: {
+        logger_->warn("pipeline", "HEDGE: closing both legs",
+            {{"reason", decision.reason},
+             {"state", to_string(hedge_manager_->state())},
              {"symbol", symbol_.get()}});
+
+        close_hedge_leg(snapshot, current_position_side_, original_pos->size.get(), decision.reason);
+        if (hedge_pos) {
+            close_hedge_leg(snapshot, hedge_position_side_, hedge_pos->size.get(), decision.reason);
+        }
+        for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
+        close_order_pending_ = true;
+        last_order_time_ns_ = now_ns;
+        last_activity_ns_.store(now_ns, std::memory_order_relaxed);
+        reset_hedge_state();
+        reset_trailing_state();
+        hedge_manager_->notify_both_closed();
         return true;
     }
-    logger_->error("pipeline", "HEDGE ордер не исполнен", {{"symbol", symbol_.get()}});
-    return false;
+
+    case HedgeAction::CloseHedge: {
+        logger_->warn("pipeline", "HEDGE: closing hedge leg",
+            {{"reason", decision.reason},
+             {"hedge_pnl", std::to_string(input.hedge_pnl)},
+             {"symbol", symbol_.get()}});
+
+        if (hedge_pos) {
+            close_hedge_leg(snapshot, hedge_position_side_, hedge_pos->size.get(), decision.reason);
+        }
+        close_order_pending_ = true;
+        last_order_time_ns_ = now_ns;
+        last_activity_ns_.store(now_ns, std::memory_order_relaxed);
+        reset_hedge_state();
+        hedge_manager_->notify_hedge_closed();
+        return false;  // Primary continues under normal stop-loss
+    }
+
+    case HedgeAction::ClosePrimary: {
+        logger_->warn("pipeline", "HEDGE: reverse — closing primary, hedge becomes primary",
+            {{"reason", decision.reason},
+             {"primary_pnl", std::to_string(input.primary_pnl)},
+             {"symbol", symbol_.get()}});
+
+        close_hedge_leg(snapshot, current_position_side_, original_pos->size.get(), decision.reason);
+        current_position_side_ = hedge_position_side_;
+        close_order_pending_ = true;
+        last_order_time_ns_ = now_ns;
+        last_activity_ns_.store(now_ns, std::memory_order_relaxed);
+        reset_hedge_state();
+        // Update trailing for the remaining leg
+        highest_price_since_entry_ = price;
+        lowest_price_since_entry_ = price;
+        position_entry_time_ns_ = hedge_entry_time_ns_;
+        hedge_manager_->notify_reversed();
+        return false;  // Remaining leg continues under normal stop-loss
+    }
+
+    case HedgeAction::None:
+        break;
+    }
+
+    return hedge_active_;
 }
 
 void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snapshot) {
@@ -1886,202 +1950,41 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
         // Запоминаем начальный размер и время входа при первом обновлении
         if (initial_position_size_ <= 0.0) {
             initial_position_size_ = pos.size.get();
-            position_entry_time_ns_ = clock_->now().get();
+            position_entry_time_ns_ = (pos.opened_at.get() > 0)
+                ? pos.opened_at.get() : clock_->now().get();
             logger_->info("pipeline", "Position entry time записано",
                 {{"symbol", symbol_.get()},
                  {"size", std::to_string(initial_position_size_)},
-                 {"max_hold_abs_min", std::to_string(config_.trading_params.max_hold_absolute_minutes)},
-                 {"max_hold_loss_min", std::to_string(config_.trading_params.max_hold_loss_minutes)}});
+                 {"opened_at_ns", std::to_string(position_entry_time_ns_)}});
         }
 
-        // ATR должен быть валидным
-        if (!snapshot.technical.atr_valid || snapshot.technical.atr_14 <= 0.0) continue;
-        double atr = snapshot.technical.atr_14;
-
-        // Dynamic ATR stop multiplier based on multiple market factors
-        {
-            // Используем байесовски адаптированный базовый множитель, если он доступен
-            double base = (ml_snapshot_.adapted_atr_stop_mult > 0.0)
-                ? ml_snapshot_.adapted_atr_stop_mult
-                : config_.trading_params.atr_stop_multiplier;
-
-            // ADX factor: strong trend → tighter, range → wider
-            double adx_factor = 1.0;
-            if (snapshot.technical.adx_valid) {
-                if (snapshot.technical.adx > 30.0) {
-                    adx_factor = 0.85;
-                } else if (snapshot.technical.adx > 20.0) {
-                    adx_factor = 1.0;
-                } else {
-                    adx_factor = 1.15;
-                }
-            }
-
-            // Order book depth factor: thin books need wider stops
-            double depth_factor = 1.0;
-            if (snapshot.microstructure.liquidity_valid) {
-                double depth = snapshot.microstructure.bid_depth_5_notional
-                             + snapshot.microstructure.ask_depth_5_notional;
-                if (depth < 500.0) {
-                    depth_factor = 1.3;
-                } else if (depth < 2000.0) {
-                    depth_factor = 1.1;
-                }
-            }
-
-            // Spread factor: wide spreads need wider stops
-            double spread_factor = 1.0;
-            if (snapshot.microstructure.spread_valid) {
-                if (snapshot.microstructure.spread_bps > 50.0) {
-                    spread_factor = 1.3;
-                } else if (snapshot.microstructure.spread_bps > 20.0) {
-                    spread_factor = 1.1;
-                }
-            }
-
-            // Bollinger Band width factor: high volatility → wider stop
-            double bb_factor = 1.0;
-            if (snapshot.technical.bb_valid) {
-                if (snapshot.technical.bb_bandwidth > 0.05) {
-                    bb_factor = 1.2;
-                } else if (snapshot.technical.bb_bandwidth > 0.03) {
-                    bb_factor = 1.1;
-                }
-            }
-
-            // Buy/sell pressure factor: heavy sell pressure on longs → tighter stop
-            double pressure_factor = 1.0;
-            if (snapshot.microstructure.trade_flow_valid &&
-                pos.side == Side::Buy &&
-                snapshot.microstructure.buy_sell_ratio < 0.3) {
-                pressure_factor = 0.8;
-            }
-
-            current_trail_mult_ = base * adx_factor * depth_factor
-                                * spread_factor * bb_factor * pressure_factor;
-            current_trail_mult_ = std::clamp(current_trail_mult_, 0.8, 3.0);
-
-            if (tick_count_ % 500 == 0) {
-                logger_->debug("pipeline", "Dynamic stop multiplier computed",
-                    {{"base", std::to_string(base)},
-                     {"adx_f", std::to_string(adx_factor)},
-                     {"depth_f", std::to_string(depth_factor)},
-                     {"spread_f", std::to_string(spread_factor)},
-                     {"bb_f", std::to_string(bb_factor)},
-                     {"pressure_f", std::to_string(pressure_factor)},
-                     {"result", std::to_string(current_trail_mult_)},
-                     {"symbol", symbol_.get()}});
-            }
-        }
-
-        if (pos.side == Side::Buy) {
+        // MAE update
+        bool is_long = (current_position_side_ == PositionSide::Long);
+        if (is_long) {
             highest_price_since_entry_ = std::max(highest_price_since_entry_, price);
-            // Fix: обновляем MAE для лонга на каждом тике
-            update_current_mae(price, /*is_long=*/true);
-            double profit_in_atr = (price - entry) / atr;
-
-            // Фаза 1: До breakeven — используем только ФИКСИРОВАННЫЙ стоп (safety net).
-            // Trailing stop НЕ активен — даём цене свободно двигаться.
-            if (!breakeven_activated_) {
-                // Fee-aware breakeven: не активировать, пока профит не покроет комиссии
-                double min_fee_offset = entry * common::fees::kDefaultTakerFeePct * 3.0;
-                double fee_floor_in_atr = (atr > 0.0) ? (min_fee_offset / atr) : 100.0;
-                double effective_be_threshold = std::max(
-                    config_.trading_params.breakeven_atr_threshold,
-                    fee_floor_in_atr * 1.5);  // 1.5× комиссии в ATR — буфер
-
-                if (profit_in_atr >= effective_be_threshold) {
-                    // Достигли breakeven уровня → активируем trailing
-                    breakeven_activated_ = true;
-                    // Лочим 50% текущего профита выше entry
-                    double current_profit = price - entry;
-                    double breakeven_level = entry + current_profit * 0.5;
-                    // Fee-aware floor: стоп минимум покрывает round-trip комиссии
-                    breakeven_level = std::max(breakeven_level, entry + min_fee_offset);
-                    // Гарантируем: стоп минимум на 0.1 ATR выше entry (пропорционально для любой цены)
-                    breakeven_level = std::max(breakeven_level, entry + atr * 0.1);
-                    // Не ставить стоп выше текущей цены — иначе мгновенный триггер
-                    breakeven_level = std::min(breakeven_level, price - atr * 0.1);
-                    current_stop_level_ = breakeven_level;
-                    logger_->info("pipeline", "Breakeven + Trailing активирован",
-                        {{"entry", std::to_string(entry)},
-                         {"stop", std::to_string(breakeven_level)},
-                         {"locked_pct", std::to_string((breakeven_level - entry) / entry * 100.0)},
-                         {"profit_atr", std::to_string(profit_in_atr)},
-                         {"fee_floor", std::to_string(min_fee_offset)},
-                         {"be_threshold_atr", std::to_string(effective_be_threshold)},
-                         {"symbol", symbol_.get()}});
-                } else if (current_stop_level_ <= 0.0) {
-                    // Начальный ATR-стоп: защита до активации breakeven
-                    // Минимальная дистанция 0.3% от цены — не даём шуму убить позицию
-                    double atr_distance = current_trail_mult_ * atr;
-                    double min_distance = entry * 0.003;  // 0.3% от entry
-                    double stop_distance = std::max(atr_distance, min_distance);
-                    current_stop_level_ = entry - stop_distance;
-                }
-            } else {
-                // Фаза 2: После breakeven — классический Chandelier Exit
-                double atr_distance = current_trail_mult_ * atr;
-                double min_distance = entry * 0.003;  // 0.3% от entry
-                double stop_distance = std::max(atr_distance, min_distance);
-                double new_stop = highest_price_since_entry_ - stop_distance;
-                // Стоп только поднимается
-                current_stop_level_ = std::max(current_stop_level_, new_stop);
-            }
         } else {
             lowest_price_since_entry_ = std::min(lowest_price_since_entry_, price);
-            // Fix: обновляем MAE для шорта на каждом тике
-            update_current_mae(price, /*is_long=*/false);
-            double profit_in_atr = (entry - price) / atr;
+        }
+        update_current_mae(price, is_long);
 
-            if (!breakeven_activated_) {
-                // Fee-aware breakeven: не активировать, пока профит не покроет комиссии
-                double min_fee_offset = entry * common::fees::kDefaultTakerFeePct * 3.0;
-                double fee_floor_in_atr = (atr > 0.0) ? (min_fee_offset / atr) : 100.0;
-                double effective_be_threshold = std::max(
-                    config_.trading_params.breakeven_atr_threshold,
-                    fee_floor_in_atr * 1.5);  // 1.5× комиссии в ATR — буфер
+        // Delegate trailing update to exit orchestrator
+        auto ctx = build_exit_context(snapshot, pos);
+        auto update = exit_orchestrator_->update_trailing(ctx);
 
-                if (profit_in_atr >= effective_be_threshold) {
-                    breakeven_activated_ = true;
-                    // SHORT: стоп двигаем НИЖЕ entry (цена падает = профит).
-                    // breakeven_level < entry, т.к. мы лочим 50% профита.
-                    double current_profit = entry - price;
-                    double breakeven_level = entry - current_profit * 0.5;
-                    // Fee-aware floor: стоп минимум покрывает round-trip комиссии
-                    breakeven_level = std::min(breakeven_level, entry - min_fee_offset);
-                    // Гарантируем: стоп минимум на 0.1 ATR ниже entry (пропорционально для любой цены)
-                    breakeven_level = std::min(breakeven_level, entry - atr * 0.1);
-                    // Не ставить стоп ниже текущей цены — иначе мгновенный триггер
-                    breakeven_level = std::max(breakeven_level, price + atr * 0.1);
-                    current_stop_level_ = breakeven_level;
-                    logger_->info("pipeline", "Breakeven + Trailing активирован (SHORT)",
-                        {{"entry", std::to_string(entry)},
-                         {"stop", std::to_string(breakeven_level)},
-                         {"locked_pct", std::to_string((entry - breakeven_level) / entry * 100.0)},
-                         {"fee_floor", std::to_string(min_fee_offset)},
-                         {"be_threshold_atr", std::to_string(effective_be_threshold)},
-                         {"symbol", symbol_.get()}});
-                } else if (current_stop_level_ <= 0.0) {
-                    // Начальный ATR-стоп: защита до активации breakeven
-                    // Минимальная дистанция 0.3% от цены — не даём шуму убить позицию
-                    double atr_distance = current_trail_mult_ * atr;
-                    double min_distance = entry * 0.003;  // 0.3% от entry
-                    double stop_distance = std::max(atr_distance, min_distance);
-                    current_stop_level_ = entry + stop_distance;
-                }
-            } else {
-                // После breakeven — Chandelier Exit для SHORT: стоп только опускается
-                double atr_distance = current_trail_mult_ * atr;
-                double min_distance = entry * 0.003;  // 0.3% от entry
-                double stop_distance = std::max(atr_distance, min_distance);
-                double new_stop = lowest_price_since_entry_ + stop_distance;
-                if (current_stop_level_ <= 0.0) {
-                    current_stop_level_ = new_stop;  // Инициализация
-                } else {
-                    current_stop_level_ = std::min(current_stop_level_, new_stop);  // Только вниз
-                }
-            }
+        bool was_breakeven = breakeven_activated_;
+        current_trail_mult_ = update.trail_mult;
+        breakeven_activated_ = update.breakeven_activated;
+        current_stop_level_ = update.stop_level;
+        highest_price_since_entry_ = update.highest;
+        lowest_price_since_entry_ = update.lowest;
+
+        if (!was_breakeven && breakeven_activated_) {
+            logger_->info("pipeline", "Breakeven + Trailing активирован",
+                {{"entry", std::to_string(entry)},
+                 {"stop", std::to_string(current_stop_level_)},
+                 {"trail_mult", std::to_string(current_trail_mult_)},
+                 {"side", is_long ? "long" : "short"},
+                 {"symbol", symbol_.get()}});
         }
     }
 }
@@ -2089,216 +1992,40 @@ void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snap
 // ==================== Стоп-лосс позиций ====================
 
 bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& snapshot) {
-    // Система управления стопами (Chandelier Exit + Breakeven + Partial TP):
-    //
-    // 1. Trailing Stop (Chandelier Exit): стоп подтягивается за ценой, никогда не откатывается.
-    //    Адаптивный множитель ATR зависит от режима рынка (ADX).
-    // 2. Partial Take-Profit: при профите >= 2×ATR закрываем 50% позиции.
-    // 3. Фиксированный стоп (safety net): убыток > max_loss_per_trade_pct капитала → экстренное закрытие.
-    //
-    // Trailing stop — основной механизм выхода, фиксированный — страховка на случай сбоя.
-
     // Guard: если ордер на закрытие уже в процессе — не отправлять повторный стоп-лосс.
-    // Без этого каждый тик до прихода fill'а генерирует дублирующий ордер.
     if (close_order_pending_) {
-        return true;  // Стоп уже отправлен, блокируем дальнейшую обработку тика
+        return true;
     }
-
-    // Обновляем trailing stop каждый тик
-    update_trailing_stop(snapshot);
 
     auto port_snap = portfolio_->snapshot();
     if (port_snap.positions.empty()) return false;
 
     for (const auto& pos : port_snap.positions) {
         if (pos.symbol.get() != symbol_.get()) continue;
-        if (pos.avg_entry_price.get() <= 0.0) continue;  // Нет цены входа (sync)
+        if (pos.avg_entry_price.get() <= 0.0) continue;
         if (pos.current_price.get() <= 0.0) continue;
 
         double price = pos.current_price.get();
         double entry = pos.avg_entry_price.get();
 
-        // === 0. QUICK PROFIT EXIT: прибыль > комиссии + индикаторная проверка ===
-        // Фиксируем профит, но НЕ если индикаторы сильно благоприятны (дать расти)
-        bool quick_profit_triggered = false;
-        {
-            double unrealized = pos.unrealized_pnl;
-            int64_t now_check = clock_->now().get();
-            int64_t hold_ns = (position_entry_time_ns_ > 0) ? (now_check - position_entry_time_ns_) : 0;
-            const int64_t min_hold_for_qp = static_cast<int64_t>(config_.trading_params.quick_profit_min_hold_seconds)
-                                          * 1'000'000'000LL;
-            double notional = pos.size.get() * price;
-            double round_trip_fee = notional * common::fees::kDefaultTakerFeePct * 2.0;
-            double min_profit = round_trip_fee * config_.trading_params.quick_profit_fee_multiplier;
-            if (unrealized > min_profit && hold_ns >= min_hold_for_qp) {
-                // Индикаторная проверка: если рынок сильно за нас (score > +0.3),
-                // не фиксируем раннюю прибыль — дать позиции расти
-                double exit_score = evaluate_exit_score(snapshot, current_position_side_);
-                if (exit_score > 0.30) {
-                    // Индикаторы показывают сильный тренд в нашу сторону — не фиксируем
-                    if (tick_count_ % 200 == 0) {
-                        logger_->info("pipeline", "QUICK_PROFIT отложен — индикаторы благоприятны",
-                            {{"exit_score", std::to_string(exit_score)},
-                             {"pnl", std::to_string(unrealized)},
-                             {"symbol", symbol_.get()}});
-                    }
-                } else {
-                    quick_profit_triggered = true;
-                }
-            }
-        }
+        // ═══ Единая точка принятия решения: Exit Orchestrator ═══
+        auto ctx = build_exit_context(snapshot, pos);
+        ExitDecision decision = exit_orchestrator_->evaluate(ctx);
 
-        // === 1. Trailing Stop (Chandelier Exit) ===
-        bool stop_level_crossed = false;
-        if (current_stop_level_ > 0.0) {
-            if (pos.side == Side::Buy) {
-                stop_level_crossed = price <= current_stop_level_;
-            } else {
-                stop_level_crossed = price >= current_stop_level_;
-            }
-        }
-        const bool trailing_stop_triggered = breakeven_activated_ && stop_level_crossed;
-        const bool protective_atr_stop_triggered = !breakeven_activated_ && stop_level_crossed;
+        if (!decision.should_exit && !decision.should_reduce) continue;
 
-        // === 2. Partial Take-Profit: профит >= N×ATR → закрыть позицию ===
-        bool partial_tp_triggered = false;
-        if (!partial_tp_taken_ && snapshot.technical.atr_valid && snapshot.technical.atr_14 > 0.0) {
-            double atr = snapshot.technical.atr_14;
-            double profit_in_atr = (pos.side == Side::Buy)
-                ? (price - entry) / atr
-                : (entry - price) / atr;
-            if (profit_in_atr >= config_.trading_params.partial_tp_atr_threshold) {
-                // Fee-aware guard: don't TP if gross profit < 1.5× round-trip fees
-                double est_notional = pos.size.get() * price;
-                double round_trip_fee = est_notional * common::fees::kDefaultTakerFeePct * 2.0;
-                if (pos.unrealized_pnl >= round_trip_fee * 1.5) {
-                    partial_tp_triggered = true;
-                } else {
-                    logger_->debug("pipeline", "TP отложен: профит < 1.5× комиссии",
-                        {{"profit", std::to_string(pos.unrealized_pnl)},
-                         {"min_required", std::to_string(round_trip_fee * 1.5)},
-                         {"symbol", symbol_.get()}});
-                }
-            }
-        }
+        // ═══ Решение принято: выполняем закрытие ═══
 
-        // === 3. Фиксированный стоп (safety net): убыток > X% капитала ===
-        double loss_pct_of_capital = 0.0;
-        if (port_snap.total_capital > 0.0) {
-            loss_pct_of_capital = std::abs(std::min(pos.unrealized_pnl, 0.0))
-                                / port_snap.total_capital * 100.0;
-        }
-        bool fixed_stop_triggered = loss_pct_of_capital >= config_.trading_params.max_loss_per_trade_pct;
-
-        // === 3b. Per-trade price stop: ценовой убыток превысил порог от цены входа ===
-        // Для long: цена упала ниже entry. Для short: цена выросла выше entry.
-        bool price_stop_triggered = false;
-        if (entry > 0.0) {
-            double price_loss_pct = 0.0;
-            // На фьючерсах определяем по сохранённой стороне позиции
-            bool is_long_position = (current_position_side_ == PositionSide::Long);
-            if (is_long_position) {
-                price_loss_pct = (entry - price) / entry * 100.0;
-            } else {
-                price_loss_pct = (price - entry) / entry * 100.0;
-            }
-            if (price_loss_pct >= config_.trading_params.price_stop_loss_pct) {
-                price_stop_triggered = true;
-                logger_->warn("pipeline", "PRICE STOP: убыток превысил порог от цены входа",
-                    {{"price_loss_pct", std::to_string(price_loss_pct)},
-                     {"threshold_pct", std::to_string(config_.trading_params.price_stop_loss_pct)},
-                     {"entry", std::to_string(entry)},
-                     {"current", std::to_string(price)},
-                     {"position_side", is_long_position ? "Long" : "Short"},
-                     {"symbol", symbol_.get()}});
-            }
-        }
-
-        // === 4. Time-based exit: индикаторный анализ при таймауте ===
-        // Вместо простого momentum_5 используем полный evaluate_exit_score
-        bool time_exit_triggered = false;
-        if (!trailing_stop_triggered && !protective_atr_stop_triggered
-            && !fixed_stop_triggered && !price_stop_triggered
-            && position_entry_time_ns_ > 0) {
-            int64_t now_check = clock_->now().get();
-            int64_t hold_duration = now_check - position_entry_time_ns_;
-            int64_t max_hold_loss = static_cast<int64_t>(config_.trading_params.max_hold_loss_minutes)
-                                 * 60LL * 1'000'000'000LL;
-            int64_t max_hold_abs = static_cast<int64_t>(config_.trading_params.max_hold_absolute_minutes)
-                                 * 60LL * 1'000'000'000LL;
-            int64_t hold_min = hold_duration / 60'000'000'000LL;
-
-            // Полная индикаторная оценка ситуации для нашей стороны
-            double exit_score = evaluate_exit_score(snapshot, current_position_side_);
-            bool indicators_favorable = (exit_score > 0.10);  // Если > +0.10, рынок за нас
-
-            // Убыточная позиция > N мин → закрыть (only if loss > 0.3% of entry)
-            double loss_pct_of_entry = (entry > 0.0 && pos.size.get() > 0.0)
-                ? std::abs(pos.unrealized_pnl) / (entry * pos.size.get()) * 100.0
-                : 0.0;
-            if (pos.unrealized_pnl < 0.0 && loss_pct_of_entry > 0.3 && hold_duration >= max_hold_loss) {
-                // Если индикаторы показывают разворот в нашу сторону — подождать
-                if (indicators_favorable && hold_duration < max_hold_loss * 3 / 2) {
-                    if (tick_count_ % 200 == 0) {
-                        logger_->info("pipeline", "TIME_EXIT отложен — индикаторы благоприятны",
-                            {{"hold_min", std::to_string(hold_min)},
-                             {"exit_score", std::to_string(exit_score)},
-                             {"pnl", std::to_string(pos.unrealized_pnl)},
-                             {"symbol", symbol_.get()}});
-                    }
-                } else {
-                    time_exit_triggered = true;
-                    logger_->warn("pipeline", "TIME_EXIT: убыточная позиция по таймауту",
-                        {{"hold_min", std::to_string(hold_min)},
-                         {"max_hold_loss_min", std::to_string(config_.trading_params.max_hold_loss_minutes)},
-                         {"pnl", std::to_string(pos.unrealized_pnl)},
-                         {"loss_pct", std::to_string(loss_pct_of_entry)},
-                         {"exit_score", std::to_string(exit_score)},
-                         {"symbol", symbol_.get()}});
-                }
-            }
-            // Абсолютный таймаут > M мин → закрыть (extend if profitable + indicators ok)
-            if (!time_exit_triggered && hold_duration >= max_hold_abs) {
-                if (pos.unrealized_pnl > 0.0 && indicators_favorable && hold_duration < max_hold_abs * 3 / 2) {
-                    if (tick_count_ % 200 == 0) {
-                        logger_->info("pipeline", "TIME_EXIT абсолютный отложен — прибыльная + индикаторы ОК",
-                            {{"hold_min", std::to_string(hold_min)},
-                             {"exit_score", std::to_string(exit_score)},
-                             {"pnl", std::to_string(pos.unrealized_pnl)},
-                             {"symbol", symbol_.get()}});
-                    }
-                } else {
-                    time_exit_triggered = true;
-                    logger_->warn("pipeline", "TIME_EXIT: абсолютный таймаут позиции",
-                        {{"hold_min", std::to_string(hold_min)},
-                         {"max_hold_abs_min", std::to_string(config_.trading_params.max_hold_absolute_minutes)},
-                         {"pnl", std::to_string(pos.unrealized_pnl)},
-                         {"exit_score", std::to_string(exit_score)},
-                         {"symbol", symbol_.get()}});
-                }
-            }
-        }
-
-        if (!trailing_stop_triggered && !protective_atr_stop_triggered
-            && !partial_tp_triggered && !fixed_stop_triggered
-            && !price_stop_triggered && !time_exit_triggered
-            && !quick_profit_triggered) continue;
-
-        // === Стоп/TP сработал: проверяем возможность закрытия ===
-
-        // Cooldown стоп-лосса (отдельный от обычных ордеров — стоп экстренный)
+        // Cooldown стоп-лосса
         int64_t now_ns = clock_->now().get();
         if (last_stop_loss_time_ns_ > 0 &&
             (now_ns - last_stop_loss_time_ns_) < kStopLossCooldownNs) {
-            // Уже пытались недавно — не спамим биржу, но сигнализируем pipeline
-            // что стоп-лосс активен (блокировать стратегии)
             return true;
         }
 
         // Определяем реальный размер позиции для закрытия
         double actual_qty = 0.0;
         if (futures_query_adapter_) {
-            // Фьючерсы: запрашиваем позицию напрямую (не баланс base coin)
             auto fp_list = futures_query_adapter_->get_positions(symbol_);
             bool exchange_query_ok = fp_list.has_value();
             if (fp_list) {
@@ -2310,7 +2037,17 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 }
             }
             if (actual_qty <= 0.0 && exchange_query_ok) {
-                // Биржа подтвердила: позиции нет. Очищаем фантомную позицию из портфеля.
+                // Grace period: don't clean up immediately after a fill.
+                // Exchange API may not reflect the new position for a few seconds.
+                int64_t now_ns = clock_->now().get();
+                if (last_position_fill_ns_ > 0 &&
+                    (now_ns - last_position_fill_ns_) < kPhantomGracePeriodNs) {
+                    logger_->info("pipeline", "Позиция не видна на бирже, но в grace-периоде после fill — пропуск фантомной очистки",
+                        {{"symbol", symbol_.get()},
+                         {"elapsed_ms", std::to_string((now_ns - last_position_fill_ns_) / 1'000'000)},
+                         {"portfolio_size", std::to_string(pos.size.get())}});
+                    return false;
+                }
                 logger_->warn("pipeline", "Позиция не найдена на бирже — очистка фантомной позиции",
                     {{"symbol", symbol_.get()},
                      {"portfolio_size", std::to_string(pos.size.get())}});
@@ -2318,11 +2055,9 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 reset_trailing_state();
                 return true;
             }
-            if (actual_qty <= 0.0) actual_qty = pos.size.get(); // fallback (query failed)
+            if (actual_qty <= 0.0) actual_qty = pos.size.get();
         }
         if (actual_qty < 0.00001) {
-            // Токен уже продан (стоп-лосс сработал ранее), но позиция
-            // осталась в портфеле. Очищаем её принудительно.
             logger_->info("pipeline", "Стоп-лосс: актив уже продан, очищаем позицию из портфеля",
                 {{"qty", std::to_string(actual_qty)},
                  {"symbol", symbol_.get()}});
@@ -2330,37 +2065,24 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             reset_trailing_state();
             return true;
         }
-        // Пылевая позиция — невозможно продать на бирже, пропускаем
+        // Пылевая позиция
         double actual_notional = actual_qty * price;
         if (actual_notional < config_.trading_params.dust_threshold_usdt) {
             logger_->debug("pipeline", "Пылевая позиция, пропускаем стоп-лосс",
                 {{"notional", std::to_string(actual_notional)},
                  {"symbol", symbol_.get()}});
-            // Очищаем позицию из портфеля чтобы не блокировать новые сделки
             portfolio_->close_position(symbol_, current_position_side_, pos.current_price, pos.unrealized_pnl);
             reset_trailing_state();
             return false;
         }
 
-        // Определяем количество и причину закрытия
+        // Определяем количество и тип закрытия из decision
         double close_qty = actual_qty;
         bool is_full_close = true;
-        std::string reason;
 
-        if (quick_profit_triggered && !trailing_stop_triggered && !protective_atr_stop_triggered
-            && !fixed_stop_triggered && !price_stop_triggered) {
-            // Quick profit: забираем плюс целиком (full close)
-            reason = "QUICK_PROFIT: PnL=" + std::to_string(pos.unrealized_pnl) + " USDT";
-            logger_->info("pipeline", "QUICK PROFIT — фиксируем прибыль",
-                {{"symbol", symbol_.get()},
-                 {"entry", std::to_string(entry)},
-                 {"current", std::to_string(price)},
-                 {"pnl", std::to_string(pos.unrealized_pnl)}});
-        } else if (partial_tp_triggered && !trailing_stop_triggered
-            && !protective_atr_stop_triggered && !fixed_stop_triggered) {
-            // TP: закрываем позицию (с проверкой на dust)
-            close_qty = actual_qty * config_.trading_params.partial_tp_fraction;
-            // Минимальный ордер: используем per-symbol min или fallback
+        if (decision.should_reduce && !decision.should_exit) {
+            // Partial reduce (TP or continuation-based)
+            close_qty = actual_qty * decision.reduce_fraction;
             const double sym_min_notional = exchange_rules_.min_trade_usdt > 0.0
                 ? exchange_rules_.min_trade_usdt
                 : common::exchange_limits::kMinBitgetNotionalUsdt;
@@ -2372,101 +2094,81 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 double floored_close = exchange_rules_.floor_quantity(close_qty);
                 double remaining_after = actual_qty - floored_close;
                 double remaining_notional = remaining_after * price;
-                // Если остаток < min notional или < 2 лота → закрыть 100%
                 if (remaining_notional < sym_min_notional
                     || remaining_after < 2.0 * std::max(exchange_rules_.min_quantity, 1.0)) {
-                    close_qty = actual_qty; // Full close — no dust
+                    close_qty = actual_qty;
                     logger_->info("pipeline", "ANTI-DUST: остаток слишком мал, закрытие 100%",
                         {{"remaining_qty", std::to_string(remaining_after)},
                          {"remaining_notional", std::to_string(remaining_notional)},
                          {"symbol", symbol_.get()}});
                 }
             }
-
             is_full_close = (close_qty >= actual_qty - 1e-9);
-            partial_tp_taken_ = true;
-            reason = "TAKE_PROFIT: профит >= " + std::to_string(config_.trading_params.partial_tp_atr_threshold)
-                   + "×ATR, закрытие " + std::to_string(static_cast<int>(
-                       std::min(close_qty / std::max(actual_qty, 1e-9), 1.0) * 100)) + "%";
-
-            logger_->info("pipeline", "TAKE-PROFIT — закрытие позиции",
-                {{"symbol", symbol_.get()},
-                 {"entry", std::to_string(entry)},
-                 {"current", std::to_string(price)},
-                 {"close_qty", std::to_string(close_qty)},
-                 {"is_full", is_full_close ? "true" : "false"},
-                 {"pnl", std::to_string(pos.unrealized_pnl)}});
-        } else if (price_stop_triggered) {
-            double price_loss_pct = (current_position_side_ == PositionSide::Short)
-                ? (price - entry) / entry * 100.0
-                : (entry - price) / entry * 100.0;
-            reason = "PRICE_STOP: loss " + std::to_string(price_loss_pct) + "% from entry";
-        } else if (fixed_stop_triggered) {
-            reason = "FIXED_STOP: убыток " + std::to_string(loss_pct_of_capital) + "% капитала";
-        } else if (protective_atr_stop_triggered) {
-            reason = "ATR_STOP: цена " + std::to_string(price)
-                   + " прошла защитный ATR-стоп " + std::to_string(current_stop_level_);
-        } else if (trailing_stop_triggered) {
-            reason = "TRAILING_STOP: цена " + std::to_string(price)
-                   + " прошла trailing-стоп " + std::to_string(current_stop_level_);
-        } else if (time_exit_triggered) {
-            int64_t hold_dur = clock_->now().get() - position_entry_time_ns_;
-            reason = "TIME_EXIT: hold=" + std::to_string(hold_dur / 60'000'000'000LL)
-                   + "min, PnL=" + std::to_string(pos.unrealized_pnl);
+            if (decision.explanation.primary_signal == ExitSignalType::PartialReduce) {
+                partial_tp_taken_ = true;
+            }
         }
 
-        const bool is_take_profit_close = partial_tp_triggered || quick_profit_triggered;
-        const bool is_time_exit_close = time_exit_triggered;
+        // Reason string from orchestrator explanation
+        const auto& expl = decision.explanation;
+        std::string reason = expl.primary_driver;
+        if (!expl.counterfactual.empty()) {
+            reason += " [counterfactual: " + expl.counterfactual + "]";
+        }
+
+        // Classify the exit for logging/strategy naming
+        const bool is_take_profit_close =
+            (expl.primary_signal == ExitSignalType::QuickProfitHarvest ||
+             expl.primary_signal == ExitSignalType::PartialReduce);
+        const bool is_continuation_exit =
+            (expl.primary_signal == ExitSignalType::ContinuationValueExit);
+
         const char* forced_close_message = is_take_profit_close
             ? "TAKE-PROFIT СРАБОТАЛ — принудительное закрытие"
-            : (is_time_exit_close
-                ? "TIME-EXIT СРАБОТАЛ — принудительное закрытие"
+            : (is_continuation_exit
+                ? "CONTINUATION_EXIT СРАБОТАЛ — принудительное закрытие"
                 : "СТОП-ЛОСС СРАБОТАЛ — принудительное закрытие");
         const char* forced_close_order_message = is_take_profit_close
             ? "TAKE-PROFIT ОРДЕР ОТПРАВЛЕН"
-            : (is_time_exit_close
-                ? "TIME-EXIT ОРДЕР ОТПРАВЛЕН"
+            : (is_continuation_exit
+                ? "CONTINUATION_EXIT ОРДЕР ОТПРАВЛЕН"
                 : "СТОП-ЛОСС ОРДЕР ОТПРАВЛЕН");
         const char* forced_close_strategy = is_take_profit_close
             ? "take_profit"
-            : (is_time_exit_close ? "time_exit" : "stop_loss");
+            : (is_continuation_exit ? "continuation_exit" : "stop_loss");
 
         if (is_full_close) {
             logger_->warn("pipeline", forced_close_message,
                 {{"symbol", symbol_.get()},
                  {"reason", reason},
+                 {"signal", std::to_string(static_cast<int>(expl.primary_signal))},
                  {"entry", std::to_string(entry)},
                  {"current", std::to_string(price)},
                  {"trail_stop", std::to_string(current_stop_level_)},
-                 {"trail_mult", std::to_string(current_trail_mult_)},
-                 {"unrealized_pnl", std::to_string(pos.unrealized_pnl)},
-                 {"loss_pct", std::to_string(loss_pct_of_capital)}});
+                 {"continuation_value", std::to_string(decision.state.continuation_value)},
+                 {"urgency", std::to_string(decision.urgency)},
+                 {"unrealized_pnl", std::to_string(pos.unrealized_pnl)}});
         }
 
         // Формируем SELL intent для закрытия
         strategy::TradeIntent close_intent;
         close_intent.symbol = symbol_;
         close_intent.side = Side::Sell;
-        close_intent.conviction = 1.0;  // Максимальная уверенность — это стоп/TP
-        close_intent.urgency = 1.0;     // Максимальная срочность → market order
+        close_intent.conviction = 1.0;
+        close_intent.urgency = decision.urgency;
         close_intent.strategy_id = StrategyId(forced_close_strategy);
         close_intent.limit_price = snapshot.mid_price;
         close_intent.snapshot_mid_price = snapshot.mid_price;
         close_intent.suggested_quantity = Quantity(close_qty);
 
-        // Устанавливаем trade_side=Close и position_side для корректного ордера.
-        // Без этого Bitget Mix API получит tradeSide=open и откроет встречную позицию
-        // вместо закрытия текущей.
         close_intent.trade_side = TradeSide::Close;
         close_intent.position_side = current_position_side_;
         close_intent.signal_intent = (current_position_side_ == PositionSide::Long)
             ? strategy::SignalIntent::LongExit : strategy::SignalIntent::ShortExit;
-        // Для short-позиции side=Buy (закрытие short = покупка на фьючерсах)
         if (current_position_side_ == PositionSide::Short) {
             close_intent.side = Side::Buy;
         }
 
-        // Уникальный correlation_id для предотвращения дублирования
         close_intent.correlation_id = CorrelationId(
             "SL-" + std::to_string(now_ns));
 
@@ -2477,24 +2179,20 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
         risk_decision.summary = "FORCED_CLOSE: " + reason;
 
         // Stop-loss bypass: не используем execution_alpha для экстренных ордеров.
-        // ExecutionAlpha может блокировать ордер ("NoExecution: условия неблагоприятны"),
-        // но стоп-лосс ОБЯЗАН исполниться для ограничения убытков.
         execution_alpha::ExecutionAlphaResult exec_alpha;
         exec_alpha.should_execute = true;
         exec_alpha.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
-        exec_alpha.urgency_score = 1.0;
+        exec_alpha.urgency_score = decision.urgency;
         exec_alpha.rationale = "FORCED_CLOSE: bypass execution alpha";
 
-        // Обновляем cooldown стоп-лосса ПЕРЕД отправкой (даже при ошибке — не спамить)
         last_stop_loss_time_ns_ = now_ns;
-        // Также обновляем общий cooldown — стоп-лосс это тоже ордер
         last_order_time_ns_ = now_ns;
         last_activity_ns_.store(now_ns, std::memory_order_relaxed);
 
         auto order_result = execution_engine_->execute(close_intent, risk_decision, exec_alpha,
-            uncertainty::UncertaintySnapshot{});  // Стоп-лосс обходит неопределённость
+            uncertainty::UncertaintySnapshot{});
         if (order_result) {
-            close_order_pending_ = true; // Block new entries until close fills
+            close_order_pending_ = true;
             risk_engine_->record_order_sent();
             logger_->warn("pipeline", is_full_close
                     ? forced_close_order_message
@@ -2505,23 +2203,16 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                  {"reason", reason}});
 
             if (is_full_close) {
-                // Execution engine уже вызовет close_position при fill.
-                // Записываем данные для fingerprint/thompson, но НЕ вызываем
-                // portfolio_->close_position() повторно — иначе PnL будет двойным.
-
-                // Записываем результат fingerprint (стоп-лосс = негативный исход)
+                // Record fingerprint
                 if (fingerprinter_ && last_entry_fingerprint_) {
                     double norm_pnl = (pos.unrealized_pnl > 0) ? 1.0 : -1.0;
                     fingerprinter_->record_outcome(*last_entry_fingerprint_, norm_pnl);
                     last_entry_fingerprint_.reset();
                 }
 
-                // BayesianAdapter: стоп-лосс тоже является наблюдением для адаптации.
-                // БЕЗ этого Bayesian видит только стратегические закрытия, что создаёт
-                // survivorship bias — модель не учитывает неудачные сделки.
+                // BayesianAdapter: стоп-лосс тоже является наблюдением
                 if (bayesian_adapter_) {
                     ml::ParameterObservation obs;
-                    // Normalize: use PnL % / max_loss_per_trade_pct, clamped to [-1, +1]
                     const double risk_ref = std::max(config_.trading_params.max_loss_per_trade_pct, 0.5);
                     double pnl_pct = pos.unrealized_pnl_pct;
                     obs.reward = std::clamp(pnl_pct / risk_ref, -1.0, 1.0);
@@ -2529,15 +2220,13 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     bayesian_adapter_->record_observation("global", obs);
                 }
 
-                // Thompson Sampling: стоп-лосс — используем действие входа
+                // Thompson Sampling
                 if (thompson_sampler_) {
                     double ts_reward = (pos.unrealized_pnl > 0) ? 1.0 : -1.0;
                     thompson_sampler_->record_reward(current_entry_thompson_action_, ts_reward);
                 }
 
-                // ИСПРАВЛЕНИЕ H6 (аудит): feedback в world model для forced exits.
-                // Без этого world model учится только на "чистых" закрытиях
-                // и недоучитывает принудительные исходы (survivorship bias).
+                // World model feedback
                 if (world_model_) {
                     double sl_pnl_pct = (pos.notional.get() > 0.0)
                         ? pos.unrealized_pnl / pos.notional.get() * 100.0
@@ -2545,7 +2234,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     world_model::WorldStateFeedback wfb;
                     wfb.state = current_entry_world_state_;
                     wfb.strategy_id = current_position_strategy_;
-                    wfb.pnl_bps = sl_pnl_pct * 100.0;  // pct → bps
+                    wfb.pnl_bps = sl_pnl_pct * 100.0;
                     wfb.slippage_bps = current_position_slippage_bps_;
                     wfb.max_adverse_excursion_bps = current_max_adverse_excursion_bps_;
                     wfb.was_profitable = (pos.unrealized_pnl > 0.0);
@@ -2553,11 +2242,9 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     world_model_->record_feedback(wfb);
                 }
 
-                // Записываем результат в risk engine
                 risk_engine_->record_trade_result(pos.unrealized_pnl < 0.0);
+                risk_engine_->record_trade_close(current_position_strategy_, symbol_, pos.unrealized_pnl);
 
-                // Rolling statistics: стоп-лосс тоже учитывается для Kelly Criterion.
-                // Без этого win_rate/win_loss_ratio завышаются (survivorship bias).
                 {
                     double sl_pnl_pct = (pos.notional.get() > 0.0)
                         ? pos.unrealized_pnl / pos.notional.get() * 100.0
@@ -2565,7 +2252,6 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     record_trade_for_stats(sl_pnl_pct);
                 }
 
-                // Обновляем edge stats в leverage engine
                 if (leverage_engine_) {
                     leverage_engine_->update_edge_stats(rolling_win_rate(), rolling_win_loss_ratio());
                 }
@@ -2577,7 +2263,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 {{"symbol", symbol_.get()}});
         }
 
-        return true;  // Стоп-лосс/TP активен — блокируем дальнейшую торговлю на этом тике
+        return true;
     }
 
     return false;
@@ -2629,10 +2315,6 @@ bool TradingPipeline::start() {
              {"margin_mode", config_.futures.margin_mode},
              {"default_leverage", std::to_string(config_.futures.default_leverage)},
              {"symbol", symbol_.get()}});
-    } else if (config_.trading.mode == TradingMode::Paper) {
-        logger_->info("pipeline",
-            "Paper mode: пропуск биржевой настройки hold mode / margin mode / leverage",
-            {{"symbol", symbol_.get()}});
     }
 
     if (futures_query_adapter_) {
@@ -2667,6 +2349,15 @@ bool TradingPipeline::start() {
     }
 
     gateway_->start();
+
+    // Start private WS for event-driven fills
+    if (private_ws_client_) {
+        private_ws_client_->start();
+        private_ws_client_->subscribe("USDT-FUTURES", "orders");
+        private_ws_client_->subscribe("USDT-FUTURES", "fill");
+        logger_->info("pipeline", "Private WS started — subscribed to orders + fill channels");
+    }
+
     running_ = true;
     last_activity_ns_.store(clock_->now().get(), std::memory_order_relaxed);
 
@@ -2680,6 +2371,7 @@ void TradingPipeline::stop() {
     if (!running_.compare_exchange_strong(expected, false)) {
         return;
     }
+    if (private_ws_client_) private_ws_client_->stop();
     if (gateway_) gateway_->stop();
     logger_->info("pipeline", "Торговый pipeline остановлен");
 }
@@ -2724,8 +2416,15 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         // Порог: 5 секунд. Stale ticks могут вызвать ложные сигналы и bad fills.
         if (snapshot.computed_at.get() > 0) {
             int64_t age_ns = now_ns - snapshot.computed_at.get();
+            // Observability panel: feed age histogram
+            if (obs_panels_.feed_age_ms) {
+                obs_panels_.feed_age_ms->observe(static_cast<double>(age_ns) / 1'000'000.0);
+            }
             constexpr int64_t kMaxFreshnessNs = 5'000'000'000LL;
             if (age_ns > kMaxFreshnessNs) {
+                if (obs_panels_.stale_ticks_total) {
+                    obs_panels_.stale_ticks_total->increment();
+                }
                 if (tick_count_ % 50 == 0) {
                     logger_->warn("pipeline", "Stale tick отклонён",
                         {{"age_ms", std::to_string(age_ns / 1'000'000)},
@@ -2836,6 +2535,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     {
         auto ingress_stage = tick_profiler.scope(TickStageProfiler::Stage::Ingress);
+
+        // Refresh trailing/protective stop state before hedge decisions.
+        // Hedge recovery must see the current stop distance; otherwise ATR stops can
+        // flatten the primary leg before the opposite hedge ever gets a chance.
+        update_trailing_stop(snapshot);
 
         // 0a. HEDGE RECOVERY: проверяем хедж-позицию ПЕРЕД стоп-лоссом.
         // Если хедж активен — он управляет закрытием, обычный стоп-лосс отключён.
@@ -3002,6 +2706,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         // 2. Режим рынка
         regime = regime_engine_->classify(snapshot);
         risk_engine_->set_current_regime(regime.detailed);
+        cached_regime_snapshot_ = regime;
 
     // 2a. Chop regime — логируем, но НЕ блокируем вход.
     // Risk engine уже применяет chop_regime_scale (0.50) — уменьшает размер позиции.
@@ -3056,17 +2761,23 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         // 2d. Minimum ATR% gate — блокируем вход если волатильность слишком низкая.
-    // При ATR% < 0.1% (ATR/price < 0.001) стоп-лосс на расстоянии шума,
-    // любой вход мгновенно выбивается. Только для новых позиций.
+    // Порог должен быть не только "достаточным для стопа", но и экономически
+    // выше round-trip taker fee. Иначе рынок двигается слабее комиссий, и scalp
+    // систематически деградирует в churn. Только для новых позиций.
     if (!pre_trade_has_position &&
         snapshot.technical.atr_valid && snapshot.technical.atr_14 > 0.0 &&
         snapshot.mid_price.get() > 0.0) {
         double atr_pct = snapshot.technical.atr_14 / snapshot.mid_price.get();
-        if (atr_pct < 0.001) {  // < 0.1% volatility
+        constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0;
+        constexpr double kEconomicAtrFloorPct = kRoundTripTakerFeePct * 1.25;
+        double min_atr_pct = std::max(0.001, kEconomicAtrFloorPct);
+        if (atr_pct < min_atr_pct) {
             if (tick_count_ % 200 == 0) {
                 logger_->info("pipeline",
-                    "LOW_VOL BLOCK: ATR% слишком низкий для надёжного стопа",
+                    "LOW_VOL BLOCK: ATR% ниже экономического порога сделки",
                     {{"atr_pct", std::to_string(atr_pct * 100.0)},
+                     {"min_atr_pct", std::to_string(min_atr_pct * 100.0)},
+                     {"round_trip_fee_pct", std::to_string(kRoundTripTakerFeePct * 100.0)},
                      {"atr", std::to_string(snapshot.technical.atr_14)},
                      {"price", std::to_string(snapshot.mid_price.get())},
                      {"symbol", symbol_.get()}});
@@ -3082,6 +2793,17 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         ml_snapshot_.compute_aggregates();
         uncertainty = uncertainty_engine_->assess(
             snapshot, regime, world, pre_trade_portfolio, ml_snapshot_);
+        cached_uncertainty_snapshot_ = uncertainty;
+
+        // Phase 4: Build unified MarketStateVector (once per tick, shared by all decisions)
+        if (market_reaction_engine_) {
+            cached_market_state_ = market_reaction_engine_->build_state(
+                snapshot, regime, uncertainty,
+                current_funding_rate_,
+                htf_trend_direction_ * htf_trend_strength_,
+                htf_valid_,
+                snapshot.execution_context.is_feed_fresh);
+        }
 
         // 4. Статус рынка каждые 100 тиков (~30 секунд)
         if (tick_count_ % 100 == 0) {
@@ -3213,11 +2935,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     }
 
     if (!decision.trade_approved || !decision.final_intent.has_value()) {
-        if (tick_count_ % 200 == 0) {
+        for (const auto& s : strategy_registry_->active()) {
+            s->notify_entry_rejected();
+        }
+        if (++diag_decision_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
             logger_->info("pipeline", "Комитет не одобрил сигнал",
                 {{"tick", std::to_string(tick_count_)},
                  {"trade_approved", decision.trade_approved ? "true" : "false"},
                  {"has_intent", decision.final_intent.has_value() ? "true" : "false"},
+                 {"effective_threshold", std::to_string(decision.effective_threshold)},
+                 {"approval_gap", std::to_string(decision.approval_gap)},
                  {"rationale", decision.rationale}});
         }
         return;
@@ -3261,11 +2988,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 ml_snapshot_.fingerprint_sample_count = static_cast<int>(stats->count);
             }
             if (fp_edge < -0.1) {
-                if (tick_count_ % 200 == 0) {
-                    logger_->debug("pipeline",
+                for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+                if (++diag_fingerprint_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
+                    logger_->info("pipeline",
                         "Fingerprint неблагоприятный — сигнал отклонён",
                         {{"edge", std::to_string(fp_edge)},
-                         {"hash", std::to_string(fp.hash())}});
+                         {"hash", std::to_string(fp.hash())},
+                         {"diag_count", std::to_string(diag_fingerprint_block_)}});
                 }
                 return;
             }
@@ -3303,7 +3032,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (intent.side == Side::Buy &&
             snapshot.technical.rsi_valid &&
             snapshot.technical.rsi_14 > 92.0) {
-            if (tick_count_ % 200 == 0) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+            if (++diag_rsi_extreme_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
                 logger_->warn("pipeline", "RSI EXTREME: BUY заблокирован (RSI>92)",
                     {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
                      {"strategy", intent.strategy_id.get()},
@@ -3316,7 +3046,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (intent.side == Side::Sell &&
             snapshot.technical.rsi_valid &&
             snapshot.technical.rsi_14 < 8.0) {
-            if (tick_count_ % 200 == 0) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+            if (++diag_rsi_extreme_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
                 logger_->warn("pipeline", "RSI EXTREME: SELL заблокирован (RSI<8)",
                     {{"rsi_14", std::to_string(snapshot.technical.rsi_14)},
                      {"strategy", intent.strategy_id.get()},
@@ -3326,11 +3057,13 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
 
         if (intent.conviction < effective_threshold) {
-            if (tick_count_ % 200 == 0) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+            if (++diag_conviction_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
                 logger_->info("pipeline", "Conviction ниже порога",
                     {{"conviction", std::to_string(intent.conviction)},
                      {"threshold", std::to_string(effective_threshold)},
-                     {"strategy", intent.strategy_id.get()}});
+                     {"strategy", intent.strategy_id.get()},
+                     {"diag_count", std::to_string(diag_conviction_block_)}});
             }
             return;
         }
@@ -3377,14 +3110,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         
         double rr_ratio = (risk_distance > 0.0) ? (reward_distance / risk_distance) : 0.0;
         if (rr_ratio < config_.trading_params.min_risk_reward_ratio) {
-            if (tick_count_ % 200 == 0) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+            if (++diag_rr_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
                 logger_->info("pipeline", "Trade skipped: poor Risk:Reward",
                     {{"rr_ratio", std::to_string(rr_ratio)},
                      {"min_rr", std::to_string(config_.trading_params.min_risk_reward_ratio)},
                      {"risk", std::to_string(risk_distance / price * 100.0)},
                      {"reward", std::to_string(reward_distance / price * 100.0)},
                      {"strategy", intent.strategy_id.get()},
-                     {"symbol", symbol_.get()}});
+                     {"symbol", symbol_.get()},
+                     {"diag_count", std::to_string(diag_rr_block_)}});
             }
             return;
         }
@@ -3419,6 +3154,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (thompson_action == ml::EntryAction::Skip) {
             // Пропускаем сигнал полностью
             consecutive_wait1_count_ = 0;
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
             if (++diag_thompson_block_ <= kDiagLogLimit || tick_count_ % 200 == 0) {
                 logger_->info("pipeline",
                     "Thompson Sampling: сигнал пропущен (Skip)",
@@ -3512,6 +3248,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         }
         if (blocked) {
             ++diag_htf_block_;
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
             if (diag_htf_block_ <= kDiagLogLimit) {
                 logger_->info("pipeline", "HTF Trend Filter блокирует сигнал",
                     {{"side", intent.side == Side::Buy ? "BUY" : "SELL"},
@@ -3528,6 +3265,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         int64_t order_cooldown_ns = static_cast<int64_t>(config_.trading_params.order_cooldown_seconds)
                                    * 1'000'000'000LL;
         if (last_order_time_ns_ > 0 && (now_ns - last_order_time_ns_) < order_cooldown_ns) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
             if (++diag_cooldown_block_ <= kDiagLogLimit) {
                 int64_t remaining_ms = (order_cooldown_ns - (now_ns - last_order_time_ns_)) / 1'000'000LL;
                 logger_->info("pipeline", "Order cooldown блокирует вход",
@@ -3541,6 +3279,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         int64_t sl_cooldown_ns = static_cast<int64_t>(config_.trading_params.stop_loss_cooldown_seconds)
                                 * 1'000'000'000LL;
         if (last_stop_loss_time_ns_ > 0 && (now_ns - last_stop_loss_time_ns_) < sl_cooldown_ns) {
+            for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
             if (tick_count_ % 500 == 0) {
                 int64_t remaining_s = (sl_cooldown_ns - (now_ns - last_stop_loss_time_ns_)) / 1'000'000'000LL;
                 logger_->info("pipeline", "Post-SL cooldown активен",
@@ -3670,19 +3409,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                              {"position_side", std::string(to_string(intent.position_side))}});
                         return;
                     }
-                }
-            }
-
-            // Minimum hold time для стратегического закрытия (не стоп)
-            if (is_closing_position && position_entry_time_ns_ > 0 && intent.urgency < 1.0) {
-                int64_t hold_ns = clock_->now().get() - position_entry_time_ns_;
-                int64_t min_hold_ns = static_cast<int64_t>(config_.trading_params.min_hold_minutes) * 60LL * 1'000'000'000LL;
-                if (hold_ns < min_hold_ns) {
-                    logger_->debug("pipeline",
-                        "Пропуск: позиция слишком молодая для стратегического закрытия",
-                        {{"hold_sec", std::to_string(hold_ns / 1'000'000'000LL)},
-                         {"symbol", symbol_.get()}});
-                    return;
                 }
             }
 
@@ -3853,6 +3579,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
             if (oc_result.action == opportunity_cost::OpportunityAction::Suppress) {
                 ++diag_opp_cost_block_;
+                for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
                 logger_->info("pipeline", "Вход отклонён opportunity cost: Suppress",
                     {{"symbol", symbol_.get()},
                      {"reason", opportunity_cost::to_string(oc_result.reason)},
@@ -3867,6 +3594,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
             if (oc_result.action == opportunity_cost::OpportunityAction::Defer) {
                 ++diag_opp_cost_block_;
+                for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
                 logger_->info("pipeline", "Вход отложен opportunity cost: Defer",
                     {{"symbol", symbol_.get()},
                      {"reason", opportunity_cost::to_string(oc_result.reason)},
@@ -3886,6 +3614,25 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 // Upgrade будет обработан: пока продолжаем как Execute,
                 // закрытие худшей позиции реализуется в следующих фазах.
             }
+        }
+
+        // Phase 4: Market Reaction Engine entry quality gate
+        // Evaluates P(continue), P(reversal), P(shock) for the intended position.
+        // Can veto entry, reduce size, or tighten conviction threshold.
+        double market_entry_size_mult = 1.0;
+        if (market_reaction_engine_ && intent.trade_side == TradeSide::Open) {
+            auto entry_quality = market_reaction_engine_->evaluate_entry(
+                cached_market_state_, intent.position_side, intent.conviction);
+            if (entry_quality.vetoed) {
+                for (const auto& s : strategy_registry_->active()) s->notify_entry_rejected();
+                logger_->info("pipeline", "Entry vetoed by MarketReactionEngine",
+                    {{"reason", entry_quality.veto_reason},
+                     {"p_continue", std::to_string(entry_quality.probs.p_continue)},
+                     {"p_shock", std::to_string(entry_quality.probs.p_shock)},
+                     {"symbol", symbol_.get()}});
+                return;
+            }
+            market_entry_size_mult = entry_quality.size_multiplier;
         }
 
         // 10. Расчёт размера для нового ордера
@@ -3912,7 +3659,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
         // Combined size multiplier
         double combined_size_mult = uncertainty.size_multiplier *
-                correlation_risk_mult;
+                correlation_risk_mult * market_entry_size_mult;
 
         // Строим AllocationContext — полный контекст для compute_size_v2.
         // Все поля заполняются явно, т.к. compute_size_v2 использует
@@ -3937,6 +3684,25 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         // Контекст портфеля
         alloc_ctx.current_drawdown_pct = pre_trade_portfolio.pnl.current_drawdown_pct;
         alloc_ctx.consecutive_losses = pre_trade_portfolio.pnl.consecutive_losses;
+        alloc_ctx.max_loss_per_trade_pct = config_.trading_params.max_loss_per_trade_pct;
+        {
+            const double price_stop_pct = std::max(config_.trading_params.price_stop_loss_pct, 0.0);
+            double atr_stop_pct = 0.0;
+            if (snapshot.technical.atr_valid &&
+                snapshot.technical.atr_14 > 0.0 &&
+                snapshot.mid_price.get() > 0.0) {
+                const double stop_mult = (ml_snapshot_.adapted_atr_stop_mult > 0.0)
+                    ? ml_snapshot_.adapted_atr_stop_mult
+                    : config_.trading_params.atr_stop_multiplier;
+                atr_stop_pct = (snapshot.technical.atr_14 * stop_mult / snapshot.mid_price.get()) * 100.0;
+            }
+
+            if (price_stop_pct > 0.0 && atr_stop_pct > 0.0) {
+                alloc_ctx.estimated_stop_distance_pct = std::min(price_stop_pct, atr_stop_pct);
+            } else {
+                alloc_ctx.estimated_stop_distance_pct = std::max(price_stop_pct, atr_stop_pct);
+            }
+        }
         if (exchange_rules_.min_trade_usdt > 0.0) {
             portfolio_allocator::ExchangeFilters ef;
             ef.symbol = symbol_;
@@ -3991,9 +3757,20 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         if (risk_decision.verdict == risk::RiskVerdict::Denied ||
             risk_decision.verdict == risk::RiskVerdict::Throttled) {
             ++diag_risk_block_;
+            std::string reason_codes;
+            for (const auto& r : risk_decision.reasons) {
+                if (!reason_codes.empty()) reason_codes += ",";
+                reason_codes += r.code + ":" + r.message;
+            }
+            std::string hard_blocks_str;
+            for (const auto& b : risk_decision.hard_blocks) {
+                if (!hard_blocks_str.empty()) hard_blocks_str += ",";
+                hard_blocks_str += b;
+            }
             logger_->warn("pipeline", "Сделка отклонена риск-движком",
                 {{"verdict", risk::to_string(risk_decision.verdict)},
-                 {"reasons", std::to_string(risk_decision.reasons.size())},
+                 {"reasons", reason_codes.empty() ? std::to_string(risk_decision.reasons.size()) : reason_codes},
+                 {"hard_blocks", hard_blocks_str},
                  {"summary", risk_decision.summary},
                  {"diag_count", std::to_string(diag_risk_block_)}});
             // Уведомить стратегию — не переспамливать вход
@@ -4144,8 +3921,8 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             return;
         }
 
-        // Для открывающего ордера синхронизируем leverage с execution engine.
-        // В production дополнительно устанавливаем плечо на бирже, в paper только симулируем.
+        // Для открывающего ордера синхронизируем leverage с execution engine
+        // и устанавливаем плечо на бирже.
         if (intent.trade_side == TradeSide::Open) {
             std::string hold_side = (intent.position_side == PositionSide::Long) ? "long" : "short";
             int& last_applied = (intent.position_side == PositionSide::Long)
@@ -4172,8 +3949,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 execution_engine_->set_leverage(static_cast<double>(lev_decision.leverage));
             }
 
-            logger_->debug("pipeline",
-                futures_submitter_ ? "Плечо установлено на бирже" : "Плечо смоделировано в PAPER",
+            logger_->debug("pipeline", "Плечо установлено на бирже",
                 {{"leverage", std::to_string(lev_decision.leverage)},
                  {"hold_side", hold_side},
                  {"rationale", lev_decision.rationale}});
@@ -4197,16 +3973,27 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         // Шум может только УМЕНЬШИТЬ размер, но не увеличить его.
         noisy_qty = std::min(noisy_qty, approved);
         noisy_qty = std::max(noisy_qty, 0.0);
+
+        // КРИТИЧНО: после noise + floor проверяем min_notional.
+        // Noise -2% + floor с precision=2 могут уронить notional ниже $5 минимума биржи.
+        if (exchange_rules_.quantity_precision >= 0) {
+            double floored = exchange_rules_.floor_quantity(noisy_qty);
+            double floored_notional = floored * snapshot.mid_price.get();
+            double min_notional = exchange_rules_.min_trade_usdt > 0.0
+                ? exchange_rules_.min_trade_usdt
+                : common::exchange_limits::kMinBitgetNotionalUsdt;
+            if (floored_notional < min_notional) {
+                // Откат: используем одобренный размер без шума
+                noisy_qty = approved;
+            }
+        }
+
         risk_decision.approved_quantity = Quantity(noisy_qty);
     }
 
-    // 12b. Anti-fingerprinting: order timing jitter (50-300ms).
-    // Предотвращает обнаружение паттернов по точному времени подачи ордеров.
-    // Scalping-safe: задержка < рыночного impact на 1-минутных свечах.
-    {
-        int jitter_ms = generate_order_jitter_ms(50, 300);
-        std::this_thread::sleep_for(std::chrono::milliseconds(jitter_ms));
-    }
+    // 12b. Anti-fingerprinting: small jitter applied at exchange client level.
+    // Removed synchronous sleep from pipeline thread — blocking here delays
+    // stop-loss/trailing stop evaluation for up to 300ms on every order.
 
     // Устанавливаем cooldown ПЕРЕД отправкой — чтобы даже при ошибке
     // не спамить биржу повторными запросами.
@@ -4248,6 +4035,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             lowest_price_since_entry_ = entry_price;
             initial_position_size_ = risk_decision.approved_quantity.get();
             position_entry_time_ns_ = clock_->now().get();
+            last_position_fill_ns_ = position_entry_time_ns_;
 
             // Сохраняем fingerprint на входе для записи результата при закрытии
             if (fingerprinter_) {
@@ -4262,6 +4050,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                     intent.side,
                     intent.position_side);
             }
+
+            // Persist position open event
+            persist_position_event("PositionOpened", symbol_,
+                intent.position_side, snapshot.mid_price.get(), 0.0,
+                risk_decision.approved_quantity.get(), intent.strategy_id.get());
         }
 
         // Сброс trailing state при полном закрытии позиции
@@ -4322,6 +4115,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 s->notify_position_closed();
             }
 
+            // Persist position close event
+            persist_position_event("PositionClosed", symbol_,
+                current_position_side_, snapshot.mid_price.get(), closing_pnl,
+                0.0, current_position_strategy_.get());
+
             reset_trailing_state();
         }
     } else {
@@ -4350,6 +4148,58 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             s->notify_entry_rejected();
         }
     }
+
+    // ─── Phase 8: Capture full decision chain telemetry ───────────────────
+    if (telemetry_ && telemetry_->is_enabled()) {
+        telemetry::TelemetryEnvelope env;
+        env.sequence_id = telemetry_seq_.fetch_add(1, std::memory_order_relaxed);
+        env.correlation_id = intent.correlation_id;
+        env.captured_at = Timestamp(clock_->now().get());
+        env.symbol = symbol_;
+        env.strategy_id = intent.strategy_id;
+        env.strategy_version = StrategyVersion(0);
+        env.config_hash = ConfigHash(config_.config_hash);
+
+        // Market data
+        env.last_price = snapshot.last_price.get();
+        env.mid_price = snapshot.mid_price.get();
+        env.spread_bps = snapshot.microstructure.spread_bps;
+
+        // World state
+        env.world_state = world.label;
+        env.regime_label = regime.label;
+        env.regime_confidence = regime.confidence;
+        env.uncertainty_level = uncertainty.level;
+        env.uncertainty_score = uncertainty.aggregate_score;
+
+        // Decision chain
+        env.trade_approved = order_result.has_value();
+        env.final_conviction = intent.conviction;
+        env.risk_verdict = risk::to_string(risk_decision.verdict);
+
+        // Execution alpha
+        env.execution_style = execution_alpha::to_string(exec_alpha.recommended_style);
+        env.execution_urgency = exec_alpha.urgency_score;
+        env.execution_cost_bps = exec_alpha.quality.total_cost_bps;
+
+        // Portfolio snapshot
+        auto psnap = portfolio_->snapshot();
+        env.portfolio_exposure_pct = psnap.exposure.exposure_pct;
+        env.daily_pnl = psnap.pnl.realized_pnl_today;
+        env.drawdown_pct = psnap.pnl.current_drawdown_pct;
+        env.open_positions = psnap.exposure.open_positions_count;
+
+        // Pipeline latency
+        env.total_pipeline_ns = clock_->now().get() - now_ns;
+
+        telemetry_->capture(env);
+
+        // Notify incident detector
+        if (incident_detector_) {
+            incident_detector_->on_order_sent(now_ns);
+        }
+    }
+
     }
 }
 
@@ -4436,6 +4286,13 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
     run_order_watchdog(now_ns);
     run_continuous_reconciliation(now_ns);
 
+    // Periodic portfolio snapshot (every 30 seconds) — для recovery при рестарте
+    if (persistence_ && persistence_->is_enabled() &&
+        (last_snapshot_ns_ == 0 || (now_ns - last_snapshot_ns_) >= kSnapshotIntervalNs)) {
+        last_snapshot_ns_ = now_ns;
+        persist_portfolio_snapshot();
+    }
+
     // Daily reset: сбрасываем intraday drawdown, daily PnL, loss streaks при смене UTC-дня.
     // Без этого INTRADAY_DRAWDOWN блокирует торговлю навсегда после достижения лимита.
     {
@@ -4506,6 +4363,32 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
          (now_ns - last_reference_price_update_ns_) >= kReferencePriceIntervalNs)) {
         last_reference_price_update_ns_ = now_ns;
         update_reference_prices();
+    }
+
+    // Phase 8: Periodic incident detection
+    if (incident_detector_ && (now_ns - last_incident_check_ns_) >= kIncidentCheckIntervalNs) {
+        last_incident_check_ns_ = now_ns;
+        auto incidents = incident_detector_->check(now_ns);
+        for (const auto& inc : incidents) {
+            if (inc.severity == telemetry::IncidentSeverity::Critical) {
+                logger_->error("incident", "CRITICAL INCIDENT: " + inc.description,
+                    {{"mitigation", inc.mitigation}});
+            }
+        }
+    }
+
+    // Phase 8: Funding drag metric
+    if (obs_panels_.funding_rate_bps && std::abs(current_funding_rate_) > 1e-10) {
+        obs_panels_.funding_rate_bps->observe(current_funding_rate_ * 10000.0); // rate → bps
+        if (obs_panels_.funding_drag_cumulative_bps && has_open_position()) {
+            obs_panels_.funding_drag_cumulative_bps->increment(
+                std::abs(current_funding_rate_) * 10000.0);
+        }
+    }
+
+    // Phase 8: Flush telemetry buffers periodically
+    if (telemetry_) {
+        telemetry_->flush();
     }
 }
 
@@ -4696,8 +4579,9 @@ void TradingPipeline::record_trade_for_stats(double pnl_pct) {
 
 double TradingPipeline::rolling_win_rate() const {
     if (trade_history_.empty()) {
-        // Консервативная оценка по умолчанию (до накопления статистики)
-        return 0.45;
+        // Нейтральный prior для новых символов — даём боту возможность
+        // накопить статистику. Kelly(0.50, 1.5) = 0.167 > 0.
+        return 0.50;
     }
     int wins = 0;
     for (const auto& t : trade_history_) {
@@ -4708,8 +4592,8 @@ double TradingPipeline::rolling_win_rate() const {
 
 double TradingPipeline::rolling_win_loss_ratio() const {
     if (trade_history_.empty()) {
-        // Консервативная оценка по умолчанию
-        return 1.2;
+        // Умеренно-оптимистичный prior: WR=0.50, RR=1.5 → Kelly=0.167
+        return 1.5;
     }
     double total_wins = 0.0;
     double total_losses = 0.0;
@@ -4752,14 +4636,26 @@ void TradingPipeline::update_reference_prices() {
     auto in_flight = reference_price_fetch_in_flight_;
     const std::string symbol = symbol_.get();
 
-    std::thread([rest_client = std::move(rest_client),
+    // Fire async task with RAII guarantee on in_flight flag.
+    // Using jthread ensures joinable on pipeline destruction.
+    if (ref_price_thread_.joinable()) {
+        ref_price_thread_.join();
+    }
+    ref_price_thread_ = std::jthread([rest_client = std::move(rest_client),
                  correlation_monitor = std::move(correlation_monitor),
                  logger = std::move(logger),
                  in_flight = std::move(in_flight),
-                 symbol]() {
+                 symbol](std::stop_token stoken) {
+        // RAII guard: always clear in_flight on exit (normal or exception)
+        struct InFlightGuard {
+            std::shared_ptr<std::atomic<bool>> flag;
+            ~InFlightGuard() { if (flag) flag->store(false, std::memory_order_release); }
+        } guard{in_flight};
+
         static const std::vector<std::string> kReferenceAssets = {"BTCUSDT", "ETHUSDT"};
 
         for (const auto& asset : kReferenceAssets) {
+            if (stoken.stop_requested()) return;
             if (symbol == asset) continue;
 
             try {
@@ -4791,9 +4687,305 @@ void TradingPipeline::update_reference_prices() {
                 }
             }
         }
+    });
+}
 
-        in_flight->store(false, std::memory_order_release);
-    }).detach();
+void TradingPipeline::persist_portfolio_snapshot() {
+    if (!persistence_ || !persistence_->is_enabled()) return;
+
+    auto snap = portfolio_->snapshot();
+    boost::json::array positions_arr;
+    for (const auto& pos : snap.positions) {
+        boost::json::object pobj;
+        pobj["symbol"] = pos.symbol.get();
+        pobj["side"] = (pos.side == Side::Buy ? "Buy" : "Sell");
+        pobj["position_side"] = (pos.position_side == PositionSide::Long ? "long" : "short");
+        pobj["size"] = pos.size.get();
+        pobj["avg_entry_price"] = pos.avg_entry_price.get();
+        pobj["current_price"] = pos.current_price.get();
+        pobj["unrealized_pnl"] = pos.unrealized_pnl;
+        pobj["strategy_id"] = pos.strategy_id.get();
+        pobj["opened_at_ns"] = pos.opened_at.get();
+        pobj["updated_at_ns"] = pos.updated_at.get();
+        positions_arr.push_back(std::move(pobj));
+    }
+
+    boost::json::object root;
+    root["symbol"] = symbol_.get();
+    root["positions"] = std::move(positions_arr);
+    root["total_capital"] = snap.total_capital;
+    root["available_capital"] = snap.available_capital;
+    root["timestamp_ns"] = clock_->now().get();
+
+    auto result = persistence_->snapshots().save(
+        persistence::SnapshotType::Portfolio,
+        boost::json::serialize(root));
+
+    if (!result) {
+        logger_->warn("pipeline", "Не удалось сохранить snapshot портфеля",
+            {{"symbol", symbol_.get()}});
+    }
+}
+
+void TradingPipeline::persist_position_event(
+    const std::string& event_type, const Symbol& symbol,
+    PositionSide ps, double price, double pnl,
+    double size, const std::string& strategy_id) {
+    if (!persistence_ || !persistence_->is_enabled()) return;
+
+    boost::json::object root;
+    root["event"] = event_type;
+    root["symbol"] = symbol.get();
+    root["position_side"] = (ps == PositionSide::Long ? "long" : "short");
+    root["price"] = price;
+    root["pnl"] = pnl;
+    root["size"] = size;
+    root["strategy_id"] = strategy_id;
+    root["timestamp_ns"] = clock_->now().get();
+
+    if (event_type == "PositionOpened") {
+        root["opened_at_ns"] = clock_->now().get();
+    }
+
+    auto result = persistence_->journal().append(
+        persistence::JournalEntryType::PortfolioChange,
+        boost::json::serialize(root),
+        CorrelationId{""},
+        StrategyId{strategy_id});
+
+    if (!result) {
+        logger_->warn("pipeline", "Не удалось записать событие позиции",
+            {{"symbol", symbol.get()},
+             {"event", event_type}});
+    }
+}
+
+ExitContext TradingPipeline::build_exit_context(
+    const features::FeatureSnapshot& snapshot,
+    const portfolio::Position& pos) const {
+    ExitContext ctx;
+    ctx.symbol = symbol_;
+    ctx.position_side = current_position_side_;
+    ctx.entry_price = pos.avg_entry_price.get();
+    ctx.current_price = pos.current_price.get();
+    ctx.position_size = pos.size.get();
+    ctx.initial_position_size = initial_position_size_;
+    ctx.unrealized_pnl = pos.unrealized_pnl;
+    ctx.unrealized_pnl_pct = pos.unrealized_pnl_pct;
+    ctx.entry_time_ns = position_entry_time_ns_;
+    ctx.now_ns = clock_->now().get();
+
+    ctx.highest_price_since_entry = highest_price_since_entry_;
+    ctx.lowest_price_since_entry = lowest_price_since_entry_;
+    ctx.current_stop_level = current_stop_level_;
+    ctx.breakeven_activated = breakeven_activated_;
+    ctx.partial_tp_taken = partial_tp_taken_;
+    ctx.current_trail_mult = current_trail_mult_;
+
+    ctx.atr_14 = snapshot.technical.atr_14;
+    ctx.atr_valid = snapshot.technical.atr_valid;
+    ctx.mid_price = snapshot.mid_price.get();
+    ctx.spread_bps = snapshot.microstructure.spread_valid ? snapshot.microstructure.spread_bps : 0.0;
+    ctx.book_imbalance = snapshot.microstructure.book_imbalance_valid
+        ? snapshot.microstructure.book_imbalance_5 : 0.0;
+    ctx.depth_usd = snapshot.microstructure.liquidity_valid
+        ? (snapshot.microstructure.bid_depth_5_notional + snapshot.microstructure.ask_depth_5_notional) : 10000.0;
+    ctx.vpin_toxic = snapshot.microstructure.vpin_valid && snapshot.microstructure.vpin_toxic;
+
+    ctx.ema_8 = snapshot.technical.ema_valid ? snapshot.technical.ema_8 : 0.0;
+    ctx.ema_20 = snapshot.technical.ema_valid ? snapshot.technical.ema_20 : 0.0;
+    ctx.ema_50 = snapshot.technical.ema_valid ? snapshot.technical.ema_50 : 0.0;
+    ctx.rsi_14 = snapshot.technical.rsi_valid ? snapshot.technical.rsi_14 : 50.0;
+    ctx.adx = snapshot.technical.adx_valid ? snapshot.technical.adx : 0.0;
+    ctx.macd_histogram = snapshot.technical.macd_valid ? snapshot.technical.macd_histogram : 0.0;
+    ctx.bb_width = snapshot.technical.bb_valid ? snapshot.technical.bb_bandwidth : 0.0;
+    ctx.buy_pressure = snapshot.microstructure.trade_flow_valid
+        ? snapshot.microstructure.buy_sell_ratio : 0.5;
+
+    auto port_snap = portfolio_->snapshot();
+    ctx.total_capital = port_snap.total_capital;
+    ctx.max_loss_per_trade_pct = config_.trading_params.max_loss_per_trade_pct;
+    ctx.price_stop_loss_pct = config_.trading_params.price_stop_loss_pct;
+
+    // Regime (enriched from cached regime engine output)
+    ctx.regime_stability = cached_regime_snapshot_.stability;
+    ctx.regime_confidence = cached_regime_snapshot_.confidence;
+    ctx.cusum_regime_change = snapshot.technical.cusum_valid && snapshot.technical.cusum_regime_change;
+
+    // Uncertainty (enriched from cached uncertainty engine output)
+    ctx.uncertainty = cached_uncertainty_snapshot_.aggregate_score;
+
+    // Volatility regime
+    ctx.realized_vol_short = snapshot.technical.volatility_valid ? snapshot.technical.volatility_5 : 0.0;
+    ctx.realized_vol_long = snapshot.technical.volatility_valid ? snapshot.technical.volatility_20 : 0.0;
+
+    // Microstructure enrichment
+    ctx.queue_depletion_bid = snapshot.microstructure.queue_depletion_bid;
+    ctx.queue_depletion_ask = snapshot.microstructure.queue_depletion_ask;
+    ctx.cancel_burst_intensity = snapshot.microstructure.cancel_burst_intensity;
+    ctx.top_of_book_churn = snapshot.microstructure.top_of_book_churn;
+    ctx.adverse_selection_bps = snapshot.microstructure.execution_feedback_valid
+        ? snapshot.microstructure.adverse_selection_bps : 0.0;
+    ctx.refill_asymmetry = snapshot.microstructure.refill_asymmetry;
+
+    // Time-of-Day
+    ctx.session_hour_utc = snapshot.technical.tod_valid ? snapshot.technical.session_hour_utc : 0;
+    ctx.tod_volatility_mult = snapshot.technical.tod_valid ? snapshot.technical.tod_volatility_mult : 1.0;
+    ctx.tod_volume_mult = snapshot.technical.tod_valid ? snapshot.technical.tod_volume_mult : 1.0;
+
+    // Execution context
+    ctx.estimated_slippage_bps = snapshot.execution_context.estimated_slippage_bps;
+    ctx.is_feed_fresh = snapshot.execution_context.is_feed_fresh;
+
+    ctx.funding_rate = current_funding_rate_;
+
+    ctx.taker_fee_pct = common::fees::kDefaultTakerFeePct * 100.0;  // fraction→percentage (0.0006→0.06)
+
+    ctx.atr_stop_multiplier = (ml_snapshot_.adapted_atr_stop_mult > 0.0)
+        ? ml_snapshot_.adapted_atr_stop_mult
+        : config_.trading_params.atr_stop_multiplier;
+    ctx.breakeven_atr_threshold = config_.trading_params.breakeven_atr_threshold;
+    ctx.partial_tp_atr_threshold = config_.trading_params.partial_tp_atr_threshold;
+    ctx.partial_tp_fraction = config_.trading_params.partial_tp_fraction;
+    ctx.quick_profit_fee_multiplier = config_.trading_params.quick_profit_fee_multiplier;
+
+    ctx.hedge_active = hedge_active_;
+
+    // Phase 4: Market Reaction Engine probabilities and EVs
+    if (market_reaction_engine_) {
+        auto mkt_decision = market_reaction_engine_->evaluate(
+            cached_market_state_, ctx.position_side,
+            ctx.unrealized_pnl_pct,
+            0.0 /* exit_score computed separately */);
+        ctx.p_continue = mkt_decision.probs.p_continue;
+        ctx.p_reversal = mkt_decision.probs.p_reversal;
+        ctx.p_shock = mkt_decision.probs.p_shock;
+        ctx.hold_ev_bps = mkt_decision.action_evs[0].expected_value;
+        ctx.close_ev_bps = mkt_decision.action_evs[1].expected_value;
+    }
+
+    return ctx;
+}
+
+// ==================== Private WS Event Handler ====================
+
+void TradingPipeline::on_private_ws_message(const std::string& channel,
+                                             const boost::json::value& data) {
+    if (!running_ || !execution_engine_) return;
+
+    try {
+        if (channel == "fill" && data.is_array()) {
+            // Bitget private fill channel: authoritative per-trade fills.
+            // Each item is a single trade with delta quantities.
+            for (const auto& item : data.as_array()) {
+                if (!item.is_object()) continue;
+                const auto& obj = item.as_object();
+
+                std::string order_id_str;
+                if (obj.contains("orderId")) {
+                    order_id_str = std::string(obj.at("orderId").as_string());
+                }
+                if (order_id_str.empty()) continue;
+
+                std::string trade_id;
+                if (obj.contains("tradeId")) {
+                    trade_id = std::string(obj.at("tradeId").as_string());
+                }
+
+                double fill_sz = 0.0;
+                if (obj.contains("fillSz")) {
+                    fill_sz = std::stod(std::string(obj.at("fillSz").as_string()));
+                } else if (obj.contains("baseVolume")) {
+                    fill_sz = std::stod(std::string(obj.at("baseVolume").as_string()));
+                }
+
+                double fill_px = 0.0;
+                if (obj.contains("fillPx")) {
+                    fill_px = std::stod(std::string(obj.at("fillPx").as_string()));
+                } else if (obj.contains("fillPrice")) {
+                    fill_px = std::stod(std::string(obj.at("fillPrice").as_string()));
+                }
+
+                double fee = 0.0;
+                if (obj.contains("fee")) {
+                    fee = std::stod(std::string(obj.at("fee").as_string()));
+                }
+
+                int64_t fill_time_ns = clock_->now().get();
+                if (obj.contains("fillTime")) {
+                    // Bitget fillTime is in milliseconds
+                    int64_t fill_time_ms = std::stoll(std::string(obj.at("fillTime").as_string()));
+                    fill_time_ns = fill_time_ms * 1'000'000;
+                }
+
+                execution::FillEvent fill;
+                fill.order_id = OrderId(order_id_str);
+                fill.fill_quantity = Quantity(fill_sz);   // Per-trade delta
+                fill.fill_price = Price(fill_px);         // Per-trade price
+                fill.cumulative_filled = Quantity(0.0);   // Not used from fill channel
+                fill.fee = fee;
+                fill.trade_id = trade_id;
+                fill.occurred_at = Timestamp(fill_time_ns);
+
+                execution_engine_->on_fill_event(fill);
+
+                logger_->debug("pipeline", "Fill channel event routed",
+                    {{"order_id", order_id_str},
+                     {"trade_id", trade_id},
+                     {"fill_sz", std::to_string(fill_sz)},
+                     {"fill_px", std::to_string(fill_px)}});
+            }
+        } else if (channel == "orders" && data.is_array()) {
+            // Orders channel: lifecycle transitions only.
+            // Do NOT use for fill accounting — that comes from the fill channel.
+            for (const auto& item : data.as_array()) {
+                if (!item.is_object()) continue;
+                const auto& obj = item.as_object();
+
+                std::string order_id_str;
+                if (obj.contains("orderId")) {
+                    order_id_str = std::string(obj.at("orderId").as_string());
+                }
+                if (order_id_str.empty()) continue;
+
+                std::string status;
+                if (obj.contains("status")) {
+                    status = std::string(obj.at("status").as_string());
+                }
+
+                double filled_qty = 0.0;
+                if (obj.contains("baseVolume")) {
+                    filled_qty = std::stod(std::string(obj.at("baseVolume").as_string()));
+                } else if (obj.contains("filledQty")) {
+                    filled_qty = std::stod(std::string(obj.at("filledQty").as_string()));
+                }
+
+                double fill_price = 0.0;
+                if (obj.contains("priceAvg")) {
+                    fill_price = std::stod(std::string(obj.at("priceAvg").as_string()));
+                }
+
+                if (status == "cancelled" || status == "canceled") {
+                    execution_engine_->on_order_update(
+                        OrderId(order_id_str),
+                        execution::OrderState::Cancelled,
+                        Quantity(filled_qty),
+                        Price(fill_price));
+                } else if (status == "filled") {
+                    // Reconciliation: if fill channel missed events, process_order_fill
+                    // will detect that and apply only if needed.
+                    execution_engine_->on_order_update(
+                        OrderId(order_id_str),
+                        execution::OrderState::Filled,
+                        Quantity(filled_qty),
+                        Price(fill_price));
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        logger_->error("pipeline", "Error processing private WS message: "
+            + std::string(ex.what()), {{"channel", channel}});
+    }
 }
 
 } // namespace tb::pipeline

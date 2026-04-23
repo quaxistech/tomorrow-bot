@@ -45,11 +45,18 @@ public:
     /// @brief Восстановить состояние из WAL (event journal)
     RecoveryResult recover_from_journal();
 
+    /// @brief Полное deterministic recovery (Phase 6): позиции + pending orders +
+    ///        protective TP/SL + pair-state inference
+    ExtendedRecoveryResult recover_full_state();
+
     /// @brief Получить последний результат восстановления (потокобезопасная копия)
     [[nodiscard]] RecoveryResult last_result() const;
 
     /// @brief Статус последнего recovery
     [[nodiscard]] RecoveryStatus status() const;
+
+    /// @brief Last extended result (includes pair-state, pending, protective)
+    [[nodiscard]] ExtendedRecoveryResult last_extended_result() const;
 
 private:
     /// Загрузить фьючерсные позиции с биржи и сравнить с портфелем.
@@ -75,6 +82,7 @@ private:
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
 
     RecoveryResult last_result_;
+    ExtendedRecoveryResult last_extended_result_;
     mutable std::mutex mutex_;
 };
 

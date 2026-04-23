@@ -15,6 +15,23 @@ include(cmake/CompilerWarnings.cmake)
 include(cmake/Sanitizers.cmake)
 include(cmake/ProjectOptions.cmake)
 
+# Git SHA for runtime manifest (immutable build traceability)
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT GIT_SHA)
+    set(GIT_SHA "unknown")
+endif()
+add_compile_definitions(
+    TB_GIT_SHA="${GIT_SHA}"
+    TB_VERSION="${PROJECT_VERSION}"
+    TB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+)
+
 # Поиск внешних зависимостей
 find_package(Boost 1.82 REQUIRED COMPONENTS system json thread)
 find_package(OpenSSL REQUIRED)
@@ -27,7 +44,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CTest)
 enable_testing()
 
-# Подсистемы
+# ── Production core subsystems ──
 add_subdirectory(src/common)
 add_subdirectory(src/config)
 add_subdirectory(src/security)
@@ -61,6 +78,8 @@ add_subdirectory(src/resilience)
 add_subdirectory(src/scanner)
 add_subdirectory(src/ml)
 add_subdirectory(src/leverage)
+add_subdirectory(src/telemetry)
+add_subdirectory(src/cost_attribution)
 add_subdirectory(src/pipeline)
 add_subdirectory(src/app)
 

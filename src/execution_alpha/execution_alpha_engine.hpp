@@ -21,6 +21,16 @@ public:
         const strategy::TradeIntent& intent,
         const features::FeatureSnapshot& features,
         const uncertainty::UncertaintySnapshot& uncertainty) = 0;
+
+    /// Оценить параметры исполнения для пары ног (pair EIS).
+    /// Вместо независимой оценки каждой ноги, считает joint pair EIS:
+    ///   pair_EIS = EIS(long) + EIS(short) + correlation_penalty
+    /// P(pair fill) = P(long fill) * P(short fill)
+    virtual PairExecutionAlphaResult evaluate_pair(
+        const strategy::TradeIntent& long_intent,
+        const strategy::TradeIntent& short_intent,
+        const features::FeatureSnapshot& features,
+        const uncertainty::UncertaintySnapshot& uncertainty) = 0;
 };
 
 /// Реализация на основе правил (production-grade)
@@ -77,6 +87,19 @@ public:
         // Для VIP-тиров значения корректируются через production config.
         double taker_fee_bps{6.0};   ///< Taker комиссия [bps]
         double maker_fee_bps{2.0};   ///< Maker комиссия [bps]
+
+        // ── EV-based style selection ──
+        // Opportunity cost: edge lost (bps) when a limit order doesn't fill.
+        // Scaled by urgency: effective_opp_cost = urgency * opportunity_cost_bps.
+        // Enables EV-based maker/taker switching per Almgren-Chriss framework:
+        //   EIS(style) = P(fill) * exec_cost + (1 - P(fill)) * opp_cost
+        // (Lower EIS = better style choice.)
+        double opportunity_cost_bps{30.0};  ///< Typical setup edge in bps
+
+        // ── Queue-aware adjustments ──
+        double queue_depletion_penalty{0.08};  ///< Fill prob reduction when our-side queue depleting fast
+        double churn_penalty{0.06};            ///< Fill prob reduction when top-of-book is unstable
+        double feedback_weight{0.30};          ///< Weight for historical passive_fill_rate feedback
     };
 
     RuleBasedExecutionAlpha(Config config,
@@ -86,6 +109,12 @@ public:
 
     ExecutionAlphaResult evaluate(
         const strategy::TradeIntent& intent,
+        const features::FeatureSnapshot& features,
+        const uncertainty::UncertaintySnapshot& uncertainty) override;
+
+    PairExecutionAlphaResult evaluate_pair(
+        const strategy::TradeIntent& long_intent,
+        const strategy::TradeIntent& short_intent,
         const features::FeatureSnapshot& features,
         const uncertainty::UncertaintySnapshot& uncertainty) override;
 

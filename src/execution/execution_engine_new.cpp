@@ -13,58 +13,6 @@ namespace tb::execution {
 using tb::common::fees::kDefaultTakerFeePct;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PaperOrderSubmitter
-// ═══════════════════════════════════════════════════════════════════════════════
-
-OrderSubmitResult PaperOrderSubmitter::submit_order(const OrderRecord& order) {
-    OrderSubmitResult result;
-    result.order_id = order.order_id;
-
-    const auto& sym_rules = get_rules(order.symbol);
-    const double submitted_qty = sym_rules.floor_quantity(order.original_quantity.get());
-    if (!sym_rules.is_quantity_valid(submitted_qty)) {
-        result.success = false;
-        result.error_message = "Paper reject: quantity invalid after exchange floor";
-        return result;
-    }
-
-    const double reference_price = sym_rules.round_price(order.price.get());
-    if (reference_price > 0.0 &&
-        !sym_rules.is_notional_valid(submitted_qty * reference_price)) {
-        result.success = false;
-        result.error_message = "Paper reject: order below exchange minimum notional";
-        return result;
-    }
-
-    result.success = true;
-    result.exchange_order_id = OrderId("PAPER-" + std::to_string(next_exchange_id_++));
-    result.submitted_quantity = Quantity(submitted_qty);
-    return result;
-}
-
-bool PaperOrderSubmitter::cancel_order(const OrderId& /*order_id*/, const Symbol& /*symbol*/) {
-    return true;
-}
-
-void PaperOrderSubmitter::set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules) {
-    std::lock_guard lock(rules_mutex_);
-    rules_by_symbol_[symbol.get()] = rules;
-}
-
-const ExchangeSymbolRules& PaperOrderSubmitter::rules(const Symbol& symbol) const {
-    return get_rules(symbol);
-}
-
-const ExchangeSymbolRules& PaperOrderSubmitter::get_rules(const Symbol& symbol) const {
-    std::lock_guard lock(rules_mutex_);
-    auto it = rules_by_symbol_.find(symbol.get());
-    if (it != rules_by_symbol_.end()) {
-        return it->second;
-    }
-    return default_rules_;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // ExecutionEngine — конструктор
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -101,6 +49,9 @@ Result<OrderId> ExecutionEngine::execute(
     const execution_alpha::ExecutionAlphaResult& exec_alpha,
     const uncertainty::UncertaintySnapshot& uncertainty)
 {
+    // H-4: Serialize execute() to prevent dedup TOCTOU race
+    std::lock_guard<std::mutex> exec_lock(execute_mutex_);
+
     // §5 Step 1-2: Валидация входных данных
     auto validation = validate_inputs(intent, risk_decision, exec_alpha, uncertainty);
     if (!validation) {
@@ -289,41 +240,51 @@ Result<OrderId> ExecutionEngine::execute(
                 return OrderId(order_id_str);
             }
         } else {
-            // A6 fix: вместо оптимистичного fill — retry с backoff,
-            // и если обе попытки провалились — не финализируем fill локально.
-            // Ордер остаётся в состоянии Open, reconciliation подхватит реальный статус.
+            // Exponential backoff retry for market order fill confirmation.
+            // Futures margin is critical — stale fill state can cause over-leveraged
+            // subsequent trades. We retry 3 times with 50ms/100ms/200ms backoff.
             logger_->warn("Execution",
-                "Не удалось подтвердить fill с биржи, повторяем запрос...",
+                "Не удалось подтвердить fill с биржи, повторяем с backoff...",
                 {{"order_id", order_id_str}});
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            fill_detail = submitter_->query_order_fill_detail(
-                order.exchange_order_id, order.symbol);
+            int backoff_ms = 50;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+                fill_detail = submitter_->query_order_fill_detail(
+                    order.exchange_order_id, order.symbol);
 
-            if (fill_detail.success) {
-                if (fill_detail.fill_price.get() > 0.0) {
-                    confirmed_price = fill_detail.fill_price;
-                }
-                if (fill_detail.filled_qty.get() > 0.0) {
-                    confirmed_qty = fill_detail.filled_qty;
-                }
-                if (fill_detail.filled_qty.get() <= 0.0) {
-                    logger_->error("Execution", "Market ордер НЕ исполнен биржей (retry)",
-                        {{"order_id", order_id_str},
-                         {"status", fill_detail.status}});
-                    registry_.transition(order.order_id, OrderState::Cancelled,
-                        "Exchange reported no fill on retry: " + fill_detail.status);
-                    if (portfolio_ && requires_margin_reserve(order)) {
-                        portfolio_->release_cash(order.order_id);
+                if (fill_detail.success) {
+                    if (fill_detail.fill_price.get() > 0.0) {
+                        confirmed_price = fill_detail.fill_price;
                     }
-                    return OrderId(order_id_str);
+                    if (fill_detail.filled_qty.get() > 0.0) {
+                        confirmed_qty = fill_detail.filled_qty;
+                    }
+                    if (fill_detail.filled_qty.get() <= 0.0) {
+                        logger_->error("Execution", "Market ордер НЕ исполнен биржей (retry)",
+                            {{"order_id", order_id_str},
+                             {"status", fill_detail.status},
+                             {"attempt", std::to_string(attempt + 1)}});
+                        registry_.transition(order.order_id, OrderState::Cancelled,
+                            "Exchange reported no fill on retry: " + fill_detail.status);
+                        if (portfolio_ && requires_margin_reserve(order)) {
+                            portfolio_->release_cash(order.order_id);
+                        }
+                        return OrderId(order_id_str);
+                    }
+                    logger_->info("Execution",
+                        "Fill подтверждён при повторном запросе",
+                        {{"order_id", order_id_str},
+                         {"filled_qty", std::to_string(confirmed_qty.get())},
+                         {"fill_price", std::to_string(confirmed_price.get())},
+                         {"attempt", std::to_string(attempt + 1)}});
+                    break;
                 }
-                logger_->info("Execution",
-                    "Fill подтверждён при повторном запросе",
-                    {{"order_id", order_id_str},
-                     {"filled_qty", std::to_string(confirmed_qty.get())},
-                     {"fill_price", std::to_string(confirmed_price.get())}});
-            } else {
+
+                backoff_ms *= 2;
+            }
+
+            if (!fill_detail.success) {
                 // Обе попытки провалились — НЕ обрабатываем fill оптимистично.
                 // Переводим ордер в Open: reconciliation подхватит реальный статус
                 // с биржи на следующем цикле сверки.
@@ -496,16 +457,27 @@ void ExecutionEngine::on_order_update(
     Quantity filled_qty, Price fill_price)
 {
     auto opt = registry_.get_order(order_id);
+    // effective_id = internal order ID for all registry operations
+    // (order_id may be the exchange order ID from WS "orders" channel)
+    OrderId effective_id = order_id;
     if (!opt) {
-        logger_->warn("Execution", "Обновление для неизвестного ордера",
+        // Fallback: WS events use exchange_order_id
+        opt = registry_.get_order_by_exchange_id(order_id);
+        if (opt) {
+            effective_id = opt->order_id;  // resolve to internal ID
+        }
+    }
+    if (!opt) {
+        logger_->debug("Execution", "Обновление для неизвестного ордера (WS race)",
             {{"order_id", order_id.get()}});
         return;
     }
 
-    // FSM transition
-    if (!registry_.transition(order_id, new_state, "Exchange update")) {
+    // FSM transition (use effective_id = internal order ID)
+    if (!registry_.transition(effective_id, new_state, "Exchange update")) {
         logger_->warn("Execution", "Недопустимый переход",
             {{"order_id", order_id.get()},
+             {"effective_id", effective_id.get()},
              {"to", to_string(new_state)}});
         return;
     }
@@ -514,14 +486,25 @@ void ExecutionEngine::on_order_update(
     if ((new_state == OrderState::Cancelled || new_state == OrderState::Rejected ||
          new_state == OrderState::Expired)) {
         if (portfolio_ && requires_margin_reserve(*opt)) {
-            portfolio_->release_cash(order_id);
+            portfolio_->release_cash(effective_id);
         }
         exec_metrics_.record_cancel(*opt);
     }
 
     // Handle fill via FillProcessor
     if (filled_qty.get() > 0.0) {
-        fill_processor_.process_order_fill(order_id, filled_qty, fill_price);
+        fill_processor_.process_order_fill(effective_id, filled_qty, fill_price);
+
+        // Enforce cancel-remaining policy on REST/order-update path too,
+        // not only on WS fill events (on_fill_event). If partial fill arrived
+        // via REST poll, the CancelRemaining intent must still be honoured.
+        auto cancel_action = fill_processor_.check_cancel_remaining(order_id);
+        if (cancel_action.needed) {
+            logger_->info("Execution", "CancelRemaining (order_update path): отмена остатка",
+                {{"order_id", cancel_action.order_id.get()},
+                 {"symbol", cancel_action.symbol.get()}});
+            cancel_manager_.cancel_remaining(cancel_action.order_id);
+        }
     }
 
     if (new_state == OrderState::Filled && filled_qty.get() > 0.0 && fill_price.get() > 0.0) {
@@ -536,6 +519,24 @@ void ExecutionEngine::on_order_update(
 
 void ExecutionEngine::on_fill_event(const FillEvent& fill) {
     fill_processor_.process_fill_event(fill);
+
+    // Resolve internal order ID for cancel-remaining policy.
+    // fill.order_id may be the exchange order ID from WS.
+    OrderId effective_id = fill.order_id;
+    auto opt = registry_.get_order(fill.order_id);
+    if (!opt) {
+        opt = registry_.get_order_by_exchange_id(fill.order_id);
+        if (opt) effective_id = opt->order_id;
+    }
+
+    // Enforce cancel-remaining policy after partial fills
+    auto cancel_action = fill_processor_.check_cancel_remaining(effective_id);
+    if (cancel_action.needed) {
+        logger_->info("Execution", "CancelRemaining: отмена остатка после partial fill",
+            {{"order_id", cancel_action.order_id.get()},
+             {"symbol", cancel_action.symbol.get()}});
+        cancel_manager_.cancel_remaining(cancel_action.order_id);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -656,7 +657,7 @@ OrderRecord ExecutionEngine::create_order_record(
     record.last_updated = clock_->now();
 
     // §13: Тип ордера из плана
-    // IMPORTANT: Force Market until private WS channel implemented
+    // Market orders: confirmed via REST + supplemented by private WS fills
     record.order_type = OrderType::Market;
     record.tif = TimeInForce::ImmediateOrCancel;
 

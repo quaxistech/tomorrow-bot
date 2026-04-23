@@ -150,9 +150,8 @@ enum class OrderStatus {
     Expired             ///< Истёк срок действия
 };
 
-/// Режим торговли
+/// Режим торговли — только production (live futures)
 enum class TradingMode {
-    Paper,      ///< Бумажная торговля (без реальных ордеров)
     Production  ///< Реальная торговля (боевой режим)
 };
 

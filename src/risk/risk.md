@@ -744,7 +744,7 @@ Helper-функция `warn()` была объявлена в `risk_checks.cpp`,
 Дополнительно он подмешивает параметры не из `risk`, а из `trading_params`:
 
 - `max_loss_per_trade_pct`;
-- `max_position_hold_ns`;
+- `operational_deadman_ns`;
 - `post_loss_cooldown_ns`.
 
 ## 9.2. Runtime overrides поверх конфига

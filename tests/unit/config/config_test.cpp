@@ -246,23 +246,6 @@ TEST_CASE("Config: TradingParamsInvalidPartialTpFractionFails", "[config]") {
     REQUIRE_FALSE(result.has_value());
 }
 
-TEST_CASE("Config: TradingParamsZeroHoldMinutesFails", "[config]") {
-    ConfigValidator validator;
-    auto cfg = make_valid_config();
-    cfg.trading_params.max_hold_loss_minutes = 0;
-    auto result = validator.validate(cfg);
-    REQUIRE_FALSE(result.has_value());
-}
-
-TEST_CASE("Config: TradingParamsAbsoluteHoldLessThanLossFails", "[config]") {
-    ConfigValidator validator;
-    auto cfg = make_valid_config();
-    cfg.trading_params.max_hold_loss_minutes = 60;
-    cfg.trading_params.max_hold_absolute_minutes = 30; // < loss minutes
-    auto result = validator.validate(cfg);
-    REQUIRE_FALSE(result.has_value());
-}
-
 // ============================================================
 // Тесты валидации decision
 // ============================================================

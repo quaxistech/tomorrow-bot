@@ -6,11 +6,9 @@ namespace tb::order_book {
 
 namespace {
 
-// Единая логика применения уровней к любой стороне стакана.
-// size == 0 → удаление уровня (стандартная L2-семантика бирж, включая Bitget).
-// price <= 0 или size < 0 → невалидные данные, молча пропускаются.
+// Единая логика применения уровней к любой стороне стакана (без событий — для snapshots).
 template<typename Map>
-void apply_book_levels(Map& side, const std::vector<normalizer::BookLevel>& levels) {
+void apply_book_levels_simple(Map& side, const std::vector<normalizer::BookLevel>& levels) {
     for (const auto& lvl : levels) {
         if (lvl.price.get() <= 0.0) continue;
         if (lvl.size.get() == 0.0) {
@@ -18,7 +16,6 @@ void apply_book_levels(Map& side, const std::vector<normalizer::BookLevel>& leve
         } else if (lvl.size.get() > 0.0) {
             side.insert_or_assign(lvl.price, lvl.size);
         }
-        // size < 0 — невалидные данные, пропускаем
     }
 }
 
@@ -55,8 +52,8 @@ void LocalOrderBook::apply_snapshot(const normalizer::NormalizedOrderBook& snap)
 
     bids_.clear();
     asks_.clear();
-    apply_book_levels(bids_, snap.bids);
-    apply_book_levels(asks_, snap.asks);
+    apply_book_levels_simple(bids_, snap.bids);
+    apply_book_levels_simple(asks_, snap.asks);
     last_sequence_ = snap.sequence;
     last_updated_  = snap.envelope.processed_ts;
 
@@ -74,6 +71,17 @@ void LocalOrderBook::apply_snapshot(const normalizer::NormalizedOrderBook& snap)
 }
 
 bool LocalOrderBook::apply_delta(const normalizer::NormalizedOrderBook& delta) {
+    BookEventBatch pending_events{
+        .symbol = symbol_,
+        .events = {},
+        .top_changes = 0,
+        .levels_added = 0,
+        .levels_removed = 0,
+        .levels_updated = 0,
+        .timestamp = Timestamp{0}
+    };
+
+    {   // Critical section — acquire mutex
     std::scoped_lock lock(mutex_);
 
     if (quality_ == BookQuality::Uninitialized || quality_ == BookQuality::Desynced) {
@@ -101,8 +109,43 @@ bool LocalOrderBook::apply_delta(const normalizer::NormalizedOrderBook& delta) {
         return false;
     }
 
-    apply_book_levels(bids_, delta.bids);
-    apply_book_levels(asks_, delta.asks);
+    // Capture best bid/ask BEFORE applying delta (for top-change detection)
+    const auto old_best_bid = bids_.empty() ? Price{0.0} : bids_.begin()->first;
+    const auto old_best_ask = asks_.empty() ? Price{0.0} : asks_.begin()->first;
+
+    BookEventBatch batch{
+        .symbol = symbol_,
+        .events = {},
+        .top_changes = 0,
+        .levels_added = 0,
+        .levels_removed = 0,
+        .levels_updated = 0,
+        .timestamp = delta.envelope.processed_ts
+    };
+
+    apply_book_levels_with_events(bids_, delta.bids, BookSide::Bid,
+                                   delta.envelope.processed_ts, batch);
+    apply_book_levels_with_events(asks_, delta.asks, BookSide::Ask,
+                                   delta.envelope.processed_ts, batch);
+
+    // Detect top-of-book changes
+    const auto new_best_bid = bids_.empty() ? Price{0.0} : bids_.begin()->first;
+    const auto new_best_ask = asks_.empty() ? Price{0.0} : asks_.begin()->first;
+
+    if (new_best_bid.get() != old_best_bid.get() ||
+        new_best_ask.get() != old_best_ask.get()) {
+        ++batch.top_changes;
+        // Mark any event at old/new best as top-of-book
+        for (auto& ev : batch.events) {
+            if ((ev.side == BookSide::Bid &&
+                 (ev.price.get() == old_best_bid.get() || ev.price.get() == new_best_bid.get())) ||
+                (ev.side == BookSide::Ask &&
+                 (ev.price.get() == old_best_ask.get() || ev.price.get() == new_best_ask.get()))) {
+                ev.is_top_of_book = true;
+            }
+        }
+    }
+
     last_sequence_ = delta.sequence;
     last_updated_  = delta.envelope.processed_ts;
 
@@ -117,6 +160,19 @@ bool LocalOrderBook::apply_delta(const normalizer::NormalizedOrderBook& delta) {
     if (deltas_counter_)   deltas_counter_->increment();
     if (bid_levels_gauge_) bid_levels_gauge_->set(static_cast<double>(bids_.size()));
     if (ask_levels_gauge_) ask_levels_gauge_->set(static_cast<double>(asks_.size()));
+
+    // Move events out before releasing lock
+    if (!batch.events.empty()) {
+        pending_events = std::move(batch);
+    }
+
+    } // scoped_lock released — safe to call subscribers
+
+    // Emit book events outside the mutex to prevent deadlock
+    // (subscribers may call top_of_book()/depth_summary() which acquire mutex_)
+    if (!pending_events.events.empty()) {
+        emit_events(pending_events);
+    }
     return true;
 }
 
@@ -286,6 +342,72 @@ bool LocalOrderBook::detect_crossed_book() {
         return true;
     }
     return false;
+}
+
+void LocalOrderBook::subscribe(BookEventCallback cb) {
+    std::scoped_lock lock(mutex_);
+    subscribers_.push_back(std::move(cb));
+}
+
+void LocalOrderBook::emit_events(const BookEventBatch& batch) {
+    for (const auto& cb : subscribers_) {
+        cb(batch);
+    }
+}
+
+template<typename Map>
+void LocalOrderBook::apply_book_levels_with_events(
+    Map& side, const std::vector<normalizer::BookLevel>& levels,
+    BookSide book_side, tb::Timestamp ts, BookEventBatch& batch) {
+
+    for (const auto& lvl : levels) {
+        if (lvl.price.get() <= 0.0) continue;
+
+        auto it = side.find(lvl.price);
+        const Quantity old_size = (it != side.end()) ? it->second : Quantity{0.0};
+
+        if (lvl.size.get() == 0.0) {
+            if (it != side.end()) {
+                side.erase(it);
+                batch.events.push_back(BookEvent{
+                    .type = BookEventType::LevelRemoved,
+                    .side = book_side,
+                    .price = lvl.price,
+                    .old_size = old_size,
+                    .new_size = Quantity{0.0},
+                    .timestamp = ts,
+                    .is_top_of_book = false
+                });
+                ++batch.levels_removed;
+            }
+        } else if (lvl.size.get() > 0.0) {
+            if (it == side.end()) {
+                side.insert_or_assign(lvl.price, lvl.size);
+                batch.events.push_back(BookEvent{
+                    .type = BookEventType::LevelAdded,
+                    .side = book_side,
+                    .price = lvl.price,
+                    .old_size = Quantity{0.0},
+                    .new_size = lvl.size,
+                    .timestamp = ts,
+                    .is_top_of_book = false
+                });
+                ++batch.levels_added;
+            } else {
+                side.insert_or_assign(lvl.price, lvl.size);
+                batch.events.push_back(BookEvent{
+                    .type = BookEventType::LevelUpdated,
+                    .side = book_side,
+                    .price = lvl.price,
+                    .old_size = old_size,
+                    .new_size = lvl.size,
+                    .timestamp = ts,
+                    .is_top_of_book = false
+                });
+                ++batch.levels_updated;
+            }
+        }
+    }
 }
 
 } // namespace tb::order_book

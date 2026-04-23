@@ -362,4 +362,26 @@ private:
     const ExtendedRiskConfig& cfg_;
 };
 
+/// 34. Venue Health check — blocks trading when venue is degraded
+/// Monitors: REST latency, WS reconnects, reject rate, clock drift, fill gaps
+class VenueHealthCheck : public IRiskCheck {
+public:
+    explicit VenueHealthCheck(const ExtendedRiskConfig& cfg) : cfg_(cfg) {}
+    std::string_view name() const noexcept override { return "venue_health_check"; }
+    void evaluate(const RiskContext& ctx, RiskDecision& decision) override;
+private:
+    const ExtendedRiskConfig& cfg_;
+};
+
+/// 35. Margin Distance check — reduces size or blocks when close to liquidation
+/// Ensures position + hedge margin stays within safe distance
+class MarginDistanceCheck : public IRiskCheck {
+public:
+    explicit MarginDistanceCheck(const ExtendedRiskConfig& cfg) : cfg_(cfg) {}
+    std::string_view name() const noexcept override { return "margin_distance_check"; }
+    void evaluate(const RiskContext& ctx, RiskDecision& decision) override;
+private:
+    const ExtendedRiskConfig& cfg_;
+};
+
 } // namespace tb::risk

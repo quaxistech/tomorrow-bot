@@ -73,13 +73,14 @@ SignedHeaders make_auth_headers(
     std::string_view passphrase,
     std::string_view method,
     std::string_view path,
-    std::string_view body
+    std::string_view body,
+    int64_t clock_offset_ms
 ) {
-    // Временная метка в миллисекундах (Bitget v2 API требует мс)
+    // Timestamp in milliseconds, corrected for clock drift with exchange
     auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()
-    ).count();
+    ).count() - clock_offset_ms;
 
     std::string ts = std::to_string(ms);
 

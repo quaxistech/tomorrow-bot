@@ -480,7 +480,13 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_orders(
         // Проверить filled_qty
         double local_filled = local.filled_quantity.get();
         double exchange_filled = found->filled_quantity.get();
-        // Use relative tolerance: max(1e-8, 0.001% of quantity)
+        // Relative tolerance: max(1e-8, 0.001% of exchange quantity).
+        // For USDT-M futures on Bitget, this catches rounding differences
+        // from lot-size precision while remaining tight enough to flag
+        // genuine fill discrepancies. At 1000 USDT notional, tolerance ≈ 0.01 USDT.
+        // Reconciliation ONLY flags mismatches as warnings; the pipeline or operator
+        // must act. Tighter tolerance is acceptable because mismatch logging is
+        // warning-severity and non-blocking.
         double tolerance = std::max(1e-8, exchange_filled * 1e-5);
         if (std::abs(local_filled - exchange_filled) > tolerance) {
             MismatchRecord m;

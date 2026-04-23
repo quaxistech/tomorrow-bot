@@ -96,6 +96,16 @@ struct ScannerConfig {
     int volatility_window{14};
     double depth_near_mid_pct{0.10};   // ±0.1% from mid for depth calc
 
+    // ── Scan timeout & circuit breaker ──
+    int scan_timeout_ms{60'000};           ///< Max duration for entire scan() call
+    int circuit_breaker_threshold{5};      ///< Consecutive API failures before tripping
+    int circuit_breaker_reset_ms{300'000}; ///< Time before circuit breaker resets
+
+    // ── Basket diversification ──
+    bool enable_diversification{true};          ///< Apply correlation/concentration constraints
+    double max_correlation_in_basket{0.85};     ///< Max Pearson correlation between any pair of returns
+    int max_pairs_per_sector{2};                ///< Max pairs from same token "sector" (L1/L2/meme/etc)
+
     // ── Logging ──
     bool log_detailed_analysis{false};
     bool log_rejected_pairs{true};

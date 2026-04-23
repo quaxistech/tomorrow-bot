@@ -88,6 +88,7 @@ private:
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
 
     std::atomic<uint64_t> wal_sequence_{0};
+    std::atomic<uint64_t> wal_corruption_count_{0};
     std::unordered_map<uint64_t, WalEntry> pending_entries_;
     mutable std::mutex mutex_;
 };

@@ -136,6 +136,11 @@ LeverageDecision LeverageEngine::compute_leverage(
 
     // 5. EMA smoothing — предотвращаем осцилляцию плеча между тиками
     const double ema_alpha = config_.leverage_engine.ema_alpha;
+    // При смене режима сбрасываем EMA, чтобы не тащить инерцию старого режима
+    if (regime != last_regime_) {
+        ema_initialized_ = false;
+        last_regime_ = regime;
+    }
     if (!ema_initialized_) {
         ema_leverage_ = raw;
         ema_initialized_ = true;

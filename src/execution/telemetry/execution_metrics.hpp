@@ -29,6 +29,13 @@ struct ExecutionStats {
     double fill_rate_pct{0.0};              ///< filled / total * 100
     double reject_rate_pct{0.0};
     double cancel_rate_pct{0.0};
+
+    // ── Execution quality feedback (Phase 6) ──
+    int64_t passive_submissions{0};          ///< Total limit order submissions
+    int64_t passive_fills{0};                ///< Limit orders that got filled
+    double passive_fill_rate_pct{0.0};       ///< passive_fills / passive_submissions * 100
+    double cancel_to_fill_ratio{0.0};        ///< cancelled / filled
+    double adverse_selection_mean_bps{0.0};  ///< Avg adverse price move after fill
 };
 
 /// Execution Metrics Collector

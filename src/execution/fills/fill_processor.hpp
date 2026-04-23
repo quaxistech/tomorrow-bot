@@ -53,12 +53,23 @@ public:
         Side side{Side::Buy};
     };
 
+    /// Check if a partial fill should trigger cancel-remaining policy.
+    /// Called after process_fill_event on partial fills.
+    CancelRemainingAction check_cancel_remaining(const OrderId& order_id) const;
+
 private:
-    /// Применить fill к портфелю (general)
+    /// Применить fill к портфелю (general — full order fill)
     void apply_fill_to_portfolio(const OrderRecord& order);
+
+    /// Применить одиночный fill инкрементально (partial fill support)
+    void apply_incremental_fill(const OrderRecord& order, const FillEvent& fill);
 
     /// Вычислить PnL для SELL/Close fill
     double compute_gross_pnl(const OrderRecord& order) const;
+
+    /// Вычислить PnL для одного инкрементального fill delta
+    double compute_incremental_pnl(const OrderRecord& order,
+                                   Quantity fill_qty, Price fill_price) const;
 
     OrderRegistry& registry_;
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;

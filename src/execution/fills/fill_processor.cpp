@@ -1,5 +1,6 @@
 #include "execution/fills/fill_processor.hpp"
 #include "common/constants.hpp"
+#include <algorithm>
 
 namespace tb::execution {
 
@@ -75,37 +76,79 @@ bool FillProcessor::process_market_fill(
 }
 
 bool FillProcessor::process_fill_event(const FillEvent& fill) {
+    // TradeId dedup: reject if this exact trade was already processed.
+    // This prevents double-counting on WS reconnect snapshots.
+    if (!fill.trade_id.empty() && registry_.is_trade_id_seen(fill.trade_id)) {
+        logger_->debug("FillProcessor", "Fill event дубликат по tradeId",
+            {{"order_id", fill.order_id.get()},
+             {"trade_id", fill.trade_id}});
+        if (metrics_) {
+            metrics_->counter("tb_fill_duplicates_total")->increment();
+        }
+        return false;
+    }
+
     auto opt = registry_.get_order(fill.order_id);
+    // effective_id = internal order ID for all registry operations
+    // (fill.order_id may be the exchange order ID from WS)
+    OrderId effective_id = fill.order_id;
     if (!opt) {
-        logger_->warn("FillProcessor", "Fill event для неизвестного ордера",
+        // Fallback: WS fill events use exchange_order_id, try reverse lookup
+        opt = registry_.get_order_by_exchange_id(fill.order_id);
+        if (opt) {
+            effective_id = opt->order_id;  // resolve to internal ID
+        }
+    }
+    if (!opt) {
+        logger_->debug("FillProcessor", "Fill event для неизвестного ордера (WS race)",
             {{"order_id", fill.order_id.get()},
              {"trade_id", fill.trade_id}});
         return false;
     }
 
+    // Guard: if WS fill has price=0, skip ALL processing. Don't mark tradeId,
+    // don't transition FSM, don't mark fill_applied. The REST path
+    // (process_market_fill) will handle this fill with the correct price.
+    // Bitget WS fill channel sometimes sends fillPx=0; marking fill_applied
+    // here would block the REST path and leave the portfolio stale.
+    if (fill.fill_price.get() <= 0.0) {
+        logger_->warn("FillProcessor", "WS fill с fill_price <= 0 — пропуск, ждём REST подтверждения",
+            {{"order_id", effective_id.get()},
+             {"exchange_id", fill.order_id.get()},
+             {"fill_qty", std::to_string(fill.fill_quantity.get())},
+             {"trade_id", fill.trade_id}});
+        return false;
+    }
+
+    // Mark tradeId as seen before processing
+    if (!fill.trade_id.empty()) {
+        registry_.mark_trade_id_seen(fill.trade_id);
+    }
+
     auto order = *opt;
 
-    // Обновить volumes
+    // Compute new cumulative fill from delta
     double prev_cost = order.filled_quantity.get() * order.avg_fill_price.get();
     double fill_cost = fill.fill_quantity.get() * fill.fill_price.get();
     double new_filled = order.filled_quantity.get() + fill.fill_quantity.get();
 
     order.filled_quantity = Quantity(new_filled);
-    order.remaining_quantity = Quantity(order.original_quantity.get() - new_filled);
+    order.remaining_quantity = Quantity(
+        std::max(0.0, order.original_quantity.get() - new_filled));
     if (new_filled > 0.0) {
         order.avg_fill_price = Price((prev_cost + fill_cost) / new_filled);
     }
 
-    // Записать fill event
+    // Append to per-order fill ledger
     order.execution_info.fills.push_back(fill);
 
-    // Latency
+    // Latency (first fill only)
     if (order.execution_info.fills.size() == 1 && order.created_at.get() > 0) {
         order.execution_info.first_fill_latency_ms =
             (fill.occurred_at.get() - order.created_at.get()) / 1'000'000;
     }
 
-    // Slippage
+    // Slippage tracking
     if (order.execution_info.expected_fill_price.get() > 0.0) {
         order.execution_info.realized_slippage =
             (order.avg_fill_price.get() - order.execution_info.expected_fill_price.get())
@@ -114,30 +157,52 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
 
     order.last_updated = clock_->now();
 
-    // FSM transition
-    if (new_filled >= order.original_quantity.get()) {
-        registry_.transition(fill.order_id, OrderState::Filled, "Full fill (fill event)");
+    // FSM transition (use effective_id = internal order ID)
+    bool is_full_fill = (new_filled >= order.original_quantity.get() * 0.999);
+    if (is_full_fill) {
+        registry_.transition(effective_id, OrderState::Filled, "Full fill (fill event)");
         order.state = OrderState::Filled;
-
-        // Portfolio update
-        if (!registry_.is_fill_applied(fill.order_id)) {
-            registry_.mark_fill_applied(fill.order_id);
-            apply_fill_to_portfolio(order);
-        }
     } else {
-        registry_.transition(fill.order_id, OrderState::PartiallyFilled,
+        registry_.transition(effective_id, OrderState::PartiallyFilled,
                              "Partial fill (fill event)");
         order.state = OrderState::PartiallyFilled;
     }
 
     registry_.update_order(order);
 
+    // Incremental portfolio update: apply this individual fill delta immediately.
+    // This replaces the old approach of waiting for full fill.
+    if (portfolio_ && fill.fill_quantity.get() > 0.0) {
+        apply_incremental_fill(order, fill);
+    }
+
+    // Mark fill as tracked by WS path on EVERY fill (partial or full).
+    // This prevents REST process_order_fill / process_market_fill from re-applying.
+    // CRITICAL: use effective_id (internal order ID), NOT fill.order_id (may be exchange ID).
+    // Without this matching, the idempotency guard in process_market_fill wouldn't
+    // recognise the already-applied fill because it checks by internal ID.
+    registry_.mark_fill_applied(effective_id);
+
+    if (!is_full_fill) {
+        // Partial fill: check if CancelRemaining policy applies
+        auto cancel_action = check_cancel_remaining(effective_id);
+        if (cancel_action.needed) {
+            logger_->info("FillProcessor", "CancelRemaining policy triggered",
+                {{"order_id", effective_id.get()},
+                 {"filled", std::to_string(new_filled)},
+                 {"original", std::to_string(order.original_quantity.get())}});
+            // Note: actual cancel is returned via check_cancel_remaining;
+            // caller (ExecutionEngine) is responsible for executing the cancel.
+        }
+    }
+
     if (metrics_) {
         metrics_->counter("order_fills_total", {})->increment();
     }
 
     logger_->debug("FillProcessor", "Fill event обработан",
-        {{"order_id", fill.order_id.get()},
+        {{"order_id", effective_id.get()},
+         {"exchange_id", fill.order_id.get()},
          {"fill_qty", std::to_string(fill.fill_quantity.get())},
          {"fill_price", std::to_string(fill.fill_price.get())},
          {"cumulative", std::to_string(new_filled)},
@@ -148,24 +213,33 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
 
 bool FillProcessor::process_order_fill(const OrderId& order_id,
                                         Quantity filled_qty, Price fill_price) {
+    // This is called from on_order_update (REST poll / WS order channel).
+    // If fill events already processed this order incrementally via process_fill_event,
+    // the fill_applied flag will be set. In that case, we only reconcile the
+    // cumulative filled_qty (take max to avoid going backward) and skip portfolio ops
+    // to prevent double-counting.
     auto opt = registry_.get_order(order_id);
     if (!opt) return false;
 
     auto order = *opt;
-    order.filled_quantity = filled_qty;
-    order.remaining_quantity = Quantity(order.original_quantity.get() - filled_qty.get());
-    if (fill_price.get() > 0.0) {
+    bool already_applied = registry_.is_fill_applied(order_id);
+
+    // Take max of reported vs tracked fill to handle out-of-order delivery
+    double reconciled_filled = std::max(order.filled_quantity.get(), filled_qty.get());
+    order.filled_quantity = Quantity(reconciled_filled);
+    order.remaining_quantity = Quantity(
+        std::max(0.0, order.original_quantity.get() - reconciled_filled));
+    if (fill_price.get() > 0.0 && !already_applied) {
+        // Only overwrite avg price if fills weren't already tracked incrementally
         order.avg_fill_price = fill_price;
     }
     order.last_updated = clock_->now();
     registry_.update_order(order);
 
-    // Portfolio update при полном fill
-    if (order.state == OrderState::Filled && portfolio_) {
-        if (!registry_.is_fill_applied(order_id)) {
-            registry_.mark_fill_applied(order_id);
-            apply_fill_to_portfolio(order);
-        }
+    // Portfolio update only if fills weren't already applied via process_fill_event
+    if (order.state == OrderState::Filled && portfolio_ && !already_applied) {
+        registry_.mark_fill_applied(order_id);
+        apply_fill_to_portfolio(order);
     }
 
     return true;
@@ -210,6 +284,74 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
     }
 }
 
+void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillEvent& fill) {
+    if (!portfolio_) return;
+
+    Quantity fill_qty = fill.fill_quantity;
+    Price fill_price = fill.fill_price;
+
+    // Guard: skip portfolio update if fill_price is zero/negative.
+    // A corrupted WS fill with price=0 would create a position with entry=0,
+    // causing incorrect PnL and phantom-position cascading.
+    if (fill_price.get() <= 0.0) {
+        logger_->warn("FillProcessor", "Пропуск apply_incremental_fill: fill_price <= 0",
+            {{"order_id", order.order_id.get()},
+             {"fill_qty", std::to_string(fill_qty.get())},
+             {"fill_price", std::to_string(fill_price.get())},
+             {"symbol", order.symbol.get()}});
+        return;
+    }
+
+    if (order.trade_side == TradeSide::Close) {
+        double pnl = compute_incremental_pnl(order, fill_qty, fill_price);
+        portfolio_->reduce_position(order.symbol, order.position_side, fill_qty,
+                                    fill_price, pnl);
+        double fee = fill_price.get() * fill_qty.get() * kDefaultTakerFeePct;
+        portfolio_->record_fee(order.symbol, fee, order.order_id);
+
+        logger_->info("FillProcessor", "Инкрементальный close fill",
+            {{"symbol", order.symbol.get()},
+             {"position_side", order.position_side == PositionSide::Long ? "Long" : "Short"},
+             {"qty", std::to_string(fill_qty.get())},
+             {"price", std::to_string(fill_price.get())},
+             {"pnl", std::to_string(pnl)}});
+    } else {
+        // TradeSide::Open — increase position
+        portfolio::Position pos;
+        pos.symbol = order.symbol;
+        pos.side = order.side;
+        pos.size = fill_qty;
+        pos.avg_entry_price = fill_price;
+        pos.current_price = fill_price;
+        pos.notional = NotionalValue(fill_qty.get() * fill_price.get());
+        pos.strategy_id = order.strategy_id;
+        pos.opened_at = clock_->now();
+        pos.updated_at = clock_->now();
+        portfolio_->open_position(pos);
+        portfolio_->release_cash(order.order_id);
+        double fee = fill_qty.get() * fill_price.get() * kDefaultTakerFeePct;
+        portfolio_->record_fee(order.symbol, fee, order.order_id);
+    }
+}
+
+double FillProcessor::compute_incremental_pnl(const OrderRecord& order,
+                                               Quantity fill_qty, Price fill_price) const {
+    if (!portfolio_) return 0.0;
+
+    auto existing = portfolio_->get_position(order.symbol, order.position_side);
+    if (!existing) return 0.0;
+
+    double entry = existing->avg_entry_price.get();
+    double exit_p = fill_price.get();
+    double qty = fill_qty.get();
+
+    if (order.position_side == PositionSide::Long) {
+        return (exit_p - entry) * qty;
+    } else {
+        return (entry - exit_p) * qty;
+    }
+}
+
 double FillProcessor::compute_gross_pnl(const OrderRecord& order) const {
     if (!portfolio_) return 0.0;
 
@@ -228,6 +370,34 @@ double FillProcessor::compute_gross_pnl(const OrderRecord& order) const {
     } else {
         return (entry - exit_p) * qty;  // Short: прибыль при падении
     }
+}
+
+FillProcessor::CancelRemainingAction FillProcessor::check_cancel_remaining(
+    const OrderId& order_id) const
+{
+    CancelRemainingAction action;
+    auto opt = registry_.get_order(order_id);
+    if (!opt) return action;
+
+    const auto& order = *opt;
+
+    // Only trigger for CancelRemaining policy on partially filled orders
+    if (order.execution_info.fill_policy != PartialFillPolicy::CancelRemaining) {
+        return action;
+    }
+    if (order.state != OrderState::PartiallyFilled) {
+        return action;
+    }
+    if (order.remaining_quantity.get() <= 0.0) {
+        return action;
+    }
+
+    action.needed = true;
+    action.order_id = order.order_id;
+    action.exchange_order_id = order.exchange_order_id;
+    action.symbol = order.symbol;
+    action.side = order.side;
+    return action;
 }
 
 } // namespace tb::execution

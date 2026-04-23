@@ -272,10 +272,11 @@ double HierarchicalAllocator::compute_volatility_multiplier() const {
         kelly_full = (p * b - q) / b;
         kelly_full = std::max(kelly_full, 0.0);
     }
-    // Если Kelly = 0 (нет edge), возвращаем минимальный множитель вместо полного размера
+    // Kelly f*≤0: нет статистического преимущества → не торгуем (Kelly 1956, Thorp 2006)
     double kelly_adj = kelly_full > 0.0
         ? config_.kelly_fraction * kelly_full
-        : config_.min_size_multiplier;
+        : 0.0;
+    if (kelly_adj <= 0.0) return 0.0;
 
     // Комбинированный множитель: vol_ratio × kelly_adj
     double combined = vol_ratio * std::max(kelly_adj, 0.1);
@@ -330,9 +331,11 @@ double HierarchicalAllocator::compute_volatility_multiplier(const AllocationCont
         kelly_full = (p * b - q) / b;
         kelly_full = std::max(kelly_full, 0.0);
     }
+    // Kelly f*≤0: нет статистического преимущества → не торгуем (Kelly 1956, Thorp 2006)
     double kelly_adj = kelly_full > 0.0
         ? config_.kelly_fraction * kelly_full
-        : config_.min_size_multiplier;
+        : 0.0;
+    if (kelly_adj <= 0.0) return 0.0;
 
     double combined = vol_ratio * std::max(kelly_adj, 0.1);
 
@@ -387,7 +390,7 @@ double HierarchicalAllocator::compute_liquidity_cap(
 void HierarchicalAllocator::apply_exchange_filters(
     double& qty, double price,
     const ExchangeFilters& filters,
-    double available_capital,
+    double max_affordable_notional,
     SizingResult& result) const
 {
     double qty_before = qty;
@@ -398,11 +401,11 @@ void HierarchicalAllocator::apply_exchange_filters(
     // Если после округления ниже min_quantity — попробовать увеличить до min_quantity
     if (qty < filters.min_quantity) {
         double bump_notional = filters.min_quantity * price;
-        if (bump_notional <= available_capital) {
+        if (bump_notional <= max_affordable_notional) {
             qty = filters.min_quantity;
         } else {
             result.approved = false;
-            result.reduction_reason = "Недостаточно капитала для минимального объёма биржи";
+            result.reduction_reason = "Минимальный объём биржи превышает допустимый риск сделки";
             qty = 0.0;
             return;
         }
@@ -421,7 +424,7 @@ void HierarchicalAllocator::apply_exchange_filters(
         min_qty_for_notional = std::ceil(min_qty_for_notional / std::max(filters.quantity_step, 1e-15))
                              * std::max(filters.quantity_step, 1e-15);
         double bump_notional = min_qty_for_notional * price;
-        if (bump_notional <= available_capital &&
+        if (bump_notional <= max_affordable_notional &&
             (filters.max_quantity <= 0.0 || min_qty_for_notional <= filters.max_quantity)) {
             qty = min_qty_for_notional;
         } else {
@@ -432,12 +435,12 @@ void HierarchicalAllocator::apply_exchange_filters(
                      {"min_notional", std::to_string(filters.min_notional)},
                      {"min_qty_for_notional", std::to_string(min_qty_for_notional)},
                      {"bump_notional", std::to_string(bump_notional)},
-                     {"available_capital", std::to_string(available_capital)},
+                     {"max_affordable_notional", std::to_string(max_affordable_notional)},
                      {"price", std::to_string(price)},
                      {"quantity_step", std::to_string(filters.quantity_step)}});
             }
             result.approved = false;
-            result.reduction_reason = "Недостаточно капитала для минимального нотионала биржи";
+            result.reduction_reason = "Минимальный нотионал биржи превышает допустимый риск сделки";
             qty = 0.0;
             return;
         }
@@ -636,6 +639,7 @@ SizingResult HierarchicalAllocator::compute_size_v2(
     // Шаг 11: Ограничить доступным капиталом (с учётом плеча)
     double max_from_capital = compute_effective_available_notional(
         portfolio, config_.max_leverage);
+    double max_affordable_notional = max_from_capital;
     double final_notional = qty * price;
     if (max_from_capital <= 0.0) {
         result.approved = false;
@@ -648,12 +652,49 @@ SizingResult HierarchicalAllocator::compute_size_v2(
         result.reduction_reason = "Ограничен доступным капиталом";
     }
 
+    // Шаг 11a: Ограничить риск сделки по ожидаемой дистанции до защитного стопа.
+    // Если безопасный размер меньше биржевого min_notional, вход должен быть отклонён заранее.
+    if (portfolio.total_capital > 0.0 &&
+        context.max_loss_per_trade_pct > 0.0 &&
+        context.estimated_stop_distance_pct > 0.0) {
+        const double round_trip_fee_pct = (context.exchange_filters.has_value()
+            ? context.exchange_filters->taker_fee_pct
+            : tb::common::fees::kDefaultTakerFeePct) * 2.0 * 100.0;
+        const double estimated_total_loss_pct =
+            context.estimated_stop_distance_pct + round_trip_fee_pct;
+        const double max_loss_abs =
+            portfolio.total_capital * (context.max_loss_per_trade_pct / 100.0);
+
+        ConstraintDecision cd;
+        cd.constraint_name = "capital_risk_cap";
+        cd.limit_value = max_loss_abs;
+        cd.input_value = qty * price;
+        cd.details = "stop_pct=" + std::to_string(context.estimated_stop_distance_pct)
+                   + " fee_pct=" + std::to_string(round_trip_fee_pct)
+                   + " max_loss_pct=" + std::to_string(context.max_loss_per_trade_pct);
+
+        if (estimated_total_loss_pct > 0.0 && max_loss_abs > 0.0) {
+            const double max_notional_from_risk =
+                max_loss_abs / (estimated_total_loss_pct / 100.0);
+            max_affordable_notional = std::min(max_affordable_notional, max_notional_from_risk);
+            if ((qty * price) > max_notional_from_risk) {
+                qty = max_notional_from_risk / price;
+                result.was_reduced = true;
+                result.reduction_reason = "Ограничен риск-бюджетом сделки";
+                cd.was_binding = true;
+            }
+        }
+
+        cd.output_value = qty * price;
+        result.constraint_audit.push_back(std::move(cd));
+    }
+
     qty = std::max(qty, 0.0);
 
     // Шаг 12: Exchange filters
     if (context.exchange_filters.has_value()) {
         apply_exchange_filters(qty, price, *context.exchange_filters,
-                               max_from_capital, result);
+                               max_affordable_notional, result);
         if (!result.approved) return result;
     } else {
         // Exchange filters отсутствуют — блокируем вход.

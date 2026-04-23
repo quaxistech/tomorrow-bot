@@ -99,4 +99,64 @@ struct RecoveryConfig {
     Symbol symbol_filter{Symbol("")};
 };
 
+// ============================================================
+// Расширенные типы для deterministic recovery (Phase 6)
+// — обеспечивают полное восстановление pair-state, pending orders,
+//   protective TP/SL после рестарта / reconnect
+// ============================================================
+
+/// Восстановленный pending (working) ордер на бирже
+struct RecoveredPendingOrder {
+    OrderId order_id{""};
+    Symbol symbol{""};
+    Side side{Side::Buy};
+    PositionSide position_side{PositionSide::Long};
+    double price{0.0};
+    double remaining_qty{0.0};
+    std::string order_type;          ///< "limit", "market", "trigger"
+    bool is_reduce_only{false};
+    std::string exchange_order_id;
+    std::string resolution;          ///< "adopted" | "cancelled" | "orphan"
+};
+
+/// Восстановленный protective ордер (TP/SL)
+struct RecoveredProtectiveOrder {
+    OrderId order_id{""};
+    Symbol symbol{""};
+    PositionSide position_side{PositionSide::Long};
+    double trigger_price{0.0};
+    bool is_tp{false};               ///< true = take-profit, false = stop-loss
+    bool still_active{false};        ///< Жив ли на бирже
+    std::string resolution;
+};
+
+/// Восстановленное состояние пары primary + hedge
+struct RecoveredPairState {
+    Symbol symbol{""};
+    bool has_primary{false};
+    bool has_hedge{false};
+    Side primary_side{Side::Buy};
+    double primary_size{0.0};
+    double hedge_size{0.0};
+    double primary_entry_price{0.0};
+    double hedge_entry_price{0.0};
+    std::string inferred_state;      ///< "PrimaryOnly" | "PrimaryPlusHedge" | etc.
+    std::string resolution;
+};
+
+/// Расширенный результат deterministic recovery
+struct ExtendedRecoveryResult {
+    RecoveryResult base;
+
+    std::vector<RecoveredPendingOrder> pending_orders;
+    std::vector<RecoveredProtectiveOrder> protective_orders;
+    std::vector<RecoveredPairState> pair_states;
+
+    int pending_orders_adopted{0};
+    int pending_orders_cancelled{0};
+    int protective_orders_verified{0};
+    int protective_orders_missing{0};
+    int pair_states_restored{0};
+};
+
 } // namespace tb::recovery

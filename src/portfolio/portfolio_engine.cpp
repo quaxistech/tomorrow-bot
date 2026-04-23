@@ -617,6 +617,7 @@ void InMemoryPortfolioEngine::reset_daily() {
 void InMemoryPortfolioEngine::set_capital(double equity_from_exchange) {
     std::lock_guard lock(mutex_);
     double old_capital = total_capital_;
+    const bool is_first_exchange_sync = !capital_synced_from_exchange_;
 
     // ИСПРАВЛЕНИЕ C3: equity_from_exchange (usdtEquity) уже включает unrealized PnL и realized PnL.
     // compute_pnl() отдельно добавляет realized_pnl_today_ и unrealized_pnl.
@@ -629,9 +630,12 @@ void InMemoryPortfolioEngine::set_capital(double equity_from_exchange) {
     }
     total_capital_ = equity_from_exchange - realized_pnl_today_ - total_unrealized;
 
-    // НЕ сбрасываем realized_pnl_today_ — это внутридневной трекер, сброс обнулит историю.
-    // НЕ сбрасываем peak_equity_ вниз — обновляем только вверх.
-    if (equity_from_exchange > peak_equity_) {
+    // На первом sync synthetic peak из initial_capital ненадёжен — базируемся на реальном equity биржи.
+    // На последующих sync сохраняем peak только вверх, чтобы не стирать реальную просадку.
+    if (is_first_exchange_sync) {
+        peak_equity_ = equity_from_exchange;
+        capital_synced_from_exchange_ = true;
+    } else if (equity_from_exchange > peak_equity_) {
         peak_equity_ = equity_from_exchange;
     }
 
@@ -945,6 +949,66 @@ void InMemoryPortfolioEngine::emit_event(
         event_log_.erase(event_log_.begin(),
                          event_log_.begin() + static_cast<std::ptrdiff_t>(event_log_.size() - kMaxEventLogSize));
     }
+}
+
+void InMemoryPortfolioEngine::sync_position_from_exchange(
+    const Symbol& symbol, PositionSide ps,
+    Quantity size, Price avg_entry_price,
+    Price current_price, double unrealized_pnl,
+    Timestamp opened_at)
+{
+    std::lock_guard lock(mutex_);
+
+    auto key = make_pos_key(symbol.get(), ps);
+    auto it = positions_.find(key);
+
+    if (it != positions_.end()) {
+        // Обновить существующую позицию в полное соответствие с биржей
+        auto& pos = it->second;
+        pos.size = size;
+        pos.avg_entry_price = avg_entry_price;
+        pos.current_price = current_price;
+        pos.notional = NotionalValue(current_price.get() * size.get());
+        pos.unrealized_pnl = unrealized_pnl;
+        pos.opened_at = opened_at;
+        pos.updated_at = clock_->now();
+        recalculate_position_pnl(pos);
+
+        logger_->info("Portfolio", "Позиция синхронизирована с биржей (exchange-truth)",
+            {{"symbol", symbol.get()},
+             {"side", ps == PositionSide::Long ? "long" : "short"},
+             {"size", std::to_string(size.get())},
+             {"entry", std::to_string(avg_entry_price.get())},
+             {"opened_at_ns", std::to_string(opened_at.get())}});
+    } else {
+        // Создать новую позицию из exchange-truth
+        Position pos;
+        pos.symbol = symbol;
+        pos.side = (ps == PositionSide::Long) ? Side::Buy : Side::Sell;
+        pos.position_side = ps;
+        pos.size = size;
+        pos.avg_entry_price = avg_entry_price;
+        pos.current_price = current_price;
+        pos.notional = NotionalValue(current_price.get() * size.get());
+        pos.unrealized_pnl = unrealized_pnl;
+        pos.strategy_id = StrategyId("sync_from_exchange");
+        pos.opened_at = opened_at;
+        pos.updated_at = clock_->now();
+
+        positions_[key] = pos;
+
+        logger_->info("Portfolio", "Позиция создана из exchange-truth",
+            {{"symbol", symbol.get()},
+             {"side", ps == PositionSide::Long ? "long" : "short"},
+             {"size", std::to_string(size.get())},
+             {"entry", std::to_string(avg_entry_price.get())}});
+    }
+
+    emit_event(PortfolioEventType::ReconciliationAdjustment, symbol,
+               size.get(), cash_ledger_.available_cash,
+               "exchange_sync side=" + std::string(ps == PositionSide::Long ? "long" : "short") +
+               " qty=" + std::to_string(size.get()) +
+               " entry=" + std::to_string(avg_entry_price.get()));
 }
 
 } // namespace tb::portfolio

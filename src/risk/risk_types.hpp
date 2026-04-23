@@ -146,6 +146,7 @@ struct IntraTradeAssessment {
     double reduce_fraction{0.0};
     std::vector<RiskReasonCode> reasons;
     Timestamp assessed_at{Timestamp(0)};
+    bool is_safety_exit{false};           ///< Phase 5: true = risk/safety, false = alpha/market
 };
 
 /// Конфигурация лимитов риска (USDT-M futures scalping)
@@ -211,7 +212,7 @@ struct ExtendedRiskConfig {
 
     // === Intra-trade ===
     double max_adverse_excursion_pct{3.0};      ///< MAE: макс. неблагоприятное отклонение (% капитала)
-    int64_t max_position_hold_ns{3'600'000'000'000LL}; ///< Макс. время удержания (1 час, scalping)
+    int64_t operational_deadman_ns{2'700'000'000'000LL}; ///< Operational deadman threshold (45 min). Fires only with 2+ degradation signals.
     int64_t post_loss_cooldown_ns{60'000'000'000LL};   ///< Cooldown после убытка (60с)
 
     // === Kill switch ===

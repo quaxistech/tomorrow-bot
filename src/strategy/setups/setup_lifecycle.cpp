@@ -170,13 +170,14 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     double atr = tech.atr_14;
     double tolerance = mid * cfg_.retest_level_tolerance_pct;
 
-    // BUY retest: цена у BB middle снизу, momentum_20 > 0 (общий тренд вверх)
-    bool buy_retest = (tech.bb_percent_b > 0.35 && tech.bb_percent_b < 0.55) &&
+    // BUY retest: цена у BB lower-middle, momentum_20 > 0 (общий тренд вверх)
+    // H-12 fix: non-overlapping BB%B ranges (was 0.35-0.55 / 0.45-0.65 → overlap 0.45-0.55)
+    bool buy_retest = (tech.bb_percent_b > 0.30 && tech.bb_percent_b < 0.48) &&
                       (tech.momentum_20 > 0.0) &&
                       (micro.book_imbalance_5 > 0.05);
 
-    // SELL retest: цена у BB middle сверху, momentum_20 < 0
-    bool sell_retest = (tech.bb_percent_b > 0.45 && tech.bb_percent_b < 0.65) &&
+    // SELL retest: цена у BB upper-middle, momentum_20 < 0
+    bool sell_retest = (tech.bb_percent_b > 0.52 && tech.bb_percent_b < 0.70) &&
                        (tech.momentum_20 < 0.0) &&
                        (micro.book_imbalance_5 < -0.05);
 
@@ -334,9 +335,11 @@ std::optional<Setup> SetupDetector::detect_rejection(const StrategyContext& ctx,
 
     if (!buy_rejection && !sell_rejection) return std::nullopt;
 
-    // RSI дополнительное подтверждение — должен быть в экстремальной зоне (подтверждает отбой)
-    if (buy_rejection && tech.rsi_valid && tech.rsi_14 > 50.0) return std::nullopt;
-    if (sell_rejection && tech.rsi_valid && tech.rsi_14 < 50.0) return std::nullopt;
+    // RSI подтверждение — M-16 fix: Wilder standard oversold/overbought zones
+    // Buy rejection: RSI must be in oversold territory (< 35), not just < 50
+    // Sell rejection: RSI must be in overbought territory (> 65), not just > 50
+    if (buy_rejection && tech.rsi_valid && tech.rsi_14 > 35.0) return std::nullopt;
+    if (sell_rejection && tech.rsi_valid && tech.rsi_14 < 65.0) return std::nullopt;
 
     if (sell_rejection && !ctx.futures_enabled && !ctx.position.has_position) return std::nullopt;
 
@@ -420,10 +423,10 @@ SetupValidationResult SetupValidator::validate(const Setup& setup,
     }
 
     // 5. Структура сломалась — imbalance развернулся сильно
-    //    Крипто-книги (15 уровней) очень волатильны — используем 5× порог,
-    //    чтобы не отменять сетап из-за кратковременных колебаний.
+    //    M-17 fix: 10× was unrealistic (requires 80% of book to reverse).
+    //    Use 3× = 0.24 which is achievable in volatile crypto books.
     bool imbalance_reversed = false;
-    const double rev_threshold = cfg_.imbalance_threshold * 10.0;  // 10× — crypto books are noisy
+    const double rev_threshold = cfg_.imbalance_threshold * 3.0;  // 3× — meaningful but achievable
     if (setup.side == Side::Buy && micro.book_imbalance_5 < -rev_threshold) {
         imbalance_reversed = true;
     }

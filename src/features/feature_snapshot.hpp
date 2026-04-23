@@ -7,6 +7,7 @@ namespace tb::features {
 // Технические индикаторы на основе свечных данных
 struct TechnicalFeatures {
     double sma_20{0.0};
+    double ema_8{0.0};
     double ema_20{0.0};
     double ema_50{0.0};
     bool sma_valid{false};
@@ -37,7 +38,7 @@ struct TechnicalFeatures {
     bool adx_valid{false};
 
     double obv{0.0};
-    double obv_normalized{0.0};
+    double directional_volume_proxy{0.0}; ///< Normalized OBV — local volume-direction proxy
     bool obv_valid{false};
 
     double volatility_5{0.0};
@@ -102,9 +103,26 @@ struct MicrostructureFeatures {
     // ==================== VPIN ====================
     /// Volume-Synchronized Probability of Informed Trading
     double vpin{0.0};                  ///< VPIN значение [0..1], >0.7 = токсичный поток
+    double vpin_canonical{0.0};        ///< Canonical VPIN (фиксированный бакет, Easley et al. 2012)
+    double vpin_adaptive{0.0};         ///< Adaptive VPIN (рекалибруемый бакет)
     double vpin_ma{0.0};               ///< Скользящее среднее VPIN
     bool vpin_toxic{false};            ///< Флаг токсичного потока (VPIN > порог)
     bool vpin_valid{false};
+
+    // ==================== Event-Time Features (Phase 6) ====================
+    double top_of_book_churn{0.0};     ///< Частота смены best bid/ask [0..1]
+    double cancel_burst_intensity{0.0};///< Доля removals в event window [0..1]
+    bool cancel_burst_active{false};   ///< Burst выше порога
+    double queue_depletion_bid{0.0};   ///< Скорость истощения bid-стороны
+    double queue_depletion_ask{0.0};   ///< Скорость истощения ask-стороны
+    double refill_asymmetry{0.0};      ///< (bid_refills - ask_refills)/total [-1..1]
+    bool event_features_valid{false};  ///< Достаточно событий для event-time features
+
+    // ==================== Execution Quality Feedback ====================
+    double passive_fill_rate{0.0};     ///< Limit fills / total limit orders
+    double cancel_to_fill_ratio{0.0};  ///< Cancels / fills
+    double adverse_selection_bps{0.0}; ///< Средний adverse move после fill (bps)
+    bool execution_feedback_valid{false};
 };
 
 // Контекст исполнения — оценка условий для открытия позиции

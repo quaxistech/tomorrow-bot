@@ -33,5 +33,12 @@ if [[ "${TOMORROW_BOT_PRODUCTION_CONFIRM:-}" != "I_UNDERSTAND_LIVE_TRADING" ]]; 
     exit 1
 fi
 
-timeout 600 ./build/src/app/tomorrow-bot --config configs/production.yaml
+BINARY="${TOMORROW_BOT_BINARY:-./build-release/src/app/tomorrow-bot}"
+if [[ ! -x "$BINARY" ]]; then
+    echo "FATAL: Release binary not found or not executable: $BINARY" >&2
+    echo "Build a release binary first: ./scripts/build_release.sh" >&2
+    exit 1
+fi
+
+timeout 600 "$BINARY" --config configs/production.yaml
 echo "BOT_EXIT_CODE=$?"

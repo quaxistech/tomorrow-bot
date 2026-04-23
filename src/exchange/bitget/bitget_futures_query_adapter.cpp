@@ -488,4 +488,77 @@ double BitgetFuturesQueryAdapter::get_current_funding_rate(const Symbol& symbol)
     }
 }
 
+// ============================================================
+// get_order_history (история заполненных/отменённых ордеров)
+// ============================================================
+
+Result<std::vector<reconciliation::ExchangeOrderInfo>>
+BitgetFuturesQueryAdapter::get_order_history(const Symbol& symbol, int limit)
+{
+    std::string query = "productType=" + futures_config_.product_type;
+    if (!symbol.get().empty()) {
+        query += "&symbol=" + symbol.get();
+    }
+    if (limit > 0 && limit <= 100) {
+        query += "&limit=" + std::to_string(limit);
+    }
+
+    auto resp = rest_client_->get("/api/v2/mix/order/orders-history", query);
+    if (!resp.success) {
+        if (logger_) {
+            logger_->warn("FuturesQuery", "Ошибка запроса orders-history",
+                {{"error", resp.error_message},
+                 {"status", std::to_string(resp.status_code)}});
+        }
+        return Err<std::vector<reconciliation::ExchangeOrderInfo>>(
+            TbError::ExchangeConnectionFailed);
+    }
+
+    std::vector<reconciliation::ExchangeOrderInfo> result;
+    try {
+        auto doc = boost::json::parse(resp.body);
+        const auto& root = doc.as_object();
+
+        const auto code = json_str(root, "code");
+        if (code != "00000") {
+            const auto msg = json_str(root, "msg");
+            if (logger_) {
+                logger_->warn("FuturesQuery", "Bitget API ошибка (orders-history)",
+                    {{"code", code}, {"msg", msg}});
+            }
+            return Err<std::vector<reconciliation::ExchangeOrderInfo>>(
+                TbError::ExchangeConnectionFailed);
+        }
+
+        // Mix API v2: data.entrustedList — массив ордеров (same as orders-pending)
+        const auto& data = root.at("data").as_object();
+        const auto orders_it = data.find("entrustedList");
+        if (orders_it != data.end() && orders_it->value().is_array()) {
+            const auto& orders = orders_it->value().as_array();
+            result.reserve(orders.size());
+            for (const auto& item : orders) {
+                result.push_back(parse_order(item.as_object()));
+            }
+        }
+    } catch (const std::exception& ex) {
+        if (logger_) {
+            logger_->warn("FuturesQuery", "Ошибка парсинга orders-history",
+                {{"exception", ex.what()}});
+        }
+        return Err<std::vector<reconciliation::ExchangeOrderInfo>>(
+            TbError::ReconciliationFailed);
+    }
+
+    return result;
+}
+
+// ============================================================
+// get_server_time_ms (прокси)
+// ============================================================
+
+int64_t BitgetFuturesQueryAdapter::get_server_time_ms()
+{
+    return rest_client_->get_server_time_ms();
+}
+
 } // namespace tb::exchange::bitget

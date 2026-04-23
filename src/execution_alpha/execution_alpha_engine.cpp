@@ -220,42 +220,62 @@ ExecutionStyle RuleBasedExecutionAlpha::determine_style(
         return ExecutionStyle::NoExecution;
     }
 
-    // ── Правило 4: Высокая срочность → агрессивно ─────────────────────────
+    // ── Hard rule: extreme urgency → force Aggressive ─────────────────
+    // At very high urgency, alpha is decaying rapidly and 95% fill guarantee
+    // is more valuable than fee savings. EV model assumptions (fill prob)
+    // become unreliable at extremes.
     if (urgency > config_.urgency_aggressive_threshold) {
         return ExecutionStyle::Aggressive;
     }
 
-    // ── Правило 5: PostOnly — идеальные условия для минимальной комиссии ──
-    // Применяется при очень узком спреде, низкой срочности и чистом потоке
-    if (spread_bps < config_.postonly_spread_threshold_bps
-        && urgency < config_.postonly_urgency_max
-        && adverse_score < config_.postonly_adverse_max
-        && (!features.microstructure.vpin_valid || !features.microstructure.vpin_toxic)) {
-        return ExecutionStyle::PostOnly;
-    }
+    // ── EV-based style selection (Almgren-Chriss framework) ─────────────
+    // For each candidate style, compute Expected Implementation Shortfall:
+    //   EIS(style) = P(fill) × cost_bps + (1 − P(fill)) × opportunity_cost
+    // Where opportunity_cost = urgency × opportunity_cost_bps.
+    // Pick the style with lowest EIS.
 
-    // ── Правило 6: Пассивный с учётом имбаланса стакана ──────────────────
-    if (urgency < config_.urgency_passive_threshold
-        && spread_bps < config_.max_spread_bps_passive) {
+    const double opp_cost = urgency * config_.opportunity_cost_bps;
 
-        // Сильный имбаланс ПРОТИВ нас при пассивном ордере → переключиться на Hybrid.
-        // (Тонкая сторона нашего направления означает низкую вероятность fill.)
-        if (directional_imbalance < -config_.imbalance_unfavorable_threshold) {
-            return ExecutionStyle::Hybrid;
+    struct StyleCandidate {
+        ExecutionStyle style;
+        double eis;     // Expected Implementation Shortfall
+        bool viable;
+    };
+
+    auto compute_eis = [&](ExecutionStyle s) -> StyleCandidate {
+        // Check viability constraints
+        if (s == ExecutionStyle::PostOnly) {
+            if (spread_bps >= config_.postonly_spread_threshold_bps
+                || adverse_score >= config_.postonly_adverse_max) {
+                return {s, 1e12, false};
+            }
         }
-        return ExecutionStyle::Passive;
+        if ((s == ExecutionStyle::Passive || s == ExecutionStyle::PostOnly)
+            && spread_bps > config_.max_spread_bps_passive) {
+            return {s, 1e12, false};
+        }
+
+        double fp = estimate_fill_probability(s, intent, features, directional_imbalance);
+        auto q = estimate_quality(s, intent, features, adverse_score, directional_imbalance);
+        double eis = fp * q.total_cost_bps + (1.0 - fp) * opp_cost;
+        return {s, eis, true};
+    };
+
+    std::array<StyleCandidate, 4> candidates = {{
+        compute_eis(ExecutionStyle::PostOnly),
+        compute_eis(ExecutionStyle::Passive),
+        compute_eis(ExecutionStyle::Hybrid),
+        compute_eis(ExecutionStyle::Aggressive),
+    }};
+
+    StyleCandidate best = {ExecutionStyle::Hybrid, 1e12, false};
+    for (const auto& c : candidates) {
+        if (c.viable && c.eis < best.eis) {
+            best = c;
+        }
     }
 
-    // ── Правило 7: Промежуточная срочность + имбаланс ─────────────────────
-    // Благоприятный имбаланс при умеренной срочности даёт шанс на Passive
-    if (urgency < config_.urgency_aggressive_threshold
-        && directional_imbalance > config_.imbalance_favorable_threshold
-        && spread_bps < config_.max_spread_bps_passive) {
-        return ExecutionStyle::Passive;
-    }
-
-    // ── По умолчанию → Hybrid ─────────────────────────────────────────────
-    return ExecutionStyle::Hybrid;
+    return best.style;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,6 +461,28 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
                 fp += std::clamp(directional_imbalance * 0.10, -0.10, 0.0);
             }
 
+            // ── Queue-aware adjustments ──────────────────────────────
+            if (features.microstructure.event_features_valid) {
+                // Queue depletion on OUR side: faster depletion = lower fill
+                // (others cancel/get filled ahead of us, price level less stable)
+                double our_depletion = (intent.side == Side::Buy)
+                    ? features.microstructure.queue_depletion_bid
+                    : features.microstructure.queue_depletion_ask;
+                fp -= std::clamp(our_depletion, 0.0, 1.0) * config_.queue_depletion_penalty;
+
+                // Top-of-book churn: unstable best price = harder to stay at front
+                fp -= std::clamp(features.microstructure.top_of_book_churn, 0.0, 1.0)
+                    * config_.churn_penalty;
+            }
+
+            // ── Execution feedback: blend with historical fill rate ──
+            if (features.microstructure.execution_feedback_valid
+                && features.microstructure.passive_fill_rate > 0.0) {
+                double hist = features.microstructure.passive_fill_rate;
+                fp = fp * (1.0 - config_.feedback_weight)
+                   + hist * config_.feedback_weight;
+            }
+
             return std::clamp(fp, config_.min_fill_probability_passive, 0.75);
         }
 
@@ -618,6 +660,106 @@ std::optional<SlicePlan> RuleBasedExecutionAlpha::compute_slice_plan(
                    + "% от глубины, нарезка на " + std::to_string(plan.num_slices) + " частей";
 
     return plan;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// evaluate_pair — pair-level EIS: long + short legs evaluated jointly
+// ─────────────────────────────────────────────────────────────────────────────
+
+PairExecutionAlphaResult RuleBasedExecutionAlpha::evaluate_pair(
+    const strategy::TradeIntent& long_intent,
+    const strategy::TradeIntent& short_intent,
+    const features::FeatureSnapshot& features,
+    const uncertainty::UncertaintySnapshot& uncertainty)
+{
+    PairExecutionAlphaResult pair_result;
+
+    // Evaluate each leg independently first
+    pair_result.long_leg = evaluate(long_intent, features, uncertainty);
+    pair_result.short_leg = evaluate(short_intent, features, uncertainty);
+
+    // If either leg is NoExecution, the pair cannot execute
+    if (!pair_result.long_leg.should_execute || !pair_result.short_leg.should_execute) {
+        pair_result.should_execute_pair = false;
+        pair_result.rationale = "NoExecution: one or both legs blocked";
+        return pair_result;
+    }
+
+    // Pair fill probability = P(long fill) × P(short fill)
+    // Conservative: assumes independence (correlated fills would be worse)
+    pair_result.pair_fill_probability =
+        pair_result.long_leg.quality.fill_probability *
+        pair_result.short_leg.quality.fill_probability;
+
+    // Pair total cost = sum of both legs
+    pair_result.pair_total_cost_bps =
+        pair_result.long_leg.quality.total_cost_bps +
+        pair_result.short_leg.quality.total_cost_bps;
+
+    // Pair EIS: weighted by fill probability
+    // If only one leg fills, we incur the cost of that leg PLUS the opportunity cost
+    // of the failed leg (must unwind the orphan).
+    double opp_cost_long = pair_result.long_leg.urgency_score * config_.opportunity_cost_bps;
+    double opp_cost_short = pair_result.short_leg.urgency_score * config_.opportunity_cost_bps;
+
+    double p_both = pair_result.pair_fill_probability;
+    double p_long_only = pair_result.long_leg.quality.fill_probability *
+                         (1.0 - pair_result.short_leg.quality.fill_probability);
+    double p_short_only = (1.0 - pair_result.long_leg.quality.fill_probability) *
+                          pair_result.short_leg.quality.fill_probability;
+    double p_neither = (1.0 - pair_result.long_leg.quality.fill_probability) *
+                       (1.0 - pair_result.short_leg.quality.fill_probability);
+
+    // Orphan unwind cost: if one leg fills but not the other, we must close the orphan
+    // at taker cost + spread + slippage
+    double orphan_unwind_cost_bps = features.microstructure.spread_bps +
+                                     config_.taker_fee_bps + 2.0; // 2 bps slippage estimate
+
+    pair_result.pair_eis_bps =
+        p_both * pair_result.pair_total_cost_bps +
+        p_long_only * (pair_result.long_leg.quality.total_cost_bps + orphan_unwind_cost_bps) +
+        p_short_only * (pair_result.short_leg.quality.total_cost_bps + orphan_unwind_cost_bps) +
+        p_neither * (opp_cost_long + opp_cost_short);
+
+    // For pairs: if one leg is Passive and other Aggressive, prefer making both Aggressive
+    // to minimize fill skew. Only override if the pair fill probability is too low.
+    if (pair_result.pair_fill_probability < 0.50) {
+        // Low pair fill probability → force both legs Aggressive for reliability
+        pair_result.long_leg.recommended_style = ExecutionStyle::Aggressive;
+        pair_result.short_leg.recommended_style = ExecutionStyle::Aggressive;
+        // Recompute costs with aggressive style
+        pair_result.long_leg.quality = estimate_quality(
+            ExecutionStyle::Aggressive, long_intent, features,
+            pair_result.long_leg.decision_factors.adverse_selection_score,
+            pair_result.long_leg.decision_factors.directional_imbalance);
+        pair_result.short_leg.quality = estimate_quality(
+            ExecutionStyle::Aggressive, short_intent, features,
+            pair_result.short_leg.decision_factors.adverse_selection_score,
+            pair_result.short_leg.decision_factors.directional_imbalance);
+        pair_result.pair_total_cost_bps =
+            pair_result.long_leg.quality.total_cost_bps +
+            pair_result.short_leg.quality.total_cost_bps;
+    }
+
+    pair_result.should_execute_pair = true;
+
+    std::ostringstream oss;
+    oss << "pair_eis=" << pair_result.pair_eis_bps
+        << " p_both=" << p_both
+        << " cost=" << pair_result.pair_total_cost_bps
+        << " long=" << to_string(pair_result.long_leg.recommended_style)
+        << " short=" << to_string(pair_result.short_leg.recommended_style);
+    pair_result.rationale = oss.str();
+
+    if (metrics_) {
+        static const std::vector<double> kPairEisBuckets{
+            0.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0};
+        metrics_->histogram("execution_alpha_pair_eis_bps", kPairEisBuckets, {})
+                ->observe(pair_result.pair_eis_bps);
+        metrics_->counter("execution_alpha_pair_evaluations", {})->increment();
+    }
+
+    return pair_result;
 }
 
 } // namespace tb::execution_alpha

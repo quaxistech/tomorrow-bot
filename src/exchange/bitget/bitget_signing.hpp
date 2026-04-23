@@ -23,7 +23,8 @@ SignedHeaders make_auth_headers(
     std::string_view passphrase,
     std::string_view method,
     std::string_view path,
-    std::string_view body = ""
+    std::string_view body = "",
+    int64_t clock_offset_ms = 0
 );
 
 } // namespace tb::exchange::bitget

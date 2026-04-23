@@ -3,13 +3,12 @@
  * @file production_guard.hpp
  * @brief Защита от случайного запуска в production режиме
  *
- * Требует явного подтверждения перед торговлей реальными деньгами.
  * Проверяет:
- * - Режим торговли (Paper/Production)
- * - Тип API ключей (testnet vs production URL)
+ * - Тип API ключей (URL в allowlist Bitget production хостов)
  * - Наличие переменной окружения TOMORROW_BOT_PRODUCTION_CONFIRM с точным токеном
  * - Полноту всех трёх API-секретов (key, secret, passphrase)
  * - Хэш конфигурации
+ * - Release build (NDEBUG defined)
  */
 #include "common/types.hpp"
 #include "common/result.hpp"

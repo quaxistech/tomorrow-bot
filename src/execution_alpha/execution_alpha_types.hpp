@@ -73,6 +73,17 @@ struct ExecutionAlphaResult {
     DecisionFactors decision_factors;              ///< Полная аудит-трасса факторов решения
 };
 
+/// Результат pair-level execution analysis (pair EIS)
+struct PairExecutionAlphaResult {
+    ExecutionAlphaResult long_leg;
+    ExecutionAlphaResult short_leg;
+    double pair_eis_bps{0.0};        ///< Combined pair expected implementation shortfall
+    double pair_fill_probability{0.0}; ///< P(both legs fill) = P(long) * P(short)
+    double pair_total_cost_bps{0.0}; ///< Sum of both legs' expected costs
+    bool should_execute_pair{true};
+    std::string rationale;
+};
+
 /// Преобразование стиля исполнения в строку
 std::string to_string(ExecutionStyle style);
 

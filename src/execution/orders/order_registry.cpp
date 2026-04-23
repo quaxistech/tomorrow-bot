@@ -29,6 +29,17 @@ std::optional<OrderRecord> OrderRegistry::get_order(const OrderId& order_id) con
     return it->second;
 }
 
+std::optional<OrderRecord> OrderRegistry::get_order_by_exchange_id(const OrderId& exchange_id) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& [_, order] : orders_) {
+        if (!order.exchange_order_id.get().empty() &&
+            order.exchange_order_id.get() == exchange_id.get()) {
+            return order;
+        }
+    }
+    return std::nullopt;
+}
+
 void OrderRegistry::update_order(const OrderRecord& order) {
     std::lock_guard lock(mutex_);
     auto it = orders_.find(order.order_id.get());
@@ -130,6 +141,18 @@ bool OrderRegistry::is_fill_applied(const OrderId& order_id) const {
 void OrderRegistry::mark_fill_applied(const OrderId& order_id) {
     std::lock_guard lock(mutex_);
     fill_applied_.insert(order_id.get());
+}
+
+// ─── TradeId dedup ──────────────────────────────────────────────────
+
+bool OrderRegistry::is_trade_id_seen(const std::string& trade_id) const {
+    std::lock_guard lock(mutex_);
+    return seen_trade_ids_.contains(trade_id);
+}
+
+void OrderRegistry::mark_trade_id_seen(const std::string& trade_id) {
+    std::lock_guard lock(mutex_);
+    seen_trade_ids_.insert(trade_id);
 }
 
 // ─── Intent dedup ───────────────────────────────────────────────────

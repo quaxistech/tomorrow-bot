@@ -6,7 +6,9 @@
 #include "clock/wall_clock.hpp"
 #include "common/enums.hpp"
 #include "security/production_guard.hpp"
+#include <cstdlib>
 #include <filesystem>
+#include <string_view>
 
 namespace tb::app {
 
@@ -52,6 +54,22 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
     else if (lvl == "warn")     log_level = logging::LogLevel::Warn;
     else if (lvl == "error")    log_level = logging::LogLevel::Error;
     else if (lvl == "critical") log_level = logging::LogLevel::Critical;
+
+    // Production guardrail: запретить trace/debug логирование без diagnostic override.
+    // Чтобы разрешить debug-логи в production, оператор должен задать:
+    //   TOMORROW_BOT_DIAGNOSTIC_OVERRIDE=1
+    if (components.config.trading.mode == TradingMode::Production &&
+        log_level < logging::LogLevel::Info) {
+        const char* diag = std::getenv("TOMORROW_BOT_DIAGNOSTIC_OVERRIDE");
+        if (diag == nullptr || std::string_view(diag) != "1") {
+            log_level = logging::LogLevel::Info;
+            // Создаём временный логгер для предупреждения
+            auto temp_logger = logging::create_console_logger(logging::LogLevel::Warn, json_fmt);
+            temp_logger->warn("bootstrap",
+                "Production режим: debug/trace логирование повышено до Info. "
+                "Для диагностики задайте TOMORROW_BOT_DIAGNOSTIC_OVERRIDE=1");
+        }
+    }
 
     auto console_logger = logging::create_console_logger(log_level, json_fmt);
     components.logger = console_logger;
