@@ -1,4 +1,5 @@
 #include "execution/recovery/recovery_manager.hpp"
+#include <algorithm>
 
 namespace tb::execution {
 
@@ -41,27 +42,41 @@ void RecoveryManager::recover_unknown_orders() {
     });
 
     for (const auto& order : unknown_orders) {
-        // §21: Запрашиваем биржу о реальном статусе
-        // Используем query_order_fill_price как proxy: если вернёт > 0, ордер исполнен
-        auto fill_price = submitter_->query_order_fill_price(
+        // §21: Запрашиваем биржу о реальном статусе/объёме исполнения.
+        auto fill_detail = submitter_->query_order_fill_detail(
             order.exchange_order_id, order.symbol);
+        auto fill_price = fill_detail.fill_price;
 
-        if (fill_price.get() > 0.0) {
-            // Ордер был исполнен на бирже
-            registry_.force_transition(order.order_id, OrderState::Filled,
-                                       "Recovery: confirmed filled by exchange");
+        if (fill_detail.success && fill_price.get() > 0.0 && fill_detail.filled_qty.get() > 0.0) {
             auto updated = registry_.get_order(order.order_id);
             if (updated) {
                 auto u = *updated;
                 u.avg_fill_price = fill_price;
-                u.filled_quantity = u.original_quantity;
-                u.remaining_quantity = Quantity(0.0);
+                // ВАЖНО: при partial fill используем подтверждённый cumulative filled qty.
+                u.filled_quantity = Quantity(std::min(
+                    u.original_quantity.get(),
+                    fill_detail.filled_qty.get()));
+                u.remaining_quantity = Quantity(std::max(
+                    0.0, u.original_quantity.get() - u.filled_quantity.get()));
+                const bool full_fill = (u.remaining_quantity.get() <= 1e-12);
+                const auto recovered_state = full_fill
+                    ? OrderState::Filled
+                    : OrderState::PartiallyFilled;
+                registry_.force_transition(
+                    order.order_id,
+                    recovered_state,
+                    full_fill
+                        ? "Recovery: confirmed full fill by exchange"
+                        : "Recovery: confirmed partial fill by exchange");
+                u.state = recovered_state;
                 u.last_updated = clock_->now();
                 registry_.update_order(u);
             }
-            logger_->info("RecoveryManager", "Ордер восстановлен как Filled",
+            logger_->info("RecoveryManager", "Ордер восстановлен как исполненный",
                 {{"order_id", order.order_id.get()},
-                 {"fill_price", std::to_string(fill_price.get())}});
+                 {"fill_price", std::to_string(fill_price.get())},
+                 {"filled_qty", std::to_string(fill_detail.filled_qty.get())},
+                 {"original_qty", std::to_string(order.original_quantity.get())}});
         } else {
             // Unable to confirm fill — attempt actual cancel on exchange first.
             // Only transition to Cancelled after successful cancel_order() call.

@@ -502,8 +502,11 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
              {"price", std::to_string(order.price.get())},
              {"product_type", futures_config_.product_type}});
 
-        // Anti-fingerprinting: randomize submission timing
-        apply_submission_jitter();
+        // Anti-fingerprinting jitter допустим только для открывающих ордеров.
+        // Для закрытия позиции (risk-off path) задержка недопустима.
+        if (order.trade_side == TradeSide::Open) {
+            apply_submission_jitter();
+        }
 
         auto response = rest_client_->post(kPlaceOrderPath, body);
 

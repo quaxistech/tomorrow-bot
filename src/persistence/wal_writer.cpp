@@ -261,6 +261,14 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
         }
     }
 
+    if (wal_corruption_count_ > 0) {
+        logger_->error("WAL", std::format(
+            "Обнаружено повреждение WAL ({} записей). Recovery в safe-mode: "
+            "незавершённые записи не будут автоматически применены.",
+            wal_corruption_count_));
+        return {};
+    }
+
     logger_->info("WAL", std::format(
         "Найдено {} незавершённых записей", uncommitted.size()));
 

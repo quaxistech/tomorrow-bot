@@ -54,6 +54,13 @@ ProductionGuardResult ProductionGuard::validate(
     result.env_confirmation_present = check_env_confirmation();
     result.config_hash = config_hash;
 
+    // Для non-production режимов строгие production-проверки не применяются.
+    if (mode != TradingMode::Production) {
+        result.allowed = true;
+        result.reason = "Non-production mode: production guard bypassed";
+        return result;
+    }
+
     // Production — нужны все проверки
 
     // 0. Debug build guard: запретить production на debug-сборках

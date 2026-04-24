@@ -294,6 +294,7 @@ double RuleBasedOpportunityCost::effective_conviction_threshold(
     const PortfolioContext& portfolio_ctx) const
 {
     double threshold = base_threshold;
+    double penalty_adj = 0.0;
 
     // Penalty за просадку: +drawdown_penalty_scale за каждые 5% drawdown от пика.
     // current_drawdown_pct приходит как fraction [0,1] (pipeline нормализует).
@@ -301,15 +302,19 @@ double RuleBasedOpportunityCost::effective_conviction_threshold(
     // Обоснование: Thorp 2006, half-Kelly при drawdown — снижение risk appetite
     // пропорционально глубине просадки.
     if (portfolio_ctx.current_drawdown_pct > 0.0) {
-        threshold += config_.drawdown_penalty_scale *
-                     (portfolio_ctx.current_drawdown_pct / 0.05);
+        penalty_adj += config_.drawdown_penalty_scale *
+                       (portfolio_ctx.current_drawdown_pct / 0.05);
     }
 
     // Penalty за серию убытков: behavioral tilt protection.
     // После серии убытков повышаем планку для входа.
     if (portfolio_ctx.consecutive_losses > 0) {
-        threshold += config_.consecutive_loss_penalty * portfolio_ctx.consecutive_losses;
+        penalty_adj += config_.consecutive_loss_penalty * portfolio_ctx.consecutive_losses;
     }
+
+    // Ограничиваем суммарный penalty, чтобы avoid hard freeze после серии просадок.
+    penalty_adj = std::clamp(penalty_adj, 0.0, 0.20);
+    threshold += penalty_adj;
 
     return std::clamp(threshold, 0.0, 0.95);
 }

@@ -918,11 +918,12 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         }
         if (!unknown_keys.empty()) {
             std::sort(unknown_keys.begin(), unknown_keys.end());
-            std::cerr << "[CONFIG] WARNING: " << unknown_keys.size()
+            std::cerr << "[CONFIG] ERROR: " << unknown_keys.size()
                       << " unknown config key(s) detected (possible typos):\n";
             for (const auto& k : unknown_keys) {
                 std::cerr << "  - " << k << "\n";
             }
+            return Err<AppConfig>(TbError::ConfigLoadFailed);
         }
     }
 

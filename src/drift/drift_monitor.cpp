@@ -229,6 +229,7 @@ std::size_t DriftMonitor::stream_count() const {
 double DriftMonitor::compute_psi(const std::deque<double>& reference,
                                   const std::deque<double>& test) const {
     if (reference.empty() || test.empty()) return 0.0;
+    if (config_.psi_bins == 0) return 0.0;
 
     // Определяем границы бинов по reference
     auto ref_sorted = std::vector<double>(reference.begin(), reference.end());
