@@ -500,11 +500,13 @@ DecayMetric AlphaDecayMonitor::compute_confidence_reliability(
     auto brier = [](const std::deque<TradeOutcome>& t, size_t s, size_t e) {
         double sum = 0.0;
         for (size_t i = s; i < e; ++i) {
+            if (!std::isfinite(t[i].conviction)) continue;
             double outcome = (t[i].pnl_bps > 0.0) ? 1.0 : 0.0;
             double diff = t[i].conviction - outcome;
             sum += diff * diff;
         }
-        return sum / static_cast<double>(e - s);
+        const double n = static_cast<double>(e - s);
+        return (n > 0.0) ? (sum / n) : 0.0;
     };
 
     double short_brier = brier(trades, short_start, n);
@@ -512,7 +514,7 @@ DecayMetric AlphaDecayMonitor::compute_confidence_reliability(
 
     // Дрейф: рост Brier-скора = ухудшение калибровки = деградация
     // Нормируем на long_brier для сравнимости
-    if (long_brier > 1e-9)
+    if (long_brier > 1e-9 && std::isfinite(short_brier) && std::isfinite(long_brier))
         metric.drift_pct = (short_brier - long_brier) / long_brier;
 
     metric.current_value  = short_brier;

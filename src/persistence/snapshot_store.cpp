@@ -14,12 +14,14 @@ VoidResult SnapshotStore::save(
     const std::string& payload_json,
     const ConfigHash& config_hash) {
 
-    // Генерация монотонного snapshot_id
-    uint64_t id = snapshot_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-
     // Текущее время в наносекундах (system_clock for cross-restart portability)
     auto now = std::chrono::system_clock::now().time_since_epoch();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+    std::lock_guard lock(mutex_);
+    // Генерация монотонного snapshot_id под мьютексом, чтобы сохранялся
+    // тот же порядок, в котором записи попадают в adapter.
+    uint64_t id = snapshot_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     SnapshotEntry entry;
     entry.snapshot_id = id;
@@ -28,7 +30,6 @@ VoidResult SnapshotStore::save(
     entry.config_hash = config_hash;
     entry.payload_json = payload_json;
 
-    std::lock_guard lock(mutex_);
     return adapter_->store_snapshot(entry);
 }
 

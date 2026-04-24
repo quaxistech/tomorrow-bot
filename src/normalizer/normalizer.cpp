@@ -278,12 +278,14 @@ void BitgetNormalizer::process_raw_message(const exchange::bitget::RawWsMessage&
     } else if (channel.starts_with("candle")) {
         // Интервал из имени канала: "candle1m" → "1m"
         const std::string interval = channel.substr(6);
-        const int64_t interval_ms = interval_to_ms(interval);
+        int64_t interval_ms = interval_to_ms(interval);
 
         if (interval_ms == 0) {
             logger_->warn("BitgetNormalizer", "Unknown candle interval",
                           {{"channel", channel}, {"interval", interval}});
-            return;
+            // Fail-soft fallback: обрабатываем как 1m, чтобы не терять live-поток
+            // при появлении нового/нестандартного алиаса интервала.
+            interval_ms = 60'000;
         }
 
         // Время в ms для определения закрытости свечи

@@ -745,7 +745,8 @@ double ScannerEngine::compute_return_correlation(const std::vector<CandleData>& 
     rb.reserve(n - 1);
 
     for (size_t i = 1; i < n; ++i) {
-        if (a[i-1].close <= 0.0 || b[i-1].close <= 0.0) continue;
+        if (a[i-1].close <= 0.0 || b[i-1].close <= 0.0 ||
+            a[i].close <= 0.0 || b[i].close <= 0.0) continue;
         ra.push_back(std::log(a[i].close / a[i-1].close));
         rb.push_back(std::log(b[i].close / b[i-1].close));
     }
@@ -762,9 +763,16 @@ double ScannerEngine::compute_return_correlation(const std::vector<CandleData>& 
         sum_b2 += rb[i] * rb[i];
     }
 
-    double denom = std::sqrt((m * sum_a2 - sum_a * sum_a) * (m * sum_b2 - sum_b * sum_b));
-    if (denom < 1e-15) return 0.0;
-    return (m * sum_ab - sum_a * sum_b) / denom;
+    const double var_a = m * sum_a2 - sum_a * sum_a;
+    const double var_b = m * sum_b2 - sum_b * sum_b;
+    if (!std::isfinite(var_a) || !std::isfinite(var_b) || var_a <= 1e-18 || var_b <= 1e-18) {
+        return 0.0;
+    }
+
+    double denom = std::sqrt(var_a * var_b);
+    if (!std::isfinite(denom) || denom < 1e-15) return 0.0;
+    double corr = (m * sum_ab - sum_a * sum_b) / denom;
+    return std::isfinite(corr) ? std::clamp(corr, -1.0, 1.0) : 0.0;
 }
 
 void ScannerEngine::diversify_basket(std::vector<SymbolAnalysis>& ranked,

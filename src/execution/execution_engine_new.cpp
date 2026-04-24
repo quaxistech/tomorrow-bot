@@ -50,7 +50,7 @@ Result<OrderId> ExecutionEngine::execute(
     const uncertainty::UncertaintySnapshot& uncertainty)
 {
     // H-4: Serialize execute() to prevent dedup TOCTOU race
-    std::lock_guard<std::mutex> exec_lock(execute_mutex_);
+    std::unique_lock<std::mutex> exec_lock(execute_mutex_);
 
     // §5 Step 1-2: Валидация входных данных
     auto validation = validate_inputs(intent, risk_decision, exec_alpha, uncertainty);
@@ -248,6 +248,9 @@ Result<OrderId> ExecutionEngine::execute(
                 {{"order_id", order_id_str}});
 
             int backoff_ms = 50;
+            // Не держим глобальный execute_mutex_ во время sleep/network retry,
+            // чтобы не блокировать другие срочные операции исполнения.
+            exec_lock.unlock();
             for (int attempt = 0; attempt < 3; ++attempt) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
                 fill_detail = submitter_->query_order_fill_detail(
@@ -261,6 +264,9 @@ Result<OrderId> ExecutionEngine::execute(
                         confirmed_qty = fill_detail.filled_qty;
                     }
                     if (fill_detail.filled_qty.get() <= 0.0) {
+                        if (!exec_lock.owns_lock()) {
+                            exec_lock.lock();
+                        }
                         logger_->error("Execution", "Market ордер НЕ исполнен биржей (retry)",
                             {{"order_id", order_id_str},
                              {"status", fill_detail.status},
@@ -283,6 +289,7 @@ Result<OrderId> ExecutionEngine::execute(
 
                 backoff_ms *= 2;
             }
+            exec_lock.lock();
 
             if (!fill_detail.success) {
                 // Обе попытки провалились — НЕ обрабатываем fill оптимистично.

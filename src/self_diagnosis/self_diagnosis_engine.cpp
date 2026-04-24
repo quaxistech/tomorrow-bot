@@ -20,6 +20,7 @@
 #include "metrics/gauge.hpp"
 #include "persistence/event_journal.hpp"
 #include "persistence/persistence_types.hpp"
+#include <boost/json.hpp>
 #include <sstream>
 #include <stdexcept>
 
@@ -599,34 +600,36 @@ std::string SelfDiagnosisEngine::generate_human_summary(const DiagnosticRecord& 
 // ============================================================
 
 std::string SelfDiagnosisEngine::generate_machine_json(const DiagnosticRecord& record) {
-    std::ostringstream ss;
-    ss << "{";
-    ss << "\"diagnostic_id\":" << record.diagnostic_id;
-    ss << ",\"type\":\"" << to_string(record.type) << "\"";
-    ss << ",\"severity\":\"" << to_string(record.severity) << "\"";
-    ss << ",\"recommended_action\":\"" << to_string(record.recommended_action) << "\"";
-    ss << ",\"correlation_id\":\"" << record.correlation_id.get() << "\"";
-    ss << ",\"symbol\":\"" << record.symbol.get() << "\"";
-    ss << ",\"created_at\":" << record.created_at.get();
-    ss << ",\"world_state\":\"" << record.world_state << "\"";
-    ss << ",\"regime\":\"" << record.regime << "\"";
-    ss << ",\"uncertainty_level\":\"" << record.uncertainty_level << "\"";
-    ss << ",\"verdict\":\"" << record.verdict << "\"";
-    ss << ",\"trade_executed\":" << (record.trade_executed ? "true" : "false");
-    ss << ",\"strategy_id\":\"" << record.strategy_id << "\"";
-    ss << ",\"risk_verdict\":\"" << record.risk_verdict << "\"";
+    namespace json = boost::json;
 
-    ss << ",\"factors\":[";
-    for (std::size_t i = 0; i < record.factors.size(); ++i) {
-        if (i > 0) ss << ",";
-        ss << "{\"component\":\"" << record.factors[i].component << "\""
-           << ",\"observation\":\"" << record.factors[i].observation << "\""
-           << ",\"impact\":" << record.factors[i].impact << "}";
+    json::object root;
+    root["diagnostic_id"] = static_cast<std::int64_t>(record.diagnostic_id);
+    root["type"] = std::string(to_string(record.type));
+    root["severity"] = std::string(to_string(record.severity));
+    root["recommended_action"] = std::string(to_string(record.recommended_action));
+    root["correlation_id"] = record.correlation_id.get();
+    root["symbol"] = record.symbol.get();
+    root["created_at"] = record.created_at.get();
+    root["world_state"] = record.world_state;
+    root["regime"] = record.regime;
+    root["uncertainty_level"] = record.uncertainty_level;
+    root["verdict"] = record.verdict;
+    root["trade_executed"] = record.trade_executed;
+    root["strategy_id"] = record.strategy_id;
+    root["risk_verdict"] = record.risk_verdict;
+
+    json::array factors;
+    factors.reserve(record.factors.size());
+    for (const auto& factor : record.factors) {
+        json::object f;
+        f["component"] = factor.component;
+        f["observation"] = factor.observation;
+        f["impact"] = factor.impact;
+        factors.push_back(std::move(f));
     }
-    ss << "]";
+    root["factors"] = std::move(factors);
 
-    ss << "}";
-    return ss.str();
+    return json::serialize(root);
 }
 
 // ============================================================
