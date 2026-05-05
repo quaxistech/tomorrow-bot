@@ -1,5 +1,6 @@
 #include "strategy_allocator/strategy_allocator.hpp"
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <sstream>
 
@@ -47,7 +48,9 @@ AllocationResult RegimeAwareAllocator::allocate(
                     alloc.weight = 0.0;
                     alloc.reason = "Отключена режимом: " + hint.reason;
                 } else {
-                    alloc.weight *= hint.weight_multiplier;
+                    double regime_multiplier = hint.weight_multiplier;
+                    if (!std::isfinite(regime_multiplier)) regime_multiplier = 0.0;
+                    alloc.weight *= regime_multiplier;
                     alloc.reason = "Режим: " + hint.reason;
                 }
                 break;
@@ -57,7 +60,9 @@ AllocationResult RegimeAwareAllocator::allocate(
         // 2. Применяем пригодность из мировой модели
         for (const auto& suit : world.strategy_suitability) {
             if (suit.strategy_id.get() == sid) {
-                alloc.weight *= suit.suitability;
+                double world_model_multiplier = suit.suitability;
+                if (!std::isfinite(world_model_multiplier)) world_model_multiplier = 0.0;
+                alloc.weight *= world_model_multiplier;
                 if (!alloc.reason.empty()) alloc.reason += " | ";
                 alloc.reason += "Мир: " + suit.reason;
                 break;
@@ -65,8 +70,10 @@ AllocationResult RegimeAwareAllocator::allocate(
         }
 
         // 3. Применяем множитель неопределённости
-        alloc.weight *= uncertainty.size_multiplier;
-        alloc.size_multiplier = uncertainty.size_multiplier;
+        double uncertainty_multiplier = uncertainty.size_multiplier;
+        if (!std::isfinite(uncertainty_multiplier)) uncertainty_multiplier = 0.0;
+        alloc.weight *= uncertainty_multiplier;
+        alloc.size_multiplier = uncertainty_multiplier;
 
         // 4. Отключаем стратегии с очень низким весом.
         // Порог 0.00001: при micro-cap торговле uncertainty multiplier

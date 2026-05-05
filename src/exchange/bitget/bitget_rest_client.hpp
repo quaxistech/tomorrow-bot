@@ -128,6 +128,7 @@ private:
     /// Persistent connection state (connection pooling)
     struct ConnectionPool;
     std::unique_ptr<ConnectionPool> conn_pool_;
+    mutable std::mutex conn_pool_mutex_;
 };
 
 } // namespace tb::exchange::bitget

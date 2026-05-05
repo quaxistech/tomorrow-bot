@@ -35,7 +35,10 @@ bool CircuitBreaker::allow_request() const {
             return true;
 
         case CircuitState::Open: {
-            const int64_t elapsed = now_ms() - last_failure_time_ms_.load(std::memory_order_acquire);
+            // BUG-S34-04: clamp to 0 — NTP backward jump can produce negative elapsed,
+            // which would never satisfy >= recovery_timeout_ms, locking CB open forever.
+            const int64_t elapsed = std::max(int64_t{0},
+                now_ms() - last_failure_time_ms_.load(std::memory_order_acquire));
             if (elapsed >= config_.recovery_timeout_ms) {
                 // CAS: только один поток выполняет переход Open → HalfOpen
                 int expected = static_cast<int>(CircuitState::Open);

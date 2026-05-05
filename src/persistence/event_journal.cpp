@@ -3,11 +3,25 @@
  * @brief Реализация журнала событий
  */
 #include "persistence/event_journal.hpp"
+#include <algorithm>
+#include <limits>
 
 namespace tb::persistence {
 
 EventJournal::EventJournal(std::shared_ptr<IStorageAdapter> adapter)
-    : adapter_(std::move(adapter)) {}
+    : adapter_(std::move(adapter)) {
+    if (!adapter_) return;
+
+    auto existing = adapter_->query_journal(
+        Timestamp{0},
+        Timestamp{std::numeric_limits<int64_t>::max()},
+        std::nullopt);
+    if (!existing) return;
+
+    for (const auto& entry : *existing) {
+        sequence_counter_ = std::max(sequence_counter_, entry.sequence_id);
+    }
+}
 
 VoidResult EventJournal::append(
     JournalEntryType type,
@@ -22,9 +36,9 @@ VoidResult EventJournal::append(
 
     std::lock_guard lock(mutex_);
 
-    // Генерация монотонного sequence_id под mutex, чтобы гарантировать
-    // совпадение порядка sequence_id с порядком записи в adapter.
-    uint64_t seq = ++sequence_counter_;
+    // BUG-S10-01: increment sequence_counter_ only after successful append.
+    // Preallocate the next seq without committing it yet.
+    uint64_t seq = sequence_counter_ + 1;
 
     JournalEntry entry;
     entry.sequence_id = seq;
@@ -35,7 +49,11 @@ VoidResult EventJournal::append(
     entry.config_hash = config_hash;
     entry.payload_json = payload_json;
 
-    return adapter_->append_journal(entry);
+    auto result = adapter_->append_journal(entry);
+    if (result.has_value()) {
+        sequence_counter_ = seq; // commit only on success
+    }
+    return result;
 }
 
 Result<std::vector<JournalEntry>> EventJournal::query(

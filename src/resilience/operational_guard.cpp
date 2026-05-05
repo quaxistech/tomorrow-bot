@@ -20,8 +20,10 @@ OperationalGuard::OperationalGuard(
     , clock_(std::move(clock))
     , metrics_(std::move(metrics))
 {
-    order_results_.resize(
-        static_cast<std::size_t>(config_.reject_window_orders), true);
+    // BUG-S8-10: negative int cast to size_t wraps to ~UINT64_MAX → OOM.
+    int window = config_.reject_window_orders;
+    if (window <= 0) window = 20;
+    order_results_.resize(static_cast<std::size_t>(window), true);
 
     if (metrics_) {
         gauge_guard_state_ = metrics_->gauge("tb_operational_guard_state", {});
@@ -169,7 +171,10 @@ GuardAssessment OperationalGuard::assess() const {
 
     // Cooldown after incident
     if (last_incident_time_ns_ > 0 && clock_) {
+        // BUG-S35-03: NTP backward jump can make elapsed_ms negative → cooldown stuck forever.
+        // Treat negative elapsed as 0 (cooldown still active, conservative).
         int64_t elapsed_ms = (clock_->now().get() - last_incident_time_ns_) / 1'000'000;
+        if (elapsed_ms < 0) elapsed_ms = 0;
         if (elapsed_ms < config_.cooldown_after_incident_ms) {
             result.verdict = GuardVerdict::ReduceRisk;
             result.size_multiplier = config_.reduced_size_multiplier;

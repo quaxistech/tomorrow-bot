@@ -138,29 +138,33 @@ void InMemoryPortfolioEngine::update_price(const Symbol& symbol, Price price) {
 void InMemoryPortfolioEngine::record_funding_payment(const Symbol& symbol, double funding_amount) {
     std::lock_guard lock(mutex_);
 
-    // Apply to both legs (hedge mode)
-    for (auto* suffix : {":long", ":short"}) {
-        auto it = positions_.find(symbol.get() + suffix);
+    // In hedge mode longs PAY funding (positive rate) and shorts RECEIVE it,
+    // so the two legs must receive opposite signs. Applying the same sign to
+    // both would double-count the funding cost (net should be ~0 in a perfect
+    // hedge).  Apply +funding_amount to the long leg and -funding_amount to the
+    // short leg.
+    struct LegEntry { const char* suffix; double amount; };
+    for (const auto& le : {LegEntry{":long", funding_amount},
+                            LegEntry{":short", -funding_amount}}) {
+        auto it = positions_.find(symbol.get() + le.suffix);
         if (it == positions_.end()) continue;
 
         auto& pos = it->second;
-
-        // Добавляем funding payment к accumulated_funding
-        pos.accumulated_funding += funding_amount;
-
-        // Пересчитываем P&L с учетом нового funding
+        // BUG-S18-08: skip zero-sized (zombie) positions — they shouldn't accumulate funding
+        if (pos.size.get() <= 1e-12) continue;
+        pos.accumulated_funding += le.amount;
         recalculate_position_pnl(pos);
 
         logger_->debug("Portfolio", "Записан funding payment",
                       {{"symbol", symbol.get()},
-                       {"leg", suffix},
-                       {"funding_amount", std::to_string(funding_amount)},
+                       {"leg", le.suffix},
+                       {"funding_amount", std::to_string(le.amount)},
                        {"accumulated_funding", std::to_string(pos.accumulated_funding)},
                        {"unrealized_pnl", std::to_string(pos.unrealized_pnl)}});
 
         emit_event(PortfolioEventType::PositionUpdated, symbol,
-                   funding_amount, cash_ledger_.available_cash,
-                   "funding_payment=" + std::to_string(funding_amount));
+                   le.amount, cash_ledger_.available_cash,
+                   "funding_payment=" + std::to_string(le.amount));
     }
 }
 
@@ -169,7 +173,18 @@ void InMemoryPortfolioEngine::close_position(
 {
     std::lock_guard lock(mutex_);
 
-    // Search both legs by composite key
+    // HIGH-2: in hedge-mode both :long and :short can coexist — closing without a
+    // side would silently close the wrong leg. Detect this and refuse to proceed.
+    bool has_long  = positions_.count(symbol.get() + ":long") > 0;
+    bool has_short = positions_.count(symbol.get() + ":short") > 0;
+    if (has_long && has_short) {
+        logger_->error("Portfolio",
+            "close_position() called without side in hedge-mode — ambiguous leg. "
+            "Use the overload with PositionSide.",
+            {{"symbol", symbol.get()}});
+        return;
+    }
+
     auto it = positions_.find(symbol.get() + ":long");
     if (it == positions_.end()) it = positions_.find(symbol.get() + ":short");
     if (it == positions_.end()) {

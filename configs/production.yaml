@@ -63,7 +63,7 @@ decision:
 # РЕШЕНИЕ: TP=2.0×ATR, Stop=1.5×ATR → R:R = 2.0/1.5 = 1.33 → при WR 50% уже прибыль
 trading_params:
   atr_stop_multiplier: 1.5          # 1.5×ATR stop (было 2.0) — теснее, меньше убыток
-  max_loss_per_trade_pct: 10.0      # На текущем балансе нужен двузначный риск-бюджет, чтобы честно пройти min_notional=5 USDT
+  max_loss_per_trade_pct: 5.0       # MEDIUM-7: reduced from 10% to 5% — 10% was too aggressive; scalps should stay tight
   breakeven_atr_threshold: 0.5      # Breakeven at 0.5×ATR — не слишком рано
   partial_tp_atr_threshold: 2.0     # Take profit at 2.0×ATR (было 1.5) — даём прибыли расти
   partial_tp_fraction: 0.50          # Close 50% at TP (было 70%) — оставляем runner

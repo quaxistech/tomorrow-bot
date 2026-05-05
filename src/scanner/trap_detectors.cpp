@@ -1,6 +1,7 @@
 #include "trap_detectors.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace tb::scanner {
@@ -211,10 +212,12 @@ TrapDetection NoiseChopDetector::detect(const MarketSnapshot& snapshot,
     double risk = 0.0;
     double confidence = 0.0;
 
+    // BUG-S13-10: noise_chop_threshold >= 1.0 → denominator (1.0 - threshold) <= 0 → div/zero
+    const double eff_chop_thr = std::clamp(cfg_.noise_chop_threshold, 0.01, 0.99);
     // Высокий chop_ratio (>60%) → шумный рынок
-    if (chop_ratio > cfg_.noise_chop_threshold) {
-        risk = std::min((chop_ratio - cfg_.noise_chop_threshold) /
-                        (1.0 - cfg_.noise_chop_threshold) * 0.7 + 0.3, 1.0);
+    if (chop_ratio > eff_chop_thr) {
+        risk = std::min((chop_ratio - eff_chop_thr) /
+                        (1.0 - eff_chop_thr) * 0.7 + 0.3, 1.0);
         confidence = 0.7;
         result.reasons.push_back("high_chop_ratio_" +
             std::to_string(static_cast<int>(chop_ratio * 100)) + "pct");
@@ -242,6 +245,7 @@ TrapDetection MomentumTrapDetector::detect(const MarketSnapshot& snapshot,
     TrapDetection result{TrapType::MomentumTrap, 0.0, 0.0, {}};
 
     const auto& candles = snapshot.candles;
+    if (candles.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return result;
     if (candles.size() < 10) return result;
 
     size_t lookback = std::min(candles.size(), size_t(15));
@@ -273,7 +277,8 @@ TrapDetection MomentumTrapDetector::detect(const MarketSnapshot& snapshot,
         if (consistent >= 3 && std::abs(move) > max_impulse) {
             max_impulse = std::abs(move);
             impulse_start_idx = static_cast<int>(i);
-            impulse_end_idx = static_cast<int>(i + consistent);
+            impulse_end_idx = std::min(static_cast<int>(i + consistent),
+                                       static_cast<int>(candles.size()));
         }
     }
 
@@ -316,6 +321,8 @@ TrapDetection FundingCrowdTrapDetector::detect(const MarketSnapshot& snapshot,
     TrapDetection result{TrapType::FundingCrowdTrap, 0.0, 0.0, {}};
 
     double fr = snapshot.funding_rate;
+    if (!std::isfinite(fr)) return result;
+
     double threshold = cfg_.funding_extreme_threshold;
 
     double abs_fr = std::abs(fr);
@@ -324,7 +331,7 @@ TrapDetection FundingCrowdTrapDetector::detect(const MarketSnapshot& snapshot,
         result.risk_score = std::min(0.3 + excess * 0.4, 1.0);
         result.confidence = std::min(0.5 + excess * 0.2, 0.85);
 
-        std::string direction = (fr > 0) ? "longs_crowded" : "shorts_crowded";
+        std::string direction = (fr > 0) ? "longs_crowded" : (fr < 0) ? "shorts_crowded" : "neutral";
         result.reasons.push_back(direction + "_funding_" +
             std::to_string(static_cast<int>(fr * 10000)) + "bps");
     }

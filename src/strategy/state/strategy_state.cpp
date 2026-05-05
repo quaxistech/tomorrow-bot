@@ -1,5 +1,6 @@
 #include "strategy/state/strategy_state.hpp"
 #include <algorithm>
+#include <chrono>
 
 namespace tb::strategy {
 
@@ -7,6 +8,7 @@ StrategyStateMachine::StrategyStateMachine(const ScalpStrategyConfig& cfg)
     : cfg_(cfg) {}
 
 bool StrategyStateMachine::transition_to(SymbolState new_state, int64_t now_ns) {
+    std::lock_guard lock(mutex_);
     // Валидация допустимых переходов
     bool valid = false;
     switch (state_) {
@@ -14,6 +16,7 @@ bool StrategyStateMachine::transition_to(SymbolState new_state, int64_t now_ns) 
             valid = (new_state == SymbolState::Candidate ||
                      new_state == SymbolState::SetupForming ||  // прямой переход при мгновенном обнаружении
                      new_state == SymbolState::PositionOpen ||  // восстановление
+                     new_state == SymbolState::Cooldown ||      // recovery: position closed while FSM was Idle
                      new_state == SymbolState::Blocked);
             break;
         case SymbolState::Candidate:
@@ -78,26 +81,42 @@ bool StrategyStateMachine::transition_to(SymbolState new_state, int64_t now_ns) 
 }
 
 void StrategyStateMachine::set_setup(Setup setup) {
+    std::lock_guard lock(mutex_);
     active_setup_ = std::move(setup);
 }
 
 void StrategyStateMachine::clear_setup() {
+    std::lock_guard lock(mutex_);
     active_setup_.reset();
 }
 
 void StrategyStateMachine::start_cooldown(int64_t now_ns, int64_t duration_ms) {
-    cooldown_end_ns_ = now_ns + duration_ms * 1'000'000LL;
-    // Прямое присвоение — cooldown может начаться из любого состояния
-    state_ = SymbolState::Cooldown;
-    last_transition_ns_ = now_ns;
+    std::lock_guard lock(mutex_);
+    if (now_ns <= 0) return; // Bad clock — don't set a cooldown with invalid time
+    // BUG-RS-14 fix: use std::chrono to avoid int64_t overflow when duration_ms
+    // exceeds ~9 million ms (~150 min). Manual multiplication (duration_ms * 1'000'000LL)
+    // overflows for large values; chrono arithmetic is safe and expressive.
+    using namespace std::chrono;
+    const int64_t duration_ns =
+        duration_cast<nanoseconds>(milliseconds(duration_ms)).count();
+    cooldown_end_ns_ = now_ns + duration_ns;
+
+    // BUG-S31-01 fix: always go through transition_to() — direct state_ assignment
+    // bypasses FSM invariants that other components rely on. If the current state
+    // doesn't allow Cooldown the transition is silently dropped; callers that need
+    // forced cooldown should first ensure the FSM is in a compatible state.
+    transition_to(SymbolState::Cooldown, now_ns);
 }
 
 bool StrategyStateMachine::is_cooldown_expired(int64_t now_ns) const {
+    std::lock_guard lock(mutex_);
+    if (now_ns <= 0) return false; // Bad clock — conservatively keep cooldown active
     return now_ns >= cooldown_end_ns_;
 }
 
 void StrategyStateMachine::open_position(const Setup& setup, double entry_price, double size,
                                          Side side, PositionSide pos_side, double atr, int64_t now_ns) {
+    std::lock_guard lock(mutex_);
     position_ctx_ = StrategyPositionContext{};
     position_ctx_.has_position = true;
     position_ctx_.side = side;
@@ -113,6 +132,7 @@ void StrategyStateMachine::open_position(const Setup& setup, double entry_price,
 }
 
 void StrategyStateMachine::update_position(double current_price, double unrealized_pnl, int64_t now_ns) {
+    std::lock_guard lock(mutex_);
     if (!position_ctx_.has_position) return;
 
     position_ctx_.unrealized_pnl = unrealized_pnl;
@@ -135,15 +155,18 @@ void StrategyStateMachine::update_position(double current_price, double unrealiz
 }
 
 void StrategyStateMachine::close_position() {
+    std::lock_guard lock(mutex_);
     position_ctx_ = StrategyPositionContext{};
 }
 
 void StrategyStateMachine::block(int64_t now_ns) {
+    std::lock_guard lock(mutex_);
     state_ = SymbolState::Blocked;
     last_transition_ns_ = now_ns;
 }
 
 void StrategyStateMachine::unblock(int64_t now_ns) {
+    std::lock_guard lock(mutex_);
     if (state_ == SymbolState::Blocked) {
         state_ = SymbolState::Idle;
         last_transition_ns_ = now_ns;
@@ -151,15 +174,22 @@ void StrategyStateMachine::unblock(int64_t now_ns) {
 }
 
 void StrategyStateMachine::reset() {
+    std::lock_guard lock(mutex_);
+    // BUG-S31-02: preserve position_ctx_ if a position is active so the pipeline
+    // can still observe and close it. Callers must call close_position() explicitly
+    // before reset() when a position is open to avoid orphaned positions.
+    if (!position_ctx_.has_position) {
+        position_ctx_ = StrategyPositionContext{};
+    }
     state_ = SymbolState::Idle;
     active_setup_.reset();
-    position_ctx_ = StrategyPositionContext{};
     last_transition_ns_ = 0;
     cooldown_end_ns_ = 0;
     setup_counter_ = 0;
 }
 
 std::string StrategyStateMachine::next_setup_id() {
+    std::lock_guard lock(mutex_);
     return "setup_" + std::to_string(++setup_counter_);
 }
 

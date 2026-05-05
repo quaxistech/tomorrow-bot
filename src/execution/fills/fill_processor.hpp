@@ -11,6 +11,7 @@
 #include "execution/orders/order_registry.hpp"
 #include "execution/execution_config.hpp"
 #include "portfolio/portfolio_engine.hpp"
+#include "persistence/event_journal.hpp"
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include "metrics/metrics_registry.hpp"
@@ -57,6 +58,12 @@ public:
     /// Called after process_fill_event on partial fills.
     CancelRemainingAction check_cancel_remaining(const OrderId& order_id) const;
 
+    /// Attach an event journal for fee persistence (CRITICAL-3).
+    /// Optional: if not set, fee events are not journaled.
+    void set_journal(std::shared_ptr<persistence::EventJournal> journal) {
+        journal_ = std::move(journal);
+    }
+
 private:
     /// Применить fill к портфелю (general — full order fill)
     void apply_fill_to_portfolio(const OrderRecord& order);
@@ -71,11 +78,16 @@ private:
     double compute_incremental_pnl(const OrderRecord& order,
                                    Quantity fill_qty, Price fill_price) const;
 
+    /// Append a FeeCharged event to the journal for crash-recovery durability.
+    void journal_fee_event(const Symbol& symbol, const OrderId& order_id,
+                           double fee, double fill_price, double fill_qty);
+
     OrderRegistry& registry_;
     std::shared_ptr<portfolio::IPortfolioEngine> portfolio_;
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
+    std::shared_ptr<persistence::EventJournal> journal_;
     const ExecutionConfig& config_;
 };
 

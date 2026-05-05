@@ -182,9 +182,12 @@ ExecutionAlphaResult RuleBasedExecutionAlpha::evaluate(
 bool RuleBasedExecutionAlpha::validate_features(
     const features::FeatureSnapshot& features) const
 {
-    if (features.mid_price.get() <= 0.0) return false;
+    // BUG-S12-04: NaN <= 0.0 is false — NaN passes the guard silently
+    if (!std::isfinite(features.mid_price.get()) || features.mid_price.get() <= 0.0) return false;
     if (!features.microstructure.spread_valid) return false;
-    if (features.microstructure.spread_bps < 0.0) return false;
+    // BUG-S15-04: NaN < 0.0 is false — NaN spread passes through to downstream calculations
+    if (!std::isfinite(features.microstructure.spread_bps)
+        || features.microstructure.spread_bps < 0.0) return false;
     return true;
 }
 
@@ -352,12 +355,15 @@ double RuleBasedExecutionAlpha::estimate_adverse_selection(
     // VPIN нормализован: [0..1], значение > vpin_toxic_threshold = токсично.
     // Вес выше, чем у других факторов, т.к. VPIN объединяет volume и direction.
     if (features.microstructure.vpin_valid) {
-        double vpin_norm = std::clamp(
-            features.microstructure.vpin / config_.vpin_toxic_threshold, 0.0, 1.0);
-        factors.vpin_toxicity = vpin_norm;
-        factors.vpin_used = true;
-        score += vpin_norm * config_.vpin_weight;
-        weight_sum += config_.vpin_weight;
+        // BUG-S12-05/S15-02: threshold=0 → vpin/0 = Inf → all orders classified as toxic
+        if (config_.vpin_toxic_threshold > 0.0) {
+            double vpin_norm = std::clamp(
+                features.microstructure.vpin / config_.vpin_toxic_threshold, 0.0, 1.0);
+            factors.vpin_toxicity = vpin_norm;
+            factors.vpin_used = true;
+            score += vpin_norm * config_.vpin_weight;
+            weight_sum += config_.vpin_weight;
+        }
     }
 
     // ── Агрессивный поток ────────────────────────────────────────────────
@@ -433,8 +439,10 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
             double fp = 0.60;
 
             // ── Штраф за широкий спред ─────────────────────────────────
-            double spread_ratio = features.microstructure.spread_bps
-                                 / config_.max_spread_bps_passive;
+            // BUG-S15-03: max_spread_bps_passive=0 → spread/0 = Inf → fp degraded to -Inf
+            double spread_ratio = (config_.max_spread_bps_passive > 1e-9)
+                ? features.microstructure.spread_bps / config_.max_spread_bps_passive
+                : 10.0; // treat as extremely wide spread
             fp -= std::clamp(spread_ratio * 0.15, 0.0, 0.20);
 
             // ── Штраф за размер ордера относительно opposite-side depth ─
@@ -483,7 +491,9 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
                    + hist * config_.feedback_weight;
             }
 
-            return std::clamp(fp, config_.min_fill_probability_passive, 0.75);
+            // BUG-S15-08: min_fill_probability_passive > 0.75 → inverted clamp → fp always=min
+            double clamp_lo = std::min(config_.min_fill_probability_passive, 0.75);
+            return std::clamp(fp, clamp_lo, 0.75);
         }
 
         case ExecutionStyle::Hybrid: {
@@ -541,6 +551,9 @@ ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
 
     // ── Полная стоимость исполнения (spread + fees + slippage + adverse) ──
     // Комиссии USDT-M futures: taker 0.06% (6 bps), maker 0.02% (2 bps) standard tier.
+    // Taker cost is one-way: we cross half the spread (from mid to best ask/bid),
+    // not the full bid-ask spread. Using full spread double-counts the cost.
+    const double half_spread_bps = quality.spread_cost_bps / 2.0;
     if (style == ExecutionStyle::Passive || style == ExecutionStyle::PostOnly) {
         // Maker: execution shortfall ~30% от spread (posted at best bid/ask with improvement)
         // + maker комиссия + adverse selection penalty
@@ -548,11 +561,12 @@ ExecutionQualityEstimate RuleBasedExecutionAlpha::estimate_quality(
                                 + config_.maker_fee_bps
                                 + adverse_score * quality.spread_cost_bps * 0.20;
     } else {
-        // Taker: пересекаем спред + slippage + taker комиссия + adverse penalty
-        quality.total_cost_bps = quality.spread_cost_bps
+        // Taker: пересекаем только половину спреда (mid → best ask/bid)
+        // + slippage + taker комиссия + adverse penalty
+        quality.total_cost_bps = half_spread_bps
                                 + quality.estimated_slippage_bps
                                 + config_.taker_fee_bps
-                                + adverse_score * quality.spread_cost_bps * 0.15;
+                                + adverse_score * half_spread_bps * 0.15;
     }
 
     return quality;
@@ -603,12 +617,14 @@ std::optional<Price> RuleBasedExecutionAlpha::compute_limit_price(
             limit = mid + half_spread - capped_improvement;
         }
     } else {
-        // Hybrid: внутри спреда для IOC-поведения
+        // Hybrid: внутри спреда для IOC-поведения.
+        // Buy: limit above mid (inside the spread toward best ask) → likely fill
+        // Sell: limit below mid (inside the spread toward best bid) → likely fill
         const double inside_offset = half_spread * 0.4;
         if (intent.side == Side::Buy) {
-            limit = mid - inside_offset;
-        } else {
             limit = mid + inside_offset;
+        } else {
+            limit = mid - inside_offset;
         }
     }
 
@@ -639,12 +655,21 @@ std::optional<SlicePlan> RuleBasedExecutionAlpha::compute_slice_plan(
                                  * features.mid_price.get();
     const double ratio = order_notional / available_depth;
 
+    // Guard against NaN/Inf from degenerate inputs before integer cast (UB on x86)
+    if (!std::isfinite(order_notional) || !std::isfinite(ratio)) {
+        return std::nullopt;
+    }
+
+    // BUG-S15-05: threshold=0 → ratio/0 = Inf → static_cast<int>(Inf) = UB
+    if (config_.large_order_slice_threshold <= 0.0) return std::nullopt;
     if (ratio < config_.large_order_slice_threshold) {
         return std::nullopt;
     }
 
     SlicePlan plan;
-    plan.num_slices = std::max(2, static_cast<int>(ratio / config_.large_order_slice_threshold));
+    double slices_d = ratio / config_.large_order_slice_threshold;
+    if (!std::isfinite(slices_d)) return std::nullopt;
+    plan.num_slices = std::max(2, static_cast<int>(slices_d));
     plan.num_slices = std::min(plan.num_slices, 10);
 
     // Адаптивный интервал: высокая нестабильность → быстрее, узкий спред → медленнее
@@ -727,7 +752,13 @@ PairExecutionAlphaResult RuleBasedExecutionAlpha::evaluate_pair(
         // Low pair fill probability → force both legs Aggressive for reliability
         pair_result.long_leg.recommended_style = ExecutionStyle::Aggressive;
         pair_result.short_leg.recommended_style = ExecutionStyle::Aggressive;
-        // Recompute costs with aggressive style
+        // Recompute fill probability and costs with the new aggressive style
+        pair_result.long_leg.quality.fill_probability = estimate_fill_probability(
+            ExecutionStyle::Aggressive, long_intent, features,
+            pair_result.long_leg.decision_factors.directional_imbalance);
+        pair_result.short_leg.quality.fill_probability = estimate_fill_probability(
+            ExecutionStyle::Aggressive, short_intent, features,
+            pair_result.short_leg.decision_factors.directional_imbalance);
         pair_result.long_leg.quality = estimate_quality(
             ExecutionStyle::Aggressive, long_intent, features,
             pair_result.long_leg.decision_factors.adverse_selection_score,
@@ -736,9 +767,33 @@ PairExecutionAlphaResult RuleBasedExecutionAlpha::evaluate_pair(
             ExecutionStyle::Aggressive, short_intent, features,
             pair_result.short_leg.decision_factors.adverse_selection_score,
             pair_result.short_leg.decision_factors.directional_imbalance);
+        pair_result.pair_fill_probability =
+            pair_result.long_leg.quality.fill_probability *
+            pair_result.short_leg.quality.fill_probability;
         pair_result.pair_total_cost_bps =
             pair_result.long_leg.quality.total_cost_bps +
             pair_result.short_leg.quality.total_cost_bps;
+
+        // BUG-NEW-01 fix: recompute pair_eis_bps with updated per-leg costs and
+        // fill probabilities.  The EIS computed above used pre-override (Passive)
+        // quality values and is now stale.
+        const double p_both_new =
+            pair_result.long_leg.quality.fill_probability *
+            pair_result.short_leg.quality.fill_probability;
+        const double p_long_only_new =
+            pair_result.long_leg.quality.fill_probability *
+            (1.0 - pair_result.short_leg.quality.fill_probability);
+        const double p_short_only_new =
+            (1.0 - pair_result.long_leg.quality.fill_probability) *
+            pair_result.short_leg.quality.fill_probability;
+        const double p_neither_new =
+            (1.0 - pair_result.long_leg.quality.fill_probability) *
+            (1.0 - pair_result.short_leg.quality.fill_probability);
+        pair_result.pair_eis_bps =
+            p_both_new  * pair_result.pair_total_cost_bps
+            + p_long_only_new  * (pair_result.long_leg.quality.total_cost_bps  + orphan_unwind_cost_bps)
+            + p_short_only_new * (pair_result.short_leg.quality.total_cost_bps + orphan_unwind_cost_bps)
+            + p_neither_new    * (opp_cost_long + opp_cost_short);
     }
 
     pair_result.should_execute_pair = true;

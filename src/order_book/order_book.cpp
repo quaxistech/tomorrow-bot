@@ -350,7 +350,15 @@ void LocalOrderBook::subscribe(BookEventCallback cb) {
 }
 
 void LocalOrderBook::emit_events(const BookEventBatch& batch) {
-    for (const auto& cb : subscribers_) {
+    // BUG-ML-01 fix: take a snapshot of subscribers under lock, then call callbacks
+    // without holding the lock to prevent use-after-free if subscribe() reallocates
+    // the vector concurrently, and to avoid deadlocks in callbacks that re-enter the book.
+    std::vector<BookEventCallback> local_subscribers;
+    {
+        std::scoped_lock lock(mutex_);
+        local_subscribers = subscribers_;
+    }
+    for (const auto& cb : local_subscribers) {
         cb(batch);
     }
 }

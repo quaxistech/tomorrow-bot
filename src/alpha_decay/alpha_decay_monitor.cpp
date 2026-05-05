@@ -26,7 +26,8 @@ namespace {
 double window_mean(const std::deque<TradeOutcome>& t,
                    size_t start, size_t end,
                    auto field_fn) {
-    if (start >= end) return 0.0;
+    // BUG-S11-05: no bounds check → UB when end > t.size()
+    if (start >= end || end > t.size()) return 0.0;
     double s = 0.0;
     for (size_t i = start; i < end; ++i) s += field_fn(t[i]);
     return s / static_cast<double>(end - start);
@@ -37,7 +38,7 @@ double window_stddev(const std::deque<TradeOutcome>& t,
                      size_t start, size_t end,
                      double mean, auto field_fn) {
     size_t n = end - start;
-    if (n < 2) return 0.0;
+    if (n < 2 || end > t.size()) return 0.0;
     double v = 0.0;
     for (size_t i = start; i < end; ++i) {
         double d = field_fn(t[i]) - mean;
@@ -98,6 +99,14 @@ void AlphaDecayMonitor::record_trade_outcome(
     const StrategyId& strategy_id,
     const TradeOutcome& outcome)
 {
+    if (!std::isfinite(outcome.conviction)) {
+        if (metrics_) {
+            metrics_->counter("alpha_decay_invalid_outcomes_total",
+                {{"reason", "nonfinite_conviction"}})->increment();
+        }
+        return;
+    }
+
     {
         std::lock_guard lock(mutex_);
         auto& history = trade_history_[strategy_id.get()];
@@ -291,6 +300,11 @@ DecayMetric AlphaDecayMonitor::compute_expectancy(
     metric.baseline_value = long_mean;
     metric.lookback_trades = config_.short_lookback;
 
+    if (!std::isfinite(long_mean)) {
+        metric.is_degraded = true;
+        metric.drift_pct = -1.0;
+        return metric;
+    }
     if (std::abs(long_mean) > 1e-9)
         metric.drift_pct = (short_mean - long_mean) / std::abs(long_mean);
 
@@ -373,6 +387,11 @@ DecayMetric AlphaDecayMonitor::compute_slippage(
     metric.baseline_value = long_mean;
     metric.lookback_trades = config_.short_lookback;
 
+    if (!std::isfinite(long_mean)) {
+        metric.is_degraded = true;
+        metric.drift_pct = 1.0;
+        return metric;
+    }
     if (std::abs(long_mean) > 1e-9)
         metric.drift_pct = (short_mean - long_mean) / std::abs(long_mean);
 
@@ -412,6 +431,11 @@ DecayMetric AlphaDecayMonitor::compute_execution_quality(
     metric.baseline_value = long_mean;
     metric.lookback_trades = config_.short_lookback;
 
+    if (!std::isfinite(long_mean)) {
+        metric.is_degraded = true;
+        metric.drift_pct = -1.0;
+        return metric;
+    }
     if (std::abs(long_mean) > 1e-9)
         metric.drift_pct = (short_mean - long_mean) / std::abs(long_mean);
 
@@ -499,12 +523,17 @@ DecayMetric AlphaDecayMonitor::compute_confidence_reliability(
     // outcome = 1 если pnl > 0, иначе 0
     auto brier = [](const std::deque<TradeOutcome>& t, size_t s, size_t e) {
         double sum = 0.0;
+        size_t count = 0;
         for (size_t i = s; i < e; ++i) {
+            if (!std::isfinite(t[i].conviction)) {
+                continue;
+            }
             double outcome = (t[i].pnl_bps > 0.0) ? 1.0 : 0.0;
             double diff = t[i].conviction - outcome;
             sum += diff * diff;
+            ++count;
         }
-        return sum / static_cast<double>(e - s);
+        return count > 0 ? sum / static_cast<double>(count) : 1.0;
     };
 
     double short_brier = brier(trades, short_start, n);

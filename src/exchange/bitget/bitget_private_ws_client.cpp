@@ -1,5 +1,6 @@
 #include "bitget_private_ws_client.hpp"
 #include "bitget_signing.hpp"
+#include <openssl/crypto.h>
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -67,6 +68,7 @@ struct BitgetPrivateWsClient::Impl {
 
     net::steady_timer    reconnect_timer;
     net::steady_timer    heartbeat_timer;
+    net::steady_timer    auth_timer;     // BUG-S23-04: enforces 10s auth timeout
 
     std::unique_ptr<WsStream> ws_stream;
     beast::flat_buffer   read_buf;
@@ -95,6 +97,7 @@ struct BitgetPrivateWsClient::Impl {
         , logger(std::move(log))
         , reconnect_timer(ioc)
         , heartbeat_timer(ioc)
+        , auth_timer(ioc)
         , url_parts(parse_private_url(config.url))
     {
         ssl_ctx.set_verify_mode(ssl::verify_peer);
@@ -172,6 +175,17 @@ struct BitgetPrivateWsClient::Impl {
         reconnect_attempt = 0;
         logger->info(kComp, "WS connected, sending login...");
 
+        // BUG-S23-04: start auth timeout — disconnect and reconnect if no "login" event
+        // arrives within 10 seconds to prevent the channel from blocking indefinitely.
+        auth_timer.expires_after(std::chrono::seconds(10));
+        auth_timer.async_wait([this](beast::error_code ec) {
+            if (ec || !running.load(std::memory_order_relaxed)) return;
+            if (!authenticated.load(std::memory_order_acquire)) {
+                logger->error(kComp, "Auth timeout — reconnecting");
+                schedule_reconnect();
+            }
+        });
+
         // Send login for authentication
         send_login();
         do_read();
@@ -199,6 +213,10 @@ struct BitgetPrivateWsClient::Impl {
         login_msg["args"] = boost::json::array{arg};
 
         enqueue_write(boost::json::serialize(login_msg));
+        // BUG-S9-03: zero signing material after use to prevent it from remaining
+        // accessible in memory dumps.
+        OPENSSL_cleanse(sign_payload.data(), sign_payload.size());
+        OPENSSL_cleanse(sign.data(), sign.size());
     }
 
     // ----------------------------------------------------------------
@@ -239,6 +257,7 @@ struct BitgetPrivateWsClient::Impl {
     void schedule_reconnect() {
         connected.store(false, std::memory_order_release);
         authenticated.store(false, std::memory_order_release);
+        auth_timer.cancel();  // BUG-S23-04: ensure auth timer doesn't fire after reconnect
         if (on_connection) on_connection(false, false);
         if (!running.load(std::memory_order_relaxed)) return;
 
@@ -294,6 +313,7 @@ struct BitgetPrivateWsClient::Impl {
                 std::string event(obj.at("event").as_string());
                 if (event == "login") {
                     authenticated.store(true, std::memory_order_release);
+                    auth_timer.cancel();  // BUG-S23-04: auth succeeded, cancel timeout
                     logger->info(kComp, "Authenticated successfully");
                     if (on_connection) on_connection(true, true);
                     resubscribe_all();
@@ -404,8 +424,14 @@ void BitgetPrivateWsClient::stop() {
     impl_->logger->info(kComp, "Stopping private WS client");
     impl_->heartbeat_timer.cancel();
     impl_->reconnect_timer.cancel();
-    net::post(impl_->ioc, [this]() { impl_->do_close(); });
-    impl_->ioc.stop();
+    // BUG-S9-04: posting do_close then immediately calling ioc.stop() races —
+    // ioc may stop before do_close executes, leaving the fd open.
+    // Fix: post a combined task that closes the WS and then stops the ioc,
+    // ensuring the close handshake completes before the event loop exits.
+    net::post(impl_->ioc, [this]() {
+        impl_->do_close();
+        impl_->ioc.stop();
+    });
     if (impl_->io_thread.joinable()) impl_->io_thread.join();
 }
 

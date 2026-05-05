@@ -48,7 +48,8 @@ enum class FilterReason {
     Blacklisted,
     InvalidData,
     PriceTooLow,
-    PoorTickEconomics
+    PoorTickEconomics,
+    ExtremeMove24h       ///< 24h price change outside allowed range (BUG-S4-31)
 };
 
 // ─── Market Data Types (§5.2) ─────────────────────────────────────────────────
@@ -340,6 +341,7 @@ inline const char* to_string(FilterReason r) {
         case FilterReason::InvalidData:       return "invalid_data";
         case FilterReason::PriceTooLow:       return "price_too_low";
         case FilterReason::PoorTickEconomics: return "poor_tick_economics";
+        case FilterReason::ExtremeMove24h:    return "extreme_move_24h";
     }
     return "unknown";
 }

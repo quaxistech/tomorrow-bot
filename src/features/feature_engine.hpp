@@ -77,6 +77,7 @@ private:
     mutable std::unordered_map<std::string, buffers::CandleBuffer<500>> candle_buffers_;
     mutable std::unordered_map<std::string, buffers::TradeBuffer<1000>> trade_buffers_;
     mutable std::unordered_map<std::string, normalizer::NormalizedTicker> last_tickers_;
+    mutable std::unordered_map<std::string, int64_t> last_trade_received_ns_;
 
     mutable std::mutex mutex_;
 };

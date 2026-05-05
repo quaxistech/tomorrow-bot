@@ -25,7 +25,7 @@ CostAttributionSummary CostAttributionEngine::summarize(Timestamp from, Timestam
     std::lock_guard lock(mutex_);
     std::vector<TradeCostBreakdown> filtered;
     for (const auto& t : trades_) {
-        if (t.opened_at >= from && t.closed_at <= to) {
+        if (t.opened_at >= from && t.closed_at <= to && t.opened_at <= t.closed_at) {
             filtered.push_back(t);
         }
     }

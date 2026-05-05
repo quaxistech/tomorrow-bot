@@ -59,7 +59,13 @@ EnsembleResult RegimeEnsemble::compute_weights(
             double posterior_weight = w.expected_win_rate;
 
             // PnL bonus: slight tilt toward strategies with positive cumulative PnL
-            double pnl_bonus = std::tanh(perf.cumulative_pnl_bps * config_.pnl_bonus_scale);
+            // BUG-S10-05: NaN pnl_bps → tanh(NaN) = NaN → posterior_weight += NaN → all weights NaN
+            double pnl_bonus = 0.0;
+            {
+                double arg = perf.cumulative_pnl_bps * config_.pnl_bonus_scale;
+                arg = std::clamp(arg, -10.0, 10.0);
+                if (std::isfinite(arg)) pnl_bonus = std::tanh(arg);
+            }
             posterior_weight += pnl_bonus * 0.1;
             posterior_weight = std::clamp(posterior_weight, 0.0, 1.0);
 
@@ -72,28 +78,20 @@ EnsembleResult RegimeEnsemble::compute_weights(
         result.weights.push_back(std::move(w));
     }
 
-    // Normalize and apply floor
-    if (total_raw > 0.0) {
-        for (auto& w : result.weights) {
-            w.weight /= total_raw;
-        }
+    // BUG-S22-05: applying the floor AFTER normalization means at cold-start all
+    // strategies can be below min_w, making floor boost them all to equal weight —
+    // destroying the confidence ordering that the Bayesian update computed.
+    // Fix: apply floor BEFORE normalization so the raw confidence signal is preserved.
+    const double min_w = config_.min_weight;
+    for (auto& w : result.weights) {
+        if (w.weight < min_w) w.weight = min_w;
     }
 
-    // Apply minimum weight floor to prevent complete starvation
-    const double min_w = config_.min_weight;
-    bool needs_renorm = false;
-    for (auto& w : result.weights) {
-        if (w.weight < min_w) {
-            w.weight = min_w;
-            needs_renorm = true;
-        }
-    }
-    if (needs_renorm) {
-        double sum = 0.0;
-        for (const auto& w : result.weights) sum += w.weight;
-        if (sum > 0.0) {
-            for (auto& w : result.weights) w.weight /= sum;
-        }
+    // Normalize so weights sum to 1.0
+    double total_after_floor = 0.0;
+    for (const auto& w : result.weights) total_after_floor += w.weight;
+    if (total_after_floor > 0.0) {
+        for (auto& w : result.weights) w.weight /= total_after_floor;
     }
 
     return result;

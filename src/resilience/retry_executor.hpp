@@ -177,8 +177,10 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
 {
     using ResponseType = decltype(operation());
 
-    std::unique_lock lock(mutex_);
-    last_attempts_.clear();
+    {
+        std::lock_guard lock(mutex_);
+        last_attempts_.clear();
+    }
 
     constexpr const char* kComponent = "RetryExecutor";
 
@@ -197,7 +199,10 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
             ea.success = false;
             ea.error_message = "Circuit breaker open";
             ea.error_class = ErrorClassification::Transient;
-            last_attempts_.push_back(std::move(ea));
+            {
+                std::lock_guard lock(mutex_);
+                last_attempts_.push_back(std::move(ea));
+            }
             break;
         }
 
@@ -228,7 +233,10 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
         ea.error_message = msg;
         ea.latency_ms = latency_ms;
         ea.error_class = error_class;
-        last_attempts_.push_back(ea);
+        {
+            std::lock_guard lock(mutex_);
+            last_attempts_.push_back(ea);
+        }
 
         // Обновляем метрики
         if (metrics_) {
@@ -295,9 +303,7 @@ auto RetryExecutor::execute(const std::string& operation_name, F&& operation)
              {"delay_ms", std::to_string(delay)},
              {"msg", msg}});
 
-        lock.unlock();
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-        lock.lock();
     }
 
     return last_response;

@@ -123,8 +123,11 @@ void BitgetRestClient::wait_for_rate_limit(const std::string& path) {
         auto now = std::chrono::steady_clock::now();
         double elapsed_sec = std::chrono::duration<double>(now - bucket.last_refill).count();
 
-        bucket.tokens = std::min(bucket.max_tokens, bucket.tokens + elapsed_sec * bucket.refill_rate);
-        bucket.last_refill = now;
+        // BUG-S18-05: skip tiny elapsed_sec to avoid FP precision loss accumulating incorrectly.
+        if (elapsed_sec >= 1e-6) {
+            bucket.tokens = std::min(bucket.max_tokens, bucket.tokens + elapsed_sec * bucket.refill_rate);
+            bucket.last_refill = now;
+        }
 
         if (bucket.tokens >= 1.0) {
             bucket.tokens -= 1.0;
@@ -343,6 +346,7 @@ RestResponse BitgetRestClient::execute_once(const std::string& method,
                                              const std::string& path,
                                              const std::string& body) {
     RestResponse response;
+    std::unique_lock<std::mutex> pool_lock(conn_pool_mutex_);
 
     try {
         // 1. Подписать запрос (fresh timestamp every attempt — critical for retry)
@@ -427,9 +431,14 @@ RestResponse BitgetRestClient::execute_once(const std::string& method,
         http::write(*pool.stream, req);
 
         // 6. Прочитать ответ
+        // BUG-S23-01: no body size limit → malformed/adversarial response can OOM.
+        // Use response_parser with body_limit to cap at 4 MB (all valid API responses
+        // are orders of magnitude smaller).
         beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-        http::read(*pool.stream, buffer, res);
+        http::response_parser<http::string_body> parser;
+        parser.body_limit(4 * 1024 * 1024);  // 4 MB hard cap
+        http::read(*pool.stream, buffer, parser);
+        auto res = parser.release();
 
         pool.last_used = std::chrono::steady_clock::now();
         ++pool.requests_on_connection;

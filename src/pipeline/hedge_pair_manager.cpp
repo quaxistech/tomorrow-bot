@@ -19,8 +19,15 @@ bool HedgePairManager::can_hedge() const {
 }
 
 void HedgePairManager::notify_hedge_opened() {
-    state_ = HedgePairState::PrimaryPlusHedge;
-    ++hedge_count_;
+    // Transition to pending — portfolio confirmation (has_hedge=true) will
+    // increment hedge_count_ and advance to PrimaryPlusHedge.  This prevents
+    // counting unfilled orders against the per-position hedge budget.
+    state_ = HedgePairState::HedgeSentPending;
+}
+
+void HedgePairManager::notify_hedge_failed() {
+    // Order was cancelled or rejected without ever filling.
+    state_ = HedgePairState::PrimaryOnly;
 }
 
 void HedgePairManager::notify_hedge_closed() {
@@ -44,6 +51,9 @@ HedgePairDecision HedgePairManager::evaluate(const HedgePairInput& input) {
     case HedgePairState::PrimaryOnly:
         return evaluate_primary_only(input);
 
+    case HedgePairState::HedgeSentPending:
+        return evaluate_hedge_pending(input);
+
     case HedgePairState::PrimaryPlusHedge:
     case HedgePairState::ProfitLockPair:
     case HedgePairState::AsymmetricUnwind:
@@ -56,8 +66,14 @@ HedgePairDecision HedgePairManager::evaluate(const HedgePairInput& input) {
     case HedgePairState::EmergencyFlatten:
         // Emergency flatten requested — close both
         return {HedgeAction::CloseBoth, 0.0, "Emergency flatten active", 1.0};
+
+    default:
+        // BUG-S24-09: new enum value added without updating switch → silent no-op
+        if (logger_) logger_->error("HedgePairManager",
+            "evaluate(): unhandled HedgePairState — returning NoAction",
+            {{"state", std::to_string(static_cast<int>(state_))}});
+        return {};
     }
-    return {};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -142,10 +158,14 @@ double HedgePairManager::compute_hedge_ratio(const HedgePairInput& input) const 
     }
 
     // High funding cost for primary side → smaller hedge (hedging is also paying)
-    bool primary_long = (input.primary_side == PositionSide::Long);
-    double eff_funding = primary_long ? input.funding_rate : -input.funding_rate;
-    if (eff_funding > 0.0005) {
-        ratio *= 0.8;  // Both sides pay in opposite directions, reduce exposure
+    // BUG-S8-09: NaN funding_rate makes eff_funding NaN; the comparison silently
+    // returns false, skipping the penalty. Guard before use.
+    if (std::isfinite(input.funding_rate)) {
+        bool primary_long = (input.primary_side == PositionSide::Long);
+        double eff_funding = primary_long ? input.funding_rate : -input.funding_rate;
+        if (eff_funding > 0.0005) {
+            ratio *= 0.8;  // Both sides pay in opposite directions, reduce exposure
+        }
     }
 
     // Thin liquidity → smaller hedge to avoid moving market
@@ -154,6 +174,26 @@ double HedgePairManager::compute_hedge_ratio(const HedgePairInput& input) const 
     }
 
     return std::clamp(ratio, 0.3, 1.2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEDGE SENT PENDING — waiting for portfolio to confirm fill
+// hedge_count_ is NOT yet incremented; only advance once portfolio shows the leg.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+HedgePairDecision HedgePairManager::evaluate_hedge_pending(const HedgePairInput& input) {
+    if (input.has_hedge) {
+        // Portfolio confirmed the hedge leg — commit the count and enter active mode.
+        ++hedge_count_;
+        state_ = HedgePairState::PrimaryPlusHedge;
+        logger_->info("pipeline", "HEDGE confirmed by portfolio — entering pair mode",
+            {{"hedge_count", std::to_string(hedge_count_)}});
+        return evaluate_pair_active(input);
+    }
+    // Portfolio hasn't reflected the fill yet (or order is still in-flight).
+    // Stay in pending — pipeline's order watchdog will call notify_hedge_failed()
+    // if the order is cancelled.
+    return {};
 }
 
 HedgePairDecision HedgePairManager::evaluate_primary_only(const HedgePairInput& input) {
@@ -217,7 +257,7 @@ HedgePairDecision HedgePairManager::evaluate_pair_active(const HedgePairInput& i
         ? false : true;  // Hedge is opposite of primary
 
     // 2a: Hedge leg profitable + market turning for primary → close hedge
-    if (input.hedge_pnl > round_trip_fees && input.hedge_hold_ns > 5'000'000'000LL) {
+    if (input.hedge_pnl > round_trip_fees) {
         bool momentum_for_primary = false;
         if (input.momentum_valid) {
             bool primary_long = (input.primary_side == PositionSide::Long);
@@ -227,20 +267,29 @@ HedgePairDecision HedgePairManager::evaluate_pair_active(const HedgePairInput& i
         }
         bool primary_recovering = input.exit_score_primary > 0.10;
         bool regime_stabilizing = input.regime_stability > 0.5 && !input.cusum_regime_change;
+        double unwind_confidence = 0.0;
+        if (momentum_for_primary) unwind_confidence += 0.45;
+        if (primary_recovering) unwind_confidence += 0.35;
+        if (regime_stabilizing) unwind_confidence += 0.20;
+        if (regime_stabilizing && input.hedge_pnl > round_trip_fees * 2.0) {
+            // Strongly profitable hedge in a stabilized regime can be unwound
+            // even without momentum confirmation.
+            unwind_confidence += 0.35;
+        }
 
-        if (momentum_for_primary || primary_recovering || regime_stabilizing) {
+        if (unwind_confidence >= 0.55) {
             state_ = HedgePairState::AsymmetricUnwind;
             return {HedgeAction::CloseHedge, 0.0,
                 std::format("Unwind hedge: hedge_pnl={:.2f}, primary_score={:.2f}, "
-                    "regime_stab={:.2f}, momentum_ok={}",
+                    "regime_stab={:.2f}, momentum_ok={}, confidence={:.2f}",
                     input.hedge_pnl, input.exit_score_primary,
-                    input.regime_stability, momentum_for_primary),
-                0.7};
+                    input.regime_stability, momentum_for_primary, unwind_confidence),
+                std::clamp(0.55 + unwind_confidence * 0.30, 0.0, 1.0)};
         }
     }
 
     // 2b: Primary leg profitable + market turning for hedge → close primary (reverse)
-    if (input.primary_pnl > round_trip_fees && input.hedge_hold_ns > 5'000'000'000LL) {
+    if (input.primary_pnl > round_trip_fees) {
         bool momentum_for_hedge = false;
         if (input.momentum_valid) {
             momentum_for_hedge = is_hedge_long
@@ -248,14 +297,20 @@ HedgePairDecision HedgePairManager::evaluate_pair_active(const HedgePairInput& i
                 : (input.momentum < -0.0005);
         }
         bool hedge_strengthening = input.exit_score_hedge > 0.10;
+        bool regime_break_continues = input.cusum_regime_change && input.regime_stability < 0.40;
+        double reverse_confidence = 0.0;
+        if (momentum_for_hedge) reverse_confidence += 0.45;
+        if (hedge_strengthening) reverse_confidence += 0.35;
+        if (regime_break_continues) reverse_confidence += 0.20;
 
-        if (momentum_for_hedge || hedge_strengthening) {
+        if (reverse_confidence >= 0.55) {
             state_ = HedgePairState::ReverseTransition;
             return {HedgeAction::ClosePrimary, 0.0,
                 std::format("Reverse: primary_pnl={:.2f}, hedge_score={:.2f}, "
-                    "momentum_for_hedge={}",
-                    input.primary_pnl, input.exit_score_hedge, momentum_for_hedge),
-                0.7};
+                    "momentum_for_hedge={}, confidence={:.2f}",
+                    input.primary_pnl, input.exit_score_hedge,
+                    momentum_for_hedge, reverse_confidence),
+                std::clamp(0.55 + reverse_confidence * 0.30, 0.0, 1.0)};
         }
     }
 

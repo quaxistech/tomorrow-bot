@@ -19,6 +19,15 @@ MetaLabelResult MetaLabelClassifier::classify(
     std::lock_guard<std::mutex> lock(mutex_);
 
     const double raw = compute_raw_score(signal, context);
+    if (!std::isfinite(raw)) {
+        return MetaLabelResult{
+            .probability = 0.5,
+            .bet_size = 0.0,
+            .should_trade = false,
+            .threshold_used = adaptive_threshold_,
+            .rationale = "NaN/Inf upstream input — trading blocked"
+        };
+    }
     const double prob = calibrate(raw);
     const double threshold = adaptive_threshold_;
 
@@ -79,6 +88,14 @@ double MetaLabelClassifier::current_threshold() const {
 double MetaLabelClassifier::compute_raw_score(
     const PrimarySignal& signal,
     const MetaLabelContext& context) const {
+
+    // BUG-ML-09 fix: NaN inputs silently blocked trading without any warning.
+    // Return NaN so the caller can detect and report the upstream data issue.
+    if (!std::isfinite(signal.conviction) || !std::isfinite(signal.feature_quality) ||
+        !std::isfinite(context.regime_confidence) || !std::isfinite(context.uncertainty_score) ||
+        !std::isfinite(context.spread_bps) || !std::isfinite(context.vpin)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
 
     // Weighted composite of signal quality, regime, execution conditions, momentum
     // Each component maps to [0, 1]
@@ -166,36 +183,52 @@ void MetaLabelClassifier::update_calibration() {
         const double det = h11 * h22 - h12 * h12;
         if (std::abs(det) < 1e-15) break;
 
-        A -= (h22 * g1 - h12 * g2) / det;
-        B -= (h11 * g2 - h12 * g1) / det;
+        const double dA = (h22 * g1 - h12 * g2) / det;
+        const double dB = (h11 * g2 - h12 * g1) / det;
+        // BUG-S21-07: guard against Newton step divergence → NaN A/B → all outputs NaN.
+        if (!std::isfinite(dA) || !std::isfinite(dB)) {
+            A = 1.0; B = 0.0;
+            break;
+        }
+        A -= dA;
+        B -= dB;
+    }
+
+    if (!std::isfinite(A) || !std::isfinite(B)) {
+        A = 1.0; B = 0.0;
     }
 
     platt_a_ = A;
     platt_b_ = B;
     calibrated_ = true;
 
-    // Adaptive threshold via Brier score minimization
+    // BUG-ML-08 fix: adaptive threshold selection using full-dataset metrics.
+    // Old code evaluated Brier score only on above-threshold samples (survivorship
+    // bias), which always minimised at the highest threshold (0.75), blocking >75%
+    // of setups. New code uses precision × sqrt(coverage) across all samples —
+    // balancing prediction accuracy with sufficient trade coverage.
     if (config_.adaptive_threshold) {
-        double best_brier = 1.0;
+        double best_score = -1.0;
         double best_thresh = config_.default_threshold;
+        const double n_total = static_cast<double>(scores.size());
 
         for (double t = 0.45; t <= 0.75; t += 0.01) {
-            double brier = 0.0;
-            int count = 0;
+            int above = 0, correct_above = 0;
             for (size_t i = 0; i < scores.size(); ++i) {
                 const double p = 1.0 / (1.0 + std::exp(-(A * scores[i] + B)));
                 if (p >= t) {
-                    const double actual = labels[i];
-                    brier += (p - actual) * (p - actual);
-                    ++count;
+                    ++above;
+                    if (labels[i] > 0.5) ++correct_above;
                 }
             }
-            if (count > 0) {
-                brier /= static_cast<double>(count);
-                if (brier < best_brier) {
-                    best_brier = brier;
-                    best_thresh = t;
-                }
+            if (above < 5) continue;  // Need at least 5 samples at this threshold
+            const double precision = static_cast<double>(correct_above) / static_cast<double>(above);
+            const double coverage  = static_cast<double>(above) / n_total;
+            // Weighted metric: high precision is worthless at coverage < 5%
+            const double score = precision * std::sqrt(coverage);
+            if (score > best_score) {
+                best_score = score;
+                best_thresh = t;
             }
         }
         adaptive_threshold_ = best_thresh;

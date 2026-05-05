@@ -6,6 +6,7 @@
 #include "resilience/retry_executor.hpp"
 
 #include <algorithm>
+#include <boost/json.hpp>
 #include <cmath>
 #include <random>
 
@@ -71,17 +72,24 @@ std::vector<ExecutionAttempt> RetryExecutor::last_attempts() const {
 ErrorClassification RetryExecutor::classify_error(
     int http_status, const std::string& body)
 {
-    // Bitget USDT-M API: ошибки в body (может прийти с HTTP 200)
+    // BUG-S19-05 fix: parse JSON to extract the "code" field rather than using
+    // substring search, which can misclassify permanent errors if the error
+    // code digits happen to appear in a message string.
     if (!body.empty()) {
-        // Rate limit: Bitget code 43011 "too many requests"
-        if (body.find("43011") != std::string::npos) {
-            return ErrorClassification::RateLimit;
-        }
-        // Auth failures: 40014 (invalid key), 40016 (IP whitelist), 40017 (expired key)
-        if (body.find("40014") != std::string::npos ||
-            body.find("40016") != std::string::npos ||
-            body.find("40017") != std::string::npos) {
-            return ErrorClassification::AuthFailure;
+        try {
+            auto jv = boost::json::parse(body);
+            auto code_sv = jv.at("code").as_string();
+            std::string code(code_sv.begin(), code_sv.end());
+            // Rate limit: Bitget code 43011 "too many requests"
+            if (code == "43011") {
+                return ErrorClassification::RateLimit;
+            }
+            // Auth failures: invalid key, IP whitelist, expired key
+            if (code == "40014" || code == "40016" || code == "40017") {
+                return ErrorClassification::AuthFailure;
+            }
+        } catch (...) {
+            // Body is not valid JSON (e.g., plain text error from proxy) — fall through
         }
     }
 

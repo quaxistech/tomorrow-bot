@@ -8,18 +8,28 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <random>
 
 namespace tb::execution {
 
 // ── SymbolAccum helpers ──
 
+// Reservoir sampling (Algorithm R, Vitter 1985).
+// Maintains a uniform random sample of up to kReservoirSize observations
+// so that any subset of size k from the full stream is equally likely.
+// This gives an unbiased sample for computing any percentile, including P99.
 void ExecutionQualityMonitor::SymbolAccum::push_fill_latency(double ms) {
-    if (fill_latency_top_.size() < kTopN) {
-        fill_latency_top_.push_back(ms);
-        std::sort(fill_latency_top_.begin(), fill_latency_top_.end());
-    } else if (ms > fill_latency_top_.front()) {
-        fill_latency_top_.front() = ms;
-        std::sort(fill_latency_top_.begin(), fill_latency_top_.end());
+    ++reservoir_total_;
+    if (latency_reservoir_.size() < kReservoirSize) {
+        latency_reservoir_.push_back(ms);
+    } else {
+        // Replace a random existing element with probability kReservoirSize / reservoir_total_
+        thread_local std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_int_distribution<int64_t> dist(0, reservoir_total_ - 1);
+        int64_t idx = dist(rng);
+        if (static_cast<std::size_t>(idx) < kReservoirSize) {
+            latency_reservoir_[static_cast<std::size_t>(idx)] = ms;
+        }
     }
 }
 
@@ -52,6 +62,10 @@ void ExecutionQualityMonitor::on_fill(
     const Symbol& symbol, int64_t latency_ns,
     double expected_price, double actual_price, Side side)
 {
+    // Guard against negative latency caused by NTP backward time jumps.
+    // Callers should use steady_clock for interval measurements; if system_clock
+    // was used and jumped backward, latency_ns can be negative — clamp to zero.
+    if (latency_ns < 0) latency_ns = 0;
     double latency_ms = static_cast<double>(latency_ns) / 1e6;
 
     // Slippage: positive = unfavorable
@@ -76,6 +90,8 @@ void ExecutionQualityMonitor::on_fill(
 void ExecutionQualityMonitor::on_cancel(
     const Symbol& symbol, int64_t latency_ns)
 {
+    // Guard against negative latency caused by NTP backward time jumps.
+    if (latency_ns < 0) latency_ns = 0;
     double latency_ms = static_cast<double>(latency_ns) / 1e6;
 
     std::lock_guard lock(mutex_);
@@ -134,7 +150,7 @@ SymbolExecQuality ExecutionQualityMonitor::aggregate_quality() const {
         total.slippage_sum_bps += a.slippage_sum_bps;
         if (a.fill_latency_max_ms > total.fill_latency_max_ms)
             total.fill_latency_max_ms = a.fill_latency_max_ms;
-        for (double v : a.fill_latency_top_)
+        for (double v : a.latency_reservoir_)
             total.push_fill_latency(v);
     }
     return compute_quality(total, "ALL");
@@ -163,12 +179,17 @@ SymbolExecQuality ExecutionQualityMonitor::compute_quality(
         q.avg_cancel_latency_ms = a.cancel_latency_sum_ms / static_cast<double>(a.cancels);
     }
 
-    // P99 from top-N reservoir
-    if (!a.fill_latency_top_.empty()) {
-        auto idx = static_cast<std::size_t>(
-            std::ceil(0.99 * static_cast<double>(a.fill_latency_top_.size())) - 1);
-        idx = std::min(idx, a.fill_latency_top_.size() - 1);
-        q.p99_fill_latency_ms = a.fill_latency_top_[idx];
+    // P99 from reservoir sample: sort a copy, then index at the 99th percentile rank.
+    // The reservoir is a uniform random sample so this is an unbiased P99 estimate.
+    if (!a.latency_reservoir_.empty()) {
+        std::vector<double> sorted = a.latency_reservoir_;
+        std::sort(sorted.begin(), sorted.end());
+        // Nearest-rank method: rank = ceil(0.99 * n), 1-based → index = rank - 1
+        auto n = sorted.size();
+        auto rank = static_cast<std::size_t>(std::ceil(0.99 * static_cast<double>(n)));
+        if (rank == 0) rank = 1;
+        auto idx = std::min(rank - 1, n - 1);
+        q.p99_fill_latency_ms = sorted[idx];
     }
 
     // Missed liquidity as % of fills

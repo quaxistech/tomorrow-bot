@@ -18,7 +18,11 @@ OrderRegistry::OrderRegistry(
 void OrderRegistry::register_order(OrderRecord order) {
     std::lock_guard lock(mutex_);
     auto id = order.order_id.get();
-    fsms_.emplace(id, OrderFSM(order.order_id));
+    fsms_.try_emplace(id, order.order_id);
+    // BUG-S25-04: populate exchange_id secondary index for O(1) reverse lookup
+    if (!order.exchange_order_id.get().empty()) {
+        exchange_id_index_[order.exchange_order_id.get()] = id;
+    }
     orders_.emplace(id, std::move(order));
 }
 
@@ -31,19 +35,22 @@ std::optional<OrderRecord> OrderRegistry::get_order(const OrderId& order_id) con
 
 std::optional<OrderRecord> OrderRegistry::get_order_by_exchange_id(const OrderId& exchange_id) const {
     std::lock_guard lock(mutex_);
-    for (const auto& [_, order] : orders_) {
-        if (!order.exchange_order_id.get().empty() &&
-            order.exchange_order_id.get() == exchange_id.get()) {
-            return order;
-        }
-    }
-    return std::nullopt;
+    // BUG-S25-04: O(1) lookup via secondary index instead of O(n) linear scan
+    auto idx_it = exchange_id_index_.find(exchange_id.get());
+    if (idx_it == exchange_id_index_.end()) return std::nullopt;
+    auto it = orders_.find(idx_it->second);
+    if (it == orders_.end()) return std::nullopt;
+    return it->second;
 }
 
 void OrderRegistry::update_order(const OrderRecord& order) {
     std::lock_guard lock(mutex_);
     auto it = orders_.find(order.order_id.get());
     if (it != orders_.end()) {
+        // Maintain exchange_id index: if exchange_order_id was just assigned, index it
+        if (!order.exchange_order_id.get().empty()) {
+            exchange_id_index_[order.exchange_order_id.get()] = order.order_id.get();
+        }
         it->second = order;
     }
 }
@@ -113,6 +120,9 @@ void OrderRegistry::force_transition(const OrderId& order_id, OrderState new_sta
         order_it->second.last_updated = clock_->now();
     }
 
+    // Recovery path must allow subsequent fills to be applied after state repair.
+    fill_applied_.erase(order_id.get());
+
     logger_->warn("OrderRegistry", "Принудительный FSM-переход (recovery)",
         {{"order_id", order_id.get()}, {"to", to_string(new_state)}, {"reason", reason}});
 }
@@ -152,7 +162,30 @@ bool OrderRegistry::is_trade_id_seen(const std::string& trade_id) const {
 
 void OrderRegistry::mark_trade_id_seen(const std::string& trade_id) {
     std::lock_guard lock(mutex_);
-    seen_trade_ids_.insert(trade_id);
+    auto [_, inserted] = seen_trade_ids_.insert(trade_id);
+    if (!inserted) {
+        return;
+    }
+
+    seen_trade_id_fifo_.push_back(trade_id);
+    while (seen_trade_id_fifo_.size() > kMaxSeenTradeIds) {
+        seen_trade_ids_.erase(seen_trade_id_fifo_.front());
+        seen_trade_id_fifo_.pop_front();
+    }
+}
+
+bool OrderRegistry::check_and_mark_trade_id_seen(const std::string& trade_id) {
+    std::lock_guard lock(mutex_);
+    auto [it, inserted] = seen_trade_ids_.insert(trade_id);
+    if (!inserted) {
+        return true;  // duplicate: already seen
+    }
+    seen_trade_id_fifo_.push_back(trade_id);
+    while (seen_trade_id_fifo_.size() > kMaxSeenTradeIds) {
+        seen_trade_ids_.erase(seen_trade_id_fifo_.front());
+        seen_trade_id_fifo_.pop_front();
+    }
+    return false;  // new trade_id
 }
 
 // ─── Intent dedup ───────────────────────────────────────────────────
@@ -190,6 +223,9 @@ size_t OrderRegistry::cleanup_terminal_orders(int64_t max_age_ns) {
         if (it->second.is_terminal() &&
             (now_ns - it->second.last_updated.get()) > max_age_ns) {
             auto oid = it->first;
+            // Also evict from the exchange_id secondary index
+            const auto& ex_id = it->second.exchange_order_id.get();
+            if (!ex_id.empty()) exchange_id_index_.erase(ex_id);
             fsms_.erase(oid);
             fill_applied_.erase(oid);
             it = orders_.erase(it);
@@ -215,8 +251,16 @@ std::vector<OrderId> OrderRegistry::get_timed_out_orders(int64_t max_open_durati
 // ─── Iteration ───────────────────────────────────────────────────────
 
 void OrderRegistry::for_each(const std::function<void(const OrderRecord&)>& fn) const {
-    std::lock_guard lock(mutex_);
-    for (const auto& [_, o] : orders_) {
+    std::vector<OrderRecord> snapshot;
+    {
+        std::lock_guard lock(mutex_);
+        snapshot.reserve(orders_.size());
+        for (const auto& [_, o] : orders_) {
+            snapshot.push_back(o);
+        }
+    }
+
+    for (const auto& o : snapshot) {
         fn(o);
     }
 }

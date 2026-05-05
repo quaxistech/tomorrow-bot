@@ -31,6 +31,14 @@ HierarchicalAllocator::HierarchicalAllocator(
     : config_(std::move(config))
     , logger_(std::move(logger))
 {
+    // BUG-S15-14: kelly_fraction > 1.0 multiplies raw Kelly, producing over-leverage.
+    // Clamp to (0, 1] so the allocator always uses at most full-Kelly sizing.
+    if (config_.kelly_fraction <= 0.0 || config_.kelly_fraction > 1.0) {
+        if (logger_) logger_->warn("PortfolioAllocator",
+            "kelly_fraction out of (0,1] — clamped to 0.5",
+            {{"kelly_fraction", std::to_string(config_.kelly_fraction)}});
+        config_.kelly_fraction = 0.5;
+    }
 }
 
 SizingResult HierarchicalAllocator::compute_size(
@@ -111,17 +119,10 @@ SizingResult HierarchicalAllocator::compute_size(
         result.reduction_reason = "Превышен лимит стратегии";
     }
 
-    // Шаг 5: Применить множитель неопределённости (уменьшает при высокой неопределённости)
-    double multiplier = std::clamp(uncertainty_size_multiplier, 0.0, 1.0);
-    if (multiplier < 1.0) {
-        qty *= multiplier;
-        result.was_reduced = true;
-        if (result.reduction_reason.empty()) {
-            result.reduction_reason = "Уменьшен из-за неопределённости";
-        }
-    }
-
-    // Шаг 5.5: Volatility Targeting — адаптивный размер на основе волатильности рынка
+    // MEDIUM-6 fix: apply vol_multiplier BEFORE the hard limit checks so that limits
+    // are never temporarily violated. Previously vol_multiplier was applied after limits,
+    // then limits were re-checked in a separate block — architecturally incorrect.
+    // Шаг 5: Volatility Targeting — адаптивный размер на основе волатильности рынка
     double vol_multiplier = compute_volatility_multiplier();
     if (std::abs(vol_multiplier - 1.0) > 0.01) {
         qty *= vol_multiplier;
@@ -131,8 +132,18 @@ SizingResult HierarchicalAllocator::compute_size(
         }
     }
 
-    // Шаг 5.6: Повторное применение жёстких лимитов ПОСЛЕ vol multiplier.
-    // Vol multiplier может увеличить размер (до 2x), что нарушит concentration/strategy/budget caps.
+    // Шаг 5.5: Применить множитель неопределённости (уменьшает при высокой неопределённости)
+    double multiplier = std::clamp(uncertainty_size_multiplier, 0.0, 1.0);
+    if (multiplier < 1.0) {
+        qty *= multiplier;
+        result.was_reduced = true;
+        if (result.reduction_reason.empty()) {
+            result.reduction_reason = "Уменьшен из-за неопределённости";
+        }
+    }
+
+    // Шаг 5.6: Применить жёсткие лимиты ПОСЛЕ всех множителей.
+    // Vol multiplier может увеличить размер (до 2x) — проверяем все caps один раз здесь.
     {
         double notional_after_vol = qty * price;
         if (notional_after_vol > budget_limit) {
@@ -244,6 +255,7 @@ void HierarchicalAllocator::set_market_context(
     double win_rate,
     double avg_win_loss_ratio)
 {
+    std::lock_guard<std::mutex> lock(context_mutex_);
     realized_vol_annual_ = realized_vol_annualized;
     current_regime_ = current_regime;
     win_rate_ = std::clamp(win_rate, 0.0, 1.0);
@@ -257,41 +269,41 @@ void HierarchicalAllocator::update_global_budget(double new_budget) {
 }
 
 double HierarchicalAllocator::compute_volatility_multiplier() const {
-    if (realized_vol_annual_ <= 0.0) return 1.0;
+    double vol, win, ratio;
+    regime::DetailedRegime reg;
+    {
+        std::lock_guard<std::mutex> lock(context_mutex_);
+        vol   = realized_vol_annual_;
+        win   = win_rate_;
+        ratio = avg_win_loss_ratio_;
+        reg   = current_regime_;
+    }
+    if (vol <= 0.0) return 1.0;
 
-    // Vol targeting: размер = целевая_вол / реализованная_вол
-    double vol_ratio = config_.target_annual_vol / realized_vol_annual_;
+    double vol_ratio = config_.target_annual_vol / vol;
 
-    // Kelly-критерий: f* = (p*b - q) / b, где p=win_rate, b=avg_win/avg_loss, q=1-p
-    // Если edge нулевой или отрицательный — не торгуем (Kelly = 0)
     double kelly_full = 0.0;
-    if (avg_win_loss_ratio_ > 0.0) {
-        double p = win_rate_;
+    if (ratio > 0.0) {
+        double p = win;
         double q = 1.0 - p;
-        double b = avg_win_loss_ratio_;
+        double b = ratio;
         kelly_full = (p * b - q) / b;
         kelly_full = std::max(kelly_full, 0.0);
     }
-    // Kelly f*≤0: нет статистического преимущества → не торгуем (Kelly 1956, Thorp 2006)
     double kelly_adj = kelly_full > 0.0
         ? config_.kelly_fraction * kelly_full
         : 0.0;
     if (kelly_adj <= 0.0) return 0.0;
 
-    // Комбинированный множитель: vol_ratio × kelly_adj
     double combined = vol_ratio * std::max(kelly_adj, 0.1);
-
-    // Поправка на режим рынка
-    double regime_mult = compute_regime_multiplier();
-    combined *= regime_mult;
-
-    // Ограничение плечом
+    combined *= compute_regime_multiplier(reg);
     combined = std::min(combined, config_.max_leverage);
 
     return std::clamp(combined, config_.min_size_multiplier, config_.max_size_multiplier);
 }
 
 double HierarchicalAllocator::compute_regime_multiplier() const {
+    std::lock_guard<std::mutex> lock(context_mutex_);
     return compute_regime_multiplier(current_regime_);
 }
 
@@ -358,7 +370,12 @@ double HierarchicalAllocator::compute_drawdown_scale(double current_drawdown_pct
         return config_.drawdown_min_size_fraction;
     }
     // Линейная интерполяция: 1.0 → drawdown_min_size_fraction
+    // BUG-S15-01: equal thresholds → range=0 → div/zero → NaN
     double range = config_.drawdown_scale_max_pct - config_.drawdown_scale_start_pct;
+    if (range < 1e-9) {
+        return (current_drawdown_pct > config_.drawdown_scale_start_pct)
+            ? config_.drawdown_min_size_fraction : 1.0;
+    }
     double progress = (current_drawdown_pct - config_.drawdown_scale_start_pct) / range;
     return 1.0 - progress * (1.0 - config_.drawdown_min_size_fraction);
 }
@@ -397,6 +414,15 @@ void HierarchicalAllocator::apply_exchange_filters(
 
     // Округлить вниз до шага
     qty = round_quantity_down(qty, filters);
+
+    // BUG-S15-07: if min_quantity > max_quantity, bumping to min then clamping to max
+    // produces qty < min → exchange reject.  Detect and reject early.
+    if (filters.max_quantity > 0.0 && filters.min_quantity > filters.max_quantity) {
+        result.approved = false;
+        result.reduction_reason = "Инвертированные фильтры биржи: min_qty > max_qty";
+        qty = 0.0;
+        return;
+    }
 
     // Если после округления ниже min_quantity — попробовать увеличить до min_quantity
     if (qty < filters.min_quantity) {

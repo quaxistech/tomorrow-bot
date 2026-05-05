@@ -162,7 +162,9 @@ private:
     std::vector<double> volumes_calibration_;
 
     // === Volume Profile ===
-    void update_volume_profile(double price, double volume);
+    // NOTE: Volume profile is updated inline in on_trade() using a lock-free snapshot
+    // pattern. The separate update_volume_profile() method has been removed to avoid
+    // duplicate state mutations and incorrect locking.
     VolumeProfileConfig vp_cfg_;               ///< Конфигурация Volume Profile
     struct PriceVolume {
         double price;                          ///< Цена трейда

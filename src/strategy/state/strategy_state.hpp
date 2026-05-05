@@ -19,19 +19,24 @@ class StrategyStateMachine {
 public:
     explicit StrategyStateMachine(const ScalpStrategyConfig& cfg);
 
-    /// Текущее состояние
-    SymbolState state() const { return state_; }
+    /// Текущее состояние (thread-safe)
+    SymbolState state() const { std::lock_guard lock(mutex_); return state_; }
 
     /// Перевести в новое состояние (с валидацией переходов)
     bool transition_to(SymbolState new_state, int64_t now_ns);
 
-    /// Активный сетап (если есть)
+    /// Активный сетап (если есть) — caller must not hold mutex_
     const std::optional<Setup>& active_setup() const { return active_setup_; }
     std::optional<Setup>& active_setup() { return active_setup_; }
 
-    /// Позиционный контекст
+    /// Позиционный контекст — caller must not hold mutex_
     const StrategyPositionContext& position_context() const { return position_ctx_; }
     StrategyPositionContext& position_context() { return position_ctx_; }
+
+    /// Thread-safe snapshot accessors for cross-thread callers
+    std::optional<Setup> active_setup_copy() const {
+        std::lock_guard lock(mutex_); return active_setup_;
+    }
 
     /// Установить новый сетап
     void set_setup(Setup setup);
@@ -75,6 +80,8 @@ public:
 
 private:
     const ScalpStrategyConfig& cfg_;
+    // recursive_mutex: start_cooldown() calls transition_to() under the same lock
+    mutable std::recursive_mutex mutex_;
     SymbolState state_{SymbolState::Idle};
     std::optional<Setup> active_setup_;
     StrategyPositionContext position_ctx_;

@@ -15,6 +15,12 @@ SmartTwapExecutor::SmartTwapExecutor(
     : config_(std::move(config))
     , logger_(std::move(logger))
 {
+    if (config_.min_slices == 0)
+        throw std::invalid_argument("TwapConfig: min_slices must be > 0");
+    if (config_.min_slices > config_.max_slices)
+        throw std::invalid_argument("TwapConfig: min_slices > max_slices");
+    if (config_.urgency_aggressive < 0.0 || config_.urgency_aggressive > 1.0)
+        throw std::invalid_argument("TwapConfig: urgency_aggressive must be in [0,1]");
 }
 
 bool SmartTwapExecutor::should_use_twap(
@@ -89,9 +95,13 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
     size_t num_slices = config_.min_slices;
     if (liquidity > 0.0) {
         double ratio = total / liquidity;
-        // Чем больше ордер относительно ликвидности, тем больше слайсов
-        num_slices = static_cast<size_t>(
-            config_.min_slices + ratio * (config_.max_slices - config_.min_slices) * 10.0);
+        // BUG-S8-02: clamp the double BEFORE cast — large ratio causes size_t overflow (UB)
+        double raw_slices = config_.min_slices
+            + ratio * (config_.max_slices - config_.min_slices) * 10.0;
+        raw_slices = std::clamp(raw_slices,
+            static_cast<double>(config_.min_slices),
+            static_cast<double>(config_.max_slices));
+        num_slices = static_cast<size_t>(raw_slices);
     }
     num_slices = std::clamp(num_slices, config_.min_slices, config_.max_slices);
 
@@ -272,6 +282,22 @@ void SmartTwapExecutor::record_slice_fill(
     }
 
     auto& slice = twap_order.slices[slice_index];
+    if (slice.filled) {
+        logger_->debug("TWAP", "Duplicate slice fill ignored",
+            {{"twap_id", twap_order.twap_id},
+             {"slice", std::to_string(slice_index)}});
+        return;
+    }
+
+    // BUG-S18-02: NaN fill_price → avg_fill_price becomes NaN → all metrics invalid.
+    if (!std::isfinite(fill_price.get()) || fill_price.get() <= 0.0) {
+        logger_->error("TWAP", "NaN/invalid fill_price rejected",
+            {{"twap_id", twap_order.twap_id},
+             {"slice", std::to_string(slice_index)},
+             {"fill_price", std::to_string(fill_price.get())}});
+        return;
+    }
+
     slice.filled_qty = filled_qty;
     slice.filled = true;
 
@@ -285,11 +311,12 @@ void SmartTwapExecutor::record_slice_fill(
     }
     twap_order.filled_qty = Quantity(new_total_qty);
 
-    // Проверяем завершение: все слайсы должны быть заполнены (не просто отправлены)
-    bool all_filled = std::all_of(
+    // BUG-S8-13: std::all_of on empty range returns true.
+    // BUG-S18-07: Guard !twap_order.completed to prevent double-completion.
+    bool all_filled = !twap_order.slices.empty() && std::all_of(
         twap_order.slices.begin(), twap_order.slices.end(),
         [](const TwapSlice& s) { return s.filled; });
-    if (all_filled) {
+    if (all_filled && !twap_order.completed) {
         twap_order.completed = true;
         logger_->info("TWAP", "TWAP ордер завершён",
             {{"twap_id", twap_order.twap_id},

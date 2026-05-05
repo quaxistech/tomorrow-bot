@@ -71,11 +71,9 @@ void PairEconomicsTracker::record(const PairEconomicsRecord& rec) {
     daily_.avg_time_in_pair_sec +=
         (time_sec - daily_.avg_time_in_pair_sec) / daily_.pair_cycles;
 
-    // Win rate: count wins, compute ratio
-    int wins = static_cast<int>(std::round(
-        daily_.win_rate * (daily_.pair_cycles - 1)));
-    if (rec.net_pair_pnl > 0.0) wins++;
-    daily_.win_rate = static_cast<double>(wins) / daily_.pair_cycles;
+    // BUG-S32-05: track wins as integer to avoid float rounding error accumulation
+    if (rec.net_pair_pnl > 0.0) daily_.win_count++;
+    daily_.win_rate = static_cast<double>(daily_.win_count) / daily_.pair_cycles;
 
     // Store record
     records_.push_back(rec);

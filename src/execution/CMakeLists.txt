@@ -15,5 +15,5 @@ add_library(tb_execution STATIC
 target_include_directories(tb_execution PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(tb_execution PUBLIC
     tb_common tb_strategy tb_risk tb_execution_alpha tb_portfolio
-    tb_logging tb_clock tb_metrics tb_uncertainty
+    tb_logging tb_clock tb_metrics tb_uncertainty tb_persistence
 )

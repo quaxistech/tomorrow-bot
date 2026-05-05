@@ -20,6 +20,7 @@
 #include "metrics/gauge.hpp"
 #include "persistence/event_journal.hpp"
 #include "persistence/persistence_types.hpp"
+#include <boost/json.hpp>
 #include <sstream>
 #include <stdexcept>
 
@@ -54,7 +55,9 @@ SelfDiagnosisEngine::SelfDiagnosisEngine(
 SelfDiagnosisEngine::SelfDiagnosisEngine() = default;
 
 uint64_t SelfDiagnosisEngine::next_diagnostic_id() {
-    return next_id_.fetch_add(1, std::memory_order_relaxed);
+    // HIGH-14: acq_rel prevents duplicate IDs under concurrent access by
+    // establishing a happens-before relationship across threads.
+    return next_id_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 // ============================================================
@@ -599,34 +602,36 @@ std::string SelfDiagnosisEngine::generate_human_summary(const DiagnosticRecord& 
 // ============================================================
 
 std::string SelfDiagnosisEngine::generate_machine_json(const DiagnosticRecord& record) {
-    std::ostringstream ss;
-    ss << "{";
-    ss << "\"diagnostic_id\":" << record.diagnostic_id;
-    ss << ",\"type\":\"" << to_string(record.type) << "\"";
-    ss << ",\"severity\":\"" << to_string(record.severity) << "\"";
-    ss << ",\"recommended_action\":\"" << to_string(record.recommended_action) << "\"";
-    ss << ",\"correlation_id\":\"" << record.correlation_id.get() << "\"";
-    ss << ",\"symbol\":\"" << record.symbol.get() << "\"";
-    ss << ",\"created_at\":" << record.created_at.get();
-    ss << ",\"world_state\":\"" << record.world_state << "\"";
-    ss << ",\"regime\":\"" << record.regime << "\"";
-    ss << ",\"uncertainty_level\":\"" << record.uncertainty_level << "\"";
-    ss << ",\"verdict\":\"" << record.verdict << "\"";
-    ss << ",\"trade_executed\":" << (record.trade_executed ? "true" : "false");
-    ss << ",\"strategy_id\":\"" << record.strategy_id << "\"";
-    ss << ",\"risk_verdict\":\"" << record.risk_verdict << "\"";
+    // CRITICAL-9: Use boost::json::object to properly escape all string values.
+    // Raw string concatenation would produce broken JSON if symbol/verdict/etc
+    // contain '"' or '\' characters.
+    boost::json::object obj;
+    obj["diagnostic_id"]       = record.diagnostic_id;
+    obj["type"]                = to_string(record.type);
+    obj["severity"]            = to_string(record.severity);
+    obj["recommended_action"]  = to_string(record.recommended_action);
+    obj["correlation_id"]      = record.correlation_id.get();
+    obj["symbol"]              = record.symbol.get();
+    obj["created_at"]          = record.created_at.get();
+    obj["world_state"]         = record.world_state;
+    obj["regime"]              = record.regime;
+    obj["uncertainty_level"]   = record.uncertainty_level;
+    obj["verdict"]             = record.verdict;
+    obj["trade_executed"]      = record.trade_executed;
+    obj["strategy_id"]         = record.strategy_id;
+    obj["risk_verdict"]        = record.risk_verdict;
 
-    ss << ",\"factors\":[";
-    for (std::size_t i = 0; i < record.factors.size(); ++i) {
-        if (i > 0) ss << ",";
-        ss << "{\"component\":\"" << record.factors[i].component << "\""
-           << ",\"observation\":\"" << record.factors[i].observation << "\""
-           << ",\"impact\":" << record.factors[i].impact << "}";
+    boost::json::array factors_arr;
+    for (const auto& f : record.factors) {
+        boost::json::object factor_obj;
+        factor_obj["component"]   = f.component;
+        factor_obj["observation"] = f.observation;
+        factor_obj["impact"]      = f.impact;
+        factors_arr.push_back(std::move(factor_obj));
     }
-    ss << "]";
+    obj["factors"] = std::move(factors_arr);
 
-    ss << "}";
-    return ss.str();
+    return boost::json::serialize(obj);
 }
 
 // ============================================================

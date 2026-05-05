@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace tb::leverage {
@@ -215,9 +216,17 @@ double LeverageEngine::compute_liquidation_price(const LiquidationParams& params
     // Taker fee учитывается как worst-case cost закрытия позиции при ликвидации.
 
     if (params.position_side == PositionSide::Long) {
-        return params.entry_price * (1.0 - inv_lev + params.maintenance_margin_rate + params.taker_fee_rate);
+        double liq = params.entry_price * (1.0 - inv_lev + params.maintenance_margin_rate + params.taker_fee_rate);
+        // BUG-S22-02: if mmr+fee > inv_lev (e.g. extreme leverage + high maintenance),
+        // liq >= entry_price, meaning the position is immediately liquidatable.
+        // Return 0.0 to signal an unsafe configuration to is_liquidation_safe().
+        if (liq >= params.entry_price) return 0.0;
+        return liq;
     } else {
-        return params.entry_price * (1.0 + inv_lev - params.maintenance_margin_rate - params.taker_fee_rate);
+        double liq = params.entry_price * (1.0 + inv_lev - params.maintenance_margin_rate - params.taker_fee_rate);
+        // For shorts, liq must be above entry_price; if not, config is invalid.
+        if (liq <= params.entry_price) return std::numeric_limits<double>::max();
+        return liq;
     }
 }
 
@@ -367,6 +376,9 @@ double LeverageEngine::adversarial_multiplier(double severity) {
     //   0.9  → 0.25
     //   1.0  → 0.15 (максимальная угроза)
 
+    // BUG-S7-04: std::clamp(NaN, ...) returns NaN on x86 (comparisons with NaN are false).
+    // Guard before clamp so downstream lerp() never receives NaN → NaN position size.
+    if (!std::isfinite(severity)) return 0.5;
     severity = std::clamp(severity, 0.0, 1.0);
     return lerp(1.0, 0.15, severity);
 }

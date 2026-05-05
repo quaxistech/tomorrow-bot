@@ -14,6 +14,7 @@
 #include <vector>
 #include <mutex>
 #include <cstdint>
+#include <boost/container_hash/hash.hpp>
 
 namespace tb::ml {
 
@@ -100,10 +101,12 @@ private:
     using Key = std::pair<std::string, regime::DetailedRegime>;
 
     struct KeyHash {
+        // BUG-ML-18 fix: XOR with shift is a weak combiner for small enum values
+        // and causes hash collisions. boost::hash_combine uses a proper mixing function.
         size_t operator()(const Key& k) const {
-            auto h1 = std::hash<std::string>{}(k.first);
-            auto h2 = std::hash<int>{}(static_cast<int>(k.second));
-            return h1 ^ (h2 << 16);
+            size_t seed = std::hash<std::string>{}(k.first);
+            boost::hash_combine(seed, static_cast<int>(k.second));
+            return seed;
         }
     };
 

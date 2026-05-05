@@ -459,6 +459,14 @@ DetailedRegime RuleBasedRegimeEngine::apply_hysteresis(
         ? std::max(1, config_.transition.confirmation_ticks - 1)
         : config_.transition.confirmation_ticks;
 
+    // MEDIUM-10 fix: enforce a minimum dwell time of 5 ticks even when CUSUM is
+    // accelerating the transition, to prevent rapid regime cycling (flip-flopping).
+    // Without this guard, CUSUM + low dwell_time_ticks config allows per-tick regime changes.
+    constexpr int kCusumMinDwellTicks = 5;
+    const int effective_dwell_ticks = cusum_change_detected
+        ? std::max(kCusumMinDwellTicks, config_.transition.dwell_time_ticks)
+        : config_.transition.dwell_time_ticks;
+
     if (state.confirmed_regime == DetailedRegime::Undefined) {
         // Первая классификация — принимаем сразу
         state.confirmed_regime = immediate;
@@ -486,7 +494,7 @@ DetailedRegime RuleBasedRegimeEngine::apply_hysteresis(
 
         bool enough_ticks = state.candidate_ticks >= effective_confirmation_ticks;
         bool enough_conf  = confidence >= config_.transition.min_confidence_to_switch;
-        bool enough_dwell = state.dwell_ticks >= config_.transition.dwell_time_ticks;
+        bool enough_dwell = state.dwell_ticks >= effective_dwell_ticks;
 
         if (enough_ticks && enough_conf && enough_dwell) {
             // Подтверждаем переход

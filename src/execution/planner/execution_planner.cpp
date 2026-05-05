@@ -8,6 +8,8 @@ ExecutionPlanner::ExecutionPlanner(const ExecutionConfig& config,
     : config_(config)
     , logger_(std::move(logger))
 {
+    // BUG-S5-06 fix: logger_ is used unconditionally; nullptr crashes at first log call.
+    if (!logger_) throw std::invalid_argument("ExecutionPlanner: logger must not be null");
 }
 
 ExecutionPlan ExecutionPlanner::plan(
@@ -44,6 +46,14 @@ ExecutionPlan ExecutionPlanner::plan(
         }
     } else {
         plan.planned_price = compute_limit_price(intent, exec_alpha, market);
+        // BUG-S29-07: if limit price couldn't be determined, fall back to market
+        // rather than submitting a limit order with price=0 to the exchange.
+        if (plan.planned_price.get() <= 0.0) {
+            plan.order_type = OrderType::Market;
+            plan.tif = TimeInForce::ImmediateOrCancel;
+            plan.style = PlannedExecutionStyle::AggressiveMarket;
+            plan.reasons.push_back("limit_price_unavailable→fallback_market");
+        }
     }
 
     // §13: Таймаут
@@ -76,6 +86,8 @@ ExecutionPlan ExecutionPlanner::plan(
         plan.action == ExecutionAction::OpenPosition &&
         plan.style != PlannedExecutionStyle::AggressiveMarket) {
         plan.style = PlannedExecutionStyle::CancelIfNotFilled;
+        plan.order_type = style_to_order_type(plan.style);
+        plan.tif = style_to_tif(plan.style);
         plan.timeout_ms = std::min(plan.timeout_ms, static_cast<int64_t>(5000));
         plan.reasons.push_back("spread_too_wide→cancel_if_not_filled");
     }
@@ -152,8 +164,7 @@ PlannedExecutionStyle ExecutionPlanner::choose_style(
         case ES::Aggressive:
             return PlannedExecutionStyle::AggressiveMarket;
         case ES::PostOnly:
-            // USDT-M Futures scalping: post-only не поддерживается в текущем
-            // runtime (все ордера Market+IOC). Классифицируем как passive.
+            // Post-only alpha signal maps to passive limit planning.
             return PlannedExecutionStyle::PassiveLimit;
         case ES::NoExecution:
             // Не должен дойти сюда (отфильтровано выше), но на всякий случай
@@ -190,8 +201,9 @@ OrderType ExecutionPlanner::style_to_order_type(PlannedExecutionStyle style) con
         case PlannedExecutionStyle::PassiveLimit:
         case PlannedExecutionStyle::SmartFallback:
         case PlannedExecutionStyle::CancelIfNotFilled:
+            return OrderType::Limit;
         case PlannedExecutionStyle::ReduceOnly:
-            return OrderType::Market;  // Force market until private WS implemented
+            return OrderType::Market;
         case PlannedExecutionStyle::PostOnlyLimit:
             return OrderType::PostOnly;
     }

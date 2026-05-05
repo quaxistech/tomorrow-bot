@@ -114,7 +114,7 @@ private:
     std::ofstream output_;
     mutable std::mutex mutex_;
 
-    void rotate_if_needed();
+    void rotate_if_needed(std::unique_lock<std::mutex>& lock);
 };
 
 /// Логгер, дублирующий события в несколько downstream sink'ов.

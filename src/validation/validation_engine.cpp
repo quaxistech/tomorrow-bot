@@ -61,7 +61,9 @@ ValidationReport ValidationEngine::run_walk_forward(
     }
 
     // Aggregate
-    if (!report.folds.empty()) {
+    // BUG-S4-16: guard against division by zero if folds is empty
+    const double n = static_cast<double>(report.folds.size());
+    if (n > 0) {
         double sum = 0, sum_sq = 0;
         report.worst_fold_metric = report.folds[0].metric_value;
         report.best_fold_metric = report.folds[0].metric_value;
@@ -73,11 +75,14 @@ ValidationReport ValidationEngine::run_walk_forward(
             report.best_fold_metric = std::max(report.best_fold_metric, f.metric_value);
         }
 
-        const double n = static_cast<double>(report.folds.size());
         report.mean_metric = sum / n;
-        report.std_metric = (n > 1)
-            ? std::sqrt((sum_sq - sum * sum / n) / (n - 1.0))
-            : 0.0;
+        // BUG-S13-04: float rounding can make sum_sq < sum*sum/n → negative argument to sqrt → NaN
+        if (n > 1) {
+            double variance = std::max(0.0, (sum_sq - sum * sum / n) / (n - 1.0));
+            report.std_metric = std::sqrt(variance);
+        } else {
+            report.std_metric = 0.0;
+        }
         report.is_valid = true;
     }
 
@@ -129,12 +134,13 @@ std::vector<DataSplit> ValidationEngine::generate_cpcv_splits(
         // train_start = 0, train_end = purged_start (первая часть)
         // Вторая часть: embargoed_end .. data_size
         // Для DataSplit используем линейный train region: наибольший непрерывный блок
-        if (purged_start > embargoed_end) {
-            // test в середине
+        // BUG-S19-01 fix: emit one split per usable train block; both may exist when
+        // test is in the middle with purge/embargo gaps on both sides.
+        // Previously the else-if chain silently dropped the right block.
+        if (purged_start > 0) {
             splits.push_back({0, purged_start, test_start, test_end});
-        } else if (purged_start > 0) {
-            splits.push_back({0, purged_start, test_start, test_end});
-        } else if (embargoed_end < data_size) {
+        }
+        if (embargoed_end < data_size) {
             splits.push_back({embargoed_end, data_size, test_start, test_end});
         }
 
@@ -181,7 +187,9 @@ ValidationReport ValidationEngine::run_cpcv(
     }
 
     // Aggregate
-    if (!report.folds.empty()) {
+    // BUG-S4-16: guard against division by zero if folds is empty
+    const double n = static_cast<double>(report.folds.size());
+    if (n > 0) {
         double sum = 0, sum_sq = 0;
         report.worst_fold_metric = report.folds[0].metric_value;
         report.best_fold_metric = report.folds[0].metric_value;
@@ -193,11 +201,14 @@ ValidationReport ValidationEngine::run_cpcv(
             report.best_fold_metric = std::max(report.best_fold_metric, f.metric_value);
         }
 
-        const double n = static_cast<double>(report.folds.size());
         report.mean_metric = sum / n;
-        report.std_metric = (n > 1)
-            ? std::sqrt((sum_sq - sum * sum / n) / (n - 1.0))
-            : 0.0;
+        // BUG-S13-04: float rounding can make sum_sq < sum*sum/n → negative argument to sqrt → NaN
+        if (n > 1) {
+            double variance = std::max(0.0, (sum_sq - sum * sum / n) / (n - 1.0));
+            report.std_metric = std::sqrt(variance);
+        } else {
+            report.std_metric = 0.0;
+        }
         report.is_valid = true;
     }
 

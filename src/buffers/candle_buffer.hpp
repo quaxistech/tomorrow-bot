@@ -35,7 +35,13 @@ public:
         // Without this, each close event following live updates creates a stale intermediate
         // copy in the buffer, corrupting the candle history for downstream indicators.
         if (candle.is_closed && !buffer_.empty() && !buffer_.back().is_closed) {
-            buffer_.back() = c;
+            // BUG-S20-03: preserve accumulated high/low extremes from live updates.
+            auto& last = buffer_.back();
+            last.close     = c.close;
+            last.high      = std::max(last.high, c.high);
+            last.low       = std::min(last.low, c.low);
+            last.volume    = std::max(last.volume, c.volume); // use exchange reported volume
+            last.is_closed = true;
         } else {
             buffer_.push(c);
         }

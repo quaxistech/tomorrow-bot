@@ -25,16 +25,41 @@ DualLegManager::DualLegManager(
     , logger_(std::move(logger))
     , clock_(std::move(clock))
 {
+    if (!submitter_) throw std::invalid_argument("DualLegManager: submitter must not be null");
+    if (!logger_)    throw std::invalid_argument("DualLegManager: logger must not be null");
+    if (!clock_)     throw std::invalid_argument("DualLegManager: clock must not be null");
+    // rest_client_ is optional (reversal API disabled when null)
 }
 
 void DualLegManager::compute_tpsl(double entry_price, PositionSide side,
                                    double& tp_price, double& sl_price) const {
+    if (entry_price <= 0.0 || !std::isfinite(entry_price)) {
+        logger_->error(kComp, "compute_tpsl: invalid entry_price — TP/SL suppressed",
+            {{"entry_price", std::to_string(entry_price)}});
+        tp_price = 0.0;
+        sl_price = 0.0;
+        return;
+    }
     if (side == PositionSide::Long) {
         tp_price = entry_price * (1.0 + config_.tpsl_take_profit_pct / 100.0);
         sl_price = entry_price * (1.0 - config_.tpsl_stop_loss_pct / 100.0);
     } else {
         tp_price = entry_price * (1.0 - config_.tpsl_take_profit_pct / 100.0);
         sl_price = entry_price * (1.0 + config_.tpsl_stop_loss_pct / 100.0);
+    }
+
+    // BUG-S24-08: for micro-cap tokens, TP/SL offset may be below exchange price precision
+    // (Bitget: 8 decimal places → min tick ≈ 1e-8). If the computed TP is indistinguishable
+    // from entry after rounding, the order would be silently accepted without protection.
+    constexpr double kMinRelativeDiff = 1e-5;  // 0.001% — below this, truncation is likely
+    if (std::abs(tp_price - entry_price) < entry_price * kMinRelativeDiff ||
+        std::abs(sl_price - entry_price) < entry_price * kMinRelativeDiff) {
+        logger_->warn(kComp, "compute_tpsl: TP/SL too close to entry — precision loss for micro-cap asset, suppressing",
+            {{"entry_price", std::to_string(entry_price)},
+             {"tp_diff_bps", std::to_string(std::abs(tp_price - entry_price) / entry_price * 10000)},
+             {"sl_diff_bps", std::to_string(std::abs(sl_price - entry_price) / entry_price * 10000)}});
+        tp_price = 0.0;
+        sl_price = 0.0;
     }
 }
 
@@ -56,8 +81,10 @@ PairEntryResult DualLegManager::enter_pair(const Symbol& symbol,
     long_order.remaining_quantity = Quantity(long_spec.size);
     long_order.price = Price(long_spec.entry_price_hint);
 
-    // Attach server-side TPSL if configured
-    if (config_.attach_server_tpsl && long_spec.tp_price > 0.0) {
+    // Attach server-side TPSL if configured — guard NaN/Inf to avoid exchange reject
+    if (config_.attach_server_tpsl &&
+        long_spec.tp_price > 0.0 && std::isfinite(long_spec.tp_price) &&
+        long_spec.sl_price > 0.0 && std::isfinite(long_spec.sl_price)) {
         long_order.attached_tp_sl.stop_surplus_price = Price(long_spec.tp_price);
         long_order.attached_tp_sl.stop_loss_price = Price(long_spec.sl_price);
         long_order.attached_tp_sl.trigger_type = execution::TriggerType::MarkPrice;
@@ -77,14 +104,17 @@ PairEntryResult DualLegManager::enter_pair(const Symbol& symbol,
         return result;
     }
 
-    long_leg_.state = LegState::PendingEntry;
-    long_leg_.side = PositionSide::Long;
-    long_leg_.order_id = long_result.order_id;
-    long_leg_.exchange_order_id = long_result.exchange_order_id;
-    long_leg_.size = long_spec.size;
-    long_leg_.entry_time_ns = now_ns;
-    long_leg_.has_server_tp = (long_spec.tp_price > 0.0);
-    long_leg_.has_server_sl = (long_spec.sl_price > 0.0);
+    {
+        std::lock_guard lock(state_mutex_);
+        long_leg_.state = LegState::PendingEntry;
+        long_leg_.side = PositionSide::Long;
+        long_leg_.order_id = long_result.order_id;
+        long_leg_.exchange_order_id = long_result.exchange_order_id;
+        long_leg_.size = long_spec.size;
+        long_leg_.entry_time_ns = now_ns;
+        long_leg_.has_server_tp = (long_spec.tp_price > 0.0);
+        long_leg_.has_server_sl = (long_spec.sl_price > 0.0);
+    }
 
     // 2. Submit short leg
     execution::OrderRecord short_order;
@@ -98,7 +128,9 @@ PairEntryResult DualLegManager::enter_pair(const Symbol& symbol,
     short_order.remaining_quantity = Quantity(short_spec.size);
     short_order.price = Price(short_spec.entry_price_hint);
 
-    if (config_.attach_server_tpsl && short_spec.tp_price > 0.0) {
+    if (config_.attach_server_tpsl &&
+        short_spec.tp_price > 0.0 && std::isfinite(short_spec.tp_price) &&
+        short_spec.sl_price > 0.0 && std::isfinite(short_spec.sl_price)) {
         short_order.attached_tp_sl.stop_surplus_price = Price(short_spec.tp_price);
         short_order.attached_tp_sl.stop_loss_price = Price(short_spec.sl_price);
         short_order.attached_tp_sl.trigger_type = execution::TriggerType::MarkPrice;
@@ -125,23 +157,29 @@ PairEntryResult DualLegManager::enter_pair(const Symbol& symbol,
             close_leg(symbol, PositionSide::Long, long_spec.size, "orphan_unwind");
         }
 
-        long_leg_ = {};
+        {
+            std::lock_guard lock(state_mutex_);
+            long_leg_ = {};
+        }
         result.error = "Short leg failed: " + short_result.error_message;
         return result;
     }
 
-    short_leg_.state = LegState::PendingEntry;
-    short_leg_.side = PositionSide::Short;
-    short_leg_.order_id = short_result.order_id;
-    short_leg_.exchange_order_id = short_result.exchange_order_id;
-    short_leg_.size = short_spec.size;
-    short_leg_.entry_time_ns = now_ns;
-    short_leg_.has_server_tp = (short_spec.tp_price > 0.0);
-    short_leg_.has_server_sl = (short_spec.sl_price > 0.0);
+    {
+        std::lock_guard lock(state_mutex_);
+        short_leg_.state = LegState::PendingEntry;
+        short_leg_.side = PositionSide::Short;
+        short_leg_.order_id = short_result.order_id;
+        short_leg_.exchange_order_id = short_result.exchange_order_id;
+        short_leg_.size = short_spec.size;
+        short_leg_.entry_time_ns = now_ns;
+        short_leg_.has_server_tp = (short_spec.tp_price > 0.0);
+        short_leg_.has_server_sl = (short_spec.sl_price > 0.0);
 
-    result.success = true;
-    result.long_leg = long_leg_;
-    result.short_leg = short_leg_;
+        result.success = true;
+        result.long_leg = long_leg_;
+        result.short_leg = short_leg_;
+    }
 
     logger_->info(kComp, "Pair entry submitted successfully",
         {{"symbol", symbol.get()},
@@ -274,9 +312,12 @@ bool DualLegManager::close_leg(const Symbol& symbol, PositionSide side,
         return false;
     }
 
-    // Update leg state
-    auto& leg = (side == PositionSide::Long) ? long_leg_ : short_leg_;
-    leg.state = LegState::PendingExit;
+    // Update leg state (lock only around the state write, not during REST call above)
+    {
+        std::lock_guard lock(state_mutex_);
+        auto& leg = (side == PositionSide::Long) ? long_leg_ : short_leg_;
+        leg.state = LegState::PendingExit;
+    }
 
     logger_->info(kComp, "Leg close submitted",
         {{"side", side == PositionSide::Long ? "long" : "short"},
@@ -287,16 +328,25 @@ bool DualLegManager::close_leg(const Symbol& symbol, PositionSide side,
 }
 
 bool DualLegManager::close_both(const Symbol& symbol, const std::string& reason) {
+    // Take a snapshot of leg state before releasing lock so that REST calls
+    // (inside close_leg) don't hold state_mutex_ for potentially long durations.
+    LegSnapshot long_snap, short_snap;
+    {
+        std::lock_guard lock(state_mutex_);
+        long_snap  = long_leg_;
+        short_snap = short_leg_;
+    }
+
     bool ok = true;
 
-    if (long_leg_.state == LegState::Active) {
-        if (!close_leg(symbol, PositionSide::Long, long_leg_.size, reason)) {
+    if (long_snap.state == LegState::Active) {
+        if (!close_leg(symbol, PositionSide::Long, long_snap.size, reason)) {
             ok = false;
         }
     }
 
-    if (short_leg_.state == LegState::Active) {
-        if (!close_leg(symbol, PositionSide::Short, short_leg_.size, reason)) {
+    if (short_snap.state == LegState::Active) {
+        if (!close_leg(symbol, PositionSide::Short, short_snap.size, reason)) {
             ok = false;
         }
     }
@@ -316,19 +366,38 @@ bool DualLegManager::is_carry_too_expensive(double funding_rate) const {
 }
 
 bool DualLegManager::has_active_pair() const {
+    std::lock_guard lock(state_mutex_);
     return long_leg_.state == LegState::Active && short_leg_.state == LegState::Active;
 }
 
 void DualLegManager::reset() {
+    std::lock_guard lock(state_mutex_);
     long_leg_ = {};
     short_leg_ = {};
 }
 
 void DualLegManager::update_leg(PositionSide side, double fill_price, double fill_qty,
                                  int64_t fill_time_ns) {
+    std::lock_guard lock(state_mutex_);
     auto& leg = (side == PositionSide::Long) ? long_leg_ : short_leg_;
-    leg.entry_price = fill_price;
-    leg.size = fill_qty;
+    if (fill_qty <= 0.0 || fill_price <= 0.0) {
+        logger_->warn(kComp, "Ignoring invalid fill update",
+            {{"side", side == PositionSide::Long ? "long" : "short"},
+             {"fill_price", std::to_string(fill_price)},
+             {"fill_qty", std::to_string(fill_qty)}});
+        return;
+    }
+
+    const double prev_size = leg.size;
+    const double new_size = prev_size + fill_qty;
+    if (new_size > 0.0) {
+        if (prev_size > 0.0 && leg.entry_price > 0.0) {
+            leg.entry_price = ((leg.entry_price * prev_size) + (fill_price * fill_qty)) / new_size;
+        } else {
+            leg.entry_price = fill_price;
+        }
+    }
+    leg.size = new_size;
     leg.entry_time_ns = fill_time_ns;
     leg.state = LegState::Active;
 }

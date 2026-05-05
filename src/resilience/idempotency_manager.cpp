@@ -112,12 +112,11 @@ size_t IdempotencyManager::active_count() const {
 // ============================================================
 
 int64_t IdempotencyManager::now_ms() const {
-    if (clock_) {
-        return clock_->now().get() / 1'000'000;
-    }
-    // Fallback: system_clock
+    // BUG-S34-05: system_clock can jump forward on NTP sync, making all dedup
+    // entries appear past-the-window and erasing them → double-fill possible.
+    // Use steady_clock (monotonic) so dedup expiry is stable regardless of NTP.
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 } // namespace tb::resilience

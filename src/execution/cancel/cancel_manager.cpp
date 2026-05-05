@@ -94,6 +94,13 @@ bool CancelManager::cancel_remaining(const OrderId& order_id) {
 }
 
 bool CancelManager::do_cancel(const OrderId& order_id) {
+    // BUG-S12-07: submitter_ can be null if not set; guard before use
+    if (!submitter_) {
+        logger_->error("CancelManager", "submitter_ is null — cannot cancel order",
+            {{"order_id", order_id.get()}});
+        return false;
+    }
+
     auto opt = registry_.get_order(order_id);
     if (!opt) {
         logger_->warn("CancelManager", "Ордер не найден для отмены",
@@ -121,9 +128,13 @@ bool CancelManager::do_cancel(const OrderId& order_id) {
             {{"order_id", order_id.get()},
              {"symbol", opt->symbol.get()}});
     } else {
-        // §33: cancel не подтверждён — не считаем отменённым
-        // Оставляем в CancelPending для recovery
-        logger_->warn("CancelManager", "Cancel не подтверждён — оставляем в CancelPending",
+        // Cancel rejected by exchange — order was likely already filled (market IOC).
+        // Move to UnknownRecovery so reconciliation resolves the actual state.
+        // Leaving in CancelPending would create an infinite watchdog → cancel loop.
+        registry_.force_transition(order_id, OrderState::UnknownRecovery,
+            "Cancel rejected — awaiting reconciliation");
+        logger_->warn("CancelManager",
+            "Cancel не подтверждён — переведён в UnknownRecovery для reconciliation",
             {{"order_id", order_id.get()},
              {"symbol", opt->symbol.get()}});
     }

@@ -416,7 +416,7 @@ double PairLifecycleEngine::compute_pair_quality(const PairMarketInput& input) c
 // ============================================================
 
 double PairLifecycleEngine::compute_pair_close_score(const PairMarketInput& input) const {
-    double round_trip_fees_bps = input.taker_fee_pct * 100.0 * 4.0;  // 4 legs total
+    double round_trip_fees_bps = input.taker_fee_pct * 100.0 * 2.0;  // 2 legs to close (one per side)
     double slippage_bps = input.spread_bps * 0.5;  // Half spread as slippage estimate
 
     double score = state_.net_pair_pnl_bps
@@ -465,7 +465,13 @@ void PairLifecycleEngine::update_state(const PairMarketInput& input) {
         (state_.long_leg.size + state_.short_leg.size) * input.mid_price;
     state_.net_exposure =
         (state_.long_leg.size - state_.short_leg.size) * input.mid_price;
-    state_.funding_drag_bps = std::abs(input.funding_rate) * 100.0;
+    // Signed funding drag: positive means the primary side pays, negative means
+    // it receives a credit.  Long pays when funding_rate > 0; short pays when < 0.
+    double signed_funding_drag =
+        (input.primary_side == PositionSide::Long)
+            ?  input.funding_rate * 100.0
+            : -input.funding_rate * 100.0;
+    state_.funding_drag_bps = signed_funding_drag;
     state_.pair_quality = compute_pair_quality(input);
 }
 

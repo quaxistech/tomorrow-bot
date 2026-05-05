@@ -126,6 +126,8 @@ private:
     /// База знаний: fingerprint → статистика
     std::unordered_map<MicroFingerprint, FingerprintStats, FingerprintHasher>
         knowledge_base_;
+    /// FIFO insertion order for O(1) eviction (replaces O(n) min-count scan)
+    std::deque<MicroFingerprint> insertion_order_;
     int64_t last_update_ns_{0};
     size_t total_updates_{0};
 

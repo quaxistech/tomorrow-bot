@@ -16,7 +16,7 @@ ThompsonSampler::ThompsonSampler(
     std::shared_ptr<logging::ILogger> logger)
     : config_(std::move(config))
     , logger_(std::move(logger))
-    , rng_(std::random_device{}())  // Сид от аппаратного источника энтропии
+    , rng_(config_.rng_seed != 0 ? config_.rng_seed : std::random_device{}())
 {
     // Инициализируем 5 рук бандита с равномерным prior Beta(1,1)
     arms_.resize(5);
@@ -110,8 +110,12 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
     // Находим руку по действию
     for (auto& arm : arms_) {
         if (arm.action == action) {
-            // pulls НЕ инкрементируется здесь — уже увеличен в select_action()
-            // при каждом выборе, независимо от пути (exploration или exploitation).
+            // BUG-ML-04 fix: use reward_count (not pulls) for the avg_reward weight.
+            // Wait-arms accumulate pulls from every select_action() call but only
+            // receive rewards when an actual position closes; using 1/pulls makes
+            // avg_reward ≈ 0 regardless of real performance, biasing sampling toward
+            // EnterNow. reward_count counts only actual reward observations.
+            ++arm.reward_count;
 
             const double mag = std::min(std::abs(reward), 1.0);
             if (reward > config_.reward_threshold) {
@@ -122,7 +126,7 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
                 arm.consecutive_losses++;
             }
 
-            const double w = 1.0 / static_cast<double>(arm.pulls);
+            const double w = 1.0 / static_cast<double>(arm.reward_count);
             arm.avg_reward = (1.0 - w) * arm.avg_reward + w * reward;
             arm.cumulative_reward += reward;
 
@@ -211,6 +215,7 @@ void ThompsonSampler::reset_arm(EntryAction action) {
             arm.alpha = 1.0;
             arm.beta = 1.0;
             arm.pulls = 0;
+            arm.reward_count = 0;
             arm.avg_reward = 0.0;
             arm.cumulative_reward = 0.0;
             arm.consecutive_losses = 0;
@@ -223,9 +228,10 @@ void ThompsonSampler::reset_arm(EntryAction action) {
 
 double ThompsonSampler::sample_beta(double alpha, double beta) const {
     // Beta(α, β) через Gamma: X~Gamma(α,1), Y~Gamma(β,1) → X/(X+Y) ~ Beta(α,β)
-    // Гарантируем α,β >= 0.01 для стабильности
-    alpha = std::max(alpha, 0.01);
-    beta = std::max(beta, 0.01);
+    // BUG-S26-02: clamp both bounds — large alpha/beta (>10000) cause Gamma underflow
+    // where x+y≈0, collapsing to 0.5 fallback and making sampling random.
+    alpha = std::clamp(alpha, 0.1, 10000.0);
+    beta = std::clamp(beta, 0.1, 10000.0);
 
     std::gamma_distribution<double> gamma_a(alpha, 1.0);
     std::gamma_distribution<double> gamma_b(beta, 1.0);
@@ -243,9 +249,13 @@ double ThompsonSampler::sample_beta(double alpha, double beta) const {
 void ThompsonSampler::apply_decay() {
     // Экспоненциальное забывание: α *= decay, β *= decay
     // Минимум 1.0 (prior) — не забываем полностью
+    // BUG-ML-20 fix: also decay reward_count so that avg_reward EMA weight
+    // (1/reward_count) doesn't freeze at ≈0 after long operation.
+    // Halving every decay interval keeps the effective window bounded.
     for (auto& arm : arms_) {
         arm.alpha = std::max(1.0, arm.alpha * config_.decay_factor);
         arm.beta = std::max(1.0, arm.beta * config_.decay_factor);
+        arm.reward_count = std::max<size_t>(1, arm.reward_count / 2);
     }
 }
 

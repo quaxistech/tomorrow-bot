@@ -5,6 +5,7 @@
 #include "persistence/wal_writer.hpp"
 #include <boost/json.hpp>
 #include <format>
+#include <limits>
 #include <unordered_set>
 
 namespace tb::persistence {
@@ -76,7 +77,8 @@ Result<uint64_t> WalWriter::write_intent(
 
     std::lock_guard lock(mutex_);
 
-    const uint64_t seq = ++wal_sequence_;
+    // BUG-S10-02: pre-allocate seq without committing — only increment on success
+    const uint64_t seq = wal_sequence_ + 1;
 
     WalEntry entry{
         .wal_sequence = seq,
@@ -105,6 +107,7 @@ Result<uint64_t> WalWriter::write_intent(
             "Ошибка записи intent seq={} type={}", seq, to_string(type)));
         return std::unexpected(TbError::WalWriteFailed);
     }
+    wal_sequence_ = seq; // commit only after successful journal append
 
     pending_entries_.emplace(seq, std::move(entry));
 
@@ -190,6 +193,7 @@ VoidResult WalWriter::rollback(uint64_t wal_sequence, const std::string& reason)
 
 Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
     std::lock_guard lock(mutex_);
+    wal_corruption_count_.store(0, std::memory_order_release);
 
     std::vector<WalEntry> uncommitted;
 
@@ -261,6 +265,16 @@ Result<std::vector<WalEntry>> WalWriter::find_uncommitted() {
         }
     }
 
+    const auto corruptions = wal_corruption_count_.load(std::memory_order_acquire);
+    if (corruptions > 0) {
+        if (metrics_) {
+            metrics_->counter("wal_corruptions_total")->increment(static_cast<double>(corruptions));
+        }
+        logger_->error("WAL", std::format(
+            "Recovery stopped: detected {} corrupted WAL record(s)", corruptions));
+        return std::unexpected(TbError::PersistenceError);
+    }
+
     logger_->info("WAL", std::format(
         "Найдено {} незавершённых записей", uncommitted.size()));
 
@@ -271,7 +285,8 @@ VoidResult WalWriter::write_checkpoint(const std::string& snapshot_json) {
     // ИСПРАВЛЕНИЕ: Инкремент sequence должен быть под мьютексом для гарантии монотонности
     std::lock_guard lock(mutex_);
 
-    const uint64_t seq = ++wal_sequence_;
+    // BUG-S10-02: pre-allocate seq, commit only after successful append
+    const uint64_t seq = wal_sequence_ + 1;
 
     const auto wrapped = wrap_wal_json(
         seq, WalEntryType::RecoveryCheckpoint, true, snapshot_json);
@@ -284,6 +299,7 @@ VoidResult WalWriter::write_checkpoint(const std::string& snapshot_json) {
         logger_->error("WAL", "Ошибка записи checkpoint");
         return std::unexpected(TbError::WalWriteFailed);
     }
+    wal_sequence_ = seq;
 
     metrics_->counter("wal_writes_total")->increment();
 

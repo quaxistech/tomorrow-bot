@@ -217,6 +217,10 @@ struct ExtendedRiskConfig {
 
     // === Kill switch ===
     bool kill_switch_enabled{true};
+    /// Portfolio-level drawdown threshold that auto-triggers the kill switch.
+    /// Distinct from max_adverse_excursion_pct (per-position MAE exit).
+    /// Default: 6% — roughly 2× the default per-position MAE of 3%.
+    double kill_switch_portfolio_drawdown_pct{6.0};
 
     // === Directional / same-direction ===
     int max_same_direction_positions{3};        ///< Макс. позиций в одном направлении
@@ -229,6 +233,7 @@ struct ExtendedRiskConfig {
 
     // === UTC cutoff ===
     int utc_cutoff_hour{-1};                    ///< Час UTC для прекращения торговли (-1 = отключено)
+    int utc_cutoff_minute{0};                   ///< Минута UTC внутри cutoff-часа (0..59)
 };
 
 // ═══════════════════════════════════════════════════════════════

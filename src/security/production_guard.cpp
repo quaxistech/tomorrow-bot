@@ -3,9 +3,11 @@
  * @brief Реализация защиты от случайного запуска в production
  */
 #include "security/production_guard.hpp"
+#include "common/enums.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <format>
+#include <string>
 #include <string_view>
 
 namespace tb::security {
@@ -53,6 +55,17 @@ ProductionGuardResult ProductionGuard::validate(
     result.api_keys_are_production = is_production_api(api_base_url);
     result.env_confirmation_present = check_env_confirmation();
     result.config_hash = config_hash;
+
+    // BUG-S4-23 fix: non-production modes bypass all strict credential checks.
+    // Staging/test mode with real credentials was triggering all production guards,
+    // causing false-positive blocking of non-live runs.
+    if (mode != TradingMode::Production) {
+        result.allowed = true;
+        result.reason = "Non-production mode — security checks bypassed";
+        logger_->info("ProductionGuard", "Non-production mode, запуск разрешён",
+            {{"mode", std::string(tb::to_string(mode))}});
+        return result;
+    }
 
     // Production — нужны все проверки
 
@@ -123,7 +136,12 @@ ProductionGuardResult ProductionGuard::validate(
 bool ProductionGuard::check_env_confirmation() {
     const char* val = std::getenv("TOMORROW_BOT_PRODUCTION_CONFIRM");
     if (val == nullptr) return false;
-    return std::string_view(val) == "I_UNDERSTAND_LIVE_TRADING";
+    // BUG-S4-11 fix: copy into std::string immediately.
+    // std::string_view(val) would retain a raw pointer into the static environment
+    // storage; a concurrent setenv()/putenv() call can invalidate that storage,
+    // causing undefined behaviour. std::string copies the bytes atomically from
+    // the perspective of the comparison and is safe after the pointer is released.
+    return std::string(val) == "I_UNDERSTAND_LIVE_TRADING";
 }
 
 bool ProductionGuard::is_production_api(const std::string& base_url) {

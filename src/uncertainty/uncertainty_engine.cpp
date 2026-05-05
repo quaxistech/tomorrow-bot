@@ -97,19 +97,32 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
         agg = std::min(1.0, agg + 0.1);
     }
 
-    // 4. Retrieve SymbolState (copy to avoid dangling pointer on rehash)
+    // MEDIUM-9 fix: hold the mutex across the complete read-modify-write cycle for
+    // SymbolState so that concurrent calls for the same symbol cannot interleave their
+    // reads and writes, which would cause lost updates.
     SymbolState state;
     {
         std::lock_guard lock(mutex_);
+
+        // 4. Retrieve SymbolState under lock
         state = states_[features.symbol.get()];
+
+        // 5. Determine level via hysteresis (on pre-update state for consistent thresholds)
+        // (apply_hysteresis and update_state are pure functions on the local copy — no lock needed,
+        //  but we must not release the lock between the read and write-back.)
+        auto level_inner = apply_hysteresis(agg, state);
+
+        // 6. Update state FIRST — so cooldown and execution_mode see current tick's
+        //    consecutive counters. This fixes the one-tick lag in cooldown activation.
+        update_state(state, agg, level_inner, now_ns);
+
+        // Write state back atomically with the read — no other thread can interleave.
+        states_[features.symbol.get()] = state;
     }
 
-    // 5. Determine level via hysteresis (on pre-update state for consistent thresholds)
-    auto level = apply_hysteresis(agg, state);
-
-    // 6. Update state FIRST — so cooldown and execution_mode see current tick's
-    //    consecutive counters. This fixes the one-tick lag in cooldown activation.
-    update_state(state, agg, level, now_ns);
+    // Re-derive level from the updated state (needed for the rest of the function).
+    // apply_hysteresis is const and side-effect-free, so calling it again is safe.
+    auto level = state.prev_level;
 
     // 7. EMA smoothing → persistent_score (use updated ema_score)
     double persistent = state.ema_score;
@@ -175,11 +188,10 @@ UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     result.persistent_score       = persistent;
     result.spike_score            = spike;
 
-    // Update diagnostics & cache snapshot & write state back
+    // Update diagnostics & cache snapshot
+    // (state write-back already done in the read-modify-write block above)
     {
         std::lock_guard lock(mutex_);
-        states_[features.symbol.get()] = state;
-
         diagnostics_.total_assessments++;
         if (action == UncertaintyAction::NoTrade) {
             diagnostics_.veto_count++;
@@ -534,15 +546,19 @@ double RuleBasedUncertaintyEngine::aggregate(
         return 0.5;
     }
 
-    double result = (w_regime      * dims.regime_uncertainty       +
-                     w_signal      * dims.signal_uncertainty       +
-                     w_data        * dims.data_quality_uncertainty +
-                     w_execution   * dims.execution_uncertainty    +
-                     w_portfolio   * dims.portfolio_uncertainty    +
-                     w_ml          * dims.ml_uncertainty           +
-                     w_correlation * dims.correlation_uncertainty  +
-                     w_transition  * dims.transition_uncertainty   +
-                     w_operational * dims.operational_uncertainty) / total_w;
+    // BUG-S16-01: a single NaN dimension poisons the entire aggregate.
+    // Use conservative fallback (0.7) for any non-finite dimension.
+    auto safe_dim = [](double d) { return std::isfinite(d) ? d : 0.7; };
+
+    double result = (w_regime      * safe_dim(dims.regime_uncertainty)       +
+                     w_signal      * safe_dim(dims.signal_uncertainty)       +
+                     w_data        * safe_dim(dims.data_quality_uncertainty) +
+                     w_execution   * safe_dim(dims.execution_uncertainty)    +
+                     w_portfolio   * safe_dim(dims.portfolio_uncertainty)    +
+                     w_ml          * safe_dim(dims.ml_uncertainty)           +
+                     w_correlation * safe_dim(dims.correlation_uncertainty)  +
+                     w_transition  * safe_dim(dims.transition_uncertainty)   +
+                     w_operational * safe_dim(dims.operational_uncertainty)) / total_w;
 
     // Tail-stress amplifier: each dimension > 0.8 adds 0.05
     const double raw_dims[] = {
@@ -626,15 +642,19 @@ void RuleBasedUncertaintyEngine::update_state(
     SymbolState& state, double raw_score,
     UncertaintyLevel new_level, int64_t now_ns) {
 
+    // BUG-S16-02: NaN ema_score (from NaN raw_score via BUG-S16-01 chain) makes
+    // shock_memory NaN → cooldown comparisons silently fail → never activates.
+    if (!std::isfinite(state.ema_score)) state.ema_score = raw_score;
+
     state.ema_score =
         config_.ema_alpha * raw_score +
         (1.0 - config_.ema_alpha) * state.ema_score;
 
     state.peak_score = std::max(state.peak_score * 0.95, raw_score);
 
-    state.shock_memory = std::max(
-        state.shock_memory * 0.98,
-        std::max(0.0, raw_score - state.ema_score));
+    double shock_delta = std::isfinite(raw_score) && std::isfinite(state.ema_score)
+        ? std::max(0.0, raw_score - state.ema_score) : 0.0;
+    state.shock_memory = std::max(state.shock_memory * 0.98, shock_delta);
 
     if (state.prev_level != new_level) {
         state.last_level_change_ns = now_ns;

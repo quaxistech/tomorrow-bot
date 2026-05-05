@@ -16,6 +16,7 @@
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include <memory>
+#include <mutex>
 
 namespace tb::strategy {
 
@@ -95,6 +96,7 @@ private:
     SetupValidator setup_validator_;
     PositionManager position_manager_;
 
+    mutable std::mutex mutex_;  ///< Guards all public methods against concurrent access
     std::atomic<bool> active_{true};
     std::vector<std::string> last_reasons_;
     uint64_t diag_skip_count_{0};

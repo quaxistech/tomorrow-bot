@@ -33,6 +33,10 @@ ReconciliationResult ReconciliationEngine::reconcile_on_startup(
     const std::vector<portfolio::Position>& local_positions,
     double local_cash_balance)
 {
+    // BUG-S4-03 fix: serialize concurrent reconciliation runs so that
+    // last_result_ always reflects a single coherent reconciliation and not
+    // a mixture of two concurrent ones overwriting each other.
+    std::lock_guard op_lock(op_mutex_);
     auto start_ts = clock_->now();
     logger_->info("Reconciliation", "Запуск полной startup reconciliation (USDT-M Futures)",
         {{"local_orders", std::to_string(local_orders.size())},
@@ -139,6 +143,7 @@ ReconciliationResult ReconciliationEngine::reconcile_on_startup(
 ReconciliationResult ReconciliationEngine::reconcile_active_orders(
     const std::vector<execution::OrderRecord>& local_active_orders)
 {
+    std::lock_guard op_lock(op_mutex_);
     auto start_ts = clock_->now();
     logger_->debug("Reconciliation", "Периодическая reconciliation активных ордеров",
         {{"count", std::to_string(local_active_orders.size())}});
@@ -180,6 +185,7 @@ ReconciliationResult ReconciliationEngine::reconcile_positions_and_balance(
     const std::vector<portfolio::Position>& local_positions,
     double local_cash_balance)
 {
+    std::lock_guard op_lock(op_mutex_);
     auto start_ts = clock_->now();
     logger_->debug("Reconciliation", "Периодическая reconciliation позиций и баланса",
         {{"local_positions", std::to_string(local_positions.size())},
@@ -309,8 +315,10 @@ std::optional<MismatchRecord> ReconciliationEngine::reconcile_single_order(
     // Проверить filled_qty
     double local_filled = local_order.filled_quantity.get();
     double exchange_filled = exchange_order.filled_quantity.get();
-    // Use relative tolerance: max(1e-8, 0.001% of quantity)
-    double tolerance = std::max(1e-8, exchange_filled * 1e-5);
+    // BUG-S4-13 fix: tolerance based on max of both sides.
+    // When exchange_filled=0 and local_filled=1e-9, the old formula gave
+    // tolerance=1e-8, which would incorrectly suppress the mismatch.
+    double tolerance = std::max(1e-8, std::max(local_filled, exchange_filled) * 1e-5);
     if (std::abs(local_filled - exchange_filled) > tolerance) {
         MismatchRecord mismatch;
         mismatch.type = MismatchType::QuantityMismatch;
@@ -373,7 +381,8 @@ void ReconciliationEngine::auto_resolve_mismatches(ReconciliationResult& result)
 
 void ReconciliationEngine::finalize_result(ReconciliationResult& result, Timestamp start_ts) {
     auto end_ts = clock_->now();
-    result.duration_ms = (end_ts.get() - start_ts.get()) / 1'000'000;
+    // BUG-S35-06: NTP backward jump makes duration_ms negative → SLA monitoring broken.
+    result.duration_ms = std::max(int64_t{0}, end_ts.get() - start_ts.get()) / 1'000'000;
     result.completed_at = end_ts;
 
     metrics_->counter("reconciliation_mismatches_total")->increment(
@@ -480,14 +489,9 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_orders(
         // Проверить filled_qty
         double local_filled = local.filled_quantity.get();
         double exchange_filled = found->filled_quantity.get();
-        // Relative tolerance: max(1e-8, 0.001% of exchange quantity).
-        // For USDT-M futures on Bitget, this catches rounding differences
-        // from lot-size precision while remaining tight enough to flag
-        // genuine fill discrepancies. At 1000 USDT notional, tolerance ≈ 0.01 USDT.
-        // Reconciliation ONLY flags mismatches as warnings; the pipeline or operator
-        // must act. Tighter tolerance is acceptable because mismatch logging is
-        // warning-severity and non-blocking.
-        double tolerance = std::max(1e-8, exchange_filled * 1e-5);
+        // BUG-S4-13 fix: tolerance based on max of both sides so local-side
+        // mismatches are also caught (e.g. exchange_filled=0, local_filled>0).
+        double tolerance = std::max(1e-8, std::max(local_filled, exchange_filled) * 1e-5);
         if (std::abs(local_filled - exchange_filled) > tolerance) {
             MismatchRecord m;
             m.type = MismatchType::QuantityMismatch;
@@ -589,8 +593,10 @@ std::vector<MismatchRecord> ReconciliationEngine::reconcile_positions(
         // Сравнить размер позиции с допуском position_tolerance_pct
         double exchange_size = exchange_pos->size.get();
         double local_size = local.size.get();
+        // BUG-S13-08: negative exchange_size or tolerance_pct → negative tolerance
+        // → all mismatches silently pass. Use abs to guard both inputs.
         double tolerance = std::max(1e-8,
-            exchange_size * config_.position_tolerance_pct / 100.0);
+            std::abs(exchange_size) * std::abs(config_.position_tolerance_pct) / 100.0);
 
         if (std::abs(exchange_size - local_size) > tolerance) {
             double diff_pct = (exchange_size > 1e-12)

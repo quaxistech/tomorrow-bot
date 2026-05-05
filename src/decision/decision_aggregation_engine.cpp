@@ -182,11 +182,16 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
                 double decay = compute_time_decay(signal_age_ns);
                 aged_conviction = intent.conviction * decay;
             } else {
-                // Стратегия не установила generated_at — лог для диагностики.
-                // Сигнал обрабатывается как свежий, но это признак ошибки в стратегии.
-                logger_->warn("Decision", "TradeIntent без generated_at — time decay пропущен",
+                // MEDIUM-8 fix: generated_at == 0 means the strategy did not set a timestamp.
+                // Apply a conservative default decay (0.5) to penalise potentially stale signals
+                // instead of treating them as fresh (full conviction), which could reward bugs.
+                constexpr double kDefaultDecayForMissingTimestamp = 0.5;
+                aged_conviction = intent.conviction * kDefaultDecayForMissingTimestamp;
+                logger_->warn("Decision", "TradeIntent без generated_at — применён decay по умолчанию 0.5",
                     {{"strategy", intent.strategy_id.get()},
-                     {"symbol", intent.symbol.get()}});
+                     {"symbol", intent.symbol.get()},
+                     {"original_conviction", std::to_string(intent.conviction)},
+                     {"aged_conviction", std::to_string(aged_conviction)}});
             }
         }
         contrib.aged_conviction = aged_conviction;
@@ -224,11 +229,17 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
                           (buy_total + sell_total + 1e-10);
 
         // Regime-adaptive dominance threshold (multiplicative composition)
+        // BUG-S16-03: NaN regime_thr / dominance_threshold_ → NaN regime_factor
+        // → effective_dominance_thr = NaN → dominance < NaN always false → veto skipped.
         double effective_dominance_thr = dominance_threshold_;
-        if (advanced_.enable_regime_dominance_scaling) {
+        if (advanced_.enable_regime_dominance_scaling && dominance_threshold_ > 1e-9) {
             double regime_thr = compute_regime_dominance_threshold(regime.detailed);
-            double regime_factor = regime_thr / dominance_threshold_;
-            effective_dominance_thr *= regime_factor;
+            if (std::isfinite(regime_thr)) {
+                double regime_factor = regime_thr / dominance_threshold_;
+                if (std::isfinite(regime_factor)) {
+                    effective_dominance_thr *= regime_factor;
+                }
+            }
         }
 
         if (dominance < effective_dominance_thr) {
@@ -317,6 +328,11 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
           + world.state_probabilities.probability(WS::LiquidityVacuum)
           + world.state_probabilities.probability(WS::ExhaustionSpike)
           + world.state_probabilities.probability(WS::ChopNoise);
+        // BUG-S16-04: warn when danger_prob > 1.0 so upstream model corruption is surfaced.
+        if (danger_prob > 1.0) {
+            logger_->warn("Decision", "World state danger_prob > 1.0 — world model may be corrupted",
+                {{"danger_prob", std::to_string(danger_prob)}});
+        }
         // H-11 fix: clamp to [0,1] — sum of 4 probs can exceed 1.0
         danger_prob = std::clamp(danger_prob, 0.0, 1.0);
         // Плавный буст: P(danger)=0.5 → +10% threshold, P(danger)=1.0 → +20%

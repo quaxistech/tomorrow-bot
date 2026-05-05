@@ -12,7 +12,9 @@
 #include "bitget_futures_order_submitter.hpp"
 #include "common/enums.hpp"
 
+#include <algorithm>
 #include <boost/json.hpp>
+#include <cctype>
 #include <cmath>
 #include <random>
 #include <sstream>
@@ -31,6 +33,25 @@ static void apply_submission_jitter() {
     std::uniform_int_distribution<int> dist(20, 150);
     int delay_ms = dist(rng);
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+}
+
+static bool should_apply_submission_jitter(const execution::OrderRecord& order) {
+    if (order.trade_side != TradeSide::Open) {
+        return false;
+    }
+
+    std::string strategy = order.strategy_id.get();
+    std::transform(strategy.begin(), strategy.end(), strategy.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (strategy.find("hedge") != std::string::npos ||
+        strategy.find("emergency") != std::string::npos ||
+        strategy.find("flatten") != std::string::npos ||
+        strategy.find("stop") != std::string::npos) {
+        return false;
+    }
+
+    return true;
 }
 
 // Эндпоинты Bitget Mix v2 API (Futures)
@@ -142,7 +163,7 @@ bool BitgetFuturesOrderSubmitter::set_leverage(
                         logger_->warn(kComp, "Leverage слишком высокий для символа, снижаем",
                             {{"tried", std::to_string(attempt_leverage)},
                              {"symbol", symbol.get()}});
-                        attempt_leverage = attempt_leverage / 2;
+                        attempt_leverage -= 1;
                         continue;
                     }
                 } catch (...) {
@@ -186,13 +207,14 @@ bool BitgetFuturesOrderSubmitter::set_leverage(
                 return true;
             }
 
-            // 40797 = "Exceeded the maximum settable leverage" — пробуем ниже
+            // 40797 = "Exceeded the maximum settable leverage" — пробуем ниже.
+            // Декремент на 1 гарантирует нахождение точного максимума: бинарное деление
+            // пропускало значения (40→20→10 при max=15 давало 10 вместо 15).
             if (code == "40797") {
                 logger_->warn(kComp, "Leverage слишком высокий для символа, снижаем",
                     {{"tried", std::to_string(attempt_leverage)},
                      {"symbol", symbol.get()}});
-                // Бинарное снижение: 20->10->5->2->1
-                attempt_leverage = attempt_leverage / 2;
+                attempt_leverage -= 1;
                 continue;
             }
 
@@ -338,17 +360,14 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     }
 
     // === Направление (КРИТИЧНО для фьючерсов) ===
-    // В hedge-mode "side" указывает НАПРАВЛЕНИЕ ПОЗИЦИИ, не действие:
-    //   side=buy  → позиция Long
-    //   side=sell → позиция Short
-    // "tradeSide" указывает открытие/закрытие:
-    //   tradeSide=open  → открытие позиции
-    //   tradeSide=close → закрытие позиции
+    // Bitget Mix API v2 hedge-mode (double_hold):
+    //   Long  open:  side="buy",  tradeSide="open"
+    //   Long  close: side="sell", tradeSide="close"   ← sell to close long
+    //   Short open:  side="sell", tradeSide="open"
+    //   Short close: side="buy",  tradeSide="close"   ← buy to close short
     //
-    // Long open:  side=buy,  tradeSide=open
-    // Long close: side=buy,  tradeSide=close
-    // Short open: side=sell, tradeSide=open
-    // Short close: side=sell, tradeSide=close
+    // "side" is the ORDER direction (buy=long-side, sell=short-side), not the
+    // position being held.  For closing, you must order in the OPPOSITE direction.
 
     // Defensive validation: reject if position_side or trade_side are out of enum range.
     // Prevents silent position inversion from uninitialized/corrupted enum values.
@@ -370,20 +389,13 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     std::string api_side;
     std::string api_trade_side;
 
+    // BUG-S9-01: closing a position requires the opposite side direction.
     if (order.position_side == PositionSide::Long) {
-        api_side = "buy";  // Long position direction
-        if (order.trade_side == TradeSide::Open) {
-            api_trade_side = "open";
-        } else {
-            api_trade_side = "close";
-        }
+        api_side      = (order.trade_side == TradeSide::Open) ? "buy"  : "sell";
+        api_trade_side = (order.trade_side == TradeSide::Open) ? "open" : "close";
     } else { // Short
-        api_side = "sell";  // Short position direction
-        if (order.trade_side == TradeSide::Open) {
-            api_trade_side = "open";
-        } else {
-            api_trade_side = "close";
-        }
+        api_side      = (order.trade_side == TradeSide::Open) ? "sell" : "buy";
+        api_trade_side = (order.trade_side == TradeSide::Open) ? "open" : "close";
     }
 
     obj["side"]      = api_side;
@@ -502,8 +514,10 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
              {"price", std::to_string(order.price.get())},
              {"product_type", futures_config_.product_type}});
 
-        // Anti-fingerprinting: randomize submission timing
-        apply_submission_jitter();
+        // Anti-fingerprinting is allowed only for non-protective opening orders.
+        if (should_apply_submission_jitter(order)) {
+            apply_submission_jitter();
+        }
 
         auto response = rest_client_->post(kPlaceOrderPath, body);
 

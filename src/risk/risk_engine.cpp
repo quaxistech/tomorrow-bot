@@ -118,6 +118,20 @@ RiskDecision ProductionRiskEngine::evaluate(
     decision.decided_at = clock_->now();
     decision.approved_quantity = sizing.approved_quantity;
     decision.original_size = sizing.approved_quantity;
+
+    // BUG-S17-07: NaN/Inf quantity from allocator must be rejected before checks run.
+    if (!std::isfinite(sizing.approved_quantity.get()) || sizing.approved_quantity.get() < 0.0) {
+        decision.verdict = RiskVerdict::Denied;
+        decision.allowed = false;
+        decision.action = RiskAction::Deny;
+        decision.reasons.push_back(RiskReasonCode{
+            "INVALID_SIZE",
+            "approved_quantity NaN/Inf/negative from allocator",
+            1.0
+        });
+        return decision;
+    }
+
     decision.verdict = RiskVerdict::Approved;
     decision.action = RiskAction::Allow;
     decision.allowed = true;
@@ -131,9 +145,11 @@ RiskDecision ProductionRiskEngine::evaluate(
     // Фьючерсная безопасность: закрытие позиций НЕ блокируется risk engine,
     // но safety-критичные проверки выполняются для мониторинга.
     if (intent.trade_side == TradeSide::Close) {
-        // Белый список: rate limit, slippage, stale feed
-        static constexpr std::array<std::string_view, 3> close_check_names = {
-            "order_rate_check", "max_slippage_check", "stale_feed_check"
+        // BUG-S13-09: also run leverage and drawdown checks for close trades so
+        // extreme conditions are logged and monitored — close is still always approved.
+        static constexpr std::array<std::string_view, 5> close_check_names = {
+            "order_rate_check", "max_slippage_check", "stale_feed_check",
+            "max_leverage_check", "max_drawdown_check"
         };
         for (auto& check : checks_) {
             for (auto allowed_name : close_check_names) {
@@ -216,8 +232,13 @@ void ProductionRiskEngine::finalize_decision(
         decision.current_daily_pnl = portfolio.pnl.total_pnl;
     }
 
-    // Regime factor
-    decision.regime_scaling_factor = regime_scale_factor_.load(std::memory_order_acquire);
+    // Regime factor — BUG-S17-01: validate before use; NaN/OOB factor makes all
+    // regime-scaled limits NaN, silently disabling risk checks.
+    {
+        double factor = regime_scale_factor_.load(std::memory_order_acquire);
+        if (!std::isfinite(factor) || factor < 0.1 || factor > 3.0) factor = 1.0;
+        decision.regime_scaling_factor = factor;
+    }
 
     // Global risk state
     decision.risk_state = state_.locks.compute_global_state();
@@ -387,16 +408,19 @@ IntraTradeAssessment ProductionRiskEngine::evaluate_position(
         }
     }
 
-    // Auto-trigger kill switch when portfolio drawdown breaches 2× max_adverse_excursion.
-    // This catches cascading losses across multiple positions that individual MAE checks miss.
-    // Once activated, no new trades can open; only exit/flatten orders are allowed through.
-    if (portfolio.pnl.current_drawdown_pct >= config_.max_adverse_excursion_pct * 2.0) {
+    // Auto-trigger kill switch when portfolio drawdown breaches the portfolio-level threshold.
+    // kill_switch_portfolio_drawdown_pct is a portfolio-wide stop (default 6%) — separate from
+    // max_adverse_excursion_pct (per-position MAE exit, default 3%). The portfolio threshold is
+    // intentionally larger: it catches cascading losses across multiple positions that individual
+    // MAE checks do not see. Once activated, no new trades can open; only exit/flatten orders
+    // are allowed through.
+    if (portfolio.pnl.current_drawdown_pct >= config_.kill_switch_portfolio_drawdown_pct) {
         if (!kill_switch_active_.load()) {
             activate_kill_switch(
                 "AUTO: Portfolio drawdown " +
                 std::to_string(portfolio.pnl.current_drawdown_pct) +
-                "% >= liquidation buffer " +
-                std::to_string(config_.max_adverse_excursion_pct * 2.0) + "%");
+                "% >= portfolio kill-switch threshold " +
+                std::to_string(config_.kill_switch_portfolio_drawdown_pct) + "%");
         }
         assessment.should_close = true;
         assessment.reasons.push_back({
@@ -411,7 +435,8 @@ IntraTradeAssessment ProductionRiskEngine::evaluate_position(
     // Only fires when degradation conditions are present, not on pure elapsed time.
     // Degradation = stale feed + runaway exposure + health check failure.
     // Pure time-based exit is an alpha decision (handled by exit_orchestrator).
-    const int64_t hold_ns = clock_->now().get() - position.opened_at.get();
+    // BUG-S35-04: NTP backward jump makes hold_ns negative → deadman never fires.
+    const int64_t hold_ns = std::max(int64_t{0}, clock_->now().get() - position.opened_at.get());
     if (config_.operational_deadman_ns > 0 && hold_ns > config_.operational_deadman_ns) {
         // Count degradation signals
         int degradation_count = 0;
@@ -547,6 +572,9 @@ RiskSnapshot ProductionRiskEngine::get_risk_snapshot() const {
 void ProductionRiskEngine::reset_daily() {
     std::lock_guard lock(mutex_);
     state_.reset_daily(clock_->now());
+    // BUG-S13-14: regime_scale_factor_ is not reset with the daily cycle,
+    // causing stale regime limits to persist into the next trading day.
+    regime_scale_factor_.store(1.0, std::memory_order_relaxed);
 }
 
 } // namespace tb::risk

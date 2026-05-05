@@ -1,6 +1,9 @@
 #include "execution/fills/fill_processor.hpp"
 #include "common/constants.hpp"
+#include "persistence/persistence_types.hpp"
 #include <algorithm>
+#include <cmath>
+#include <format>
 
 namespace tb::execution {
 
@@ -33,6 +36,21 @@ bool FillProcessor::process_market_fill(
         return false;
     }
 
+    // BUG-S29-02: validate fill_price before any processing
+    if (!std::isfinite(fill_price.get()) || fill_price.get() <= 0.0) {
+        logger_->error("FillProcessor", "process_market_fill: невалидная fill_price, пропуск",
+            {{"order_id", order_id.get()},
+             {"fill_price", std::to_string(fill_price.get())}});
+        return false;
+    }
+    // BUG-S29-03: validate filled_qty
+    if (!std::isfinite(filled_qty.get()) || filled_qty.get() <= 0.0) {
+        logger_->error("FillProcessor", "process_market_fill: невалидная filled_qty, пропуск",
+            {{"order_id", order_id.get()},
+             {"filled_qty", std::to_string(filled_qty.get())}});
+        return false;
+    }
+
     auto opt = registry_.get_order(order_id);
     if (!opt) {
         logger_->error("FillProcessor", "Ордер не найден для fill",
@@ -58,9 +76,9 @@ bool FillProcessor::process_market_fill(
     order.last_updated = clock_->now();
     registry_.update_order(order);
 
-    // Применить fill к портфелю
-    registry_.mark_fill_applied(order_id);
+    // Применить fill к портфелю (HIGH-10: mark only after successful portfolio update)
     apply_fill_to_portfolio(order);
+    registry_.mark_fill_applied(order_id);
 
     if (metrics_) {
         metrics_->counter("execution_fills_total", {})->increment();
@@ -76,9 +94,10 @@ bool FillProcessor::process_market_fill(
 }
 
 bool FillProcessor::process_fill_event(const FillEvent& fill) {
-    // TradeId dedup: reject if this exact trade was already processed.
-    // This prevents double-counting on WS reconnect snapshots.
-    if (!fill.trade_id.empty() && registry_.is_trade_id_seen(fill.trade_id)) {
+    // BUG-S29-04: atomic check-and-mark under one lock to prevent TOCTOU race
+    // where two threads (WS + REST) both pass is_trade_id_seen() before either
+    // calls mark_trade_id_seen() — causing double portfolio application.
+    if (!fill.trade_id.empty() && registry_.check_and_mark_trade_id_seen(fill.trade_id)) {
         logger_->debug("FillProcessor", "Fill event дубликат по tradeId",
             {{"order_id", fill.order_id.get()},
              {"trade_id", fill.trade_id}});
@@ -106,12 +125,13 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
         return false;
     }
 
-    // Guard: if WS fill has price=0, skip ALL processing. Don't mark tradeId,
+    // Guard: if WS fill has price=0 or NaN, skip ALL processing. Don't mark tradeId,
     // don't transition FSM, don't mark fill_applied. The REST path
     // (process_market_fill) will handle this fill with the correct price.
     // Bitget WS fill channel sometimes sends fillPx=0; marking fill_applied
     // here would block the REST path and leave the portfolio stale.
-    if (fill.fill_price.get() <= 0.0) {
+    // BUG-S29-01: NaN comparison is always false, so use isfinite instead of <= 0.0.
+    if (!std::isfinite(fill.fill_price.get()) || fill.fill_price.get() <= 0.0) {
         logger_->warn("FillProcessor", "WS fill с fill_price <= 0 — пропуск, ждём REST подтверждения",
             {{"order_id", effective_id.get()},
              {"exchange_id", fill.order_id.get()},
@@ -120,10 +140,7 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
         return false;
     }
 
-    // Mark tradeId as seen before processing
-    if (!fill.trade_id.empty()) {
-        registry_.mark_trade_id_seen(fill.trade_id);
-    }
+    // tradeId already marked seen by check_and_mark_trade_id_seen() above
 
     auto order = *opt;
 
@@ -257,6 +274,8 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
                                     order.avg_fill_price, gross_pnl);
         double fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
         portfolio_->record_fee(order.symbol, fee, order.order_id);
+        journal_fee_event(order.symbol, order.order_id, fee,
+                          order.avg_fill_price.get(), order.filled_quantity.get());
 
         logger_->info("FillProcessor", "Позиция уменьшена (close fill)",
             {{"symbol", order.symbol.get()},
@@ -269,6 +288,7 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
         portfolio::Position pos;
         pos.symbol = order.symbol;
         pos.side = order.side;
+        pos.position_side = order.position_side; // BUG-S8-05: hedge-mode requires position_side
         pos.size = order.filled_quantity;
         pos.avg_entry_price = order.avg_fill_price;
         pos.current_price = order.avg_fill_price;
@@ -281,6 +301,8 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
         portfolio_->release_cash(order.order_id);
         double fee = order.filled_quantity.get() * order.avg_fill_price.get() * kDefaultTakerFeePct;
         portfolio_->record_fee(order.symbol, fee, order.order_id);
+        journal_fee_event(order.symbol, order.order_id, fee,
+                          order.avg_fill_price.get(), order.filled_quantity.get());
     }
 }
 
@@ -308,6 +330,8 @@ void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillE
                                     fill_price, pnl);
         double fee = fill_price.get() * fill_qty.get() * kDefaultTakerFeePct;
         portfolio_->record_fee(order.symbol, fee, order.order_id);
+        journal_fee_event(order.symbol, order.order_id, fee,
+                          fill_price.get(), fill_qty.get());
 
         logger_->info("FillProcessor", "Инкрементальный close fill",
             {{"symbol", order.symbol.get()},
@@ -320,6 +344,7 @@ void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillE
         portfolio::Position pos;
         pos.symbol = order.symbol;
         pos.side = order.side;
+        pos.position_side = order.position_side; // BUG-S8-05: hedge-mode requires position_side
         pos.size = fill_qty;
         pos.avg_entry_price = fill_price;
         pos.current_price = fill_price;
@@ -331,6 +356,8 @@ void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillE
         portfolio_->release_cash(order.order_id);
         double fee = fill_qty.get() * fill_price.get() * kDefaultTakerFeePct;
         portfolio_->record_fee(order.symbol, fee, order.order_id);
+        journal_fee_event(order.symbol, order.order_id, fee,
+                          fill_price.get(), fill_qty.get());
     }
 }
 
@@ -369,6 +396,30 @@ double FillProcessor::compute_gross_pnl(const OrderRecord& order) const {
         return (exit_p - entry) * qty;  // Long: прибыль при росте
     } else {
         return (entry - exit_p) * qty;  // Short: прибыль при падении
+    }
+}
+
+void FillProcessor::journal_fee_event(const Symbol& symbol, const OrderId& order_id,
+                                       double fee, double fill_price, double fill_qty)
+{
+    if (!journal_) return;
+
+    // Build a minimal JSON payload describing the fee charge.
+    // Using std::format with escaped literals avoids raw string concatenation bugs.
+    auto ts = clock_ ? clock_->now().get() : int64_t{0};
+    auto payload = std::format(
+        R"({{"event":"FeeCharged","symbol":"{}","order_id":"{}","fee":{:.8f},"fill_price":{:.8f},"fill_qty":{:.8f},"ts":{}}})",
+        symbol.get(), order_id.get(), fee, fill_price, fill_qty, ts);
+
+    auto result = journal_->append(
+        persistence::JournalEntryType::PortfolioChange,
+        payload,
+        CorrelationId{order_id.get()});
+
+    if (!result && logger_) {
+        logger_->warn("FillProcessor",
+            "Не удалось записать FeeCharged в журнал",
+            {{"order_id", order_id.get()}, {"fee", std::to_string(fee)}});
     }
 }
 

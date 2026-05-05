@@ -18,6 +18,7 @@
 #include "clock/clock.hpp"
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -100,10 +101,15 @@ private:
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
 
-    // Orphan tracking
+    // BUG-S8-04: orphan fields written from execute_pair_entry/close,
+    // read from has_orphan_leg/cleanup_orphan_leg — protect with mutex.
+    mutable std::mutex orphan_mutex_;
     bool orphan_detected_{false};
     PositionSide orphan_side_{PositionSide::Long};
     int64_t orphan_detect_time_ns_{0};
+
+    // Symbol context for single-leg and orphan cleanup operations.
+    std::optional<Symbol> active_symbol_;
 };
 
 } // namespace tb::pipeline

@@ -100,15 +100,15 @@ void LiquidationCascadeDetector::on_tick(
 CascadeSignal LiquidationCascadeDetector::evaluate() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Возвращаем кэшированный результат, если данные не изменились
-    // и cooldown не истёк с момента последнего вычисления.
+    // BUG-ML-07 fix: also invalidate cache when data feed goes stale so that
+    // stale "healthy" results are not returned indefinitely after feed loss.
     if (cache_valid_) {
-        // Time-based invalidation: cooldown may have expired between ticks.
-        // If cached signal was in_cooldown, re-evaluate once cooldown window passes.
-        if (cached_signal_.in_cooldown && last_cascade_signal_ns_ > 0) {
-            const int64_t now = clock::steady_now_ns();
-            if ((now - last_cascade_signal_ns_) >= config_.cooldown_ns) {
-                cache_valid_ = false;  // cooldown expired — must re-evaluate
+        const int64_t now_ns = clock::steady_now_ns();
+        if (numeric::is_stale(last_tick_ns_, now_ns, config_.stale_threshold_ns)) {
+            cache_valid_ = false;
+        } else if (cached_signal_.in_cooldown && last_cascade_signal_ns_ > 0) {
+            if ((now_ns - last_cascade_signal_ns_) >= config_.cooldown_ns) {
+                cache_valid_ = false;
             }
         }
         if (cache_valid_) {
@@ -164,9 +164,12 @@ CascadeSignal LiquidationCascadeDetector::evaluate() const {
     if (rolling_volatility_ > numeric::kEpsilon && config_.velocity_adaptation_factor > 0.0) {
         // Scale threshold: higher current vol → LOWER threshold (more sensitive).
         // During cascades, volatility spikes → we need earlier detection.
+        // vol_scale = rolling_volatility_ / velocity_threshold: high vol → large scale
+        // → lower adapted_threshold = threshold / large_scale → easier to trigger.
         // Clamp [0.5, 3.0] prevents runaway scaling.
         const double vol_scale = std::clamp(
-            rolling_volatility_ / std::max(config_.velocity_threshold, numeric::kEpsilon)
+            rolling_volatility_
+            / std::max(config_.velocity_threshold, numeric::kEpsilon)
             * config_.velocity_adaptation_factor,
             0.5, 3.0);
         adapted_velocity_threshold = config_.velocity_threshold / vol_scale;

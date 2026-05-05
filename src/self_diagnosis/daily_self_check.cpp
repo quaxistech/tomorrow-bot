@@ -26,6 +26,7 @@ DailySelfCheck::DailySelfCheck(
 void DailySelfCheck::register_check(
     std::string name, CheckSeverity severity, CheckFn fn)
 {
+    std::lock_guard lock(checks_mutex_);
     checks_.push_back({std::move(name), severity, std::move(fn)});
 }
 
@@ -58,10 +59,21 @@ SelfCheckResult DailySelfCheck::run() {
         {"checks_registered", std::to_string(checks_.size())}
     });
 
+    // BUG-S13-13: all_critical starts true — if no critical checks registered,
+    // the loop never sets it false and we report "all_critical_passed=true"
+    // even though no checks ran. Track separately and require ≥1 critical check.
+    int num_critical_ran = 0;
     bool all_critical = true;
     bool all_passed = true;
 
-    for (const auto& reg : checks_) {
+    // Snapshot checks under lock to avoid race with register_check (BUG-S19-04)
+    std::vector<RegisteredCheck> checks_snapshot;
+    {
+        std::lock_guard lock(checks_mutex_);
+        checks_snapshot = checks_;
+    }
+
+    for (const auto& reg : checks_snapshot) {
         CheckItem item;
         item.name = reg.name;
         item.severity = reg.severity;
@@ -74,10 +86,20 @@ SelfCheckResult DailySelfCheck::run() {
         } catch (const std::exception& ex) {
             item.passed = false;
             item.detail = std::string("Exception: ") + ex.what();
+            // BUG-S4-22: log critical-severity exceptions at error level (not silently swallowed)
+            if (reg.severity == CheckSeverity::Critical) {
+                logger_->error("DailySelfCheck",
+                    "CRITICAL check threw exception: " + reg.name,
+                    {{"exception", ex.what()}});
+            }
         }
         auto check_end = std::chrono::steady_clock::now();
         item.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             check_end - check_start).count();
+
+        if (reg.severity == CheckSeverity::Critical) {
+            ++num_critical_ran;
+        }
 
         if (!item.passed) {
             all_passed = false;
@@ -106,7 +128,8 @@ SelfCheckResult DailySelfCheck::run() {
     auto wall_end = std::chrono::steady_clock::now();
     result.total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         wall_end - wall_start).count();
-    result.all_critical_passed = all_critical;
+    // Require at least one critical check to have run before declaring success.
+    result.all_critical_passed = all_critical && (num_critical_ran > 0);
     result.all_passed = all_passed;
 
     // Summary log
@@ -132,11 +155,15 @@ SelfCheckResult DailySelfCheck::run() {
     if (counter_self_check_runs_)
         counter_self_check_runs_->increment();
 
-    last_result_ = result;
+    {
+        std::lock_guard lock(result_mutex_);
+        last_result_ = result;
+    }
     return result;
 }
 
 SelfCheckResult DailySelfCheck::last_result() const {
+    std::lock_guard lock(result_mutex_);
     return last_result_;
 }
 

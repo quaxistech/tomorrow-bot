@@ -300,13 +300,16 @@ ExitDecision PositionExitOrchestrator::check_quick_profit(
 ExitDecision PositionExitOrchestrator::check_partial_tp(
     const ExitContext& ctx, const ContinuationState& state) const {
     if (ctx.partial_tp_taken) return {};
-    if (!ctx.atr_valid || ctx.atr_14 <= 0.0) return {};
+    if (!ctx.atr_valid || ctx.atr_14 <= 0.0 || !std::isfinite(ctx.atr_14)) return {};
 
     double atr = ctx.atr_14;
     bool is_long = (ctx.position_side == PositionSide::Long);
     double profit_in_atr = is_long
         ? (ctx.current_price - ctx.entry_price) / atr
         : (ctx.entry_price - ctx.current_price) / atr;
+
+    // BUG-S8-06: NaN profit_in_atr silently bypasses the early-return guard.
+    if (!std::isfinite(profit_in_atr)) return {};
 
     // Market-aware threshold: raise threshold when trend is strong and regime is stable
     // In a stable trending regime, let profits run further before taking partial
@@ -544,7 +547,9 @@ ContinuationState PositionExitOrchestrator::compute_continuation_state(const Exi
             : 0.0;
         double ema_signal = is_long ? ema_gap : -ema_gap;
 
-        double macd_signal = is_long ? ctx.macd_histogram : -ctx.macd_histogram;
+        // BUG-S8-03: macd_histogram can be NaN — clamp(NaN) returns NaN silently.
+        double raw_macd = std::isfinite(ctx.macd_histogram) ? ctx.macd_histogram : 0.0;
+        double macd_signal = is_long ? raw_macd : -raw_macd;
         double norm = (ctx.atr_valid && ctx.atr_14 > 0.0) ? ctx.atr_14 * 0.1 : 1.0;
         double macd_norm = std::clamp(macd_signal / norm, -1.0, 1.0);
 

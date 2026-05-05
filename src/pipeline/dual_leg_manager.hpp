@@ -15,6 +15,7 @@
 #include "logging/logger.hpp"
 #include "clock/clock.hpp"
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -125,9 +126,9 @@ public:
     void compute_tpsl(double entry_price, PositionSide side,
                       double& tp_price, double& sl_price) const;
 
-    /// Get current leg states
-    LegSnapshot long_leg() const { return long_leg_; }
-    LegSnapshot short_leg() const { return short_leg_; }
+    /// Get current leg states (thread-safe copies)
+    LegSnapshot long_leg()  const { std::lock_guard lock(state_mutex_); return long_leg_; }
+    LegSnapshot short_leg() const { std::lock_guard lock(state_mutex_); return short_leg_; }
     bool has_active_pair() const;
 
     /// Reset state (after both legs closed)
@@ -147,6 +148,10 @@ private:
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;
 
+    // BUG-S5-05 fix: LegSnapshot state accessed concurrently from fill callbacks
+    // (update_leg) and the pipeline thread (close_leg, has_active_pair, getters).
+    // All leg state mutations and reads must hold state_mutex_.
+    mutable std::mutex state_mutex_;
     LegSnapshot long_leg_;
     LegSnapshot short_leg_;
     int64_t last_reversal_ns_{0};

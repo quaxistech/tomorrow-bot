@@ -369,8 +369,10 @@ DefenseAssessment AdversarialMarketDefense::assess(const MarketCondition& condit
         const double max_sev = compound_severity;
         const double scale_factor = 1.0 + (max_sev - config_.auto_cooldown_severity)
                                           * config_.cooldown_severity_scale;
+        // BUG-S11-09: extreme config values → product > INT64_MAX → cast UB
+        const double cd_dbl = config_.post_shock_cooldown_ms * std::clamp(scale_factor, 1.0, 3.0);
         const auto cd_duration = static_cast<int64_t>(
-            config_.post_shock_cooldown_ms * std::clamp(scale_factor, 1.0, 3.0));
+            std::min(cd_dbl, static_cast<double>(std::numeric_limits<int64_t>::max())));
         const int64_t now_ms = to_milliseconds(condition.timestamp);
         cooldown_until_[condition.symbol.get()] = now_ms + cd_duration;
         if (config_.recovery_duration_ms > 0) {
@@ -531,7 +533,7 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_stale_market_dat
     const double age_ratio = c.market_data_age_ns > 0
         ? static_cast<double>(c.market_data_age_ns) /
           static_cast<double>(config_.max_market_data_age_ns * 2)
-        : 1.0;
+        : 0.0;
     const double severity = std::max(0.5, clamp01(age_ratio + 0.5));
 
     return ThreatDetection{
@@ -800,7 +802,8 @@ int64_t AdversarialMarketDefense::cooldown_remaining_ms_locked(
 
 void AdversarialMarketDefense::cleanup_expired_cooldowns_locked(Timestamp now) {
     const int64_t now_ms = to_milliseconds(now);
-    if (now_ms <= 0 || (now_ms - last_cleanup_ms_) < kCooldownCleanupIntervalMs) {
+    const int64_t last_cleanup_ms = last_cleanup_ms_.load(std::memory_order_acquire);
+    if (now_ms <= 0 || (now_ms - last_cleanup_ms) < kCooldownCleanupIntervalMs) {
         return;
     }
 
@@ -869,7 +872,7 @@ void AdversarialMarketDefense::cleanup_expired_cooldowns_locked(Timestamp now) {
     // Cleanup stale percentile windows
     // (piggyback on symbol_tick_state cleanup — if tick state is cleaned, clean percentiles too)
 
-    last_cleanup_ms_ = now_ms;
+    last_cleanup_ms_.store(now_ms, std::memory_order_release);
 }
 
 void AdversarialMarketDefense::update_symbol_state_locked(const MarketCondition& c) {
@@ -945,8 +948,11 @@ std::optional<ThreatDetection> AdversarialMarketDefense::detect_depth_asymmetry(
 
     if (ratio >= config_.depth_asymmetry_threshold) return std::nullopt;
 
-    const double severity = clamp01(
-        (config_.depth_asymmetry_threshold - ratio) / config_.depth_asymmetry_threshold);
+    const double raw_severity =
+        (config_.depth_asymmetry_threshold - ratio) / config_.depth_asymmetry_threshold;
+    const double kyle_asymmetry =
+        1.0 + 0.25 * std::clamp(std::abs(c.book_imbalance), 0.0, 1.0);
+    const double severity = clamp01(raw_severity * kyle_asymmetry);
 
     return ThreatDetection{
         .type = ThreatType::DepthAsymmetry,

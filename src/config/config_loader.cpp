@@ -223,11 +223,11 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     auto mode = trading_mode_from_string(mode_str);
     // Бот работает ТОЛЬКО в production режиме. Любой другой режим — ошибка.
     if (!mode.has_value()) {
-        throw std::runtime_error(
+        parse_errors.push_back(
             "Неподдерживаемый trading.mode: '" + mode_str +
             "'. Единственный допустимый режим: production");
     }
-    cfg.trading.mode = mode.value();
+    cfg.trading.mode = mode.value_or(TradingMode::Production);
     cfg.trading.initial_capital = parse_double(
         get_tracked( "trading.initial_capital", "10000.0"), 10000.0, "trading.initial_capital");
 
@@ -412,8 +412,10 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_tracked( "trading_params.pnl_gate_loss_pct", "0.5"), 0.5, "trading_params.pnl_gate_loss_pct");
 
     // ── Hedge Recovery ──
-    cfg.trading_params.hedge_recovery_enabled =
-        get_tracked( "trading_params.hedge_recovery_enabled", "false") == "true";
+    // BUG-S10-03: == "true" only accepts literal "true"; "1"/"yes"/"True" → false silently
+    cfg.trading_params.hedge_recovery_enabled = parse_bool(
+        get_tracked("trading_params.hedge_recovery_enabled", "false"),
+        false, "trading_params.hedge_recovery_enabled");
     cfg.trading_params.hedge_trigger_loss_pct = parse_double(
         get_tracked( "trading_params.hedge_trigger_loss_pct", "1.5"), 1.5, "trading_params.hedge_trigger_loss_pct");
     cfg.trading_params.hedge_profit_close_fee_mult = parse_double(
@@ -918,11 +920,12 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         }
         if (!unknown_keys.empty()) {
             std::sort(unknown_keys.begin(), unknown_keys.end());
-            std::cerr << "[CONFIG] WARNING: " << unknown_keys.size()
-                      << " unknown config key(s) detected (possible typos):\n";
+            std::cerr << "[CONFIG] ERROR: " << unknown_keys.size()
+                      << " unknown config key(s) detected:\n";
             for (const auto& k : unknown_keys) {
                 std::cerr << "  - " << k << "\n";
             }
+            return Err<AppConfig>(TbError::ConfigLoadFailed);
         }
     }
 

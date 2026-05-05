@@ -14,6 +14,7 @@ namespace tb::persistence {
 // ==================== DDL ====================
 
 static constexpr const char* kCreateJournalTable = R"sql(
+CREATE SEQUENCE IF NOT EXISTS tb_journal_sequence_id_seq;
 CREATE TABLE IF NOT EXISTS tb_journal (
     id            BIGSERIAL PRIMARY KEY,
     sequence_id   BIGINT NOT NULL,
@@ -95,12 +96,18 @@ void PostgresStorageAdapter::ensure_schema() {
     txn.exec(kCreateSnapshotsTable);
     txn.commit();
 
-    // Инициализируем next_seq_ из максимального sequence_id в таблице
-    pqxx::nontransaction ntxn(*conn_);
-    auto r = ntxn.exec("SELECT COALESCE(MAX(sequence_id), 0) FROM tb_journal");
-    if (!r.empty() && !r[0][0].is_null()) {
-        next_seq_ = r[0][0].as<uint64_t>() + 1;
-    }
+    pqxx::work seq_txn(*conn_);
+    seq_txn.exec(R"sql(
+        SELECT setval(
+            'tb_journal_sequence_id_seq',
+            GREATEST(
+                COALESCE((SELECT MAX(sequence_id) FROM tb_journal), 0),
+                COALESCE((SELECT last_value FROM tb_journal_sequence_id_seq), 1)
+            ),
+            true
+        )
+    )sql");
+    seq_txn.commit();
 }
 
 // ==================== reconnect_if_needed ====================
@@ -124,8 +131,8 @@ VoidResult PostgresStorageAdapter::append_journal(const JournalEntry& entry) {
         reconnect_if_needed();
         pqxx::work txn(*conn_);
 
-        // ИСПРАВЛЕНИЕ: Инкремент next_seq_ ПОСЛЕ успешного коммита, не до
-        uint64_t seq = next_seq_;  // Читаем текущее значение
+        auto seq_row = txn.exec("SELECT nextval('tb_journal_sequence_id_seq')");
+        uint64_t seq = seq_row[0][0].as<uint64_t>();
         txn.exec_params(
             R"sql(
             INSERT INTO tb_journal
@@ -142,9 +149,6 @@ VoidResult PostgresStorageAdapter::append_journal(const JournalEntry& entry) {
             entry.payload_json
         );
         txn.commit();
-
-        // Инкремент только после успешного коммита
-        next_seq_++;
 
         return OkVoid();
     } catch (const std::exception& e) {

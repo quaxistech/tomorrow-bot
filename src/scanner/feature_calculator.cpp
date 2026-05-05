@@ -138,7 +138,8 @@ VolatilityFeatures FeatureCalculator::compute_volatility(const MarketSnapshot& s
     // Volatility to spread ratio (higher = more tradeable for scalping)
     double spread = s.orderbook.spread();
     if (spread > 0.0 && vol.atr > 0.0) {
-        vol.vol_to_spread_ratio = vol.atr / spread;
+        // BUG-S13-07: very small spread (e.g. 1e-12) → Inf ratio → log(Inf)=Inf downstream
+        vol.vol_to_spread_ratio = std::min(vol.atr / spread, 1000.0);
     }
 
     // Price velocity: absolute average candle change
@@ -180,7 +181,8 @@ VolatilityFeatures FeatureCalculator::compute_volatility(const MarketSnapshot& s
     // - ratio 5-10: sweet spot, enough movement relative to entry cost
     // - ratio > 20: excessive slippage risk, unstable fills
     // Gaussian on log(ratio) gives a proper bell curve:
-    if (vol.vol_to_spread_ratio > 0.0) {
+    // Guard at 1e-9 (not 0.0) to prevent log(~0) underflow → extreme negative score
+    if (vol.vol_to_spread_ratio > 1e-9) {
         double log_ratio = std::log(vol.vol_to_spread_ratio);
         double log_optimal = std::log(7.0);   // peak at ATR = 7× spread
         double sigma = 0.8;                    // width of acceptable zone

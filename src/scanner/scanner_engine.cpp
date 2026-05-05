@@ -174,6 +174,19 @@ ScannerResult ScannerEngine::scan() {
 
         // Fetch orderbook
         snap.orderbook = fetch_orderbook(snap.symbol);
+        now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (now_ms >= deadline_ms) {
+            result.errors.push_back("scan_timeout_after_orderbook_fetch");
+            break;
+        }
+        if (snap.orderbook.timestamp_ms > 0 &&
+            now_ms - snap.orderbook.timestamp_ms > 10'000) {
+            logger_->warn(kComp, "Skipping stale orderbook",
+                {{"symbol", snap.symbol},
+                 {"age_ms", std::to_string(now_ms - snap.orderbook.timestamp_ms)}});
+            snap.orderbook = {};
+        }
         if (snap.orderbook.bids.empty() && snap.orderbook.asks.empty()) {
             record_api_failure();
         } else {
@@ -182,6 +195,12 @@ ScannerResult ScannerEngine::scan() {
 
         // Fetch candles
         snap.candles = fetch_candles(snap.symbol);
+        now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (now_ms >= deadline_ms) {
+            result.errors.push_back("scan_timeout_after_candle_fetch");
+            break;
+        }
         if (snap.candles.empty()) {
             record_api_failure();
         } else {
@@ -708,17 +727,22 @@ std::vector<CandleData> ScannerEngine::fetch_candles(const std::string& symbol) 
 
 bool ScannerEngine::is_circuit_breaker_open() const {
     if (consecutive_api_failures_ < config_.circuit_breaker_threshold) return false;
+    // BUG-S36-01: system_clock can go backward on NTP correction → elapsed negative
+    // → CB permanently stuck open. Use steady_clock for monotonic elapsed measurement.
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    // Auto-reset after cooldown
-    return (now_ms - circuit_breaker_tripped_at_ms_) < config_.circuit_breaker_reset_ms;
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Auto-reset after cooldown; clamp negative elapsed to 0
+    int64_t elapsed = now_ms - circuit_breaker_tripped_at_ms_;
+    if (elapsed < 0) elapsed = 0;
+    return elapsed < config_.circuit_breaker_reset_ms;
 }
 
 void ScannerEngine::record_api_failure() {
     ++consecutive_api_failures_;
     if (consecutive_api_failures_ >= config_.circuit_breaker_threshold) {
+        // Use steady_clock to match is_circuit_breaker_open() (BUG-S36-01 fix)
         circuit_breaker_tripped_at_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         logger_->warn(kComp, "Circuit breaker TRIPPED — too many API failures",
             {{"failures", std::to_string(consecutive_api_failures_)},
              {"threshold", std::to_string(config_.circuit_breaker_threshold)},
@@ -745,7 +769,9 @@ double ScannerEngine::compute_return_correlation(const std::vector<CandleData>& 
     rb.reserve(n - 1);
 
     for (size_t i = 1; i < n; ++i) {
-        if (a[i-1].close <= 0.0 || b[i-1].close <= 0.0) continue;
+        // BUG-S11-03: only previous close was guarded; current close could be <=0
+        if (a[i-1].close <= 0.0 || b[i-1].close <= 0.0
+         || a[i].close  <= 0.0 || b[i].close  <= 0.0) continue;
         ra.push_back(std::log(a[i].close / a[i-1].close));
         rb.push_back(std::log(b[i].close / b[i-1].close));
     }
@@ -762,9 +788,12 @@ double ScannerEngine::compute_return_correlation(const std::vector<CandleData>& 
         sum_b2 += rb[i] * rb[i];
     }
 
-    double denom = std::sqrt((m * sum_a2 - sum_a * sum_a) * (m * sum_b2 - sum_b * sum_b));
-    if (denom < 1e-15) return 0.0;
-    return (m * sum_ab - sum_a * sum_b) / denom;
+    const double var_a = m * sum_a2 - sum_a * sum_a;
+    const double var_b = m * sum_b2 - sum_b * sum_b;
+    double denom = std::sqrt(std::max(0.0, var_a) * std::max(0.0, var_b));
+    if (!std::isfinite(denom) || denom < 1e-9) return 0.0;
+    const double corr = (m * sum_ab - sum_a * sum_b) / denom;
+    return std::isfinite(corr) ? std::clamp(corr, -1.0, 1.0) : 0.0;
 }
 
 void ScannerEngine::diversify_basket(std::vector<SymbolAnalysis>& ranked,

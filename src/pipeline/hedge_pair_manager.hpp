@@ -11,6 +11,7 @@ namespace tb::pipeline {
 /// Состояние парной хедж-позиции (explicit state machine)
 enum class HedgePairState {
     PrimaryOnly,       ///< Только основная нога, мониторинг на триггер хеджа
+    HedgeSentPending,  ///< Ордер отправлен, ждём подтверждения портфеля (hedge_count_ не растёт)
     PrimaryPlusHedge,  ///< Обе ноги активны, мониторинг на закрытие
     ProfitLockPair,    ///< Обе ноги, фиксация profitable pair
     ReverseTransition, ///< Хедж-нога становится новой основной
@@ -102,8 +103,11 @@ public:
     /// Счётчик хеджей за lifecycle текущей позиции
     int hedge_count() const { return hedge_count_; }
 
-    /// Уведомление: хедж успешно открыт
+    /// Уведомление: ордер хеджа отправлен на биржу (до подтверждения fill)
     void notify_hedge_opened();
+
+    /// Уведомление: ордер хеджа отменён или не исполнен — сброс без счётчика
+    void notify_hedge_failed();
 
     /// Уведомление: хедж закрыт (только хедж-нога)
     void notify_hedge_closed();
@@ -117,6 +121,9 @@ public:
 private:
     /// Оценка в состоянии PrimaryOnly: нужен ли хедж?
     HedgePairDecision evaluate_primary_only(const HedgePairInput& input);
+
+    /// Ожидание portfolio-подтверждения после отправки ордера хеджа
+    HedgePairDecision evaluate_hedge_pending(const HedgePairInput& input);
 
     /// Оценка в состоянии с активным хеджем: как управлять парой?
     HedgePairDecision evaluate_pair_active(const HedgePairInput& input);
@@ -136,12 +143,13 @@ private:
 
 inline const char* to_string(HedgePairState s) {
     switch (s) {
-    case HedgePairState::PrimaryOnly:      return "PrimaryOnly";
-    case HedgePairState::PrimaryPlusHedge: return "PrimaryPlusHedge";
-    case HedgePairState::ProfitLockPair:   return "ProfitLockPair";
+    case HedgePairState::PrimaryOnly:       return "PrimaryOnly";
+    case HedgePairState::HedgeSentPending:  return "HedgeSentPending";
+    case HedgePairState::PrimaryPlusHedge:  return "PrimaryPlusHedge";
+    case HedgePairState::ProfitLockPair:    return "ProfitLockPair";
     case HedgePairState::ReverseTransition: return "ReverseTransition";
-    case HedgePairState::AsymmetricUnwind: return "AsymmetricUnwind";
-    case HedgePairState::EmergencyFlatten: return "EmergencyFlatten";
+    case HedgePairState::AsymmetricUnwind:  return "AsymmetricUnwind";
+    case HedgePairState::EmergencyFlatten:  return "EmergencyFlatten";
     }
     return "Unknown";
 }

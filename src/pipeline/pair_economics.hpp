@@ -80,6 +80,7 @@ public:
     /// Агрегированные метрики за текущий день
     struct DailyStats {
         int pair_cycles{0};
+        int win_count{0};               ///< BUG-S32-05: integer counter avoids float rounding error
         double total_gross_pnl{0.0};
         double total_net_pnl{0.0};
         double total_fees{0.0};

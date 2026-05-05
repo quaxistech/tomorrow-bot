@@ -255,6 +255,10 @@ BitgetFuturesQueryAdapter::get_open_positions(const Symbol& symbol)
     result.reserve(positions_result->size());
 
     for (const auto& pos : positions_result.value()) {
+        // BUG-S11-02: skip positions with zero/invalid mark_price — they would produce
+        // zero notional, which reconciliation treats as a discrepancy and may trigger
+        // a false close order.
+        if (pos.mark_price.get() <= 0.0 || pos.total.get() <= 0.0) continue;
         reconciliation::ExchangeOpenPositionInfo info;
         info.symbol = pos.symbol;
         info.side = (pos.position_side == PositionSide::Short) ? Side::Sell : Side::Buy;

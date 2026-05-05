@@ -44,6 +44,7 @@ double candle_interval_minutes(std::string_view interval) {
 }
 
 double scanner_min_atr_pct(const ScannerConfig& cfg) {
+    // kDefaultTakerFeePct is a raw fraction (0.0006 = 0.06%); multiply by 100 to get percent units.
     constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0 * 100.0;
     constexpr double kRuntimeEconomicAtrFloorPct = kRoundTripTakerFeePct * 1.25;
 
@@ -78,8 +79,9 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
         }
     }
 
-    // Minimum price (reject micro-price contracts with poor scalping economics)
-    if (snapshot.last_price > 0.0 && snapshot.last_price < cfg_.min_price_usdt) {
+    // BUG-S4-29 fix: use epsilon instead of exact 0.0 comparison to avoid FP
+    // rounding edge cases where a valid price rounds to exactly 0.0.
+    if (snapshot.last_price > 1e-12 && snapshot.last_price < cfg_.min_price_usdt) {
         return {FilterReason::PriceTooLow,
                 "price=" + std::to_string(snapshot.last_price) +
                 " < min=" + std::to_string(cfg_.min_price_usdt)};
@@ -156,7 +158,7 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
     }
 
     if (snapshot.last_price > 0.0 && features.volatility.atr > 0.0) {
-        constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0 * 100.0;
+        constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0;
         double atr_pct = features.volatility.atr / snapshot.last_price * 100.0;
         double min_atr_pct = scanner_min_atr_pct(cfg_);
         if (atr_pct < min_atr_pct) {
@@ -168,16 +170,16 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
         }
     }
 
-    // ИСПРАВЛЕНИЕ H10: 24h price change фильтр (YAML scorer_filter_* → ScannerConfig)
-    // Exhausted pump/dump: позиции, прошедшие >X% 24h имеют повышенный риск разворота.
+    // BUG-S4-31 fix: use ExtremeMove24h (not ExtremeVolatility) for 24h change filter.
+    // Exhausted pump/dump: assets with >X% 24h change have elevated reversal risk.
     if (snapshot.change_24h_pct != 0.0) {
         if (snapshot.change_24h_pct < cfg_.filter_min_change_24h) {
-            return {FilterReason::ExtremeVolatility,
+            return {FilterReason::ExtremeMove24h,
                     "change_24h=" + std::to_string(static_cast<int>(snapshot.change_24h_pct)) +
                     "% < min=" + std::to_string(static_cast<int>(cfg_.filter_min_change_24h)) + "%"};
         }
         if (snapshot.change_24h_pct > cfg_.filter_max_change_24h) {
-            return {FilterReason::ExtremeVolatility,
+            return {FilterReason::ExtremeMove24h,
                     "change_24h=" + std::to_string(static_cast<int>(snapshot.change_24h_pct)) +
                     "% > max=" + std::to_string(static_cast<int>(cfg_.filter_max_change_24h)) + "%"};
         }

@@ -2,6 +2,7 @@
 /// @brief Реализация Order Watchdog — монитора жизненного цикла ордеров
 
 #include "pipeline/order_watchdog.hpp"
+#include <algorithm>
 #include <time.h>
 
 namespace tb::pipeline {
@@ -41,6 +42,13 @@ std::vector<WatchdogReport> OrderWatchdog::run_check() {
 
     if (!exec_engine_) return reports;
 
+    // BUG-S4-24: guard against overflow — cap check_interval_ms at 60 000 ms (60s)
+    if (config_.check_interval_ms > 60'000) {
+        logger_->error("watchdog", "check_interval_ms exceeds 60000ms, capping to 60000ms",
+            {{"configured_ms", std::to_string(config_.check_interval_ms)}});
+        config_.check_interval_ms = 60'000;
+    }
+
     // Проверяем интервал между запусками
     const int64_t now_ns = clock_->now().get();
     const int64_t interval_ns = config_.check_interval_ms * 1'000'000LL;
@@ -52,14 +60,17 @@ std::vector<WatchdogReport> OrderWatchdog::run_check() {
     // Получить все активные ордера из Execution Engine
     auto active = exec_engine_->active_orders();
 
-    // Попутно вызываем системный cancel зависших ордеров по времени
-    exec_engine_->cancel_timed_out_orders(config_.max_open_order_ms);
+    // BUG-S4-14: removed duplicate exec_engine_->cancel_timed_out_orders() call here.
+    // The watchdog loop below already classifies and cancels timed-out orders
+    // (Open/CancelPending with age > max_open_order_ms → WatchdogOrderAction::Cancel),
+    // so calling cancel_timed_out_orders() here as well caused double cancellation.
 
     for (const auto& order : active) {
         WatchdogOrderAction action = classify_order(order, now_ns);
         if (action == WatchdogOrderAction::Ok) continue;
 
-        int64_t age_ms = (now_ns - order.last_updated.get()) / 1'000'000LL;
+        // BUG-S34-03: negative age_ms when NTP backward jump → no timeout ever fires.
+        int64_t age_ms = std::max(int64_t{0}, now_ns - order.last_updated.get()) / 1'000'000LL;
 
         WatchdogReport report;
         report.order_id = order.order_id;
@@ -143,7 +154,8 @@ WatchdogOrderAction OrderWatchdog::classify_order(
 {
     if (order.last_updated.get() <= 0) return WatchdogOrderAction::Ok;
 
-    const int64_t age_ms = (now_ns - order.last_updated.get()) / 1'000'000LL;
+    // BUG-S34-03: clamp to 0 to avoid negative age when NTP backward jump
+    const int64_t age_ms = std::max(int64_t{0}, now_ns - order.last_updated.get()) / 1'000'000LL;
 
     switch (order.state) {
         case execution::OrderState::PendingAck:

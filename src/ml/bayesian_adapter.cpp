@@ -15,6 +15,18 @@ BayesianAdapter::BayesianAdapter(
     , logger_(std::move(logger))
     , rng_(std::random_device{}())  // Сид от аппаратного источника энтропии
 {
+    // BUG-S26-01: validate learning_rate — 0/NaN/>1 silently breaks learning
+    if (!std::isfinite(config_.learning_rate) ||
+        config_.learning_rate <= 0.0 ||
+        config_.learning_rate > 1.0) {
+        if (logger_) {
+            logger_->warn("bayesian_adapter",
+                "Invalid learning_rate, resetting to 0.05",
+                {{"invalid_value", std::to_string(config_.learning_rate)}});
+        }
+        config_.learning_rate = 0.05;
+    }
+
     if (logger_) {
         logger_->info("bayesian_adapter", "Байесовский адаптер создан",
             {{"learning_rate", std::to_string(config_.learning_rate)},
@@ -29,6 +41,27 @@ void BayesianAdapter::register_parameter(
     BayesianParameter param)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // BUG-S22-08: validate parameter bounds before registration.
+    if (param.max_value <= param.min_value) {
+        if (logger_) {
+            logger_->error("bayesian_adapter",
+                "Parameter rejected: min_value >= max_value for " + param.name,
+                {{"min", std::to_string(param.min_value)},
+                 {"max", std::to_string(param.max_value)}});
+        }
+        return;
+    }
+    if (param.prior_mean < param.min_value || param.prior_mean > param.max_value) {
+        if (logger_) {
+            logger_->warn("bayesian_adapter",
+                "prior_mean clamped to [min, max] for " + param.name,
+                {{"prior_mean", std::to_string(param.prior_mean)},
+                 {"min", std::to_string(param.min_value)},
+                 {"max", std::to_string(param.max_value)}});
+        }
+        param.prior_mean = std::clamp(param.prior_mean, param.min_value, param.max_value);
+    }
 
     // Инициализируем posterior = prior
     param.posterior_mean = param.prior_mean;
@@ -191,16 +224,28 @@ void BayesianAdapter::update_posterior(
         param.max_value
     );
 
+    // BUG-S24-10: use obs_variance-relative cap so precision can't exceed the point
+    // where obs_precision becomes negligible vs prior — preventing learning freeze.
+    // max_useful = 100/obs_variance ensures obs always contributes ≥ 1% weight.
+    const double max_useful_precision = 100.0 /
+        std::max(config_.observation_variance, 1e-6);
+    const double effective_max = std::min(max_useful_precision, config_.max_precision);
+
     // Exponential forgetting: decay precision before update to prevent learning freeze
     const double decayed_precision = std::min(
         param.posterior_precision * config_.precision_decay,
-        config_.max_precision);
+        effective_max);
     const double prior_precision = std::max(decayed_precision, numeric::kEpsilon);
     const double obs_precision = numeric::safe_div(
         1.0, std::max(config_.observation_variance, numeric::kEpsilon), 1.0);
 
-    const double new_precision = std::min(prior_precision + obs_precision, config_.max_precision);
+    const double new_precision = std::min(prior_precision + obs_precision, effective_max);
     const double weighted_mean = (prior_precision * param.posterior_mean + obs_precision * observation);
+    // BUG-S14-07: at extreme precision values the product can overflow to Inf → NaN after division.
+    // Keep the prior if the weighted sum overflows; learning resumes once values normalise.
+    if (!std::isfinite(weighted_mean)) {
+        return;
+    }
     const double new_mean = numeric::safe_div(weighted_mean, new_precision, param.posterior_mean);
     const double new_variance = std::max(
         numeric::safe_div(1.0, new_precision, param.posterior_variance),
@@ -239,17 +284,23 @@ double BayesianAdapter::regime_adjusted_mean(
         return param.posterior_mean;
     }
 
-    double reward_sum = 0.0;
-    size_t count = 0;
-    for (const auto& obs : regime_it->second) {
-        if (numeric::is_finite(obs.reward)) {
-            reward_sum += obs.reward;
-            ++count;
+    // Exponentially weighted mean: recent observations get higher weight.
+    // Iterate newest-first (reverse order) so index 0 = newest, weight = decay^0 = 1.
+    double weighted_sum = 0.0;
+    double weight_total = 0.0;
+    const auto& obs_vec = regime_it->second;
+    double w = 1.0;
+    for (auto it = obs_vec.rbegin(); it != obs_vec.rend(); ++it) {
+        if (numeric::is_finite(it->reward)) {
+            weighted_sum += w * it->reward;
+            weight_total += w;
         }
+        w *= config_.precision_decay;
+        if (w < 1e-6) break;  // negligible weight — stop early
     }
-    if (count == 0) return param.posterior_mean;
+    if (weight_total < numeric::kEpsilon) return param.posterior_mean;
 
-    const double avg_reward = reward_sum / static_cast<double>(count);
+    const double avg_reward = weighted_sum / weight_total;
     const double range = std::max(param.max_value - param.min_value, numeric::kEpsilon);
     const double regime_mean = std::clamp(
         param.posterior_mean + avg_reward * range * config_.learning_rate,

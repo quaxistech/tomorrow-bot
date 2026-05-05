@@ -78,8 +78,12 @@ double MicrostructureFingerprinter::predict_edge(
 
     const double blended = 0.7 * wr_signal + 0.3 * return_signal;
 
-    // Apply threshold gates: only report edge outside neutral zone
-    if (stats.win_rate >= config_.favorable_win_rate || blended > 0.1) {
+    // BUG-ML-13: require BOTH win_rate >= favorable AND blended > 0.1 for a
+    // positive signal. OR gate allowed low-win-rate (40%) patterns with a high
+    // avg_return to bypass the neutral zone, returning positive signals for
+    // statistically losing patterns (Kelly criterion requires consistent wins).
+    // Unfavorable direction uses OR so any single warning suppresses the edge.
+    if (stats.win_rate >= config_.favorable_win_rate && blended > 0.1) {
         return numeric::safe_clamp(blended, -1.0, 1.0);
     }
     if (stats.win_rate <= config_.unfavorable_win_rate || blended < -0.1) {
@@ -98,7 +102,9 @@ void MicrostructureFingerprinter::record_outcome(
     last_update_ns_ = clock::steady_now_ns();
     ++total_updates_;
 
+    bool is_new = knowledge_base_.find(fp) == knowledge_base_.end();
     auto& stats = knowledge_base_[fp];
+    if (is_new) insertion_order_.push_back(fp);
     stats.count++;
 
     // Обновляем среднюю доходность инкрементально (скользящее среднее)
@@ -121,21 +127,13 @@ void MicrostructureFingerprinter::record_outcome(
         stats.win_rate = 0.5;
     }
 
-    // Ограничиваем размер базы знаний (удаляем самые редкие fingerprints)
-    if (knowledge_base_.size() > config_.max_history) {
-        // Находим fingerprint с наименьшим количеством наблюдений (кроме текущего)
-        auto min_it = knowledge_base_.end();
-        size_t min_count = std::numeric_limits<size_t>::max();
-        for (auto it = knowledge_base_.begin(); it != knowledge_base_.end(); ++it) {
-            if (it->first == fp) continue;  // Не удаляем текущий
-            if (it->second.count < min_count) {
-                min_count = it->second.count;
-                min_it = it;
-            }
+    // FIFO eviction: O(1) instead of O(n) min-count scan
+    while (knowledge_base_.size() > config_.max_history && !insertion_order_.empty()) {
+        const auto& oldest = insertion_order_.front();
+        if (oldest != fp) {
+            knowledge_base_.erase(oldest);
         }
-        if (min_it != knowledge_base_.end()) {
-            knowledge_base_.erase(min_it);
-        }
+        insertion_order_.pop_front();
     }
 
     if (logger_ && stats.count % 100 == 0) {

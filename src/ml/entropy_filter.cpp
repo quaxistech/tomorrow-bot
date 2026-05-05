@@ -81,9 +81,15 @@ EntropyResult EntropyFilter::compute() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Возвращаем кешированный результат, если данные не изменились
+    // BUG-ML-07 fix: invalidate cache when data feed goes stale.
+    // on_tick() sets cache_valid_=false on each tick; if the feed dies,
+    // on_tick() stops being called and the stale cached result persists forever.
     if (cache_valid_) {
-        return cached_result_;
+        if (numeric::is_stale(last_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
+            cache_valid_ = false;
+        } else {
+            return cached_result_;
+        }
     }
 
     EntropyResult result;
@@ -180,13 +186,16 @@ double EntropyFilter::compute_shannon_entropy(const std::deque<double>& data) co
     if (range < numeric::kEpsilon) return 0.0;
 
     // Подсчитываем частоты по бинам
-    // Multiply by (num_bins - 1) so that max value maps to the last bin
-    // instead of overflowing to an out-of-range index.
+    // Multiply by num_bins so that values are evenly distributed across all bins.
+    // The clamp handles the edge case where normalized == 1.0 (max value maps to
+    // bin index num_bins, which is clamped back to num_bins-1).
     const auto num_bins = config_.num_bins;
     std::vector<size_t> bins(num_bins, 0);
     for (const double val : data) {
         const double normalized = numeric::safe_div(val - min_val, range);
-        int bin = static_cast<int>(normalized * static_cast<double>(num_bins - 1));
+        // BUG-S24-03: static_cast<int>(NaN) is UB; skip non-finite values
+        if (!std::isfinite(normalized)) continue;
+        int bin = static_cast<int>(normalized * static_cast<double>(num_bins));
         bin = std::clamp(bin, 0, static_cast<int>(num_bins) - 1);
         bins[static_cast<size_t>(bin)]++;
     }

@@ -22,6 +22,7 @@ OrderFSM::OrderFSM(OrderId order_id)
 // ---------- state queries ----------
 
 OrderState OrderFSM::current_state() const {
+    std::lock_guard lock(mutex_);
     return state_;
 }
 
@@ -29,6 +30,7 @@ OrderState OrderFSM::current_state() const {
 
 bool OrderFSM::transition(OrderState new_state, const std::string& reason,
                            Timestamp now) {
+    std::lock_guard lock(mutex_);
     if (!is_valid_transition(state_, new_state)) {
         return false;
     }
@@ -51,21 +53,25 @@ bool OrderFSM::transition(OrderState new_state, const std::string& reason,
 }
 
 const std::vector<OrderTransition>& OrderFSM::history() const {
+    std::lock_guard lock(mutex_);
     return history_;
 }
 
 bool OrderFSM::is_terminal() const {
+    std::lock_guard lock(mutex_);
     return state_ == OrderState::Filled || state_ == OrderState::Cancelled ||
            state_ == OrderState::Rejected || state_ == OrderState::Expired;
 }
 
 bool OrderFSM::is_active() const {
+    std::lock_guard lock(mutex_);
     return state_ == OrderState::Open || state_ == OrderState::PartiallyFilled ||
            state_ == OrderState::PendingAck || state_ == OrderState::CancelPending;
 }
 
 void OrderFSM::force_transition(OrderState new_state, const std::string& reason,
                                  Timestamp now) {
+    std::lock_guard lock(mutex_);
     // Если вызывающая сторона не передала метку времени — подставить wall-clock
     if (now == Timestamp(0)) {
         now = wall_clock_now();
@@ -85,6 +91,7 @@ void OrderFSM::force_transition(OrderState new_state, const std::string& reason,
 // ---------- time accessors ----------
 
 Timestamp OrderFSM::last_transition_time() const {
+    std::lock_guard lock(mutex_);
     if (history_.empty()) {
         return Timestamp(created_at_ns_);
     }
@@ -92,10 +99,12 @@ Timestamp OrderFSM::last_transition_time() const {
 }
 
 Timestamp OrderFSM::created_at() const {
+    std::lock_guard lock(mutex_);
     return Timestamp(created_at_ns_);
 }
 
 int64_t OrderFSM::time_in_current_state_ms() const {
+    std::lock_guard lock(mutex_);
     auto elapsed = std::chrono::steady_clock::now() - last_transition_tp_;
     return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 }

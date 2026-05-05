@@ -25,9 +25,12 @@ SnapshotStore& PersistenceLayer::snapshots() {
 VoidResult PersistenceLayer::flush() {
     // No facade-level lock: EventJournal and SnapshotStore each have their own
     // internal mutex, so concurrent flush() / append() / save() calls are safe.
+    // BUG-S21-04: always flush both — don't short-circuit on journal failure,
+    // as snapshots must be persisted regardless.
     auto r1 = journal_.flush();
+    auto r2 = snapshots_.flush();
     if (!r1) return r1;
-    return snapshots_.flush();
+    return r2;
 }
 
 bool PersistenceLayer::is_enabled() const {

@@ -50,7 +50,7 @@ Result<OrderId> ExecutionEngine::execute(
     const uncertainty::UncertaintySnapshot& uncertainty)
 {
     // H-4: Serialize execute() to prevent dedup TOCTOU race
-    std::lock_guard<std::mutex> exec_lock(execute_mutex_);
+    std::unique_lock<std::mutex> exec_lock(execute_mutex_);
 
     // §5 Step 1-2: Валидация входных данных
     auto validation = validate_inputs(intent, risk_decision, exec_alpha, uncertainty);
@@ -201,8 +201,11 @@ Result<OrderId> ExecutionEngine::execute(
         // Запрашиваем реальный статус fill с биржи через REST order/detail.
         // Если запрос не удался — fallback к оптимистичной оценке (как раньше).
 
-        auto fill_detail = submitter_->query_order_fill_detail(
+        OrderFillDetail fill_detail;
+        exec_lock.unlock();
+        fill_detail = submitter_->query_order_fill_detail(
             order.exchange_order_id, order.symbol);
+        exec_lock.lock();
 
         Price confirmed_price = market_fill_price;
         Quantity confirmed_qty = (submit_result.submitted_quantity.get() > 0.0)
@@ -213,6 +216,13 @@ Result<OrderId> ExecutionEngine::execute(
             // Биржа подтвердила fill — используем реальные данные
             if (fill_detail.fill_price.get() > 0.0) {
                 confirmed_price = fill_detail.fill_price;
+            }
+            if (!std::isfinite(fill_detail.filled_qty.get())) {
+                logger_->error("Execution", "NaN filled_qty from exchange — order sent to recovery",
+                    {{"order_id", order_id_str}});
+                registry_.transition(order.order_id, OrderState::UnknownRecovery,
+                    "NaN filled_qty from exchange");
+                return std::unexpected(TbError::ExecutionFailed);
             }
             if (fill_detail.filled_qty.get() > 0.0) {
                 confirmed_qty = fill_detail.filled_qty;
@@ -249,13 +259,25 @@ Result<OrderId> ExecutionEngine::execute(
 
             int backoff_ms = 50;
             for (int attempt = 0; attempt < 3; ++attempt) {
+                exec_lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
                 fill_detail = submitter_->query_order_fill_detail(
                     order.exchange_order_id, order.symbol);
+                exec_lock.lock();
 
                 if (fill_detail.success) {
                     if (fill_detail.fill_price.get() > 0.0) {
                         confirmed_price = fill_detail.fill_price;
+                    }
+                    if (!std::isfinite(fill_detail.filled_qty.get())) {
+                        logger_->error("Execution", "NaN filled_qty from exchange (retry) — sent to recovery",
+                            {{"order_id", order_id_str}});
+                        registry_.transition(order.order_id, OrderState::UnknownRecovery,
+                            "NaN filled_qty from exchange on retry");
+                        if (portfolio_ && requires_margin_reserve(order)) {
+                            portfolio_->release_cash(order.order_id);
+                        }
+                        return std::unexpected(TbError::ExecutionFailed);
                     }
                     if (fill_detail.filled_qty.get() > 0.0) {
                         confirmed_qty = fill_detail.filled_qty;
@@ -313,7 +335,16 @@ Result<OrderId> ExecutionEngine::execute(
         // Вычисляем реальную задержку исполнения
         int64_t fill_latency_ms = 0;
         if (order.created_at.get() > 0) {
-            fill_latency_ms = (clock_->now().get() - order.created_at.get()) / 1'000'000;
+            int64_t now_ns   = clock_->now().get();
+            int64_t creat_ns = order.created_at.get();
+            if (now_ns < creat_ns) {
+                logger_->warn("Execution", "Clock skew: fill time < order creation time",
+                    {{"order_id", order_id_str},
+                     {"now_ns", std::to_string(now_ns)},
+                     {"created_ns", std::to_string(creat_ns)}});
+            } else {
+                fill_latency_ms = (now_ns - creat_ns) / 1'000'000;
+            }
         }
         double fill_fee = confirmed_qty.get() * confirmed_price.get() * kDefaultTakerFeePct;
         exec_metrics_.record_fill(order, confirmed_price, fill_latency_ms, fill_fee);
@@ -656,10 +687,9 @@ OrderRecord ExecutionEngine::create_order_record(
     record.created_at = clock_->now();
     record.last_updated = clock_->now();
 
-    // §13: Тип ордера из плана
-    // Market orders: confirmed via REST + supplemented by private WS fills
-    record.order_type = OrderType::Market;
-    record.tif = TimeInForce::ImmediateOrCancel;
+    // §13: Тип ордера и TIF из плана
+    record.order_type = plan.order_type;
+    record.tif = plan.tif;
 
     // §13: Цена из плана
     record.price = plan.planned_price;

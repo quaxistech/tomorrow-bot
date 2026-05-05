@@ -4,6 +4,7 @@
  */
 #include "telemetry/file_telemetry_sink.hpp"
 #include <boost/json.hpp>
+#include <cstdio>
 #include <filesystem>
 #include <algorithm>
 #include <vector>
@@ -13,8 +14,15 @@ namespace tb::telemetry {
 
 FileTelemetrySink::FileTelemetrySink(FileSinkConfig config)
     : config_(std::move(config)) {
-    std::filesystem::create_directories(config_.directory);
-    open_new_file();
+    // BUG-S19-02: wrap filesystem ops so a bad directory path doesn't crash the process.
+    try {
+        std::filesystem::create_directories(config_.directory);
+        open_new_file();
+    } catch (const std::exception& e) {
+        // Telemetry is best-effort — log to stderr and leave file_ closed.
+        // emit() checks file_.is_open() before writing, so further calls are no-ops.
+        std::fprintf(stderr, "[FileTelemetrySink] Init failed: %s\n", e.what());
+    }
 }
 
 FileTelemetrySink::~FileTelemetrySink() {
@@ -82,6 +90,11 @@ void FileTelemetrySink::open_new_file() {
         std::to_string(file_index_) + ".jsonl";
     std::string path = config_.directory + "/" + filename;
     file_.open(path, std::ios::out | std::ios::trunc);
+    // BUG-S4-26 fix: detect open failure at construction time rather than
+    // silently discovering it on the first emit() call.
+    if (!file_.is_open()) {
+        throw std::runtime_error("FileTelemetrySink: failed to open telemetry file: " + path);
+    }
     current_file_bytes_ = 0;
 }
 

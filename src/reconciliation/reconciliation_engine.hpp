@@ -129,7 +129,8 @@ private:
     std::shared_ptr<metrics::IMetricsRegistry> metrics_;
 
     ReconciliationResult last_result_;
-    mutable std::mutex mutex_;
+    mutable std::mutex mutex_;     ///< Protects last_result_ (read/write)
+    std::mutex op_mutex_;          ///< Serializes concurrent reconciliation runs (BUG-S4-03)
 };
 
 } // namespace tb::reconciliation

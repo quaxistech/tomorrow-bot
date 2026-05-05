@@ -56,6 +56,10 @@ bool HttpEndpointServer::start() {
             try {
                 run_accept_loop(bind_promise);
             } catch (const std::exception& e) {
+                // If bind_promise was already resolved (start() returned true),
+                // running_ is still true while the thread is dying — clear it so
+                // callers see the server as stopped (BUG-NEW-19).
+                running_.store(false);
                 if (logger_) {
                     logger_->error(server_name_,
                         "HTTP server fatal error: " + std::string(e.what()));
@@ -194,13 +198,24 @@ void HttpEndpointServer::run_accept_loop(std::promise<bool>& bind_result) {
 
 void HttpEndpointServer::handle_connection(tcp::socket socket) {
     beast::error_code ec;
-    beast::flat_buffer buffer;
+
+    // Wrap the raw socket in a tcp_stream so we can apply a read/write deadline.
+    // Without a timeout, a client that connects and never sends data would block
+    // the worker thread indefinitely (BUG-NEW-03).
+    beast::tcp_stream stream{std::move(socket)};
+    stream.expires_after(std::chrono::seconds(5));
+
+    // Limit buffer to 64 KiB — Prometheus scrape requests are tiny (< 200 B).
+    // An unlimited flat_buffer allows a hostile or buggy client to exhaust
+    // process memory by streaming an unbounded request body (BUG-NEW-04).
+    constexpr std::size_t kMaxBodyBytes = 64 * 1024;
+    beast::flat_buffer buffer{kMaxBodyBytes};
 
     // Read one HTTP request
     http::request<http::string_body> req;
-    http::read(socket, buffer, req, ec);
+    http::read(stream, buffer, req, ec);
     if (ec) {
-        return; // client disconnected or malformed request
+        return; // client disconnected, malformed request, or read timed out
     }
 
     // Invoke the application handler
@@ -223,6 +238,10 @@ void HttpEndpointServer::handle_connection(tcp::socket socket) {
     }
 
     // Build Beast HTTP response
+    // BUG-S12-11: handler could return an invalid code like 999; clamp to [100,599]
+    if (app_response.status_code < 100 || app_response.status_code > 599) {
+        app_response.status_code = 500;
+    }
     http::response<http::string_body> res{
         static_cast<http::status>(app_response.status_code), req.version()};
     res.set(http::field::server, "TomorrowBot/2.0");
@@ -236,10 +255,10 @@ void HttpEndpointServer::handle_connection(tcp::socket socket) {
     res.body() = std::move(app_response.body);
     res.prepare_payload();
 
-    http::write(socket, res, ec);
+    http::write(stream, res, ec);
 
-    // Graceful close
-    socket.shutdown(tcp::socket::shutdown_send, ec);
+    // Graceful close — release the stream's TCP socket
+    stream.socket().shutdown(tcp::socket::shutdown_send, ec);
 }
 
 } // namespace tb::app

@@ -24,7 +24,9 @@ VolumeProfileSnapshot compute_volume_profile_snapshot(
     size_t num_levels,
     double value_area_pct) {
     VolumeProfileSnapshot snapshot;
-    if (trade_history.size() < 50 || num_levels == 0) {
+    // BUG-S14-05: num_levels=1 produces a degenerate single-bucket histogram.
+    // Require at least 2 levels so VAH/VAL expansion and POC detection are meaningful.
+    if (trade_history.size() < 50 || num_levels < 2) {
         return snapshot;
     }
 
@@ -230,6 +232,14 @@ void AdvancedFeatureEngine::update_vpin(double volume, bool is_buy) {
                                           volumes_calibration_.end(), 0.0)
                         / static_cast<double>(volumes_calibration_.size());
         const double target = avg_vol * static_cast<double>(vpin_cfg_.bucket_size);
+        if (target == 0.0) {
+            logger_->warn("advanced_features",
+                          "VPIN calibration produced zero bucket target (avg_vol=0); "
+                          "skipping until trades arrive",
+                          {});
+            volumes_calibration_.clear();
+            return;
+        }
         canonical_bucket_target_ = target;
         adaptive_bucket_target_ = target;
         canonical_calibrated_ = true;
@@ -319,80 +329,6 @@ double AdvancedFeatureEngine::compute_vpin_from_buckets(
     return (sum_volume > 0.0) ? sum_abs_imbalance / sum_volume : 0.0;
 }
 
-// ==================== Volume Profile ====================
-
-void AdvancedFeatureEngine::update_volume_profile(double price, double volume) {
-    trade_history_.push_back({price, volume});
-    if (trade_history_.size() > vp_cfg_.lookback_trades) {
-        trade_history_.pop_front();
-    }
-    vp_dirty_ = true;
-    vp_calc_counter_++;
-
-    // Пересчитываем каждые 100 трейдов (экономия CPU)
-    if (vp_calc_counter_ % 100 != 0 && vp_poc_ > 0.0) return;
-
-    if (trade_history_.size() < 50) return;
-
-    // Диапазон цен
-    double min_price = 1e18, max_price = 0.0;
-    for (const auto& tv : trade_history_) {
-        min_price = std::min(min_price, tv.price);
-        max_price = std::max(max_price, tv.price);
-    }
-    if (max_price <= min_price) return;
-
-    // Гистограмма объёма по ценовым уровням
-    size_t num_levels = vp_cfg_.num_levels;
-    double level_width = (max_price - min_price) / static_cast<double>(num_levels);
-    std::vector<double> histogram(num_levels, 0.0);
-    double total_vol = 0.0;
-
-    for (const auto& tv : trade_history_) {
-        size_t idx = std::min(
-            static_cast<size_t>((tv.price - min_price) / level_width),
-            num_levels - 1);
-        histogram[idx] += tv.volume;
-        total_vol += tv.volume;
-    }
-
-    // POC — уровень с максимальным объёмом
-    size_t poc_idx = 0;
-    double max_vol = 0.0;
-    for (size_t i = 0; i < num_levels; ++i) {
-        if (histogram[i] > max_vol) {
-            max_vol = histogram[i];
-            poc_idx = i;
-        }
-    }
-    vp_poc_ = min_price + (static_cast<double>(poc_idx) + 0.5) * level_width;
-
-    // Value Area (70% объёма вокруг POC)
-    double target = total_vol * vp_cfg_.value_area_pct;
-    double accumulated = histogram[poc_idx];
-    size_t low_idx = poc_idx, high_idx = poc_idx;
-
-    while (accumulated < target && (low_idx > 0 || high_idx < num_levels - 1)) {
-        double add_low = (low_idx > 0) ? histogram[low_idx - 1] : 0.0;
-        double add_high = (high_idx < num_levels - 1) ? histogram[high_idx + 1] : 0.0;
-
-        if (add_high >= add_low && high_idx < num_levels - 1) {
-            high_idx++;
-            accumulated += histogram[high_idx];
-        } else if (low_idx > 0) {
-            low_idx--;
-            accumulated += histogram[low_idx];
-        } else {
-            high_idx++;
-            accumulated += histogram[high_idx];
-        }
-    }
-
-    vp_va_low_ = min_price + static_cast<double>(low_idx) * level_width;
-    vp_va_high_ = min_price + static_cast<double>(high_idx + 1) * level_width;
-    vp_dirty_ = false;
-}
-
 // ==================== fill_snapshot ====================
 
 void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
@@ -449,13 +385,21 @@ void AdvancedFeatureEngine::fill_snapshot(FeatureSnapshot& snapshot) const {
     const int64_t ns_per_hour = ns_per_sec * 3600LL;
     const int64_t ns_per_day = ns_per_hour * 24LL;
     int hour = static_cast<int>((now_ns % ns_per_day) / ns_per_hour);
-    if (hour < 0 || hour >= 24) return;
+    // BUG-S14-06: early return must explicitly mark tod_valid=false so callers
+    // can distinguish "invalid hour" from a successful (tod_valid=true) result.
+    if (hour < 0 || hour >= 24) { snapshot.technical.tod_valid = false; return; }
 
+    // BUG-S20-01: validate array sizes before indexed access to prevent out_of_range crash.
+    if (tod_cfg_.vol_multipliers.size() < 24 ||
+        tod_cfg_.volume_multipliers.size() < 24 ||
+        tod_cfg_.alpha_scores.size() < 24) {
+        return;
+    }
     snapshot.technical.session_hour_utc = hour;
     size_t h = static_cast<size_t>(hour);
-    snapshot.technical.tod_volatility_mult = tod_cfg_.vol_multipliers.at(h);
-    snapshot.technical.tod_volume_mult = tod_cfg_.volume_multipliers.at(h);
-    snapshot.technical.tod_alpha_score = tod_cfg_.alpha_scores.at(h);
+    snapshot.technical.tod_volatility_mult = tod_cfg_.vol_multipliers[h];
+    snapshot.technical.tod_volume_mult = tod_cfg_.volume_multipliers[h];
+    snapshot.technical.tod_alpha_score = tod_cfg_.alpha_scores[h];
     snapshot.technical.tod_valid = true;
 }
 

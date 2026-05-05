@@ -33,6 +33,7 @@ void FeatureEngine::on_trade(const normalizer::NormalizedTrade& trade) {
     std::lock_guard lock(mutex_);
     const std::string key = trade.envelope.symbol.get();
     trade_buffers_[key].push(trade);
+    last_trade_received_ns_[key] = trade.envelope.received_ts.get();
 }
 
 void FeatureEngine::on_ticker(const normalizer::NormalizedTicker& ticker) {
@@ -78,6 +79,17 @@ std::optional<FeatureSnapshot> FeatureEngine::compute_snapshot(
     }
     const auto& ticker = ticker_it->second;
 
+    // BUG-S29-06: NaN bid or ask from normalizer would produce NaN mid_price,
+    // poisoning all downstream microstructure features.
+    if (!std::isfinite(ticker.bid.get()) || !std::isfinite(ticker.ask.get()) ||
+        ticker.bid.get() <= 0.0 || ticker.ask.get() <= 0.0) {
+        logger_->warn("FeatureEngine", "compute_snapshot: невалидные bid/ask в тикере, пропуск",
+            {{"symbol", symbol.get()},
+             {"bid", std::to_string(ticker.bid.get())},
+             {"ask", std::to_string(ticker.ask.get())}});
+        return std::nullopt;
+    }
+
     FeatureSnapshot snap;
     snap.symbol = symbol;
     snap.computed_at = clock_->now();
@@ -85,10 +97,17 @@ std::optional<FeatureSnapshot> FeatureEngine::compute_snapshot(
     snap.mid_price = tb::Price{(ticker.bid.get() + ticker.ask.get()) * 0.5};
     snap.book_quality = book.quality();
 
-    // Возраст данных: разница между текущим временем и временем последнего тикера
-    snap.market_data_age_ns = tb::Timestamp{
-        snap.computed_at.get() - ticker.envelope.received_ts.get()
-    };
+    // Age of exchange data: time since the last trade was received (exchange staleness).
+    // Falls back to time since ticker receipt if no trades have been seen yet.
+    {
+        auto it = last_trade_received_ns_.find(symbol.get());
+        const int64_t last_data_ns = (it != last_trade_received_ns_.end())
+            ? it->second
+            : ticker.envelope.received_ts.get();
+        // BUG-S35-02: negative age when NTP backward jump → staleness monitoring broken.
+        const auto age_raw = snap.computed_at.get() - last_data_ns;
+        snap.market_data_age_ns = tb::Timestamp{age_raw > 0 ? age_raw : decltype(age_raw){0}};
+    }
 
     snap.technical = compute_technical(symbol);
     snap.microstructure = compute_microstructure(ticker, book);
@@ -157,11 +176,12 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
     // ATR
     {
         auto atr = indicators_->atr(high, low, close, config_.atr_period);
-        tf.atr_valid = atr.valid;
-        tf.atr_14 = atr.value;
+        // BUG-S29-05: atr.valid=true doesn't guarantee isfinite(atr.value)
+        tf.atr_valid = atr.valid && std::isfinite(atr.value);
+        tf.atr_14 = tf.atr_valid ? atr.value : 0.0;
         // Нормализация ATR относительно последней цены закрытия
         const double last_close = close.back();
-        tf.atr_14_normalized = (atr.valid && last_close > 0.0)
+        tf.atr_14_normalized = (tf.atr_valid && last_close > 0.0)
             ? atr.value / last_close
             : 0.0;
     }
@@ -262,9 +282,10 @@ MicrostructureFeatures FeatureEngine::compute_microstructure(
         mf.ask_depth_5_notional = depth->ask_depth_5.get() * mf.mid_price;
         mf.liquidity_valid = true;
         const double total = mf.bid_depth_5_notional + mf.ask_depth_5_notional;
+        // BUG-ML-17 fix: empty book should return 0.0 (no liquidity), not 1.0 (perfect balance)
         mf.liquidity_ratio = (total > 0.0)
             ? std::min(mf.bid_depth_5_notional, mf.ask_depth_5_notional) / (total * 0.5)
-            : 1.0;
+            : 0.0;
     }
 
     // Поток сделок из буфера

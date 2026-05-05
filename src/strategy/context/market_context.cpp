@@ -25,6 +25,13 @@ MarketContextResult MarketContextEvaluator::evaluate(const StrategyContext& ctx)
     }
 
     // 3. Проверка спреда
+    // BUG-S31-03: negative spread_bps (bid > ask) means corrupted book data.
+    // Any negative value would pass "<= max_spread_bps" silently.
+    if (micro.spread_bps < 0.0) {
+        result.quality = MarketContextQuality::Invalid;
+        result.reasons.push_back("negative_spread_corrupted_book");
+        return result;
+    }
     result.spread_ok = micro.spread_bps <= cfg_.max_spread_bps_for_entry;
     if (!result.spread_ok) {
         result.reasons.push_back("spread_too_wide");

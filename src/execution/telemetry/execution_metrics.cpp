@@ -120,7 +120,7 @@ void ExecutionMetrics::record_slippage(const Symbol& symbol,
     if (side == Side::Sell) slip_bps = -slip_bps;
 
     std::lock_guard lock(mutex_);
-    slippage_sum_bps_ += std::abs(slip_bps);
+    slippage_sum_bps_ += slip_bps;
     slippage_count_++;
     stats_.avg_slippage_bps = (slippage_count_ > 0)
         ? slippage_sum_bps_ / static_cast<double>(slippage_count_) : 0.0;

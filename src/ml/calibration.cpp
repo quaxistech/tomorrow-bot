@@ -57,9 +57,16 @@ void PlattCalibrator::fit() {
             h12 += w * s.raw_score;
         }
         const double det = h11 * h22 - h12 * h12;
-        if (std::abs(det) < 1e-15) break;
-        A -= (h22 * g1 - h12 * g2) / det;
-        B -= (h11 * g2 - h12 * g1) / det;
+        if (!std::isfinite(det) || std::abs(det) < 1e-15) break;
+        const double A_new = A - (h22 * g1 - h12 * g2) / det;
+        const double B_new = B - (h11 * g2 - h12 * g1) / det;
+        // BUG-S22-06: Newton steps can diverge to Inf/NaN before det check fires.
+        if (!std::isfinite(A_new) || !std::isfinite(B_new)) {
+            A = 1.0; B = 0.0;
+            break;
+        }
+        A = A_new;
+        B = B_new;
     }
     a_ = A;
     b_ = B;
@@ -139,43 +146,49 @@ void IsotonicCalibrator::fit() {
     std::sort(sorted.begin(), sorted.end(),
         [](const auto& a, const auto& b) { return a.raw_score < b.raw_score; });
 
-    // Bin into config_.isotonic_bins equal-frequency bins
+    // Bin into config_.isotonic_bins equal-frequency bins.
+    // Track sample count per bin for weighted PAVA merging.
     const size_t n = sorted.size();
     const size_t bin_size = std::max(size_t(1), n / config_.isotonic_bins);
 
-    std::vector<std::pair<double, double>> bins; // (score_midpoint, positive_rate)
+    struct Bin { double score; double prob; size_t count; };
+    std::vector<Bin> bins;
     for (size_t i = 0; i < n; i += bin_size) {
         const size_t end = std::min(i + bin_size, n);
-        double score_sum = 0.0;
-        double positive_count = 0.0;
+        double score_sum = 0.0, positive_count = 0.0;
         for (size_t j = i; j < end; ++j) {
             score_sum += sorted[j].raw_score;
             if (sorted[j].label) positive_count += 1.0;
         }
-        const double count = static_cast<double>(end - i);
-        bins.emplace_back(score_sum / count, positive_count / count);
+        const double cnt = static_cast<double>(end - i);
+        bins.push_back({score_sum / cnt, positive_count / cnt, end - i});
     }
 
-    // Pool Adjacent Violators (PAVA) — enforce monotonicity
-    // Isotonic regression: if bins[i].second > bins[i+1].second, merge them
-    std::vector<std::pair<double, double>> result = bins;
+    // Pool Adjacent Violators (PAVA) — weighted merge preserves the correct
+    // positive rate for unequal-size bins (BUG-ML-05: was unweighted 0.5/0.5).
     bool changed = true;
     while (changed) {
         changed = false;
-        for (size_t i = 0; i + 1 < result.size(); ++i) {
-            if (result[i].second > result[i + 1].second) {
-                // Merge: average both
-                double avg_score = (result[i].first + result[i + 1].first) / 2.0;
-                double avg_prob = (result[i].second + result[i + 1].second) / 2.0;
-                result[i] = {avg_score, avg_prob};
-                result.erase(result.begin() + static_cast<ptrdiff_t>(i) + 1);
+        for (size_t i = 0; i + 1 < bins.size(); ++i) {
+            if (bins[i].prob > bins[i + 1].prob) {
+                const double w1 = static_cast<double>(bins[i].count);
+                const double w2 = static_cast<double>(bins[i + 1].count);
+                const double wt = w1 + w2;
+                bins[i].score = (bins[i].score * w1 + bins[i + 1].score * w2) / wt;
+                bins[i].prob  = (bins[i].prob  * w1 + bins[i + 1].prob  * w2) / wt;
+                bins[i].count = bins[i].count + bins[i + 1].count;
+                bins.erase(bins.begin() + static_cast<ptrdiff_t>(i) + 1);
                 changed = true;
                 break;
             }
         }
     }
 
-    isotonic_map_ = std::move(result);
+    isotonic_map_.clear();
+    isotonic_map_.reserve(bins.size());
+    for (const auto& b : bins) {
+        isotonic_map_.emplace_back(b.score, b.prob);
+    }
     fitted_ = true;
 }
 

@@ -52,6 +52,7 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     double bsr = micro.buy_sell_ratio;
     double mid = micro.mid_price;
     if (mid <= 0.0) return std::nullopt;
+    if (!std::isfinite(imb) || !std::isfinite(bsr)) return std::nullopt;
 
     // BUY: 2 из 3 подтверждений (перекос стакана, bsr, импульс)
     int buy_score = (imb > cfg_.imbalance_threshold ? 1 : 0)
@@ -82,7 +83,7 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     }
 
     // HTF тренд guard: блокируем вход против СИЛЬНОГО тренда старшего ТФ
-    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
         // BUY при очень сильном HTF DOWN — запрещено
         if (buy_signal && ctx.htf_trend_direction == -1) return std::nullopt;
         // SELL при очень сильном HTF UP — запрещено
@@ -127,7 +128,8 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     confidence = std::min(confidence, cfg_.max_conviction);
 
     // Стоп = ATR-based
-    double atr = tech.atr_valid ? tech.atr_14 : mid * 0.005;
+    double atr = (tech.atr_valid && std::isfinite(tech.atr_14) && tech.atr_14 > 0.0)
+                     ? tech.atr_14 : mid * 0.005;
     double stop = buy_signal ? mid - atr * 2.0 : mid + atr * 2.0;
 
     Setup setup;
@@ -170,6 +172,9 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     double atr = tech.atr_14;
     double tolerance = mid * cfg_.retest_level_tolerance_pct;
 
+    // Proximity check: цена должна быть достаточно близко к BB middle (уровень ретеста)
+    if (tech.bb_middle > 0.0 && std::abs(mid - tech.bb_middle) > tolerance) return std::nullopt;
+
     // BUY retest: цена у BB lower-middle, momentum_20 > 0 (общий тренд вверх)
     // H-12 fix: non-overlapping BB%B ranges (was 0.35-0.55 / 0.45-0.65 → overlap 0.45-0.55)
     bool buy_retest = (tech.bb_percent_b > 0.30 && tech.bb_percent_b < 0.48) &&
@@ -190,7 +195,7 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     }
 
     // HTF тренд guard для retest: только при очень сильном тренде
-    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
         if (buy_retest && ctx.htf_trend_direction == -1) return std::nullopt;
         if (sell_retest && ctx.htf_trend_direction == 1) return std::nullopt;
     }
@@ -271,7 +276,7 @@ std::optional<Setup> SetupDetector::detect_pullback(const StrategyContext& ctx,
     if (!buy_pullback && !sell_pullback) return std::nullopt;
 
     // HTF тренд guard для pullback: только при очень сильном тренде
-    if (cfg_.block_counter_trend && ctx.htf_trend_strength > 0.7) {
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
         if (buy_pullback && ctx.htf_trend_direction == -1) return std::nullopt;
         if (sell_pullback && ctx.htf_trend_direction == 1) return std::nullopt;
     }
@@ -384,7 +389,9 @@ SetupValidationResult SetupValidator::validate(const Setup& setup,
     const auto& tech = ctx.features.technical;
 
     // 1. Таймаут сетапа (§15)
-    int64_t age_ms = (now_ns - setup.detected_at_ns) / 1'000'000;
+    // BUG-S35-05: negative age_ms when NTP backward jump → timeout never fires.
+    // Treat negative age as 0 — setup just detected, conservative.
+    int64_t age_ms = std::max(int64_t{0}, now_ns - setup.detected_at_ns) / 1'000'000;
     if (age_ms > cfg_.setup_timeout_ms) {
         result.valid = false;
         result.reasons.push_back("setup_timeout");
@@ -440,7 +447,7 @@ SetupValidationResult SetupValidator::validate(const Setup& setup,
     }
 
     // 6. Цена сильно ушла от reference (слишком далеко для входа)
-    if (tech.atr_valid && tech.atr_14 > 0.0) {
+    if (tech.atr_valid && std::isfinite(tech.atr_14) && tech.atr_14 > 0.0) {
         double price_move = std::abs(micro.mid_price - setup.reference_price);
         if (price_move > tech.atr_14 * 2.0) {
             result.valid = false;
@@ -471,7 +478,8 @@ bool SetupValidator::can_confirm(const Setup& setup,
     const auto& micro = ctx.features.microstructure;
 
     // Подтверждение: прошло достаточно времени + структура держится
-    int64_t age_ms = (now_ns - setup.detected_at_ns) / 1'000'000;
+    // BUG-S35-05: clamp negative age to 0 on NTP backward jump
+    int64_t age_ms = std::max(int64_t{0}, now_ns - setup.detected_at_ns) / 1'000'000;
     if (age_ms < cfg_.setup_confirmation_window_ms) {
         return false;
     }

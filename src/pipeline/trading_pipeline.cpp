@@ -383,6 +383,10 @@ TradingPipeline::TradingPipeline(
     portfolio_->set_leverage(static_cast<double>(config_.futures.default_leverage));
 
     // 7. Размер позиции (адаптация под размер капитала)
+    if (config_.trading.initial_capital <= 0.0) {
+        throw std::runtime_error("Invalid config: initial_capital must be > 0, got " +
+            std::to_string(config_.trading.initial_capital));
+    }
     portfolio_allocator::HierarchicalAllocator::Config alloc_cfg;
     alloc_cfg.budget.global_budget = config_.trading.initial_capital;
     // Фьючерсы — масштабировать бюджет на leverage
@@ -779,8 +783,8 @@ void TradingPipeline::fetch_symbol_precision() {
             // Futures API: volumePlace, pricePlace (fallback: quantityPrecision)
             auto safe_parse_precision = [&](const boost::json::value& v, int fallback) -> int {
                 double raw = parse_json_double(v);
-                if (!std::isfinite(raw)) return fallback;
-                return std::clamp(static_cast<int>(raw), 0, 18);
+                if (!std::isfinite(raw) || raw < 0.0 || raw > 18.0) return fallback;
+                return static_cast<int>(std::round(raw));
             };
             if (o.contains("quantityPrecision")) {
                 qty_prec = safe_parse_precision(o.at("quantityPrecision"), qty_prec);
@@ -1398,7 +1402,7 @@ bool TradingPipeline::check_market_readiness(const features::FeatureSnapshot& sn
     }
 
     // 3. Не входить в рынок при экстремальных HTF условиях
-    if (htf_rsi_14_ < 15.0 || htf_rsi_14_ > 85.0) {
+    if (htf_rsi_14_ < 10.0 || htf_rsi_14_ > 90.0) {
         if (market_ready_) {
             logger_->warn("pipeline",
                 "Market readiness отозвана: HTF RSI в экстремальной зоне",
@@ -1456,6 +1460,12 @@ void TradingPipeline::reset_trailing_state() {
 }
 
 void TradingPipeline::reset_hedge_state() {
+    // If the hedge order was sent but never confirmed by portfolio, notify the
+    // manager so it doesn't count the unfilled order against hedge_count_.
+    if (hedge_manager_ &&
+        hedge_manager_->state() == HedgePairState::HedgeSentPending) {
+        hedge_manager_->notify_hedge_failed();
+    }
     hedge_active_ = false;
     hedge_entry_price_ = 0.0;
     hedge_size_ = 0.0;
@@ -2052,6 +2062,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                     {{"symbol", symbol_.get()},
                      {"portfolio_size", std::to_string(pos.size.get())}});
                 portfolio_->close_position(symbol_, current_position_side_, pos.current_price, 0.0);
+                for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
                 reset_trailing_state();
                 return true;
             }
@@ -2062,6 +2073,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 {{"qty", std::to_string(actual_qty)},
                  {"symbol", symbol_.get()}});
             portfolio_->close_position(symbol_, current_position_side_, pos.current_price, pos.unrealized_pnl);
+            for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
             reset_trailing_state();
             return true;
         }
@@ -2072,6 +2084,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
                 {{"notional", std::to_string(actual_notional)},
                  {"symbol", symbol_.get()}});
             portfolio_->close_position(symbol_, current_position_side_, pos.current_price, pos.unrealized_pnl);
+            for (const auto& s : strategy_registry_->active()) s->notify_position_closed();
             reset_trailing_state();
             return false;
         }
@@ -3315,7 +3328,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         const double kMinTradeableNotional = exchange_rules_.min_trade_usdt > 0.0
             ? exchange_rules_.min_trade_usdt
             : common::exchange_limits::kMinBitgetNotionalUsdt;
-        double position_notional = position_size.get() * snapshot.mid_price.get();
+        // BUG-S32-02: mid_price=0 from feature engine failure → position_notional=0
+        // → exit signal silently rejected (0 < kMinTradeableNotional) → stuck position.
+        // When mid_price is invalid, use position_size directly as notional sentinel
+        // so the exit check proceeds. Exit orders must not be suppressed on data glitch.
+        const double safe_mid = snapshot.mid_price.get();
+        double position_notional = (safe_mid > 0.0)
+            ? position_size.get() * safe_mid
+            : kMinTradeableNotional + 1.0;  // force past threshold to allow exit
 
         {
             // === Фьючерсная логика определения закрытия / открытия ===
@@ -3789,9 +3809,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // ВАЖНО: TWAP имеет смысл только для крупных ордеров ($500+).
     // При малом капитале ($5-50) TWAP создаёт N×fees, dust-позиции и
     // rejected-слайсы из-за min notional. Проверяем нотионал ДО TWAP.
-    const double order_notional_for_twap = risk_decision.approved_quantity.get() * snapshot.mid_price.get();
+    // BUG-S32-03: mid_price=0 → order_notional=0 → twap_eligible=false → large order
+    // executed as one block with no slicing. Disable TWAP explicitly when price invalid.
+    const double mid_for_twap = snapshot.mid_price.get();
+    const double order_notional_for_twap = (mid_for_twap > 0.0)
+        ? risk_decision.approved_quantity.get() * mid_for_twap
+        : 0.0;
     const double kMinTwapNotionalPipeline = 500.0;  // Не нарезаем ордера < $500
-    const bool twap_eligible = (order_notional_for_twap >= kMinTwapNotionalPipeline);
+    const bool twap_eligible = (mid_for_twap > 0.0) && (order_notional_for_twap >= kMinTwapNotionalPipeline);
 
     const bool exec_alpha_wants_twap = twap_eligible && exec_alpha.slice_plan.has_value();
     bool twap_independently_triggered = false;
@@ -3905,6 +3930,12 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         lev_ctx.conviction = intent.conviction;
         lev_ctx.funding_rate = current_funding_rate_;
         lev_ctx.position_side = intent.position_side;
+        // BUG-S32-04: entry_price=0 when mid_price=0 → leverage engine computes NaN liq price
+        if (snapshot.mid_price.get() <= 0.0) {
+            logger_->error("pipeline", "entry_price=0 (mid_price invalid) — отклонение входа",
+                {{"symbol", symbol_.get()}});
+            return;
+        }
         lev_ctx.entry_price = snapshot.mid_price.get();
 
         auto lev_decision = leverage_engine_->compute_leverage(lev_ctx);
@@ -4030,7 +4061,10 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             // Сохраняем exec_alpha для C/C fee estimation при закрытии позиции
             last_exec_alpha_ = exec_alpha;
             reset_trailing_state();
+            // BUG-S32-04: entry_price=0 when mid_price=0 → trailing stop / PnL NaN.
+            // Fall back to last_price if mid_price is unavailable.
             double entry_price = snapshot.mid_price.get();
+            if (entry_price <= 0.0) entry_price = snapshot.last_price.get();
             highest_price_since_entry_ = entry_price;
             lowest_price_since_entry_ = entry_price;
             initial_position_size_ = risk_decision.approved_quantity.get();

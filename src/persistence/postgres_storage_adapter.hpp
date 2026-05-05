@@ -58,7 +58,6 @@ private:
     std::string conn_string_;
     std::unique_ptr<pqxx::connection> conn_;
     mutable std::mutex mutex_;
-    uint64_t next_seq_{1};
 };
 
 /// Фабричная функция — создаёт адаптер или выбрасывает исключение при ошибке

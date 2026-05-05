@@ -14,6 +14,7 @@
 #include "clock/clock.hpp"
 #include "logging/logger.hpp"
 #include <mutex>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
@@ -86,6 +87,11 @@ public:
     /// Зарегистрировать tradeId как обработанный
     void mark_trade_id_seen(const std::string& trade_id);
 
+    /// BUG-S29-04: атомарная проверка + регистрация tradeId под одним локом.
+    /// Возвращает true если tradeId был уже обработан (дубликат).
+    /// Возвращает false и регистрирует tradeId если он новый.
+    [[nodiscard]] bool check_and_mark_trade_id_seen(const std::string& trade_id);
+
     // ─── Intent dedup (§22) ─────────────────────────────────────────────
 
     /// Проверить, является ли intent дубликатом
@@ -108,20 +114,26 @@ public:
 
     // ─── Iteration ───────────────────────────────────────────────────────
 
-    /// Итерировать по всем ордерам (под мьютексом)
+    /// Итерировать по всем ордерам (через snapshot без удержания мьютекса)
     void for_each(const std::function<void(const OrderRecord&)>& fn) const;
 
 private:
     std::shared_ptr<clock::IClock> clock_;
     std::shared_ptr<logging::ILogger> logger_;
-    const ExecutionConfig& config_;
+    // BUG-S5-02 fix: store by value to prevent dangling reference if the
+    // caller's ExecutionConfig is destroyed before OrderRegistry.
+    ExecutionConfig config_;
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, OrderRecord> orders_;
     std::unordered_map<std::string, OrderFSM> fsms_;
     std::unordered_set<std::string> fill_applied_;
     std::unordered_set<std::string> seen_trade_ids_;           ///< Fill dedup by tradeId
+    std::deque<std::string> seen_trade_id_fifo_;
+    static constexpr size_t kMaxSeenTradeIds = 200000;
     std::unordered_map<std::string, int64_t> recent_intents_;  // key → timestamp_ns
+    // BUG-S25-04: secondary index for O(1) reverse lookup (exchange_order_id → internal order_id)
+    std::unordered_map<std::string, std::string> exchange_id_index_;
 };
 
 } // namespace tb::execution

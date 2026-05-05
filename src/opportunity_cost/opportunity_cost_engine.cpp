@@ -118,6 +118,14 @@ OpportunityScore RuleBasedOpportunityCost::compute_score(
 {
     OpportunityScore score;
 
+    // BUG-S16-05: NaN conviction → clamp(NaN)=NaN → pow(NaN)=NaN → all scoring NaN
+    // → net_expected_bps < threshold always false → all trades "approved"
+    if (!std::isfinite(intent.conviction)) {
+        score.expected_return_bps = 0.0;
+        score.net_expected_bps    = -score.execution_cost_bps;
+        return score;
+    }
+
     // Expected return: conviction → bps через конфигурируемый масштаб.
     // Нелинейная зависимость: conviction^1.5 усиливает разделение
     // между слабыми и сильными сигналами.
@@ -295,21 +303,30 @@ double RuleBasedOpportunityCost::effective_conviction_threshold(
 {
     double threshold = base_threshold;
 
+    double threshold_adj = 0.0;
+
     // Penalty за просадку: +drawdown_penalty_scale за каждые 5% drawdown от пика.
-    // current_drawdown_pct приходит как fraction [0,1] (pipeline нормализует).
-    // 0.05 = 5% drawdown step в fraction-единицах.
-    // Обоснование: Thorp 2006, half-Kelly при drawdown — снижение risk appetite
-    // пропорционально глубине просадки.
-    if (portfolio_ctx.current_drawdown_pct > 0.0) {
-        threshold += config_.drawdown_penalty_scale *
-                     (portfolio_ctx.current_drawdown_pct / 0.05);
+    // BUG-S16-06: NaN drawdown_pct / 0.05 = NaN → threshold = NaN → all checks disabled.
+    if (std::isfinite(portfolio_ctx.current_drawdown_pct)
+        && portfolio_ctx.current_drawdown_pct > 0.0) {
+        threshold_adj += config_.drawdown_penalty_scale *
+                         (portfolio_ctx.current_drawdown_pct / 0.05);
     }
 
     // Penalty за серию убытков: behavioral tilt protection.
-    // После серии убытков повышаем планку для входа.
+    // BUG-S16-09: unbounded penalty (100 losses × 0.1 = 10.0) → threshold=0.95 after clamp
+    // → only trades with conviction≥0.95 allowed → system can't recover.
+    // Cap the loss-streak penalty to 0.20 to ensure recovery is still possible.
     if (portfolio_ctx.consecutive_losses > 0) {
-        threshold += config_.consecutive_loss_penalty * portfolio_ctx.consecutive_losses;
+        double loss_penalty = config_.consecutive_loss_penalty * portfolio_ctx.consecutive_losses;
+        threshold_adj += std::min(loss_penalty, 0.20);
     }
+
+    // Cap combined adjustment to prevent blocking all trading after moderate
+    // drawdown or losing streaks.
+    threshold_adj = std::min(threshold_adj, 0.20);
+
+    threshold += threshold_adj;
 
     return std::clamp(threshold, 0.0, 0.95);
 }

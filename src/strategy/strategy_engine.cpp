@@ -37,6 +37,7 @@ StrategyMeta StrategyEngine::meta() const {
 std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& context) {
     if (!active_.load(std::memory_order_relaxed)) return std::nullopt;
 
+    std::lock_guard<std::mutex> lock(mutex_);
     last_reasons_.clear();
     int64_t now_ns = clock_->now().get();
 
@@ -151,24 +152,24 @@ std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& conte
         case SymbolState::PositionManaging:
         case SymbolState::ExitPending:
             return handle_position(context, now_ns);
-    }
 
-    // Диагностика: причины отсутствия сигнала
-    if (!last_reasons_.empty()) {
-        ++diag_skip_count_;
-        if (diag_skip_count_ % 200 == 1) {
-            std::string reasons;
-            for (const auto& r : last_reasons_) {
-                if (!reasons.empty()) reasons += ",";
-                reasons += r;
+        default: {
+            // Диагностика: причины отсутствия сигнала (неизвестное состояние)
+            ++diag_skip_count_;
+            if (diag_skip_count_ % 200 == 1) {
+                std::string reasons;
+                for (const auto& r : last_reasons_) {
+                    if (!reasons.empty()) reasons += ",";
+                    reasons += r;
+                }
+                logger_->debug("strategy_engine", "Нет сигнала",
+                    {{"reasons", reasons},
+                     {"state", to_string(state_machine_.state())},
+                     {"skips_since_last_log", std::to_string(diag_skip_count_)}});
             }
-            logger_->debug("strategy_engine", "Нет сигнала",
-                {{"reasons", reasons},
-                 {"state", to_string(state_machine_.state())},
-                 {"skips_since_last_log", std::to_string(diag_skip_count_)}});
+            return std::nullopt;
         }
     }
-    return std::nullopt;
 }
 
 bool StrategyEngine::is_active() const {
@@ -180,6 +181,7 @@ void StrategyEngine::set_active(bool active) {
 }
 
 void StrategyEngine::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
     state_machine_.reset();
     last_reasons_.clear();
     exit_signal_sent_ = false;
@@ -191,6 +193,7 @@ void StrategyEngine::reset() {
 
 void StrategyEngine::notify_position_opened(double entry_price, double size,
                                              Side side, PositionSide pos_side) {
+    std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
     auto& setup = state_machine_.active_setup();
     double atr = setup ? setup->atr_at_detect : entry_price * 0.005;
@@ -214,6 +217,7 @@ void StrategyEngine::notify_position_opened(double entry_price, double size,
 }
 
 void StrategyEngine::notify_position_closed() {
+    std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
     state_machine_.close_position();
     state_machine_.clear_setup();
@@ -225,6 +229,7 @@ void StrategyEngine::notify_position_closed() {
 }
 
 void StrategyEngine::notify_entry_rejected() {
+    std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
     constexpr int64_t kRejectionCooldownMs = 30'000; // 30s — не спамить при rejected sizing
     cancel_setup(now_ns, "entry_rejected_by_pipeline");
@@ -235,6 +240,7 @@ void StrategyEngine::notify_entry_rejected() {
 }
 
 SymbolState StrategyEngine::current_state() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return state_machine_.state();
 }
 
@@ -478,6 +484,16 @@ TradeIntent StrategyEngine::build_intent(const StrategyContext& ctx, const Setup
 
     // Limit price
     double mid = ctx.features.microstructure.mid_price;
+    // BUG-S34-06: NaN mid_price (from BUG-S29-06 propagation) creates NaN limit_price
+    // → downstream execution rejects intent or sends corrupted order.
+    // We've already added a guard in compute_snapshot() (BUG-S29-06 fix), but
+    // defend here as well since mid_price is also populated from manual/fallback paths.
+    if (!std::isfinite(mid) || mid <= 0.0) {
+        // Return a sentinel intent with no limit_price set — caller checks limit_price.
+        intent.limit_price = Price(0.0);
+        intent.snapshot_mid_price = Price(0.0);
+        return intent;
+    }
     double spread = ctx.features.microstructure.spread;
     if (setup.side == Side::Buy) {
         intent.limit_price = Price(mid - spread * cfg_.limit_price_spread_frac);

@@ -171,7 +171,14 @@ struct StatePerformanceStats {
 std::string to_string(WorldState state);
 std::string to_string(TransitionTendency tendency);
 
-/// Индекс состояния для матриц и массивов
-inline int state_index(WorldState s) { return static_cast<int>(s); }
+/// Индекс состояния для матриц и массивов.
+/// BUG-S4-25 fix: clamp corrupted enum values to Unknown (8) to prevent
+/// out-of-bounds array access in state_total_count / state_stay_count.
+inline int state_index(WorldState s) {
+    const int idx = static_cast<int>(s);
+    return (idx >= 0 && idx <= static_cast<int>(WorldState::Unknown))
+        ? idx
+        : static_cast<int>(WorldState::Unknown);
+}
 
 } // namespace tb::world_model

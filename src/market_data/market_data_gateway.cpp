@@ -73,7 +73,11 @@ bool MarketDataGateway::is_connected() const {
 }
 
 bool MarketDataGateway::is_feed_fresh() const {
-    return (clock_->now().get() - last_message_ts_.load()) < 1'000'000'000LL;
+    int64_t now_ns  = clock_->now().get();
+    int64_t last_ts = last_message_ts_.load();
+    int64_t diff    = now_ns - last_ts;
+    if (diff < 0) return false; // clock skew: future timestamp — treat as stale
+    return diff < 1'000'000'000LL;
 }
 
 void MarketDataGateway::on_raw_message(exchange::bitget::RawWsMessage msg) {

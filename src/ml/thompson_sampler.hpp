@@ -55,7 +55,8 @@ struct BetaArm {
     EntryAction action{EntryAction::EnterNow}; ///< Тип действия
     double alpha{1.0};    ///< Успехи + 1 (prior)
     double beta{1.0};     ///< Неудачи + 1 (prior)
-    size_t pulls{0};      ///< Количество выборов
+    size_t pulls{0};         ///< Количество выборов (selections)
+    size_t reward_count{0};  ///< Количество фактически полученных наград (BUG-ML-04)
     double avg_reward{0.0}; ///< Средняя награда
     double cumulative_reward{0.0}; ///< Накопленная награда
     size_t consecutive_losses{0};  ///< Подряд идущие убыточные исходы
@@ -83,6 +84,7 @@ struct ThompsonConfig {
     int64_t stale_threshold_ns{10'000'000'000LL}; ///< stale threshold (10s)
     size_t decay_interval{10};     ///< Применять decay каждые N reward-событий
     double magnitude_bonus{0.5};   ///< Бонус к alpha для крупных reward
+    uint32_t rng_seed{0};          ///< 0 = OS entropy (non-deterministic), non-0 = fixed seed
 };
 
 /// Thompson Sampling для оптимизации момента входа.

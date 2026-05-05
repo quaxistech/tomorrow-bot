@@ -191,7 +191,9 @@ MarketProbabilities MarketReactionEngine::estimate_probabilities(
     lo_c += (state.liquidity_score - 0.5) * 0.15;
 
     // ── HTF trend alignment ──
-    if (state.htf_valid) {
+    // BUG-S8-11: htf_valid=true does not guarantee htf_trend is finite.
+    // NaN > 0.0 and NaN < 0.0 both return false → silently trades counter-trend.
+    if (state.htf_valid && std::isfinite(state.htf_trend)) {
         bool aligned = (side == PositionSide::Long && state.htf_trend > 0.0)
                     || (side == PositionSide::Short && state.htf_trend < 0.0);
         double mag = std::abs(state.htf_trend);
@@ -238,6 +240,18 @@ MarketProbabilities MarketReactionEngine::estimate_probabilities(
                      || (side == PositionSide::Short && state.macd_histogram < 0.0);
     if (macd_aligned) lo_c += 0.15;
     else lo_r += 0.10;
+
+    // BUG-S24-01: apply uncertainty penalty when no directional signals are active.
+    // Without momentum, regime change, or extreme RSI in a low-ADX environment,
+    // the prior alone is too optimistic about continuation probability.
+    {
+        const bool rsi_neutral = (state.rsi_14 >= 25.0 && state.rsi_14 <= 75.0);
+        const bool adx_low = (state.adx < 20.0);
+        if (!state.momentum_valid && !state.cusum_regime_change && rsi_neutral && adx_low) {
+            lo_c -= 0.20;
+            lo_s += 0.25;
+        }
+    }
 
     return softmax_probs(lo_c, lo_r, lo_s, lo_m);
 }
@@ -286,8 +300,10 @@ void MarketReactionEngine::compute_action_evs(
     double hold_loss_rev = p.p_reversal * atr_move * 0.7;
     double hold_loss_shock = p.p_shock * atr_move * 2.0;
     double hold_mr = p.p_mean_revert * atr_move * 0.1;
+    // signed_funding is already in pct per 8h period; use directly so funding
+    // drag is comparable in magnitude to the ATR-based gain/loss terms.
     double hold_ev = hold_gain - hold_loss_rev - hold_loss_shock + hold_mr
-                   - signed_funding * 0.05;
+                   - signed_funding;
 
     // ── Close ──
     double close_ev = unrealized_pnl_pct - one_way_cost;

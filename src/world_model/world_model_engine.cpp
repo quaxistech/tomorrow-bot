@@ -654,7 +654,8 @@ WorldState RuleBasedWorldModelEngine::classify_immediate(
             double p1 = tech.adx / config_.stable_trend.adx_min;
             double rsi_center = (config_.stable_trend.rsi_lower + config_.stable_trend.rsi_upper) / 2.0;
             double rsi_range = (config_.stable_trend.rsi_upper - config_.stable_trend.rsi_lower) / 2.0;
-            double p2 = 1.0 - std::abs(tech.rsi_14 - rsi_center) / rsi_range;
+            double p2 = (rsi_range < 1e-10) ? 0.5
+                        : 1.0 - std::abs(tech.rsi_14 - rsi_center) / rsi_range;
             prox = std::clamp(std::min(p1, std::max(p2, 0.0)), 0.0, 1.0);
         }
 
@@ -680,7 +681,8 @@ WorldState RuleBasedWorldModelEngine::classify_immediate(
             double p1 = 1.0 - (tech.adx / config_.chop_noise.adx_max);
             double rsi_center = (config_.chop_noise.rsi_lower + config_.chop_noise.rsi_upper) / 2.0;
             double rsi_range = (config_.chop_noise.rsi_upper - config_.chop_noise.rsi_lower) / 2.0;
-            double p2 = 1.0 - std::abs(tech.rsi_14 - rsi_center) / rsi_range;
+            double p2 = (rsi_range < 1e-10) ? 0.5
+                        : 1.0 - std::abs(tech.rsi_14 - rsi_center) / rsi_range;
             double p3 = 1.0 - (micro.spread_bps / config_.chop_noise.spread_bps_max);
             prox = std::clamp(std::min({p1, std::max(p2, 0.0), p3}), 0.0, 1.0);
         }
@@ -813,10 +815,10 @@ FragilityScore RuleBasedWorldModelEngine::compute_fragility(
         spread_component = std::min(1.0, snap.microstructure.spread_bps / cfg.spread_normalization);
     }
 
-    // 3. Book instability
+    // 3. Book instability (clamped to [0,1] — raw value can exceed 1.0)
     double instability_component = 0.0;
     if (snap.microstructure.instability_valid) {
-        instability_component = snap.microstructure.book_instability;
+        instability_component = std::clamp(snap.microstructure.book_instability, 0.0, 1.0);
     }
 
     // 4. Volatility acceleration: |vol_5 - vol_20| / max(vol_20, 0.001)
@@ -840,10 +842,10 @@ FragilityScore RuleBasedWorldModelEngine::compute_fragility(
         trans_component = std::min(1.0, static_cast<double>(recent_transitions) / 5.0);
     }
 
-    // 7. VPIN toxicity
+    // 7. VPIN toxicity (clamped to [0,1] — raw value can exceed 1.0)
     double vpin_component = 0.0;
     if (snap.microstructure.vpin_valid) {
-        vpin_component = snap.microstructure.vpin;
+        vpin_component = std::clamp(snap.microstructure.vpin, 0.0, 1.0);
     }
 
     // Composite: взвешенная сумма компонент поверх base

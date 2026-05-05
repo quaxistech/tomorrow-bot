@@ -74,12 +74,15 @@ PairEntryExecResult PairExecutionCoordinator::execute_pair_entry(
     if (!pair_result.success) {
         result.error = pair_result.error;
         // Check if an orphan was left
-        if (dual_leg_mgr_->long_leg().state == LegState::Active ||
-            dual_leg_mgr_->long_leg().state == LegState::PendingEntry) {
-            orphan_detected_ = true;
-            orphan_side_ = PositionSide::Long;
-            orphan_detect_time_ns_ = clock_->now().get();
-            logger_->warn(kComp, "Orphan long leg detected after entry failure", {});
+        {
+            std::lock_guard lock(orphan_mutex_);
+            if (dual_leg_mgr_->long_leg().state == LegState::Active ||
+                dual_leg_mgr_->long_leg().state == LegState::PendingEntry) {
+                orphan_detected_ = true;
+                orphan_side_ = PositionSide::Long;
+                orphan_detect_time_ns_ = clock_->now().get();
+                logger_->warn(kComp, "Orphan long leg detected after entry failure", {});
+            }
         }
         return result;
     }
@@ -96,7 +99,11 @@ PairEntryExecResult PairExecutionCoordinator::execute_pair_entry(
             result.fill_skew_ns / 1e6, config_.max_fill_skew_ms), {});
     }
 
-    orphan_detected_ = false;
+    active_symbol_ = symbol;
+    {
+        std::lock_guard lock(orphan_mutex_);
+        orphan_detected_ = false;
+    }
     return result;
 }
 
@@ -114,50 +121,66 @@ PairCloseExecResult PairExecutionCoordinator::execute_pair_close(
     std::string reason = std::format("pair_close: urgency={:.2f}, net_pnl={:.1f}bps",
         urgency, state.net_pair_pnl_bps);
 
+    active_symbol_ = state.symbol;
+
     bool ok = dual_leg_mgr_->close_both(state.symbol, reason);
     if (!ok) {
         result.error = "close_both failed";
         // Check for partial close (one leg may have succeeded)
         auto lleg = dual_leg_mgr_->long_leg();
         auto sleg = dual_leg_mgr_->short_leg();
-        if (lleg.state == LegState::Active && sleg.state != LegState::Active) {
-            orphan_detected_ = true;
-            orphan_side_ = PositionSide::Long;
-            orphan_detect_time_ns_ = clock_->now().get();
-        } else if (sleg.state == LegState::Active && lleg.state != LegState::Active) {
-            orphan_detected_ = true;
-            orphan_side_ = PositionSide::Short;
-            orphan_detect_time_ns_ = clock_->now().get();
+        {
+            std::lock_guard lock(orphan_mutex_);
+            if (lleg.state == LegState::Active && sleg.state != LegState::Active) {
+                orphan_detected_ = true;
+                orphan_side_ = PositionSide::Long;
+                orphan_detect_time_ns_ = clock_->now().get();
+            } else if (sleg.state == LegState::Active && lleg.state != LegState::Active) {
+                orphan_detected_ = true;
+                orphan_side_ = PositionSide::Short;
+                orphan_detect_time_ns_ = clock_->now().get();
+            }
         }
         return result;
     }
 
     result.success = true;
     result.net_realized_pnl = state.net_pair_pnl_bps;
-    orphan_detected_ = false;
+    {
+        std::lock_guard lock(orphan_mutex_);
+        orphan_detected_ = false;
+    }
     return result;
 }
 
 bool PairExecutionCoordinator::close_single_leg(PositionSide side) {
     if (!dual_leg_mgr_) return false;
+    if (!active_symbol_.has_value()) {
+        logger_->error(kComp, "close_single_leg failed: active symbol is unknown", {});
+        return false;
+    }
 
     auto leg = (side == PositionSide::Long) ?
         dual_leg_mgr_->long_leg() : dual_leg_mgr_->short_leg();
-    if (leg.state != LegState::Active) return false;
+    if (leg.state != LegState::Active || leg.size <= 0.0) {
+        return false;
+    }
 
-    // We need the symbol — get it from the dual leg snapshot
-    auto lleg = dual_leg_mgr_->long_leg();
-    auto sleg = dual_leg_mgr_->short_leg();
-
-    // The symbol isn't stored in LegSnapshot, so we get it from the active leg
-    // For now, close via DualLegManager which tracks the symbol internally
     std::string reason = std::format("trim_leg: {}",
         side == PositionSide::Long ? "Long" : "Short");
 
-    // DualLegManager needs symbol for close_leg. Since we only have the leg snapshot,
-    // we need to pass it from the pair state. For now, use a default; the caller
-    // should provide context.
-    logger_->info(kComp, reason, {});
+    bool ok = dual_leg_mgr_->close_leg(*active_symbol_, side, leg.size, reason);
+    if (!ok) {
+        logger_->error(kComp, "close_single_leg failed",
+            {{"side", side == PositionSide::Long ? "long" : "short"},
+             {"symbol", active_symbol_->get()}});
+        return false;
+    }
+
+    logger_->info(kComp, "Single leg close submitted",
+        {{"side", side == PositionSide::Long ? "long" : "short"},
+         {"symbol", active_symbol_->get()},
+         {"size", std::to_string(leg.size)}});
     return true;
 }
 
@@ -175,22 +198,41 @@ bool PairExecutionCoordinator::execute_reversal(PositionSide from_side,
 }
 
 bool PairExecutionCoordinator::has_orphan_leg() const {
+    std::lock_guard lock(orphan_mutex_);
     return orphan_detected_;
 }
 
 void PairExecutionCoordinator::cleanup_orphan_leg() {
-    if (!orphan_detected_ || !dual_leg_mgr_) return;
-
-    auto leg = (orphan_side_ == PositionSide::Long) ?
-        dual_leg_mgr_->long_leg() : dual_leg_mgr_->short_leg();
-
-    if (leg.state == LegState::Active || leg.state == LegState::PendingEntry) {
-        // Get symbol from the leg's context — DualLegManager tracks it
-        logger_->warn(kComp, std::format("Cleaning up orphan {} leg, size={:.4f}",
-            orphan_side_ == PositionSide::Long ? "Long" : "Short", leg.size), {});
-        // The cleanup is done by the pipeline which has symbol context
+    PositionSide side_to_close;
+    {
+        std::lock_guard lock(orphan_mutex_);
+        if (!orphan_detected_ || !dual_leg_mgr_) return;
+        side_to_close = orphan_side_;
     }
 
+    auto leg = (side_to_close == PositionSide::Long) ?
+        dual_leg_mgr_->long_leg() : dual_leg_mgr_->short_leg();
+
+    if (!active_symbol_.has_value()) {
+        logger_->error(kComp, "Orphan cleanup skipped: active symbol is unknown", {});
+        return;
+    }
+
+    if (leg.state == LegState::Active && leg.size > 0.0) {
+        logger_->warn(kComp, std::format("Cleaning up orphan {} leg, size={:.4f}",
+            side_to_close == PositionSide::Long ? "Long" : "Short", leg.size),
+            {{"symbol", active_symbol_->get()}});
+        bool ok = dual_leg_mgr_->close_leg(*active_symbol_, side_to_close, leg.size,
+            "orphan_cleanup");
+        if (!ok) {
+            logger_->error(kComp, "Orphan cleanup close_leg failed",
+                {{"symbol", active_symbol_->get()},
+                 {"side", side_to_close == PositionSide::Long ? "long" : "short"}});
+            return;
+        }
+    }
+
+    std::lock_guard lock(orphan_mutex_);
     orphan_detected_ = false;
 }
 

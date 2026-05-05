@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace tb::exchange::bitget {
@@ -76,8 +77,13 @@ struct BitgetWsClient::Impl {
     std::atomic<bool>    connected{false};
     std::atomic<bool>    running{false};
 
+    // BUG-S23-02: track when last pong was received to detect dead connections
+    std::atomic<int64_t> last_pong_ms_{0};
+
     std::mutex           subs_mutex;
     std::vector<std::string> subscriptions;
+    // BUG-S23-03: track subscriptions pending confirmation with send timestamp
+    std::unordered_map<std::string, int64_t> pending_sub_ms_;  // channel → sent_ms
 
     /// Очередь сообщений для последовательной отправки (Boost.Beast требует)
     std::vector<std::shared_ptr<std::string>> write_queue_;
@@ -183,6 +189,11 @@ struct BitgetWsClient::Impl {
         }
         connected.store(true, std::memory_order_release);
         reconnect_attempt = 0;
+        // BUG-S23-02: initialize pong timestamp so first heartbeat check doesn't immediately fire
+        last_pong_ms_.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
         logger->info(kComp, "Подключён: " + config.url);
 
         // Отправляем ранее накопленные подписки
@@ -233,6 +244,11 @@ struct BitgetWsClient::Impl {
 
             if (payload == "pong" || payload.find("\"pong\"") != std::string::npos) {
                 raw.type = WsMsgType::Heartbeat;
+                // BUG-S23-02: record pong receipt time for dead-connection detection
+                last_pong_ms_.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                    std::memory_order_release);
             } else {
                 // Структурный разбор JSON: определяем тип по arg.channel
                 try {
@@ -241,7 +257,18 @@ struct BitgetWsClient::Impl {
 
                     if (obj.contains("event")) {
                         auto ev = obj.at("event").as_string();
-                        if (ev == "subscribe") raw.type = WsMsgType::Subscribe;
+                        if (ev == "subscribe") {
+                            raw.type = WsMsgType::Subscribe;
+                            // BUG-S23-03: mark subscription as confirmed
+                            if (obj.contains("arg") && obj.at("arg").is_object()) {
+                                const auto& arg = obj.at("arg").as_object();
+                                if (arg.contains("channel")) {
+                                    std::string ch(arg.at("channel").as_string());
+                                    std::lock_guard lock(subs_mutex);
+                                    pending_sub_ms_.erase(ch);
+                                }
+                            }
+                        }
                         else if (ev == "error") raw.type = WsMsgType::Error;
                     } else if (obj.contains("arg")) {
                         auto& arg = obj.at("arg").as_object();
@@ -316,10 +343,51 @@ struct BitgetWsClient::Impl {
             std::chrono::seconds(config.heartbeat_interval_sec)
         );
         heartbeat_timer.async_wait([this](const boost::system::error_code& ec) {
-            if (!ec && connected.load() && running.load()) {
-                do_send_on_strand("ping");
-                schedule_heartbeat();
+            if (ec || !running.load()) return;
+            if (!connected.load()) return;
+
+            // BUG-S23-02: check that pong arrived within 1.5× heartbeat interval.
+            // A missing pong means the TCP connection is dead (no FIN/RST from broker).
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int64_t pong_age_ms = now_ms - last_pong_ms_.load(std::memory_order_acquire);
+            const int64_t pong_timeout_ms = config.heartbeat_interval_sec * 1500;  // 1.5×
+            if (pong_age_ms > pong_timeout_ms) {
+                logger->error(kComp, "Pong timeout (" + std::to_string(pong_age_ms) +
+                    "ms) — dead connection, reconnecting");
+                handle_disconnect("pong_timeout");
+                return;
             }
+
+            // BUG-S23-03: retry subscriptions that haven't been confirmed within 5 seconds.
+            // Collect retry targets under the lock, then retry outside to avoid deadlock
+            // (do_subscribe_direct also acquires subs_mutex for pending_sub_ms_).
+            std::vector<std::string> retry_channels;
+            {
+                std::lock_guard lock(subs_mutex);
+                for (auto& [ch, sent_ms] : pending_sub_ms_) {
+                    if (now_ms - sent_ms > 5000) {
+                        for (const auto& sub_json : subscriptions) {
+                            try {
+                                auto jv = boost::json::parse(sub_json);
+                                if (jv.is_object() && jv.as_object().contains("channel")) {
+                                    if (std::string(jv.as_object().at("channel").as_string()) == ch) {
+                                        retry_channels.push_back(sub_json);
+                                        break;
+                                    }
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                }
+            }
+            for (const auto& sub_json : retry_channels) {
+                logger->warn(kComp, "Subscription unconfirmed after 5s — retrying");
+                do_subscribe_direct(sub_json);
+            }
+
+            do_send_on_strand("ping");
+            schedule_heartbeat();
         });
     }
 
@@ -376,6 +444,17 @@ struct BitgetWsClient::Impl {
         auto msg = R"({"op":"subscribe","args":[)" + channel + R"(]})";
         logger->info(kComp, "Подписка: " + msg);
         do_send_on_strand(std::move(msg));
+
+        // BUG-S23-03: record subscription as pending confirmation
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        try {
+            auto jv = boost::json::parse(channel);
+            if (jv.is_object() && jv.as_object().contains("channel")) {
+                std::string ch(jv.as_object().at("channel").as_string());
+                pending_sub_ms_[ch] = now_ms;
+            }
+        } catch (...) {}  // channel may not be JSON-parseable as standalone object
     }
 
     /// Отправить отписку (вызывать ТОЛЬКО из io_context потока)
@@ -441,7 +520,9 @@ void BitgetWsClient::stop() {
 void BitgetWsClient::subscribe(const std::string& channel) {
     {
         std::lock_guard lock(impl_->subs_mutex);
-        impl_->subscriptions.push_back(channel);
+        auto& subs = impl_->subscriptions;
+        if (std::find(subs.begin(), subs.end(), channel) != subs.end()) return;
+        subs.push_back(channel);
     }
     if (impl_->connected.load()) {
         net::post(impl_->ioc, [this, channel] {

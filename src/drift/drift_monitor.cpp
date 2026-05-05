@@ -94,7 +94,8 @@ DriftDetectionResult DriftMonitor::check(const std::string& stream_name) const {
     result.test_count = s.test.size();
 
     // Нужны данные в обоих окнах
-    if (s.reference.size() < config_.psi_bins * 2 || s.test.size() < config_.psi_bins) {
+    if (config_.psi_bins == 0 ||
+        s.reference.size() < config_.psi_bins * 2 || s.test.size() < config_.psi_bins) {
         return result;
     }
 
@@ -108,18 +109,21 @@ DriftDetectionResult DriftMonitor::check(const std::string& stream_name) const {
     // Для ADWIN нужен mutable — используем const_cast (state не меняется логически
     // при check, но внутренний метод может обновить маркер). Вместо этого вычисляем inline.
     result.adwin_change = false;
-    if (s.adwin_window.size() >= 2 * config_.psi_bins) {
+    if (config_.psi_bins > 0 && config_.adwin_delta > 0.0 &&
+        s.adwin_window.size() >= 2 * config_.psi_bins) {
         const auto mid = s.adwin_window.size() / 2;
-        double sum1 = 0, sum2 = 0;
-        for (std::size_t i = 0; i < mid; ++i) sum1 += s.adwin_window[i];
-        for (std::size_t i = mid; i < s.adwin_window.size(); ++i) sum2 += s.adwin_window[i];
-        const double mean1 = sum1 / static_cast<double>(mid);
-        const double mean2 = sum2 / static_cast<double>(s.adwin_window.size() - mid);
-        const double n = static_cast<double>(s.adwin_window.size());
-        const double eps_cut = std::sqrt(0.5 * (1.0 / static_cast<double>(mid) +
-                                1.0 / static_cast<double>(s.adwin_window.size() - mid)) *
-                                std::log(2.0 / config_.adwin_delta));
-        result.adwin_change = std::abs(mean1 - mean2) >= eps_cut;
+        if (mid > 0 && mid < s.adwin_window.size()) {
+            double sum1 = 0, sum2 = 0;
+            for (std::size_t i = 0; i < mid; ++i) sum1 += s.adwin_window[i];
+            for (std::size_t i = mid; i < s.adwin_window.size(); ++i) sum2 += s.adwin_window[i];
+            const double mean1 = sum1 / static_cast<double>(mid);
+            const double mean2 = sum2 / static_cast<double>(s.adwin_window.size() - mid);
+            const double eps_cut = std::sqrt(0.5 * (1.0 / static_cast<double>(mid) +
+                                    1.0 / static_cast<double>(s.adwin_window.size() - mid)) *
+                                    std::log(2.0 / config_.adwin_delta));
+            if (std::isfinite(eps_cut) && eps_cut >= 0.0)
+                result.adwin_change = std::abs(mean1 - mean2) >= eps_cut;
+        }
     }
 
     result.severity = classify_severity(result.psi_value, result.ks_p_value,
@@ -153,24 +157,29 @@ DriftSnapshot DriftMonitor::check_all() const {
         result.reference_count = s.reference.size();
         result.test_count = s.test.size();
 
-        if (s.reference.size() >= config_.psi_bins * 2 && s.test.size() >= config_.psi_bins) {
+        if (config_.psi_bins > 0 &&
+            s.reference.size() >= config_.psi_bins * 2 && s.test.size() >= config_.psi_bins) {
             result.psi_value = compute_psi(s.reference, s.test);
             auto [ks_stat, ks_p] = compute_ks(s.reference, s.test);
             result.ks_statistic = ks_stat;
             result.ks_p_value = ks_p;
             result.page_hinkley_alarm = (s.ph_sum - s.ph_min) > config_.page_hinkley_threshold;
 
-            if (s.adwin_window.size() >= 2 * config_.psi_bins) {
+            if (config_.psi_bins > 0 && config_.adwin_delta > 0.0 &&
+                s.adwin_window.size() >= 2 * config_.psi_bins) {
                 const auto mid = s.adwin_window.size() / 2;
-                double sum1 = 0, sum2 = 0;
-                for (std::size_t i = 0; i < mid; ++i) sum1 += s.adwin_window[i];
-                for (std::size_t i = mid; i < s.adwin_window.size(); ++i) sum2 += s.adwin_window[i];
-                const double mean1 = sum1 / static_cast<double>(mid);
-                const double mean2 = sum2 / static_cast<double>(s.adwin_window.size() - mid);
-                const double eps_cut = std::sqrt(0.5 * (1.0 / static_cast<double>(mid) +
-                                        1.0 / static_cast<double>(s.adwin_window.size() - mid)) *
-                                        std::log(2.0 / config_.adwin_delta));
-                result.adwin_change = std::abs(mean1 - mean2) >= eps_cut;
+                if (mid > 0 && mid < s.adwin_window.size()) {
+                    double sum1 = 0, sum2 = 0;
+                    for (std::size_t i = 0; i < mid; ++i) sum1 += s.adwin_window[i];
+                    for (std::size_t i = mid; i < s.adwin_window.size(); ++i) sum2 += s.adwin_window[i];
+                    const double mean1 = sum1 / static_cast<double>(mid);
+                    const double mean2 = sum2 / static_cast<double>(s.adwin_window.size() - mid);
+                    const double eps_cut = std::sqrt(0.5 * (1.0 / static_cast<double>(mid) +
+                                            1.0 / static_cast<double>(s.adwin_window.size() - mid)) *
+                                            std::log(2.0 / config_.adwin_delta));
+                    if (std::isfinite(eps_cut) && eps_cut >= 0.0)
+                        result.adwin_change = std::abs(mean1 - mean2) >= eps_cut;
+                }
             }
 
             result.severity = classify_severity(result.psi_value, result.ks_p_value,
@@ -228,7 +237,7 @@ std::size_t DriftMonitor::stream_count() const {
 
 double DriftMonitor::compute_psi(const std::deque<double>& reference,
                                   const std::deque<double>& test) const {
-    if (reference.empty() || test.empty()) return 0.0;
+    if (reference.empty() || test.empty() || config_.psi_bins == 0) return 0.0;
 
     // Определяем границы бинов по reference
     auto ref_sorted = std::vector<double>(reference.begin(), reference.end());
@@ -248,7 +257,7 @@ double DriftMonitor::compute_psi(const std::deque<double>& reference,
     // Считаем пропорции в каждом бине
     const double ref_n = static_cast<double>(reference.size());
     const double test_n = static_cast<double>(test.size());
-    const double epsilon = 1e-6;
+    const double epsilon = 1e-4;
 
     double psi = 0.0;
     for (std::size_t b = 0; b < bins; ++b) {
@@ -286,26 +295,23 @@ std::pair<double, double> DriftMonitor::compute_ks(
     const double n1 = static_cast<double>(ref_sorted.size());
     const double n2 = static_cast<double>(test_sorted.size());
 
-    while (i < ref_sorted.size() && j < test_sorted.size()) {
-        const double cdf1 = static_cast<double>(i + 1) / n1;
-        const double cdf2 = static_cast<double>(j + 1) / n2;
+    // Standard two-sample KS: advance both pointers when values are equal so
+    // that CDF steps are taken simultaneously.  The old single-advance formula
+    // gave a spurious D=0.5 for identical distributions with ties — the classic
+    // off-by-one that causes the test to flag non-existent drift.
+    while (i < ref_sorted.size() || j < test_sorted.size()) {
+        const bool i_ok = (i < ref_sorted.size());
+        const bool j_ok = (j < test_sorted.size());
 
-        if (ref_sorted[i] <= test_sorted[j]) {
-            d_max = std::max(d_max, std::abs(cdf1 - static_cast<double>(j) / n2));
+        if (i_ok && j_ok && ref_sorted[i] == test_sorted[j]) {
+            ++i; ++j;
+        } else if (i_ok && (!j_ok || ref_sorted[i] < test_sorted[j])) {
             ++i;
         } else {
-            d_max = std::max(d_max, std::abs(static_cast<double>(i) / n1 - cdf2));
             ++j;
         }
-    }
-    // Оставшиеся
-    while (i < ref_sorted.size()) {
-        d_max = std::max(d_max, std::abs(static_cast<double>(i + 1) / n1 - 1.0));
-        ++i;
-    }
-    while (j < test_sorted.size()) {
-        d_max = std::max(d_max, std::abs(1.0 - static_cast<double>(j + 1) / n2));
-        ++j;
+        d_max = std::max(d_max,
+            std::abs(static_cast<double>(i) / n1 - static_cast<double>(j) / n2));
     }
 
     // Approx p-value (asymptotic formula)
@@ -345,17 +351,25 @@ void DriftMonitor::update_page_hinkley(StreamState& state, double value) const {
 // ============================================================
 
 bool DriftMonitor::check_adwin(StreamState& state) const {
+    // Guard: psi_bins==0 causes 2*psi_bins==0 → size_t underflow (always false).
+    // Also guard adwin_delta≤0 (log undefined) and mid==0 (div/zero).
+    if (config_.psi_bins == 0 || config_.adwin_delta <= 0.0) return false;
     if (state.adwin_window.size() < 2 * config_.psi_bins) return false;
 
     const auto mid = state.adwin_window.size() / 2;
+    if (mid == 0 || mid == state.adwin_window.size()) return false;
+
     double sum1 = 0, sum2 = 0;
     for (std::size_t i = 0; i < mid; ++i) sum1 += state.adwin_window[i];
     for (std::size_t i = mid; i < state.adwin_window.size(); ++i) sum2 += state.adwin_window[i];
     const double mean1 = sum1 / static_cast<double>(mid);
     const double mean2 = sum2 / static_cast<double>(state.adwin_window.size() - mid);
+    const double log_arg = 2.0 / config_.adwin_delta;
+    if (log_arg <= 0.0) return false;
     const double eps_cut = std::sqrt(0.5 * (1.0 / static_cast<double>(mid) +
                             1.0 / static_cast<double>(state.adwin_window.size() - mid)) *
-                            std::log(2.0 / config_.adwin_delta));
+                            std::log(log_arg));
+    if (!std::isfinite(eps_cut) || eps_cut < 0.0) return false;
     return std::abs(mean1 - mean2) >= eps_cut;
 }
 

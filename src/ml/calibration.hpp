@@ -18,7 +18,7 @@ struct CalibrationConfig {
     size_t min_samples{50};            ///< Мин. точек для калибровки
     size_t max_samples{2000};          ///< Макс. скользящее окно
     size_t isotonic_bins{20};          ///< Число бинов для isotonic regression
-    double platt_max_iter{30};         ///< Макс. итераций Platt
+    int    platt_max_iter{30};         ///< Макс. итераций Platt (BUG-ML-06: was double → truncation)
 };
 
 /// Запись калибровочных данных

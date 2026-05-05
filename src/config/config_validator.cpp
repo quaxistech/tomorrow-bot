@@ -396,7 +396,7 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
     double max_loss_at_max_lev = cfg.trading_params.price_stop_loss_pct *
                                   static_cast<double>(cfg.futures.max_leverage);
     if (max_loss_at_max_lev > 100.0) {
-        result.add_warning(
+        result.add_error(
             std::format("price_stop_loss_pct ({:.1f}%) × max_leverage ({}) = {:.1f}% — "
                         "превышает 100%%, возможна полная потеря капитала",
                         cfg.trading_params.price_stop_loss_pct,

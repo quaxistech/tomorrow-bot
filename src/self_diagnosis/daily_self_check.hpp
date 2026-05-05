@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -110,8 +111,10 @@ private:
         CheckSeverity severity;
         CheckFn fn;
     };
+    mutable std::mutex checks_mutex_;  ///< Guards checks_ (BUG-S19-04)
     std::vector<RegisteredCheck> checks_;
 
+    mutable std::mutex result_mutex_;  ///< Guards last_result_
     SelfCheckResult last_result_;
 
     std::shared_ptr<metrics::IGauge> gauge_self_check_status_;

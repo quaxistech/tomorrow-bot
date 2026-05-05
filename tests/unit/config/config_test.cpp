@@ -7,6 +7,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include "config/config_types.hpp"
 #include "config/config_validator.hpp"
+#include "config/config_loader.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <cstdlib>
 
 using namespace tb;
 using namespace tb::config;
@@ -51,6 +56,33 @@ TEST_CASE("Config: ValidConfigPasses", "[config]") {
     auto cfg = make_valid_config();
     auto result = validator.validate(cfg);
     REQUIRE(result.has_value());
+}
+
+TEST_CASE("Config: Unknown keys are rejected by loader", "[config][loader]") {
+    auto loader = create_config_loader();
+
+    auto tmp = std::filesystem::temp_directory_path() /
+        ("tb_config_unknown_key_" + std::to_string(std::rand()) + ".yaml");
+
+    {
+        std::ofstream out(tmp);
+        REQUIRE(out.is_open());
+        out << "trading:\n";
+        out << "  mode: production\n";
+        out << "exchange:\n";
+        out << "  endpoint_rest: https://api.bitget.com\n";
+        out << "  endpoint_ws: wss://ws.bitget.com/v2/ws/public\n";
+        out << "  api_key_ref: BITGET_API_KEY\n";
+        out << "  api_secret_ref: BITGET_API_SECRET\n";
+        out << "unexpected_section:\n";
+        out << "  rogue_param: 42\n";
+    }
+
+    auto result = loader->load(tmp.string());
+    std::filesystem::remove(tmp);
+
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error() == TbError::ConfigLoadFailed);
 }
 
 // ============================================================

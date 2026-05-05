@@ -513,10 +513,10 @@ TEST_CASE("Regime: CUSUM accelerates hysteresis transition", "[regime][cusum]") 
 
     RuleBasedRegimeEngine engine(logger, clk, metrics, cfg);
 
-    // Establish uptrend
+    // Establish uptrend — need dwell_ticks >= kCusumMinDwellTicks (5) for the
+    // MEDIUM-10 anti-flip-flop guard to allow CUSUM-accelerated transitions.
     auto uptrend = make_strong_uptrend();
-    engine.classify(uptrend);
-    engine.classify(uptrend);
+    for (int i = 0; i < 5; ++i) engine.classify(uptrend);
 
     // Build a chop snapshot with CUSUM change signal
     auto chop_with_cusum = make_chop();
@@ -526,9 +526,8 @@ TEST_CASE("Regime: CUSUM accelerates hysteresis transition", "[regime][cusum]") 
     chop_with_cusum.technical.cusum_negative = 0.0;
 
     // With CUSUM, confirmation_ticks effectively becomes 2 (3-1)
-    engine.classify(chop_with_cusum);  // tick 1
-    engine.classify(chop_with_cusum);  // tick 2 — should confirm due to CUSUM
-    auto result = engine.classify(chop_with_cusum);  // tick 3
+    engine.classify(chop_with_cusum);  // tick 1: new candidate
+    auto result = engine.classify(chop_with_cusum);  // tick 2: confirms due to CUSUM
 
     REQUIRE(result.detailed == DetailedRegime::Chop);
 }

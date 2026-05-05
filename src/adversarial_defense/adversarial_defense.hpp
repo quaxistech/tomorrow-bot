@@ -16,6 +16,7 @@
 #include "adversarial_types.hpp"
 #include "common/types.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <deque>
 #include <mutex>
@@ -66,7 +67,7 @@ private:
     // --- Cooldown / Recovery ---
     std::unordered_map<std::string, int64_t> cooldown_until_;
     std::unordered_map<std::string, int64_t> recovery_until_;
-    int64_t last_cleanup_ms_{0};
+    std::atomic<int64_t> last_cleanup_ms_{0};
 
     // --- Per-symbol tick state (rate-of-change) ---
     struct SymbolTickState {

@@ -1,6 +1,7 @@
 #pragma once
 #include "execution/order_types.hpp"
 #include <chrono>
+#include <mutex>
 #include <vector>
 
 namespace tb::execution {
@@ -47,6 +48,7 @@ private:
     static Timestamp wall_clock_now() noexcept;
 
     OrderId order_id_;
+    mutable std::mutex mutex_;
     OrderState state_{OrderState::New};
     std::vector<OrderTransition> history_;
     int64_t created_at_ns_{0};  ///< Wall-clock наносекунды от эпохи

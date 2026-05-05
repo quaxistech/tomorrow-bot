@@ -81,9 +81,12 @@ private:
         double fill_latency_max_ms{0.0};
         double cancel_latency_sum_ms{0.0};
         double slippage_sum_bps{0.0};
-        // Reservoir for P99 approximation (sorted top-N)
-        std::vector<double> fill_latency_top_;
-        static constexpr std::size_t kTopN = 100;
+        // Reservoir sampling for P99 approximation (Algorithm R, Vitter 1985).
+        // Maintains a uniform random sample of up to kReservoirSize observations.
+        // To compute a percentile: sort the reservoir and index at the desired rank.
+        std::vector<double> latency_reservoir_;
+        int64_t reservoir_total_{0};      ///< total samples seen (for replacement probability)
+        static constexpr std::size_t kReservoirSize = 1024;
         void push_fill_latency(double ms);
     };
 

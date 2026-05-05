@@ -128,6 +128,8 @@ private:
     // Recent incidents (ring buffer of last 100)
     std::vector<IncidentReport> recent_;
     static constexpr size_t kMaxRecentIncidents = 100;
+    // BUG-S24-05: cap partial_fills_ to prevent unbounded growth when fills never complete
+    static constexpr size_t kMaxPartialFills = 500;
 
     std::mutex mutex_;
 };

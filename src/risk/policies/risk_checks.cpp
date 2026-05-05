@@ -15,6 +15,8 @@ namespace {
 
 void deny(RiskDecision& d, const std::string& code, const std::string& msg,
           double severity = 1.0) {
+    if (code.empty()) return;
+    severity = std::clamp(std::isfinite(severity) ? severity : 1.0, 0.0, 1.0);
     d.verdict = RiskVerdict::Denied;
     d.reasons.push_back({code, msg, severity});
     d.hard_blocks.push_back(code);
@@ -195,8 +197,8 @@ void SameDirectionCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     for (const auto& sym : long_symbols) {
         if (short_symbols.count(sym)) ++hedge_pairs;
     }
-    long_count -= hedge_pairs;
-    short_count -= hedge_pairs;
+    long_count  = std::max(0, long_count  - hedge_pairs);
+    short_count = std::max(0, short_count - hedge_pairs);
 
     if (ctx.intent.side == Side::Buy && long_count >= cfg_.max_simultaneous_long_positions) {
         deny(d, "MAX_LONG_POSITIONS",
@@ -264,7 +266,8 @@ void MaxLeverageCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     const double projected_exposure = ctx.portfolio.exposure.gross_exposure +
                                       ctx.sizing.approved_notional.get();
     const double leverage = projected_exposure / ctx.portfolio.total_capital;
-    double buffer_factor = 1.0 - (cfg_.liquidation_buffer_pct / 100.0);
+    // BUG-S13-02: pct >= 100 → buffer_factor <= 0 → effective_max <= 0 → all trades denied
+    double buffer_factor = std::max(0.0, 1.0 - (cfg_.liquidation_buffer_pct / 100.0));
     double effective_max = cfg_.max_leverage * buffer_factor;
 
     if (leverage >= effective_max) {
@@ -408,7 +411,9 @@ void TradeIntervalCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     int64_t last = state_.rates.last_trade_for_symbol(ctx.intent.symbol.get());
     if (last == 0) return;
 
+    // BUG-S34-01: elapsed is negative when NTP backward jump sets now < last → always throttled.
     int64_t elapsed = clock_->now().get() - last;
+    if (elapsed < 0) elapsed = 0;  // backward clock: treat as just-traded (conservative)
     if (elapsed < cfg_.min_trade_interval_ns) {
         throttle(d, "TRADE_INTERVAL",
                  "Интервал " + std::to_string(elapsed / 1'000'000'000LL) +
@@ -497,10 +502,17 @@ void UtcCutoffCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
     if (cfg_.utc_cutoff_hour < 0) return;
 
     const int64_t now_ns = clock_->now().get();
-    const int hour_utc = static_cast<int>((now_ns / 1'000'000'000LL % 86400) / 3600);
-    if (hour_utc >= cfg_.utc_cutoff_hour) {
+    const int64_t secs_today = now_ns / 1'000'000'000LL % 86400;
+    const int hour_utc   = static_cast<int>(secs_today / 3600);
+    const int minute_utc = static_cast<int>((secs_today % 3600) / 60);
+
+    const int cutoff_min = std::clamp(cfg_.utc_cutoff_minute, 0, 59);
+    const bool past_cutoff = (hour_utc > cfg_.utc_cutoff_hour) ||
+                             (hour_utc == cfg_.utc_cutoff_hour && minute_utc >= cutoff_min);
+    if (past_cutoff) {
         deny(d, "UTC_CUTOFF",
-             "Торговля прекращена после " + std::to_string(cfg_.utc_cutoff_hour) + ":00 UTC");
+             "Торговля прекращена после " + std::to_string(cfg_.utc_cutoff_hour)
+             + ":" + (cutoff_min < 10 ? "0" : "") + std::to_string(cutoff_min) + " UTC");
     }
 }
 
@@ -609,8 +621,10 @@ void FundingRateCostCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     // If funding is favorable (effective_cost <= 0), no check needed
     if (effective_cost <= 0.0) return;
 
-    // Годовая стоимость: cost × 3 сеанса/день × 365 дней × 100 (%)
-    double annual_cost_pct = effective_cost * 3.0 * 365.0 * 100.0;
+    // BUG-RS-13 fix: named constant instead of magic 3.0.
+    // Bitget USDT-M perpetuals settle funding every 8 hours → 3 sessions/day.
+    static constexpr double kBitgetFundingPeriodsPerDay = 3.0;
+    double annual_cost_pct = effective_cost * kBitgetFundingPeriodsPerDay * 365.0 * 100.0;
     if (annual_cost_pct > cfg_.max_annual_funding_cost_pct) {
         deny(d, "FUNDING_COST_EXCESSIVE",
              "Годовая стоимость фандинга " + std::to_string(annual_cost_pct) +
@@ -699,8 +713,9 @@ void MarginDistanceCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     }
 
     // Reduce size if distance_to_liquidation < 2× buffer
+    // BUG-S13-03: liquidation_buffer_pct=0 → warn_threshold=0 → ratio = dist/0 = Inf
     double warn_threshold = cfg_.liquidation_buffer_pct * 2.0;
-    if (m.distance_to_liquidation_pct < warn_threshold) {
+    if (warn_threshold > 0.0 && m.distance_to_liquidation_pct < warn_threshold) {
         double ratio = m.distance_to_liquidation_pct / warn_threshold;
         reduce(d, std::clamp(ratio, 0.3, 0.8), "MARGIN_DISTANCE_LOW",
                "Liquidation distance " + std::to_string(m.distance_to_liquidation_pct) +
@@ -713,6 +728,10 @@ void MarginDistanceCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
                "Combined pair margin usage " +
                std::to_string(m.combined_margin_usage_pct) + "% exceeds 80%");
     }
+
+    // BUG-S33-01: mark_price=0 → order_notional=0 → required_margin=0 → check always passes,
+    // silently bypassing the margin-availability guard. Return early on invalid mark_price.
+    if (m.mark_price <= 0.0) return;
 
     // Available margin too low for the order
     double order_notional = d.approved_quantity.get() * m.mark_price;

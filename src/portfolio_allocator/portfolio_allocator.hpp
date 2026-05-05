@@ -8,6 +8,7 @@
 #include "regime/regime_types.hpp"
 #include "logging/logger.hpp"
 #include <memory>
+#include <mutex>
 
 namespace tb::portfolio_allocator {
 
@@ -137,6 +138,7 @@ private:
     std::shared_ptr<logging::ILogger> logger_; ///< Логгер
 
     // === Рыночный контекст для volatility targeting ===
+    mutable std::mutex context_mutex_;
     double realized_vol_annual_{0.0};          ///< Реализованная годовая волатильность
     regime::DetailedRegime current_regime_{regime::DetailedRegime::Undefined}; ///< Текущий режим рынка
     double win_rate_{0.5};                     ///< Доля выигрышных сделок

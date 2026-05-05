@@ -25,7 +25,9 @@ SymbolScore PairRanker::compute(const SymbolFeatures& features,
     s.trap_risk_penalty = traps.total_risk;
 
     // Funding extreme penalty
-    double abs_funding = std::abs(snapshot.funding_rate);
+    double funding_rate = snapshot.funding_rate;
+    if (!std::isfinite(funding_rate)) funding_rate = 0.0;
+    double abs_funding = std::abs(funding_rate);
     if (abs_funding > cfg_.funding_extreme_threshold) {
         double excess = (abs_funding - cfg_.funding_extreme_threshold) / cfg_.funding_extreme_threshold;
         s.funding_penalty = std::min(excess * 0.5, 1.0);
@@ -44,7 +46,7 @@ SymbolScore PairRanker::compute(const SymbolFeatures& features,
         cfg_.weight_trap_risk * s.trap_risk_penalty +
         cfg_.weight_funding_extreme * s.funding_penalty;
 
-    s.total = std::max(0.0, positive - negative);
+    s.total = std::isfinite(positive - negative) ? std::max(0.0, positive - negative) : 0.0;
 
     // §15: Explainability — bonus/penalty reasons
     if (s.liquidity_score > 0.8) s.bonus_reasons.push_back("high_liquidity");

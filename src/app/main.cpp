@@ -239,6 +239,10 @@ int main(int argc, const char* argv[]) {
     // Выполняем сканирование с ретраями — если рынок не даёт пар, ждём
     tb::scanner::ScannerResult scanner_result;
     std::vector<std::string> active_symbols;
+    // BUG-S23-05: track symbols force-added from open positions so capital filter
+    // excludes them from budget calculation (they inflate n, deflating per-pipeline budget).
+    // These symbols are re-appended after filtering since open positions must always be managed.
+    std::unordered_set<std::string> forced_by_position_symbols;
 
     if (config.pair_selection.mode == tb::config::PairSelectionMode::Manual &&
         !config.pair_selection.manual_symbols.empty()) {
@@ -329,6 +333,7 @@ int main(int argc, const char* argv[]) {
                             }
                             if (!already_tracked) {
                                 active_symbols.push_back(symbol);
+                                forced_by_position_symbols.insert(symbol);  // BUG-S23-05
                                 logger->warn("main",
                                     "Принудительно добавлен символ с открытой фьючерсной позицией: " + symbol,
                                     {{"side", std::string(tb::to_string(position.side))},
@@ -394,6 +399,21 @@ int main(int argc, const char* argv[]) {
         const double total_capital = config.trading.initial_capital;
         const int max_leverage = config.futures.max_leverage;
 
+        // BUG-S23-05: temporarily remove forced-by-position symbols from active_symbols
+        // so they don't inflate n and shrink per_pipeline_budget for normal symbols.
+        std::vector<std::string> position_forced_temp;
+        if (!forced_by_position_symbols.empty()) {
+            std::vector<std::string> normal_symbols;
+            for (const auto& sym : active_symbols) {
+                if (forced_by_position_symbols.count(sym)) {
+                    position_forced_temp.push_back(sym);
+                } else {
+                    normal_symbols.push_back(sym);
+                }
+            }
+            active_symbols = std::move(normal_symbols);
+        }
+
         bool changed = true;
         while (changed && !active_symbols.empty()) {
             changed = false;
@@ -430,6 +450,11 @@ int main(int argc, const char* argv[]) {
         if (active_symbols.empty()) {
             logger->error("main", "Нет доступных по капиталу пар! Завершение.");
             return 1;
+        }
+
+        // BUG-S23-05: re-add forced position symbols after capital filtering
+        for (const auto& sym : position_forced_temp) {
+            active_symbols.push_back(sym);
         }
     }
 
@@ -515,6 +540,19 @@ int main(int argc, const char* argv[]) {
 
     std::atomic<bool> idle_monitor_running{true};
     int64_t last_rescan_ns = comp.clock->now().get();
+
+    // Log active symbols before starting idle_monitor_thread so the read of
+    // active_symbols happens only on the main thread (BUG-S12-01/02/03).
+    {
+        std::string all_symbols;
+        for (const auto& s : active_symbols) {
+            if (!all_symbols.empty()) all_symbols += ", ";
+            all_symbols += s;
+        }
+        logger->info("main", "Система запущена. Ожидание сигнала завершения (SIGTERM/SIGINT)...",
+            {{"active_pairs", all_symbols},
+             {"pair_count", std::to_string(active_symbols.size())}});
+    }
 
     std::thread idle_monitor_thread([&]() {
         while (idle_monitor_running.load()) {
@@ -632,7 +670,8 @@ int main(int argc, const char* argv[]) {
                     if (all_active_symbols.count(new_sym)) {
                         logger->warn("main", "Пропуск ротации: символ уже активен в другом pipeline",
                             {{"symbol", new_sym}});
-                        ++replaced;
+                        // BUG-NEW-16: do NOT increment `replaced` here — rotation was skipped,
+                        // so the slot is still idle and the counter must not advance.
                         continue;
                     }
 
@@ -686,16 +725,6 @@ int main(int argc, const char* argv[]) {
     });
 
     // ---- 6. Ожидание завершения ----
-    {
-        std::string all_symbols;
-        for (const auto& s : active_symbols) {
-            if (!all_symbols.empty()) all_symbols += ", ";
-            all_symbols += s;
-        }
-        logger->info("main", "Система запущена. Ожидание сигнала завершения (SIGTERM/SIGINT)...",
-            {{"active_pairs", all_symbols},
-             {"pair_count", std::to_string(active_symbols.size())}});
-    }
     supervisor.wait_for_shutdown();
 
     // ---- 7. Корректное завершение ----

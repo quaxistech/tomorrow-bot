@@ -140,15 +140,17 @@ RecoveryResult RecoveryService::recover_on_startup() {
                 logger_->info(kComponent, "Журнал событий воспроизведён");
                 last_result_.messages.emplace_back("Journal replayed successfully");
             } else {
-                logger_->error(kComponent, "КРИТИЧЕСКАЯ ОШИБКА при воспроизведении журнала");
-                last_result_.messages.emplace_back("Journal replay FAILED");
-                ++last_result_.errors;
-                last_result_.status = RecoveryStatus::Failed;
-                const auto end = clock_->now();
-                last_result_.duration_ms = ns_to_ms(end.get() - start.get());
-                last_result_.completed_at = end;
-                emit_recovery_metrics(metrics_, last_result_);
-                return last_result_;
+                // Corrupted journal entries are already skipped and counted as warnings
+                // inside replay_journal_after_snapshot. We continue recovery rather than
+                // failing — valid entries were applied and the exchange sync (step 3)
+                // will reconcile any remaining gaps. Only fail if there is no valid
+                // checkpoint at all (snapshot was missing — handled above).
+                logger_->warn(kComponent,
+                    "Журнал воспроизведён с ошибками — некоторые записи повреждены и пропущены. "
+                    "Состояние будет уточнено из биржи.");
+                last_result_.messages.emplace_back(
+                    "Journal replay completed with errors (corrupted entries skipped)");
+                ++last_result_.warnings;
             }
         }
     }
@@ -397,7 +399,7 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange(
 
             const double exchange_qty = info.size.get();
             const double local_qty = local_pos->size.get();
-            const double diff = std::abs(exchange_qty - local_qty);
+            const double diff = std::fabs(exchange_qty - local_qty);
 
             // Относительный порог: 0.5% от биржевого количества (источник истины).
             // Абсолютный floor предотвращает ложные срабатывания на микро-позициях.
@@ -426,8 +428,17 @@ std::vector<RecoveredPosition> RecoveryService::sync_positions_from_exchange(
             rec.had_matching_strategy = false;
 
             if (config_.close_orphan_positions) {
-                // Не синхронизировать — только предупреждение
-                rec.resolution = "Orphan futures position detected; skipped (close_orphan_positions=true)";
+                // BUG-S21-03: recovery layer is read-only (no IOrderSubmitter).
+                // Mark orphan as "needs_close" without syncing into the local portfolio —
+                // the pipeline/execution layer will submit a close order and only then
+                // reconcile. Importing the position here would cause a ghost entry.
+                rec.resolution = "needs_close";
+                logger_->error(kComponent,
+                    "Orphan position detected and marked needs_close — "
+                    "pipeline must submit a close order to clear it",
+                    {{"symbol", info.symbol.get()},
+                     {"side", info.side == Side::Buy ? "Long" : "Short"},
+                     {"size", std::to_string(info.size.get())}});
                 ++last_result_.warnings;
             } else {
                 // Синхронизировать orphan в локальный портфель для отслеживания
@@ -482,7 +493,7 @@ double RecoveryService::extract_usdt_balance(
     double local_capital = snap.total_capital;
     double adjustment = usdt_balance - local_capital;
 
-    if (std::abs(adjustment) > kCapitalSyncThresholdUsdt) {
+    if (std::fabs(adjustment) > kCapitalSyncThresholdUsdt) {
         portfolio_->set_capital(usdt_balance);
         last_result_.balance_adjustment = adjustment;
         last_result_.messages.emplace_back(

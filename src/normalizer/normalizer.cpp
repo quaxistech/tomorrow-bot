@@ -54,6 +54,12 @@ static bool iequals(std::string_view a, std::string_view b) {
     return true;
 }
 
+static std::string ascii_upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return s;
+}
+
 // Миллисекунды → наносекунды (Bitget ts → internal Timestamp)
 static constexpr int64_t ms_to_ns(int64_t ms) {
     return ms * 1'000'000LL;
@@ -64,10 +70,15 @@ static constexpr int64_t ms_to_ns(int64_t ms) {
 static int64_t interval_to_ms(std::string_view interval) {
     // Стандартные интервалы USDT-M Futures (Bitget v2 API)
     if (interval == "1m")                       return       60'000LL;
+    if (interval == "1min" || interval == "1Min") return     60'000LL;
     if (interval == "3m")                       return      180'000LL;
+    if (interval == "3min" || interval == "3Min") return    180'000LL;
     if (interval == "5m")                       return      300'000LL;
+    if (interval == "5min" || interval == "5Min") return    300'000LL;
     if (interval == "15m")                      return      900'000LL;
+    if (interval == "15min" || interval == "15Min") return  900'000LL;
     if (interval == "30m")                      return    1'800'000LL;
+    if (interval == "30min" || interval == "30Min") return 1'800'000LL;
     if (interval == "1h"  || interval == "1H")  return    3'600'000LL;
     if (interval == "2h"  || interval == "2H")  return    7'200'000LL;
     if (interval == "4h"  || interval == "4H")  return   14'400'000LL;
@@ -176,8 +187,12 @@ void BitgetNormalizer::process_raw_message(const exchange::bitget::RawWsMessage&
     if (!inst_id.empty()) {
         std::lock_guard<std::mutex> sym_lock(symbols_mutex_);
         if (!symbols_.empty()) {
-            tb::Symbol sym{inst_id};
-            if (std::ranges::find(symbols_, sym) == symbols_.end()) return;
+            const std::string normalized_inst = ascii_upper(inst_id);
+            const bool matched = std::any_of(symbols_.begin(), symbols_.end(),
+                [&](const tb::Symbol& sym) {
+                    return ascii_upper(sym.get()) == normalized_inst;
+                });
+            if (!matched) return;
         }
     }
 
@@ -278,11 +293,13 @@ void BitgetNormalizer::process_raw_message(const exchange::bitget::RawWsMessage&
     } else if (channel.starts_with("candle")) {
         // Интервал из имени канала: "candle1m" → "1m"
         const std::string interval = channel.substr(6);
-        const int64_t interval_ms = interval_to_ms(interval);
+        int64_t interval_ms = interval_to_ms(interval);
 
         if (interval_ms == 0) {
-            logger_->warn("BitgetNormalizer", "Unknown candle interval",
+            // Unknown/unsupported interval — reject instead of silently defaulting to 1m
+            logger_->warn("BitgetNormalizer", "Unknown candle interval — rejected",
                           {{"channel", channel}, {"interval", interval}});
+            ++rejected_count_;
             return;
         }
 
@@ -344,10 +361,15 @@ std::optional<NormalizedTicker> BitgetNormalizer::parse_ticker(
     const double ask_val = ticker.ask.get();
     const double last_val = ticker.last_price.get();
 
-    // Валидация: цены должны быть положительными
-    if (last_val <= 0.0 || bid_val <= 0.0 || ask_val <= 0.0) {
+    // Валидация: цены должны быть положительными и в разумных пределах
+    // BUG-S16-07: reject extreme prices (e.g. 1e308 from malformed API response)
+    // that would produce NaN spread_bps via catastrophic cancellation.
+    constexpr double kMaxReasonableTicker = 1e9;
+    if (last_val <= 0.0 || bid_val <= 0.0 || ask_val <= 0.0 ||
+        last_val > kMaxReasonableTicker || bid_val > kMaxReasonableTicker ||
+        ask_val > kMaxReasonableTicker) {
         ++rejected_count_;
-        logger_->warn("BitgetNormalizer", "Ticker rejected: non-positive prices",
+        logger_->warn("BitgetNormalizer", "Ticker rejected: non-positive or extreme prices",
                       {{"symbol", raw.symbol},
                        {"last", raw.last}, {"bid", raw.bid}, {"ask", raw.ask}});
         return std::nullopt;
@@ -447,13 +469,14 @@ std::optional<NormalizedOrderBook> BitgetNormalizer::parse_order_book(
         book.asks.push_back({tb::Price{p}, tb::Quantity{s}});
     }
 
+    // BUG-S25-01: reject one-sided books; downstream accesses both sides unconditionally.
+    if (book.bids.empty() || book.asks.empty()) {
+        return std::nullopt;  // one-sided orderbook — discard
+    }
+
     // Crossed book validation: best_bid must be < best_ask
-    if (!book.bids.empty() && !book.asks.empty()) {
-        const double best_bid = book.bids.front().price.get();
-        const double best_ask = book.asks.front().price.get();
-        if (best_bid >= best_ask) {
-            return std::nullopt;  // crossed/locked book — discard
-        }
+    if (book.bids.front().price.get() >= book.asks.front().price.get()) {
+        return std::nullopt;  // crossed/locked book — discard
     }
 
     return book;
@@ -472,14 +495,22 @@ std::optional<NormalizedCandle> BitgetNormalizer::parse_candle(
     const double c = to_double(raw.close);
     const double v = to_double(raw.volume);
 
+    // BUG-S25-03: also reject extreme absolute values (e.g. 1e-100 or 1e50 from
+    // malformed API responses) that pass positivity/consistency checks but
+    // destabilize RSI/ATR/BB calculations downstream.
+    static constexpr double kMinPrice = 1e-4;
+    static constexpr double kMaxPrice = 1e8;
+
     // Валидация OHLC:
-    // - Все цены положительные
+    // - Все цены положительные и в разумных абсолютных границах
     // - high >= low (физическое ограничение)
     // - high >= open && high >= close
     // - low  <= open && low  <= close
-    if (o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0) {
+    if (o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0
+        || o < kMinPrice || h < kMinPrice || l < kMinPrice || c < kMinPrice
+        || o > kMaxPrice || h > kMaxPrice || l > kMaxPrice || c > kMaxPrice) {
         ++rejected_count_;
-        logger_->warn("BitgetNormalizer", "Candle rejected: non-positive OHLC",
+        logger_->warn("BitgetNormalizer", "Candle rejected: non-positive or extreme OHLC",
                       {{"symbol", raw.symbol}, {"interval", raw.interval},
                        {"o", raw.open}, {"h", raw.high}, {"l", raw.low}, {"c", raw.close}});
         return std::nullopt;

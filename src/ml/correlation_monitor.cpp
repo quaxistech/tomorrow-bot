@@ -84,31 +84,33 @@ double CorrelationMonitor::compute_pearson(
     size_t x_offset = x.size() - n;
     size_t y_offset = y.size() - n;
 
-    double sum_x = 0.0, sum_y = 0.0;
-    double sum_xx = 0.0, sum_yy = 0.0, sum_xy = 0.0;
+    // Welford's online algorithm: avoids catastrophic cancellation in
+    // the two-pass formula (E[X²] - E[X]²) when values are close together.
+    double mean_x = 0.0, mean_y = 0.0;
+    double M2_x  = 0.0, M2_y  = 0.0, cov_xy = 0.0;
 
     for (size_t i = 0; i < n; ++i) {
         double xi = x[x_offset + i];
         double yi = y[y_offset + i];
-        sum_x += xi;
-        sum_y += yi;
-        sum_xx += xi * xi;
-        sum_yy += yi * yi;
-        sum_xy += xi * yi;
+        double k  = static_cast<double>(i + 1);
+        double dx = xi - mean_x;
+        double dy = yi - mean_y;
+        mean_x += dx / k;
+        mean_y += dy / k;
+        M2_x   += dx * (xi - mean_x);
+        M2_y   += dy * (yi - mean_y);
+        cov_xy += dx * (yi - mean_y);
     }
 
     double dn = static_cast<double>(n);
-    double mean_x = sum_x / dn;
-    double mean_y = sum_y / dn;
-
-    double var_x = sum_xx / dn - mean_x * mean_x;
-    double var_y = sum_yy / dn - mean_y * mean_y;
+    double var_x = M2_x / dn;
+    double var_y = M2_y / dn;
+    cov_xy /= dn;
 
     if (var_x <= numeric::kEpsilon || var_y <= numeric::kEpsilon) {
         return std::numeric_limits<double>::quiet_NaN();
     }
 
-    double cov_xy = sum_xy / dn - mean_x * mean_y;
     double corr = numeric::safe_div(cov_xy, (std::sqrt(var_x) * std::sqrt(var_y)),
                                     std::numeric_limits<double>::quiet_NaN());
 
@@ -121,9 +123,13 @@ double CorrelationMonitor::compute_pearson(
 CorrelationResult CorrelationMonitor::evaluate() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Возвращаем кэшированный результат, если данные не изменились
+    // BUG-ML-07 fix: invalidate cache when primary feed goes stale.
     if (cache_valid_) {
-        return cached_result_;
+        if (numeric::is_stale(last_primary_tick_ns_, clock::steady_now_ns(), config_.stale_threshold_ns)) {
+            cache_valid_ = false;
+        } else {
+            return cached_result_;
+        }
     }
 
     CorrelationResult result;
@@ -198,9 +204,15 @@ CorrelationResult CorrelationMonitor::evaluate() const {
     if (valid_count > 0) {
         result.avg_correlation = total_corr / static_cast<double>(valid_count);
     }
+    // BUG-S18-06: all-NaN correlations leave avg_correlation=0.0 (false "uncorrelated").
+    // When no valid pairs exist but undefined pairs are present, be conservative.
 
     // Множитель риска: 0.5 при разрыве, 0.7 при декорреляции, 1.0 в норме
     if (result.any_break) {
+        result.risk_multiplier = 0.5;
+    } else if (valid_count == 0 && result.has_undefined_pairs) {
+        // All correlations undefined — can't distinguish correlated from uncorrelated.
+        result.avg_correlation = std::numeric_limits<double>::quiet_NaN();
         result.risk_multiplier = 0.5;
     } else {
         // Проверяем декорреляцию хотя бы с одним ВАЛИДНЫМ референсом

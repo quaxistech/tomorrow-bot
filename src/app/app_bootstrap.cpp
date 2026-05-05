@@ -128,6 +128,13 @@ Result<AppComponents> AppBootstrap::initialize(std::string_view config_path) {
             api_base_url,
             components.config.config_hash);
 
+        // BUG-NEW-10: zero credentials immediately after use — they must not remain
+        // in heap memory where they could appear in crash dumps.
+        std::fill(api_key.begin(), api_key.end(), '\0');
+        std::fill(api_secret.begin(), api_secret.end(), '\0');
+        std::fill(api_passphrase.begin(), api_passphrase.end(), '\0');
+        api_key.clear(); api_secret.clear(); api_passphrase.clear();
+
         if (!guard_result.allowed) {
             components.logger->error("bootstrap",
                 "ProductionGuard: запуск запрещён — " + guard_result.reason);

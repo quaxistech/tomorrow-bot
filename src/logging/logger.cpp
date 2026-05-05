@@ -133,14 +133,17 @@ LogLevel ConsoleLogger::get_level() const {
 }
 
 void ConsoleLogger::log(LogEvent event) {
-    // Проверяем уровень — отбрасываем сообщения ниже порога
+    // BUG-ML-16 fix: perform the level check inside the mutex so that set_level()
+    // cannot change the threshold between the check and the write.
+    // min_level_ is atomic, so the load is safe here, but the re-check under lock
+    // ensures no write occurs to a level that was disabled between check and write.
+    std::lock_guard lock(mutex_);
     if (log_level_value(event.level) < min_level_.load(std::memory_order_relaxed)) {
         return;
     }
 
     const std::string formatted = format_event(event, json_format_);
 
-    std::lock_guard lock(mutex_);
     // Error и выше -> stderr
     if (log_level_value(event.level) >= log_level_value(LogLevel::Error)) {
         std::cerr << formatted << std::endl;
@@ -192,12 +195,12 @@ void FileLogger::log(LogEvent event) {
         return;
     }
 
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (!output_.is_open()) {
         return;
     }
 
-    rotate_if_needed();
+    rotate_if_needed(lock);
 
     auto formatted = format_event(event, json_format_);
     output_ << formatted << std::endl;
@@ -208,31 +211,34 @@ void FileLogger::log(LogEvent event) {
 // FileLogger — size-based rotation
 // ============================================================
 
-void FileLogger::rotate_if_needed() {
+void FileLogger::rotate_if_needed(std::unique_lock<std::mutex>& lock) {
     // ИСПРАВЛЕНИЕ H4 (аудит): size-based log rotation для 24/7 production
     if (max_file_size_ == 0 || current_size_ < max_file_size_) {
         return;
     }
 
     output_.close();
+    current_size_ = 0;
 
-    // Rotate: .log.4 → delete, .log.3 → .log.4, ..., .log → .log.1
+    // BUG-S20-02: release the mutex before expensive filesystem ops so other
+    // threads are not blocked waiting on log writes during rotation.
+    std::string path = file_path_;
+    int max_rot = max_rotated_files_;
+    lock.unlock();
+
     std::error_code ec;
-    for (int i = max_rotated_files_; i >= 1; --i) {
-        auto src = file_path_ + "." + std::to_string(i);
-        if (i == max_rotated_files_) {
+    for (int i = max_rot; i >= 1; --i) {
+        auto src = path + "." + std::to_string(i);
+        if (i == max_rot) {
             std::filesystem::remove(src, ec);
         } else {
-            auto dst = file_path_ + "." + std::to_string(i + 1);
-            std::filesystem::rename(src, dst, ec);
+            std::filesystem::rename(src, path + "." + std::to_string(i + 1), ec);
         }
     }
-    // Current → .1
-    std::filesystem::rename(file_path_, file_path_ + ".1", ec);
+    std::filesystem::rename(path, path + ".1", ec);
 
-    // Reopen fresh file
-    output_.open(file_path_, std::ios::out | std::ios::trunc);
-    current_size_ = 0;
+    lock.lock();
+    output_.open(path, std::ios::out | std::ios::trunc);
 }
 
 // ============================================================

@@ -10,13 +10,13 @@ namespace tb::risk {
 
 void LockRegistry::add_lock(LockType type, const std::string& target,
                             const std::string& reason, Timestamp now, int64_t duration_ns) {
-    // Не добавлять дубли
-    for (auto& l : locks_) {
+    // BUG-RS-07 fix: if the lock already exists, do NOT reset its timer.
+    // Resetting the timer on each new loss would create perpetual cooldown — every
+    // additional loss restarts the cooldown window so it never expires.
+    // Only add the lock if it is not already present.
+    for (const auto& l : locks_) {
         if (l.type == type && l.target == target) {
-            l.reason = reason;
-            l.activated_at = now;
-            l.duration_ns = duration_ns;
-            return;
+            return; // Lock already active; preserve original activation time.
         }
     }
     locks_.push_back({type, target, reason, now, duration_ns});
@@ -111,7 +111,18 @@ void LossStreakTracker::record_trade_result(const std::string& symbol,
         ++symbol_losses_[symbol];
         ++strategy_losses_[strategy_id];
     } else {
-        total_consecutive_losses_ = 0;
+        // BUG-RS-06 fix: only reset the global consecutive-loss counter when the
+        // symbol that just won was actually contributing to the current loss streak.
+        // Without this check, a win on ANY symbol (e.g. ETHUSDT) resets the counter
+        // even if the streak came entirely from a different symbol (e.g. BTCUSDT),
+        // making the halt_after_n_losses / cooldown_after_n_losses triggers unreachable
+        // during diversified trading.
+        const int symbol_streak = symbol_losses_.count(symbol) ? symbol_losses_[symbol] : 0;
+        if (symbol_streak > 0) {
+            // This symbol had losses that contributed to the global streak — reset.
+            total_consecutive_losses_ = 0;
+        }
+        // Always reset per-symbol and per-strategy counters for the winning symbol/strategy.
         symbol_losses_[symbol] = 0;
         strategy_losses_[strategy_id] = 0;
     }
@@ -173,6 +184,9 @@ void DrawdownTracker::update_equity(double equity, Timestamp /*now*/) {
 
 void DrawdownTracker::reset_intraday() {
     intraday_peak_ = current_equity_;
+    // BUG-RS-10: reset peak_equity_ daily so account_drawdown_pct() reflects
+    // today's drawdown, not all-time drawdown from session start months ago.
+    peak_equity_ = current_equity_;
 }
 
 double DrawdownTracker::account_drawdown_pct() const {

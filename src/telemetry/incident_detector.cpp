@@ -43,6 +43,10 @@ void IncidentDetector::on_partial_fill(const std::string& order_id, int64_t now_
     for (const auto& pf : partial_fills_) {
         if (pf.order_id == order_id) return;
     }
+    // BUG-S24-05: evict oldest entry to prevent unbounded growth
+    if (partial_fills_.size() >= kMaxPartialFills) {
+        partial_fills_.erase(partial_fills_.begin());
+    }
     partial_fills_.push_back({order_id, now_ns});
 }
 
@@ -214,10 +218,12 @@ std::vector<IncidentReport> IncidentDetector::check(int64_t now_ns) {
         }
 
         // Rejection rate check
-        size_t total_actions = order_sent_times_.size() + rejection_times_.size();
-        if (total_actions >= 5) {
+        // Denominator is orders_sent only: rej_rate = rejections / sent
+        // (using rejections + sent underestimates: 50 rejections + 100 sent = 33% not 50%)
+        size_t sent = order_sent_times_.size();
+        if (sent >= 5) {
             double rej_rate = static_cast<double>(rejection_times_.size()) /
-                              static_cast<double>(total_actions);
+                              static_cast<double>(sent);
             if (rej_rate > config_.venue_max_rejection_rate) {
                 incidents.push_back({
                     IncidentType::VenueDegradation,

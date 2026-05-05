@@ -64,7 +64,11 @@ std::string hmac_sha256_base64(std::string_view key, std::string_view message) {
     BUF_MEM* buf_ptr = nullptr;
     BIO_get_mem_ptr(mem_bio, &buf_ptr);
 
-    return std::string(buf_ptr->data, buf_ptr->length);
+    std::string result(buf_ptr->data, buf_ptr->length);
+    // BUG-S9-02: zero out digest bytes before destruction to prevent key material
+    // from remaining accessible in memory dumps or via speculative execution.
+    OPENSSL_cleanse(digest.data(), digest.size());
+    return result;
 }
 
 SignedHeaders make_auth_headers(
