@@ -1,0 +1,789 @@
+#include "risk/policies/risk_checks.hpp"
+#include "risk/risk_context.hpp"
+#include "uncertainty/uncertainty_types.hpp"
+#include "order_book/order_book_types.hpp"
+#include "common/constants.hpp"
+#include "common/enums.hpp"
+#include <cmath>
+#include <algorithm>
+#include <unordered_set>
+
+namespace tb::risk {
+
+// Вспомогательные функции
+namespace {
+
+void deny(RiskDecision& d, const std::string& code, const std::string& msg,
+          double severity = 1.0) {
+    if (code.empty()) return;
+    severity = std::clamp(std::isfinite(severity) ? severity : 1.0, 0.0, 1.0);
+    d.verdict = RiskVerdict::Denied;
+    d.reasons.push_back({code, msg, severity});
+    d.hard_blocks.push_back(code);
+}
+
+void deny_lock(RiskDecision& d, RiskAction action,
+               const std::string& code, const std::string& msg) {
+    d.verdict = RiskVerdict::Denied;
+    d.action = action;
+    d.reasons.push_back({code, msg, 1.0});
+    d.hard_blocks.push_back(code);
+}
+
+void reduce(RiskDecision& d, double ratio, const std::string& code, const std::string& msg) {
+    if (d.verdict == RiskVerdict::Approved)
+        d.verdict = RiskVerdict::ReduceSize;
+    // Используем min-семантику: каждый reduce вычисляет целевой размер от original_size,
+    // итоговый approved_quantity = min(все предложения). Это предотвращает мультипликативное
+    // компаундирование нескольких ReduceSize-проверок.
+    double target = d.original_size.get() * std::clamp(ratio, 0.0, 1.0);
+    if (target < d.approved_quantity.get()) {
+        d.approved_quantity = Quantity(target);
+    }
+    d.reasons.push_back({code, msg, 0.5});
+    d.warnings.push_back(code);
+}
+
+void throttle(RiskDecision& d, const std::string& code, const std::string& msg) {
+    if (d.verdict != RiskVerdict::Denied)
+        d.verdict = RiskVerdict::Throttled;
+    d.reasons.push_back({code, msg, 0.6});
+    d.warnings.push_back(code);
+}
+
+} // namespace
+
+// ═══════════════════════════════════════════════════════════════
+// 1. Kill Switch
+// ═══════════════════════════════════════════════════════════════
+
+void KillSwitchCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    if (state_.locks.has_emergency_halt()) {
+        deny_lock(d, RiskAction::EmergencyHalt, "KILL_SWITCH",
+                  "Аварийный выключатель активирован");
+        d.kill_switch_active = true;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 2. Day Lock
+// ═══════════════════════════════════════════════════════════════
+
+void DayLockCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    if (state_.locks.has_day_lock()) {
+        deny_lock(d, RiskAction::DenyDayLock, "DAY_LOCK",
+                  "Торговля заблокирована на сегодня");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 3. Symbol Lock
+// ═══════════════════════════════════════════════════════════════
+
+void SymbolLockCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (state_.locks.has_symbol_lock(ctx.intent.symbol.get())) {
+        deny_lock(d, RiskAction::DenySymbolLock, "SYMBOL_LOCK",
+                  "Символ " + ctx.intent.symbol.get() + " заблокирован");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 4. Strategy Lock
+// ═══════════════════════════════════════════════════════════════
+
+void StrategyLockCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (state_.locks.has_strategy_lock(ctx.intent.strategy_id.get())) {
+        deny_lock(d, RiskAction::DenyStrategyLock, "STRATEGY_LOCK",
+                  "Стратегия " + ctx.intent.strategy_id.get() + " заблокирована");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 5. Symbol Cooldown
+// ═══════════════════════════════════════════════════════════════
+
+void SymbolCooldownCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (state_.locks.has_cooldown(ctx.intent.symbol.get())) {
+        throttle(d, "SYMBOL_COOLDOWN",
+                 "Символ " + ctx.intent.symbol.get() + " в кулдауне");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 6. Max Daily Loss
+// ═══════════════════════════════════════════════════════════════
+
+void DailyLossCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    const double total_loss = std::min(ctx.portfolio.pnl.total_pnl, 0.0);
+    const double loss_pct = std::abs(total_loss) / ctx.portfolio.total_capital * 100.0;
+    d.current_daily_pnl = ctx.portfolio.pnl.total_pnl;
+
+    if (loss_pct >= cfg_.max_daily_loss_pct) {
+        deny(d, "MAX_DAILY_LOSS",
+             "Дневной убыток " + std::to_string(loss_pct) + "% >= лимит " +
+             std::to_string(cfg_.max_daily_loss_pct) + "%");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 7. Realized Daily Loss
+// ═══════════════════════════════════════════════════════════════
+
+void RealizedDailyLossCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    const double realized = std::min(ctx.portfolio.pnl.realized_pnl_today, 0.0);
+    const double pct = std::abs(realized) / ctx.portfolio.total_capital * 100.0;
+
+    if (pct >= cfg_.max_realized_daily_loss_pct) {
+        deny(d, "REALIZED_DAILY_LOSS",
+             "Реализованный дневной убыток " + std::to_string(pct) + "% >= " +
+             std::to_string(cfg_.max_realized_daily_loss_pct) + "%");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 8. Max Drawdown
+// ═══════════════════════════════════════════════════════════════
+
+void MaxDrawdownCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    d.current_drawdown_pct = ctx.portfolio.pnl.current_drawdown_pct;
+
+    if (ctx.portfolio.pnl.current_drawdown_pct >= cfg_.max_drawdown_pct) {
+        deny(d, "MAX_DRAWDOWN",
+             "Просадка " + std::to_string(ctx.portfolio.pnl.current_drawdown_pct) +
+             "% >= " + std::to_string(cfg_.max_drawdown_pct) + "%");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 9. Max Positions
+// ═══════════════════════════════════════════════════════════════
+
+void MaxPositionsCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const int count = ctx.portfolio.exposure.open_positions_count;
+    if (count >= cfg_.max_concurrent_positions) {
+        deny(d, "MAX_POSITIONS",
+             "Позиций " + std::to_string(count) + " >= лимит " +
+             std::to_string(cfg_.max_concurrent_positions), 0.8);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 10. Same Direction Positions
+// ═══════════════════════════════════════════════════════════════
+
+void SameDirectionCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    int long_count = 0, short_count = 0;
+
+    // Pair-aware counting: if both a long and short exist on the same symbol
+    // (hedge pair), count them as one net position rather than two independent ones.
+    // This prevents hedge pairs from consuming two position slots.
+    std::unordered_set<std::string> long_symbols, short_symbols;
+    for (const auto& pos : ctx.portfolio.positions) {
+        if (pos.side == Side::Buy) {
+            long_symbols.insert(pos.symbol.get());
+            ++long_count;
+        } else {
+            short_symbols.insert(pos.symbol.get());
+            ++short_count;
+        }
+    }
+
+    // Subtract hedge pairs: each symbol with both long+short is a pair, not 2 positions
+    int hedge_pairs = 0;
+    for (const auto& sym : long_symbols) {
+        if (short_symbols.count(sym)) ++hedge_pairs;
+    }
+    long_count  = std::max(0, long_count  - hedge_pairs);
+    short_count = std::max(0, short_count - hedge_pairs);
+
+    if (ctx.intent.side == Side::Buy && long_count >= cfg_.max_simultaneous_long_positions) {
+        deny(d, "MAX_LONG_POSITIONS",
+             "Long позиций " + std::to_string(long_count) + " >= " +
+             std::to_string(cfg_.max_simultaneous_long_positions), 0.7);
+    }
+    if (ctx.intent.side == Side::Sell && short_count >= cfg_.max_simultaneous_short_positions) {
+        deny(d, "MAX_SHORT_POSITIONS",
+             "Short позиций " + std::to_string(short_count) + " >= " +
+             std::to_string(cfg_.max_simultaneous_short_positions), 0.7);
+    }
+
+    // Legacy same_direction check (also pair-aware)
+    int same_dir = (ctx.intent.side == Side::Buy) ? long_count : short_count;
+    if (same_dir >= cfg_.max_same_direction_positions) {
+        deny(d, "SAME_DIRECTION",
+             "Позиций в одном направлении " + std::to_string(same_dir) +
+             " >= " + std::to_string(cfg_.max_same_direction_positions), 0.7);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 11. Exposure Limit
+// ═══════════════════════════════════════════════════════════════
+
+void ExposureLimitCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    // Проецируем post-trade экспозицию: текущая + номинал нового ордера
+    const double projected_gross = ctx.portfolio.exposure.gross_exposure +
+                                   ctx.sizing.approved_notional.get();
+    const double gross_pct = projected_gross / ctx.portfolio.total_capital * 100.0;
+    d.current_gross_exposure = ctx.portfolio.exposure.gross_exposure;
+
+    if (gross_pct >= cfg_.max_gross_exposure_pct) {
+        deny(d, "MAX_EXPOSURE",
+             "Проецируемая экспозиция " + std::to_string(gross_pct) + "% >= " +
+             std::to_string(cfg_.max_gross_exposure_pct) + "%", 0.9);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 12. Per-Trade Risk
+// ═══════════════════════════════════════════════════════════════
+
+void PerTradeRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const double notional = ctx.sizing.approved_notional.get();
+
+    // EDGE-31 (run83 sizing bug): max_position_notional как абсолютный USD floor.
+    // Если задан max_position_notional_pct > 0 — auto-scaled cap = total_capital × pct.
+    // Effective cap = max(абсолют, pct-based) — pct-based перекрывает абсолют когда capital растёт.
+    double effective_cap = cfg_.max_position_notional;
+    if (cfg_.max_position_notional_pct > 0.0 && ctx.portfolio.total_capital > 0.0) {
+        const double pct_cap = ctx.portfolio.total_capital * cfg_.max_position_notional_pct;
+        if (pct_cap > effective_cap) {
+            effective_cap = pct_cap;
+        }
+    }
+
+    if (notional > effective_cap) {
+        const double ratio = effective_cap / notional;
+        reduce(d, ratio, "MAX_NOTIONAL",
+               "Номинал " + std::to_string(notional) + " > лимит " +
+               std::to_string(effective_cap));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 13. Max Leverage
+// ═══════════════════════════════════════════════════════════════
+
+void MaxLeverageCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    // Проецируем post-trade leverage: (текущая экспозиция + новый ордер) / капитал
+    const double projected_exposure = ctx.portfolio.exposure.gross_exposure +
+                                      ctx.sizing.approved_notional.get();
+    const double leverage = projected_exposure / ctx.portfolio.total_capital;
+    // BUG-S13-02: pct >= 100 → buffer_factor <= 0 → effective_max <= 0 → all trades denied
+    double buffer_factor = std::max(0.0, 1.0 - (cfg_.liquidation_buffer_pct / 100.0));
+    double effective_max = cfg_.max_leverage * buffer_factor;
+
+    if (leverage >= effective_max) {
+        deny(d, "MAX_LEVERAGE",
+             "Проецируемое плечо " + std::to_string(leverage) + "x >= effective max " +
+             std::to_string(effective_max) + "x (buffer " +
+             std::to_string(cfg_.liquidation_buffer_pct) + "%)", 0.9);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 14. Max Slippage
+// ═══════════════════════════════════════════════════════════════
+
+void MaxSlippageCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.exec_alpha.quality.estimated_slippage_bps > cfg_.max_slippage_bps) {
+        deny(d, "MAX_SLIPPAGE",
+             "Проскальзывание " + std::to_string(ctx.exec_alpha.quality.estimated_slippage_bps) +
+             "бп > " + std::to_string(cfg_.max_slippage_bps) + "бп", 0.7);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 15. Consecutive Losses
+// ═══════════════════════════════════════════════════════════════
+
+void ConsecutiveLossesCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    // Из портфолио
+    const int losses = ctx.portfolio.pnl.consecutive_losses;
+    if (losses >= cfg_.max_consecutive_losses) {
+        deny(d, "CONSECUTIVE_LOSSES",
+             "Серия убытков " + std::to_string(losses) + " >= " +
+             std::to_string(cfg_.max_consecutive_losses), 0.8);
+    }
+
+    // Проверка halt после N убытков
+    if (losses >= cfg_.halt_after_n_losses) {
+        deny_lock(d, RiskAction::DenyAccountLock, "HALT_AFTER_LOSSES",
+                  "Серия убытков " + std::to_string(losses) + " >= halt порог " +
+                  std::to_string(cfg_.halt_after_n_losses));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 16. Per-Symbol Risk
+// ═══════════════════════════════════════════════════════════════
+
+void PerSymbolRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    const auto& symbol = ctx.intent.symbol.get();
+
+    // Концентрация символа (projected: существующая + предлагаемый ордер)
+    double symbol_exposure = 0.0;
+    for (const auto& pos : ctx.portfolio.positions) {
+        if (pos.symbol.get() == symbol) symbol_exposure += pos.notional.get();
+    }
+    const double projected_exposure = symbol_exposure + ctx.sizing.approved_notional.get();
+    const double conc_pct = projected_exposure / ctx.portfolio.total_capital * 100.0;
+    d.symbol_concentration_pct = conc_pct;
+
+    if (conc_pct >= cfg_.max_symbol_concentration_pct) {
+        deny(d, "SYMBOL_CONCENTRATION",
+             "Концентрация " + symbol + " = " + std::to_string(conc_pct) +
+             "% >= " + std::to_string(cfg_.max_symbol_concentration_pct) + "%", 0.8);
+    }
+
+    // Consecutive losses per symbol
+    int sym_losses = state_.loss_streaks.symbol_consecutive_losses(symbol);
+    if (sym_losses >= cfg_.max_consecutive_losses_per_symbol) {
+        deny(d, "SYMBOL_CONSECUTIVE_LOSSES",
+             "Серия убытков по " + symbol + ": " + std::to_string(sym_losses) +
+             " >= " + std::to_string(cfg_.max_consecutive_losses_per_symbol), 0.8);
+    }
+
+    // Daily loss per symbol
+    double sym_pnl = state_.pnl.symbol_daily_pnl(symbol);
+    if (sym_pnl < 0.0) {
+        double sym_loss_pct = std::abs(sym_pnl) / ctx.portfolio.total_capital * 100.0;
+        if (sym_loss_pct >= cfg_.max_daily_loss_per_symbol_pct) {
+            deny(d, "SYMBOL_DAILY_LOSS",
+                 "Дневной убыток по " + symbol + ": " + std::to_string(sym_loss_pct) +
+                 "% >= " + std::to_string(cfg_.max_daily_loss_per_symbol_pct) + "%", 0.8);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 17. Per-Strategy Risk
+// ═══════════════════════════════════════════════════════════════
+
+void PerStrategyRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    const auto& sid = ctx.intent.strategy_id.get();
+    auto it = state_.strategy_budgets.find(sid);
+    if (it == state_.strategy_budgets.end()) return;
+
+    const auto& budget = it->second;
+    const double loss_pct = budget.daily_loss / ctx.portfolio.total_capital * 100.0;
+    d.strategy_budget_utilization_pct = loss_pct;
+
+    if (loss_pct >= cfg_.max_strategy_daily_loss_pct) {
+        deny_lock(d, RiskAction::DenyStrategyLock, "STRATEGY_BUDGET",
+                  "Стратегия " + sid + " потеряла " + std::to_string(loss_pct) +
+                  "% >= " + std::to_string(cfg_.max_strategy_daily_loss_pct) + "%");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 18. Order Rate
+// ═══════════════════════════════════════════════════════════════
+
+void OrderRateCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    int count = state_.rates.orders_last_minute(clock_->now());
+    if (count >= cfg_.max_orders_per_minute) {
+        throttle(d, "ORDER_RATE",
+                 "Ордеров/мин " + std::to_string(count) + " >= " +
+                 std::to_string(cfg_.max_orders_per_minute));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 19. Turnover Rate
+// ═══════════════════════════════════════════════════════════════
+
+void TurnoverRateCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    int count = state_.rates.trades_last_hour(clock_->now());
+    if (count >= cfg_.max_trades_per_hour) {
+        throttle(d, "TURNOVER_RATE",
+                 "Сделок/час " + std::to_string(count) + " >= " +
+                 std::to_string(cfg_.max_trades_per_hour));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 20. Trade Interval
+// ═══════════════════════════════════════════════════════════════
+
+void TradeIntervalCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    int64_t last = state_.rates.last_trade_for_symbol(ctx.intent.symbol.get());
+    if (last == 0) return;
+
+    // BUG-S34-01: elapsed is negative when NTP backward jump sets now < last → always throttled.
+    int64_t elapsed = clock_->now().get() - last;
+    if (elapsed < 0) elapsed = 0;  // backward clock: treat as just-traded (conservative)
+    if (elapsed < cfg_.min_trade_interval_ns) {
+        throttle(d, "TRADE_INTERVAL",
+                 "Интервал " + std::to_string(elapsed / 1'000'000'000LL) +
+                 "с < " + std::to_string(cfg_.min_trade_interval_ns / 1'000'000'000LL) + "с");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 21. Stale Feed
+// ═══════════════════════════════════════════════════════════════
+
+void StaleFeedCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.features.execution_context.is_feed_fresh) {
+        deny(d, "STALE_FEED", "Данные рынка устарели");
+        return;
+    }
+    if (ctx.features.market_data_age_ns.get() > cfg_.max_feed_age_ns) {
+        deny(d, "STALE_FEED",
+             "Возраст данных " + std::to_string(ctx.features.market_data_age_ns.get() / 1'000'000'000LL) +
+             "с > " + std::to_string(cfg_.max_feed_age_ns / 1'000'000'000LL) + "с");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 22. Book Quality
+// ═══════════════════════════════════════════════════════════════
+
+void BookQualityCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.features.book_quality != order_book::BookQuality::Valid) {
+        deny(d, "INVALID_BOOK", "Стакан ордеров невалиден");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 23. Spread
+// ═══════════════════════════════════════════════════════════════
+
+void SpreadCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.features.microstructure.spread_valid) return;
+    if (ctx.features.microstructure.spread_bps > cfg_.max_spread_bps) {
+        deny(d, "WIDE_SPREAD",
+             "Спред " + std::to_string(ctx.features.microstructure.spread_bps) +
+             "бп > " + std::to_string(cfg_.max_spread_bps) + "бп", 0.7);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 24. Liquidity
+// ═══════════════════════════════════════════════════════════════
+
+void LiquidityCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.features.microstructure.liquidity_valid) return;
+    const double total = ctx.features.microstructure.bid_depth_5_notional +
+                         ctx.features.microstructure.ask_depth_5_notional;
+    if (total < cfg_.min_liquidity_depth) {
+        deny(d, "LOW_LIQUIDITY",
+             "Ликвидность " + std::to_string(total) + " < " +
+             std::to_string(cfg_.min_liquidity_depth), 0.6);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 25. Max Loss Per Trade
+// ═══════════════════════════════════════════════════════════════
+
+void MaxLossPerTradeCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.total_capital <= 0.0) return;
+
+    for (const auto& pos : ctx.portfolio.positions) {
+        if (pos.unrealized_pnl >= 0.0) continue;
+        double loss_pct = std::abs(pos.unrealized_pnl) / ctx.portfolio.total_capital * 100.0;
+        if (loss_pct >= cfg_.max_loss_per_trade_pct) {
+            deny(d, "MAX_LOSS_PER_TRADE",
+                 "Позиция " + pos.symbol.get() + " теряет " + std::to_string(loss_pct) +
+                 "% капитала (лимит: " + std::to_string(cfg_.max_loss_per_trade_pct) + "%)", 0.9);
+            break;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 26. UTC Cutoff
+// ═══════════════════════════════════════════════════════════════
+
+void UtcCutoffCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    if (cfg_.utc_cutoff_hour < 0) return;
+
+    const int64_t now_ns = clock_->now().get();
+    const int64_t secs_today = now_ns / 1'000'000'000LL % 86400;
+    const int hour_utc   = static_cast<int>(secs_today / 3600);
+    const int minute_utc = static_cast<int>((secs_today % 3600) / 60);
+
+    const int cutoff_min = std::clamp(cfg_.utc_cutoff_minute, 0, 59);
+    const bool past_cutoff = (hour_utc > cfg_.utc_cutoff_hour) ||
+                             (hour_utc == cfg_.utc_cutoff_hour && minute_utc >= cutoff_min);
+    if (past_cutoff) {
+        deny(d, "UTC_CUTOFF",
+             "Торговля прекращена после " + std::to_string(cfg_.utc_cutoff_hour)
+             + ":" + (cutoff_min < 10 ? "0" : "") + std::to_string(cutoff_min) + " UTC");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 27. Regime Scaled Limits
+// ═══════════════════════════════════════════════════════════════
+
+void RegimeScaledLimitsCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const double scale = regime_scale_.load(std::memory_order_acquire);
+    d.regime_scaling_factor = scale;
+
+    if (!cfg_.regime_aware_limits_enabled || scale >= 1.0) return;
+
+    // BUG-RISK-1 fix: floor scaled_max at min_notional × 1.05 (5% buffer for slippage/jitter).
+    // Без floor: regime scale 0.5 + max_notional 10 → scaled=5.0 → reduce → notional ниже $5
+    // → REDUCE_BELOW_MIN_NOTIONAL → Deny. На микро-аккаунте $18 это блокирует все entries
+    // после первого трейда (regime adapt снижает scale post-loss).
+    const double min_notional = std::max(common::exchange_limits::kMinBitgetNotionalUsdt, 5.0);
+    const double scaled_max = std::max(cfg_.max_position_notional * scale, min_notional * 1.05);
+    const double notional = ctx.sizing.approved_notional.get();
+    if (notional <= scaled_max) return;
+
+    const double ratio = scaled_max / notional;
+    reduce(d, ratio, "REGIME_SCALED_LIMIT",
+           "Режим scale=" + std::to_string(scale) + " — макс. номинал " +
+           std::to_string(scaled_max));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 28. Uncertainty Limits
+// ═══════════════════════════════════════════════════════════════
+
+void UncertaintyLimitsCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.uncertainty.level != UncertaintyLevel::High &&
+        ctx.uncertainty.level != UncertaintyLevel::Extreme) return;
+
+    const double adj_max = cfg_.max_position_notional * ctx.uncertainty.size_multiplier;
+    const double notional = ctx.sizing.approved_notional.get();
+    if (notional <= adj_max) return;
+
+    const double ratio = adj_max / notional;
+    reduce(d, ratio, "UNCERTAINTY_LIMIT",
+           "Неопределённость " + std::string(to_string(ctx.uncertainty.level)) +
+           " — mult=" + std::to_string(ctx.uncertainty.size_multiplier));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 29. Uncertainty Cooldown
+// ═══════════════════════════════════════════════════════════════
+
+void UncertaintyCooldownCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.uncertainty.cooldown.active) return;
+    throttle(d, "UNCERTAINTY_COOLDOWN",
+             "Кулдаун неопр.: " + ctx.uncertainty.cooldown.trigger_reason);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 30. Uncertainty Execution Mode
+// ═══════════════════════════════════════════════════════════════
+
+void UncertaintyExecutionModeCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.uncertainty.execution_mode != uncertainty::ExecutionModeRecommendation::HaltNewEntries)
+        return;
+    if (ctx.intent.trade_side == TradeSide::Open) {
+        deny(d, "UNCERTAINTY_HALT", "HaltNewEntries — новые входы запрещены");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 31. Intraday Drawdown
+// ═══════════════════════════════════════════════════════════════
+
+void IntradayDrawdownCheck::evaluate(const RiskContext& /*ctx*/, RiskDecision& d) {
+    double dd = state_.drawdown.intraday_drawdown_pct();
+    if (dd >= cfg_.max_intraday_drawdown_pct) {
+        deny(d, "INTRADAY_DRAWDOWN",
+             "Внутридневная просадка " + std::to_string(dd) + "% >= " +
+             std::to_string(cfg_.max_intraday_drawdown_pct) + "%", 0.9);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 32. Drawdown Hard Stop
+// ═══════════════════════════════════════════════════════════════
+
+void DrawdownHardStopCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (ctx.portfolio.pnl.current_drawdown_pct >= cfg_.drawdown_hard_stop_pct) {
+        deny_lock(d, RiskAction::EmergencyHalt, "DRAWDOWN_HARD_STOP",
+                  "Критическая просадка " + std::to_string(ctx.portfolio.pnl.current_drawdown_pct) +
+                  "% >= " + std::to_string(cfg_.drawdown_hard_stop_pct) + "%");
+        // Активируем emergency halt
+        state_.locks.add_lock(LockType::EmergencyHalt, "", "Drawdown hard stop",
+                              d.decided_at);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 33. Funding Rate Cost
+// ═══════════════════════════════════════════════════════════════
+
+void FundingRateCostCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    double rate = ctx.current_funding_rate;
+    if (std::abs(rate) < 1e-9) return;  // Нет данных или нулевой rate
+
+    // Funding cost depends on position direction:
+    // Long pays when rate > 0, receives when rate < 0
+    // Short pays when rate < 0, receives when rate > 0
+    bool is_long = (ctx.intent.side == Side::Buy);
+    double effective_cost = is_long ? rate : -rate;
+
+    // If funding is favorable (effective_cost <= 0), no check needed
+    if (effective_cost <= 0.0) return;
+
+    // BUG-RS-13 fix: named constant instead of magic 3.0.
+    // Bitget USDT-M perpetuals settle funding every 8 hours → 3 sessions/day.
+    static constexpr double kBitgetFundingPeriodsPerDay = 3.0;
+    double annual_cost_pct = effective_cost * kBitgetFundingPeriodsPerDay * 365.0 * 100.0;
+    if (annual_cost_pct > cfg_.max_annual_funding_cost_pct) {
+        deny(d, "FUNDING_COST_EXCESSIVE",
+             "Годовая стоимость фандинга " + std::to_string(annual_cost_pct) +
+             "% > лимит " + std::to_string(cfg_.max_annual_funding_cost_pct) + "%",
+             0.7);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 34. Venue Health — Phase 5: venue-risk protection
+// Reacts to REST/WS degradation, reject storms, clock drift,
+// fill gaps, inconsistent position snapshots.
+// ═══════════════════════════════════════════════════════════════
+
+void VenueHealthCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const auto& vh = ctx.venue_health;
+
+    // REST latency degradation: P99 > 3000ms → block
+    if (vh.rest_p99_latency_ms > 3000.0) {
+        deny(d, "VENUE_REST_DEGRADED",
+             "REST P99 latency " + std::to_string(vh.rest_p99_latency_ms) +
+             "ms exceeds 3000ms threshold",
+             0.9);
+        return;
+    }
+
+    // WebSocket instability: >3 reconnects/hour → block
+    if (vh.ws_reconnect_count_last_hour > 3) {
+        deny(d, "VENUE_WS_UNSTABLE",
+             "WS reconnects " + std::to_string(vh.ws_reconnect_count_last_hour) +
+             " in last hour (>3)",
+             0.85);
+        return;
+    }
+
+    // Reject storm: >20% reject rate → block
+    if (vh.reject_rate_last_minute > 0.20) {
+        deny(d, "VENUE_REJECT_STORM",
+             "Reject rate " + std::to_string(vh.reject_rate_last_minute * 100.0) +
+             "% exceeds 20% threshold",
+             0.9);
+        return;
+    }
+
+    // Clock drift: >500ms → block
+    if (vh.clock_drift_ms > 500.0) {
+        deny(d, "VENUE_CLOCK_DRIFT",
+             "Clock drift " + std::to_string(vh.clock_drift_ms) +
+             "ms exceeds 500ms threshold",
+             0.85);
+        return;
+    }
+
+    // Position snapshot stale → warn + reduce
+    if (vh.position_snapshot_stale) {
+        reduce(d, 0.5, "VENUE_STALE_POSITIONS",
+               "Position snapshot is stale — reducing size 50%");
+    }
+
+    // High cancel-to-fill ratio → warn
+    if (vh.cancel_fill_ratio > 5.0) {
+        reduce(d, 0.7, "VENUE_HIGH_CANCEL_RATIO",
+               "Cancel/fill ratio " + std::to_string(vh.cancel_fill_ratio) +
+               " exceeds 5.0 — possible venue issue");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 35. Margin Distance — Phase 5: margin-aware and liquidation-aware sizing
+// Ensures position sizing respects real liquidation distance and margin ratio.
+// ═══════════════════════════════════════════════════════════════
+
+void MarginDistanceCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    const auto& m = ctx.margin;
+
+    // Skip if margin data not available (distance defaults to 100%)
+    if (m.distance_to_liquidation_pct >= 99.0) return;
+
+    // Hard block: distance to liquidation < liquidation_buffer_pct (5% default)
+    if (m.distance_to_liquidation_pct < cfg_.liquidation_buffer_pct) {
+        deny(d, "MARGIN_LIQUIDATION_CLOSE",
+             "Distance to liquidation " + std::to_string(m.distance_to_liquidation_pct) +
+             "% < buffer " + std::to_string(cfg_.liquidation_buffer_pct) + "%",
+             1.0);
+        return;
+    }
+
+    // Reduce size if distance_to_liquidation < 2× buffer
+    // BUG-S13-03: liquidation_buffer_pct=0 → warn_threshold=0 → ratio = dist/0 = Inf
+    double warn_threshold = cfg_.liquidation_buffer_pct * 2.0;
+    if (warn_threshold > 0.0 && m.distance_to_liquidation_pct < warn_threshold) {
+        double ratio = m.distance_to_liquidation_pct / warn_threshold;
+        reduce(d, std::clamp(ratio, 0.3, 0.8), "MARGIN_DISTANCE_LOW",
+               "Liquidation distance " + std::to_string(m.distance_to_liquidation_pct) +
+               "% < " + std::to_string(warn_threshold) + "% warn threshold");
+    }
+
+    // Combined margin check for hedge pairs
+    if (m.hedge_active && m.combined_margin_usage_pct > 80.0) {
+        reduce(d, 0.5, "MARGIN_PAIR_USAGE_HIGH",
+               "Combined pair margin usage " +
+               std::to_string(m.combined_margin_usage_pct) + "% exceeds 80%");
+    }
+
+    // BUG-S33-01: mark_price=0 → order_notional=0 → required_margin=0 → check always passes,
+    // silently bypassing the margin-availability guard. Return early on invalid mark_price.
+    if (m.mark_price <= 0.0) return;
+
+    // Available margin too low for the order
+    double order_notional = d.approved_quantity.get() * m.mark_price;
+    double required_margin = order_notional * m.maintenance_margin_rate * 2.0;
+    if (m.available_margin > 0.0 && required_margin > m.available_margin * 0.7) {
+        double safe_ratio = (m.available_margin * 0.7) / std::max(required_margin, 0.01);
+        reduce(d, std::clamp(safe_ratio, 0.3, 0.9), "MARGIN_AVAILABLE_LOW",
+               "Required margin " + std::to_string(required_margin) +
+               " USDT > 70% of available " + std::to_string(m.available_margin) + " USDT");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 36. Reconciliation Desync — production hardening
+// ═══════════════════════════════════════════════════════════════
+
+void ReconciliationDesyncCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.reconciliation_desync) return;
+    // Closing/reduce-операции разрешаем — позволяем сократить экспозицию
+    // даже при desync, иначе позиция останется без управления.
+    if (ctx.intent.trade_side == TradeSide::Close ||
+        ctx.intent.signal_intent == strategy::SignalIntent::ReducePosition) {
+        return;
+    }
+    deny(d, "RECONCILIATION_DESYNC",
+         "Локальное состояние не синхронизировано с биржей — entry-ордера блокированы до ресинхронизации");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 37. WebSocket Disconnected — production hardening
+// ═══════════════════════════════════════════════════════════════
+
+void WsDisconnectedCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
+    if (!ctx.ws_disconnected) return;
+    deny(d, "WS_DISCONNECTED",
+         "Public WebSocket недоступен — без свежего стакана/тиков торговля небезопасна");
+}
+
+} // namespace tb::risk

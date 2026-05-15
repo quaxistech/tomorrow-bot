@@ -1,0 +1,169 @@
+#pragma once
+#include "common/types.hpp"
+#include <string>
+#include <vector>
+
+namespace tb::execution {
+
+/// Расширенный статус ордера (FSM-состояния)
+enum class OrderState {
+    New,                    ///< Создан, не отправлен
+    PendingAck,             ///< Отправлен, ожидаем подтверждение
+    Open,                   ///< Активен в стакане
+    PartiallyFilled,        ///< Частично исполнен
+    Filled,                 ///< Полностью исполнен
+    CancelPending,          ///< Запрос отмены отправлен
+    Cancelled,              ///< Отменён
+    Rejected,               ///< Отклонён биржей
+    Expired,                ///< Истёк
+    UnknownRecovery         ///< Неизвестное состояние (восстановление)
+};
+
+/// Политика обработки частичного исполнения
+enum class PartialFillPolicy {
+    WaitForFull,        ///< Ждать полного исполнения
+    CancelRemaining,    ///< Отменить остаток после первого fill
+    AllowPartial        ///< Принять частичное исполнение как есть
+};
+
+/// Запись об отдельном fill event (partial или full)
+struct FillEvent {
+    OrderId order_id{OrderId("")};
+    Quantity fill_quantity{Quantity(0.0)};       ///< Объём этого fill
+    Price fill_price{Price(0.0)};               ///< Цена этого fill
+    Quantity cumulative_filled{Quantity(0.0)};   ///< Накопленный объём после этого fill
+    double fee{0.0};                             ///< Комиссия за этот fill
+    std::string trade_id;                        ///< ID сделки на бирже
+    Timestamp occurred_at{Timestamp(0)};
+};
+
+/// Расширенная информация об исполнении ордера
+struct OrderExecutionInfo {
+    std::vector<FillEvent> fills;                  ///< Все fill events
+    PartialFillPolicy fill_policy{PartialFillPolicy::WaitForFull};
+    std::string client_order_id;                   ///< Идемпотентный ключ
+    int retry_count{0};                            ///< Кол-во попыток отправки
+    int64_t time_in_open_ms{0};                    ///< Время в состоянии Open
+    int64_t first_fill_latency_ms{0};              ///< Задержка до первого fill
+    Price expected_fill_price{Price(0.0)};         ///< Ожидаемая цена (от execution alpha)
+    double realized_slippage{0.0};                 ///< Реальное проскальзывание
+};
+
+/// Тип триггера для plan/trigger ордеров (Bitget)
+enum class TriggerType {
+    FillPrice,    ///< Триггер по цене последней сделки (fill_price / last)
+    MarkPrice     ///< Триггер по mark price
+};
+
+/// Attached TP/SL цены (прикреплённые к основному ордеру)
+struct AttachedTpSl {
+    Price stop_surplus_price{Price(0.0)};  ///< Take-profit цена (0 = не задан)
+    Price stop_loss_price{Price(0.0)};     ///< Stop-loss цена (0 = не задан)
+    TriggerType trigger_type{TriggerType::MarkPrice};  ///< Тип триггера для TP/SL
+
+    [[nodiscard]] bool has_tp() const { return stop_surplus_price.get() > 0.0; }
+    [[nodiscard]] bool has_sl() const { return stop_loss_price.get() > 0.0; }
+    [[nodiscard]] bool has_any() const { return has_tp() || has_sl(); }
+};
+
+/// Параметры plan/trigger ордера (Bitget /api/v2/mix/order/place-plan)
+struct PlanOrderParams {
+    Price trigger_price{Price(0.0)};        ///< Цена срабатывания
+    TriggerType trigger_type{TriggerType::MarkPrice};
+    Price execute_price{Price(0.0)};        ///< Цена исполнения (0 = market)
+    /// plan_type определяется из контекста: profit_plan или loss_plan
+};
+
+/// Запись об ордере
+struct OrderRecord {
+    OrderId order_id{OrderId("")};
+    OrderId exchange_order_id{OrderId("")};   ///< ID ордера на бирже
+    Symbol symbol{Symbol("")};
+    Side side{Side::Buy};
+    PositionSide position_side{PositionSide::Long};  ///< Сторона позиции (Long/Short) для фьючерсов
+    TradeSide trade_side{TradeSide::Open};            ///< Открытие/закрытие (для фьючерсов)
+    OrderType order_type{OrderType::Market};          ///< USDT-M Futures: Market по умолчанию
+    TimeInForce tif{TimeInForce::ImmediateOrCancel};  ///< USDT-M Futures: IOC по умолчанию
+    Price price{Price(0.0)};
+    Quantity original_quantity{Quantity(0.0)};
+    Quantity filled_quantity{Quantity(0.0)};
+    Quantity remaining_quantity{Quantity(0.0)};
+    Price avg_fill_price{Price(0.0)};
+    OrderState state{OrderState::New};
+
+    StrategyId strategy_id{StrategyId("")};
+    CorrelationId correlation_id{CorrelationId("")};
+
+    Timestamp created_at{Timestamp(0)};
+    Timestamp last_updated{Timestamp(0)};
+
+    std::string rejection_reason;
+    int retry_count{0};
+    OrderExecutionInfo execution_info;  ///< Расширенная информация об исполнении
+
+    /// Attached TP/SL (отправляются вместе с основным ордером через place-order)
+    AttachedTpSl attached_tp_sl;
+
+    /// Параметры plan/trigger ордера (для StopMarket/StopLimit через place-plan)
+    PlanOrderParams plan_params;
+
+    /// Проверка, является ли состояние терминальным
+    bool is_terminal() const {
+        return state == OrderState::Filled || state == OrderState::Cancelled ||
+               state == OrderState::Rejected || state == OrderState::Expired;
+    }
+
+    /// Проверка, является ли ордер активным
+    bool is_active() const {
+        return state == OrderState::Open || state == OrderState::PartiallyFilled ||
+               state == OrderState::PendingAck || state == OrderState::CancelPending;
+    }
+};
+
+/// Событие FSM-перехода
+struct OrderTransition {
+    OrderState from;
+    OrderState to;
+    std::string reason;
+    Timestamp occurred_at{Timestamp(0)};
+};
+
+/// Результат отправки ордера
+struct OrderSubmitResult {
+    bool success{false};
+    OrderId order_id{OrderId("")};
+    OrderId exchange_order_id{OrderId("")};
+    std::string error_message;
+    Quantity submitted_quantity{Quantity(0.0)};  ///< Фактическое кол-во после floor (отправлено на биржу)
+};
+
+/// Результат запроса деталей исполнения ордера с биржи
+struct OrderFillDetail {
+    bool success{false};             ///< Удалось ли получить данные
+    Price fill_price{Price(0.0)};    ///< Средняя цена исполнения
+    Quantity filled_qty{Quantity(0.0)}; ///< Фактически исполненное количество
+    Quantity original_qty{Quantity(0.0)}; ///< Объём ордера
+    std::string status;              ///< Статус ордера на бирже ("filled", "partially_filled", "cancelled" и пр.)
+    bool is_fully_filled() const { return success && filled_qty.get() > 0.0 && filled_qty.get() >= original_qty.get(); }
+    bool is_partially_filled() const { return success && filled_qty.get() > 0.0 && filled_qty.get() < original_qty.get(); }
+};
+
+/// Преобразование состояния ордера в строку
+std::string to_string(OrderState state);
+
+/// Преобразование политики частичного исполнения в строку
+std::string to_string(PartialFillPolicy policy);
+
+/// Преобразование типа триггера в строку
+inline const char* to_string(TriggerType t) {
+    switch (t) {
+        case TriggerType::FillPrice: return "fill_price";
+        case TriggerType::MarkPrice: return "mark_price";
+    }
+    return "unknown";
+}
+
+/// Проверка допустимости перехода FSM
+bool is_valid_transition(OrderState from, OrderState to);
+
+} // namespace tb::execution

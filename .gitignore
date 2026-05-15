@@ -1,0 +1,42 @@
+# Секреты — НИКОГДА не коммитить
+.env
+api.txt
+
+# Сборка
+build/
+build-release/
+build-check/
+build-debug/
+build-asan/
+build-check/
+build-tsan/
+
+a.out
+
+# IDE
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Логи
+*.log
+/logs/
+/telemetry/
+/var/log/tomorrow-bot/
+
+# OS
+.DS_Store
+Thumbs.db
+.secrets/
+
+# CTest temporary artefacts
+Testing/
+CTestTestfile.cmake
+DartConfiguration.tcl
+
+# Empty audit/plan placeholders — generated per session, not committed
+/audit.md
+/plan.md

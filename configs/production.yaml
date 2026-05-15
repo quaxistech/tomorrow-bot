@@ -1,0 +1,441 @@
+# Tomorrow Bot — production режим (РЕАЛЬНЫЕ ДЕНЬГИ!)
+# ВНИМАНИЕ: изменения в этом файле немедленно влияют на торговлю!
+# Все параметры риска установлены строже, чем в других режимах.
+# Требуется явное подтверждение перед применением.
+
+trading:
+  mode: production
+  # EDGE-30 (run57 2026-05-15): синхронизировано с биржей. Bot после startup всё равно
+  # делает sync с exchange, но это значение используется для startup pair filtering
+  # в main.cpp:510 и triggers micro_account_scaling если ниже threshold.
+  initial_capital: 15.0
+
+exchange:
+  endpoint_rest: "https://api.bitget.com"
+  endpoint_ws: "wss://ws.bitget.com/v2/ws/public"
+  endpoint_ws_private: "wss://ws.bitget.com/v2/ws/private"
+  api_key_ref: "BITGET_API_KEY"
+  api_secret_ref: "BITGET_API_SECRET"
+  passphrase_ref: "BITGET_PASSPHRASE"
+  use_private_ws: true
+  timeout_ms: 3000
+
+logging:
+  level: "info"
+  structured_json: true
+  output_path: "logs/production.log"
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+
+risk:
+  # EDGE-31 (run83 sizing fix, 2026-05-15): абсолютный $10 хардкод от sub-$1 micro-account
+  # не масштабировался с депозитом — при capital $54 target_notional $101 (5% margin × 37.5x leverage)
+  # урезался до $10 → TP всего $0.03-0.08 как при $14.
+  # Решение: max_position_notional_pct (% от capital) auto-scales с депозитом. Effective cap =
+  # max(абсолют, capital × pct). При pct=4.0 → $54 × 4 = $216, $200 × 4 = $800. Достаточно для
+  # target_notional 1.875× capital из allocator с 2× запасом. Real risk ограничен через
+  # max_loss_per_trade_pct, atr_stop_multiplier и max_concentration_pct в portfolio_allocator.
+  max_position_notional: 500.0       # Абсолютный USD floor для очень мелких аккаунтов
+  max_position_notional_pct: 4.0     # Доля от capital — auto-scales (capital × 4)
+  # EDGE-30-ALLOC: 15 → 30 — должен быть >= max_loss_per_trade_pct (20)
+  max_daily_loss_pct: 30.0
+  # EDGE-30-ALLOC: 25 → 50 — должен быть >= max_daily_loss_pct (30)
+  max_drawdown_pct: 50.0
+  max_intraday_drawdown_pct: 15.0  # Не блокировать торговлю после одного минимального стопа
+  kill_switch_enabled: true        # Safety net
+  max_strategy_daily_loss_pct: 12.0       # Один минимальный стоп должен помещаться в strategy budget
+  max_strategy_exposure_pct: 80.0         # 80% max exposure per strategy
+  max_symbol_concentration_pct: 50.0      # Max 50% per symbol with 3 pairs
+  # EDGE-30-LIMIT (run63): 6 → 10 — bot достигал 6 LONG, hit limit. User wants больше.
+  max_same_direction_positions: 10
+  regime_aware_limits_enabled: true     # ENABLE: trade only in good regimes
+  stress_regime_scale: 0.30              # 30% in stress — enough for min notional on micro-account
+  trending_regime_scale: 1.0             # Full size in trends
+  chop_regime_scale: 0.50                # 50% in chop — reduces size but stays above $5 min notional
+  max_trades_per_hour: 12                # Max 12 trades/hour — quality > quantity
+  min_trade_interval_sec: 10.0           # 10 sec between trades — меньше fee drain
+  max_adverse_excursion_pct: 5.0         # 5% adverse excursion w/ leverage
+  max_realized_daily_loss_pct: 15.0      # Match daily loss limit
+  utc_cutoff_hour: -1                    # Trade 24/7
+
+# === Decision engine: BALANCED — входить при хорошей уверенности ===
+# Было 0.68 — effective threshold после uncertainty×regime×dd доходил до 0.997 (невозможно!)
+# Формула: 0.50 × uncertainty_mult(≤1.3) × regime(≤1.1) + dd(≤0.03) ≈ 0.745 — реалистично
+decision:
+  # EDGE-30-SIGNAL-v3 (run71): 0.70 БЛОКИРОВАЛ 90% сигналов (effective threshold 0.9).
+  # Возврат к 0.55 — balance между качеством и активностью.
+  min_conviction_threshold: 0.55
+  conflict_dominance_threshold: 0.55 # Разумный (было 0.60)
+  max_acceptable_cost_bps: 300       # Allow higher cost for speed
+  drawdown_boost_scale: 0.005        # Мизерный: при 5% DD → +0.005 (было 0.01 → +0.01)
+  drawdown_max_boost: 0.03           # Потолок 3% (было 5%)
+  consecutive_loss_boost: 0.003      # 0.3% на серию (было 0.5%)
+
+# === Position management: ПРОФИТНАЯ торговля — R:R ≥ 1.0 ===
+# ПРОБЛЕМА: R:R был 1.5/2.0=0.75 → losses были в 3-5x больше profits
+# РЕШЕНИЕ: TP=2.0×ATR, Stop=1.5×ATR → R:R = 2.0/1.5 = 1.33 → при WR 50% уже прибыль
+trading_params:
+  # BUG-EDGE-3: tighten SL, widen TP — для positive expectancy при наших costs нужен
+  # asymmetric R:R. SL=1.0×ATR (small loss), TP=3.0×ATR (large win) → R:R ≥ 3.0.
+  # EDGE-15 (run29 SAGA -$0.07 full retracement from +$0.07 peak):
+  # trailing too loose, BE threshold too high. Tighten BE и partial TP.
+  # EDGE-29 (run48 2026-05-15): расширяем стоп 1.0 → 1.4 — trailing уже trail_mult≈1.87
+  # и выкидывает в +0.001 (SKYAI run47). Дополнительный простор для adverse noise.
+  # EDGE-30-RR (run67): atr_stop 1.4 → 1.0 — tighter stop. С partial_tp 4.0 ATR
+  # R:R = 4.0/1.0 = 4:1. Wins compensate losses при WR > 25%.
+  atr_stop_multiplier: 1.0
+  # EDGE-30-ALLOC (run56 2026-05-15): per-pipeline budget = $0.87 (15.72/18 pipelines).
+  # При 5% max_loss → max_notional $2.69 < $5 min biriy → 95% reject. 20% → max_notional ~$10.
+  # Real risk управляется через atr_stop_multiplier, не через этот cap.
+  max_loss_per_trade_pct: 20.0
+  # EDGE-30-PROFIT (run67): user wants максимальную прибыль от winning trades.
+  # BE 0.5 → 0.8 (даём move room), partial_tp 2.5 → 4.0 (winners run far).
+  # partial_fraction 0.50 → 0.33 (closer only 1/3, остальное trailing).
+  breakeven_atr_threshold: 0.8
+  partial_tp_atr_threshold: 4.0
+  partial_tp_fraction: 0.33
+  # EDGE-29-FIX (run49 2026-05-15): 1.30 блокировал ВСЕ входы (реальный R:R 1.25 < 1.30).
+  # Опускаем до 1.20 — все ещё margin над 12 bps fees при WR 50%.
+  # 1.25 = base setup baseline; 1.20 даёт небольшой запас для рестриктивных сетапов.
+  min_risk_reward_ratio: 1.20
+  # BUG-EDGE-6 (live run17): hard SL 1.0% = exact price kill всех 2 losses (1.04%, 1.05%).
+  # Trail stops каптурят 0.78-1.0% wins. avg_loss > avg_win → -EV.
+  # Расширяем SL до 1.5% — даём дыхание на noise, allow trail to capture larger wins.
+  # EDGE-30-RR (run67): 1.5 → 1.0 — tighter hard price stop. Меньше catastrophic loss.
+  price_stop_loss_pct: 1.0
+  quick_profit_fee_multiplier: 2.5   # 2.5× fees = порог quick exit (было 3.0) — быстрее фиксация
+  # BUG-EDGE-16 (run31 SAGA liquidation -$4.11):
+  # hedge_recovery + multiple DualLegManager instances per symbol (rotation 10min) =
+  # пирамида позиций до 1537 size → liquidation. Disabled до fix архитектуры.
+  hedge_recovery_enabled: false
+  hedge_trigger_loss_pct: 4.0
+  hedge_profit_close_fee_mult: 2.0
+
+# === Operational Safety: infrastructure guards (not alpha!) ===
+operational_safety:
+  feed_stale_ms: 1200                # Market data stale threshold
+  private_ws_gap_ms: 2500            # Private WS heartbeat gap limit
+  order_state_desync_ms: 5000        # Order state sync timeout
+  orphan_leg_grace_ms: 250           # Grace period for hedge leg matching
+  block_trade_until_full_sync: true  # Block new trades until state synced
+  venue_degraded_flatten_ms: 8000    # Flatten on venue degradation
+  operational_deadman_minutes: 45    # Deadman watchdog (45 min, only with degradation)
+
+
+
+pair_selection:
+  mode: auto                       # Auto: сканер выбирает лучшие пары и ротирует
+  symbols: ""                      # Пусто: сканер сам найдёт
+  # EDGE-29 (run48 2026-05-15): run47 показал лишь 5 уникальных символов за 25 мин,
+  # ротация повторяла те же 3-4 (SAGA/RIVER/Q/SKYAI). Расширяем coverage:
+  # top_n=12, max_spread_bps=20 — больше pairs проходит. rotation 2 min.
+  # EDGE-29-COVERAGE (run50 2026-05-15): bot торгует только 3 active_pairs из 12 top_n.
+  # Узкое горло — pre-filter detailed = 30 candidates. Расширяем до 60 → больше шанс
+  # получить 8-12 активных pairs одновременно (как user reported "недавно торговал многими").
+  # EDGE-29-MAX (run51 2026-05-15): user request "увеличить количество наблюдаемых монет,
+  # постоянная прибыльная торговля". Максимизируем coverage:
+  # max_candidates 60 → 100, top_n 12 → 20, scan_timeout 60s → 120s (scan-time bound).
+  max_candidates_for_candles: 100
+  scan_timeout_ms: 120000
+  top_n: 20
+  min_volume_usdt: 800000          # $800k+ volume — допускаем чуть менее ликвидные для разнообразия
+  max_spread_bps: 20               # 12 → 20 bps — больше pairs проходит pre-filter
+  rotation_interval_hours: 0.05    # 3 min (минимум валидатора). Идле-ресканы дополняют
+  # DATA-DRIVEN BLACKLIST (trade_analyzer 2026-05-14, 40 trades):
+  # BIO PF=0.13, BILL PF=0.42, LAB PF=0.91, DYM PF=0.86, LAYER 2L=-$0.31, ONDO/FIL/ASTER/INJ/UB/INTC singles
+  blacklist: "BTCUSDT,ETHUSDT,XAGUSDT,XAUUSDT,BIOUSDT,BILLUSDT,LABUSDT,DYMUSDT,ONDOUSDT,FILUSDT,ASTERUSDT,LAYERUSDT,INJUSDT,UBUSDT,INTCUSDT"
+  # Futures bidirectional scoring: допускаем как рост, так и падение (short = profit)
+  scorer_filter_min_change_24h: -20.0    # Allow coins dropping up to 20% (amazing for short)
+  # EDGE-29 (run48 2026-05-15): 0.30 → 0.20 — допускаем менее волатильные pairs
+  # для расширения watchlist. Combined с min_rr=1.3 — fees покрываются.
+  scorer_volatility_low_threshold: 0.20
+  scorer_volatility_high_threshold: 20.0 # 20% max vol (ОК для futures)
+  # EDGE-29-MAX (run52 2026-05-15): scan 100→19 passed, но diversification cap 8 урезал до 9.
+  # Поднимаем до 25 — фактически снимаем cap для alts, бот видит все passed pairs.
+  max_pairs_per_sector: 25
+  enable_diversification: true
+
+# ── Execution Alpha: AGGRESSIVE execution for scalping ────────────────────────
+execution_alpha:
+  max_spread_bps_passive: 25.0          # Accept wider spreads
+  max_spread_bps_any: 80.0              # Very tolerant
+  adverse_selection_threshold: 0.80     # Relaxed: accept more trades
+  urgency_passive_threshold: 0.3        # Lower bar for passive
+  urgency_aggressive_threshold: 0.5     # Lower bar for aggressive (more market orders)
+  large_order_slice_threshold: 0.20     # Our orders are tiny
+  # VPIN
+  vpin_toxic_threshold: 0.95            # XRP VPIN ranges 0.90-0.93 normally
+  vpin_weight: 0.20                     # Less weight on VPIN
+  # Order book imbalance
+  imbalance_favorable_threshold: 0.15   # Lower bar
+  imbalance_unfavorable_threshold: 0.50 # Higher tolerance
+  # Limit price
+  use_weighted_mid_price: true
+  limit_price_passive_bps: 5.0          # Wider limit offset
+  # Urgency
+  urgency_cusum_boost: 0.25             # Higher urgency boost
+  urgency_tod_weight: 0.05              # Less time-of-day effect
+  # Fill probability
+  min_fill_probability_passive: 0.15    # Lower bar
+  # PostOnly (maker fee savings)
+  postonly_spread_threshold_bps: 8.0    # Wider threshold
+  postonly_urgency_max: 0.40
+  postonly_adverse_max: 0.40
+  # EV-based maker/taker switching (Almgren-Chriss framework)
+  opportunity_cost_bps: 30.0            # Typical setup edge: missed fill costs ~30 bps
+  queue_depletion_penalty: 0.08         # Fill prob reduction when our-side queue depleting
+  churn_penalty: 0.06                   # Fill prob reduction when top-of-book unstable
+  feedback_weight: 0.30                 # Blend with historical passive_fill_rate
+
+# ── Opportunity Cost: USDT-M futures scalping gating ────────────────────────
+# Научные основания:
+#   - Almgren & Chriss 2001: edge > execution cost для положительного ожидания
+#   - Hull 2018: margin reserves, concentration limits для фьючерсов
+#   - Thorp 2006: drawdown scaling (half-Kelly approach)
+#   - Markowitz MPT: диверсификация по инструментам и стратегиям
+opportunity_cost:
+  min_net_expected_bps: 1.0              # > avg half-spread (~0.5 bps на BTCUSDT)
+  execute_min_net_bps: 3.0               # ~3× half-spread: cost-to-edge ratio 1:3
+  high_exposure_threshold: 0.70          # 70% margin util → 30% reserve для maintenance
+  high_exposure_min_conviction: 0.50     # Снижен с 0.60 — не блокировать при загруженности
+  max_symbol_concentration: 0.50         # 50% макс на один символ (3 пары — диверсификация)
+  max_strategy_concentration: 1.00       # Single-strategy prod: no blocking
+  capital_exhaustion_threshold: 0.90     # 10% buffer (было 0.85) — микро-аккаунт не может позволить большие резервы
+  weight_conviction: 0.35               # Главный драйвер composite score
+  weight_net_edge: 0.35                 # Чистый edge — второй драйвер
+  weight_capital_efficiency: 0.15       # Вторичный фактор
+  weight_urgency: 0.15                  # Вторичный фактор
+  conviction_to_bps_scale: 100.0        # conviction 1.0 → 100 bps (leveraged scalp returns)
+  upgrade_min_edge_advantage_bps: 5.0   # > 2× round-trip cost (~4 bps maker fees)
+  drawdown_penalty_scale: 0.05          # +0.05 к порогу за каждые 5% DD (было 0.30 — блокировало всё!)
+  consecutive_loss_penalty: 0.005       # +0.005 за каждый consecutive loss (было 0.015)
+
+# ── Regime Classification ─────────────────────────────────────────────────────
+# Настройки классификатора рыночных режимов: пороги, гистерезис, политика
+regime:
+  # Тренд
+  trend_adx_strong: 30.0            # ADX выше этого = сильный тренд
+  trend_adx_weak_min: 18.0          # Нижняя граница слабого тренда
+  trend_adx_weak_max: 30.0          # Верхняя граница слабого тренда
+  trend_rsi_bias: 55.0              # RSI выше 55 = бычий, ниже 45 = медвежий (Wilder 1978, C. Brown 1999)
+
+  # Возврат к среднему
+  mr_rsi_overbought: 70.0           # RSI порог перекупленности
+  mr_rsi_oversold: 30.0             # RSI порог перепроданности
+  mr_adx_max: 25.0                  # Макс ADX для mean-reversion
+
+  # Волатильность
+  vol_bb_expansion: 0.06            # BB bandwidth для расширения волатильности
+  vol_bb_compression: 0.015          # BB bandwidth для сжатия (was 0.02 — less strict)
+  vol_atr_expansion: 0.02           # Нормализованный ATR для расширения
+  vol_adx_compression_max: 15.0     # Макс ADX для компрессии (was 20 — allow weak trends)
+
+  # Стресс / аномалии
+  stress_rsi_extreme_high: 95.0     # RSI аномально высокий (крипто: 85-95 — нормальный тренд)
+  stress_rsi_extreme_low: 5.0       # RSI аномально низкий (крипто: 5-15 — нормальная коррекция)
+  stress_obv_extreme: 3.0           # OBV нормализованный — аномалия (2.0 слишком чувствительно)
+  stress_aggressive_flow: 0.75      # Порог токсичного потока
+  stress_spread_toxic_bps: 15.0     # Spread токсичности (bps)
+  stress_book_instability: 0.6      # Нестабильность книги ордеров
+  stress_spread_bps: 30.0           # Spread стресса (bps)
+  stress_liquidity_ratio: 0.3       # Дисбаланс книги: ratio < 0.3 = перекос ≥ 3.3:1 (Cont et al. 2010)
+
+  # Chop / боковик
+  chop_adx_max: 18.0                # ADX ниже этого = Chop
+
+  # Гистерезис / переходная политика
+  transition_confirmation_ticks: 3  # Тиков для подтверждения смены режима
+  transition_min_confidence: 0.55   # Мин confidence для смены
+  transition_dwell_ticks: 5         # Мин тиков в режиме перед сменой
+
+  # Уверенность / стабильность
+  confidence_base: 0.5              # Базовая уверенность
+  confidence_data_quality_weight: 0.2
+  confidence_max_indicators: 12     # 12 реально используемых индикаторов
+  confidence_anomaly: 0.9
+  stability_same_regime: 0.9
+  stability_first_classification: 0.5
+
+# ── World Model v2 ────────────────────────────────────────────────────────────
+# Мировая модель: классификация состояний рынка, хрупкость, пригодность стратегий
+world_model:
+  model_version: "2.0.0"
+  min_valid_indicators: 4
+
+  # Пороги классификации состояний
+  toxic_microstructure:
+    book_instability_min: 0.7
+    aggressive_flow_min: 0.8
+    spread_bps_min: 15.0
+
+  liquidity_vacuum:
+    spread_bps_critical: 50.0
+    spread_bps_secondary: 20.0
+    liquidity_ratio_min: 0.3
+
+  exhaustion_spike:
+    rsi_upper: 80.0
+    rsi_lower: 20.0
+    momentum_abs_min: 0.02
+
+  fragile_breakout:
+    bb_percent_b_upper: 0.95
+    bb_percent_b_lower: 0.05
+    volatility_5_min: 0.02
+    book_imbalance_abs_min: 0.3
+
+  compression:
+    bb_bandwidth_max: 0.03
+    atr_normalized_max: 0.01
+    volatility_5_max: 0.01
+
+  stable_trend:
+    adx_min: 25.0
+    rsi_lower: 40.0
+    rsi_upper: 70.0
+
+  chop_noise:
+    adx_max: 20.0
+    rsi_lower: 40.0
+    rsi_upper: 60.0
+    spread_bps_max: 20.0
+
+  # Хрупкость (composite scoring)
+  fragility:
+    spread_stress_weight: 0.15
+    book_instability_weight: 0.20
+    volatility_accel_weight: 0.12
+    liquidity_imbalance_weight: 0.10
+    transition_instability_weight: 0.15
+    vpin_toxicity_weight: 0.10
+
+  # Гистерезис (сглаживание переходов между состояниями)
+  hysteresis:
+    enabled: true
+    confirmation_ticks: 2
+    min_dwell_ticks: 3
+
+  # История состояний
+  history:
+    max_entries: 200
+    tendency_lookback: 5
+
+  # Персистентность (blend base + empirical)
+  persistence:
+    history_blend_weight: 0.3
+    min_history_for_empirical: 10
+
+  # Пригодность стратегий
+  suitability:
+    feedback_blend_weight: 0.3
+    min_trades_for_feedback: 20
+    hard_veto_threshold: 0.01
+
+  # Обратная связь (feedback loop)
+  feedback:
+    enabled: true
+    ema_alpha: 0.05
+
+# ─── FUTURES TRADING (USDT-M) ──────────────────────────────────────────────
+# Адаптивное управление кредитным плечом для фьючерсной торговли на Bitget
+# Научная основа: Kelly Criterion + ATR-нормализация + режим рынка
+# f* ≈ W - (1-W)/R; для WR=60%, R:R=1.0 → f*=0.20 → conservative leverage
+futures:
+  enabled: true
+  product_type: "USDT-FUTURES"
+  margin_coin: "USDT"
+  margin_mode: "isolated"        # isolated: risk isolated per position
+
+  # Adaptive leverage: engine computes optimal from regime × 6 multipliers
+  # Bitget supports 50-125x depending on symbol; engine auto-clamps per symbol
+  # EDGE-30-LEV-v3 (run74): user заметил все leverage=6, margin=$0.83 (5.5% vs target 3%).
+  # min_notional биржи $5, leverage_at_3pct = $5/$0.45 = 11×. Минимум 11 → margin ≤ 3%.
+  # Bot будет реально варьировать 11-75 теперь.
+  default_leverage: 30
+  max_leverage: 75
+  min_leverage: 11
+
+  # Kelly-inspired regime-based leverage (Wilder ADX classification)
+  # Trending (ADX>25): high Sharpe → higher leverage justified
+  # Ranging (ADX 15-25): mean-reversion, lower Sharpe → conservative
+  # Volatile (high ATR): wider stops → lower leverage for same risk
+  # EDGE-30-LEV-v3: regime baselines подняты под min=11.
+  leverage_trending: 60          # Strong trend → bigger leverage (notional 6× higher)
+  leverage_ranging: 35
+  leverage_volatile: 15          # Wider safety но >=min
+
+  # EDGE-30-LIQ (run66 2026-05-15): 5.0 → 2.5 — 5% слишком жёстко для leverage 20-50×.
+  # При lev=20 actual buffer ~4.54%, при lev=50 ~1.48%. Bot отклонял ВСЕ trades.
+  # 2.5% адекватно для scalping с tight stops (atr_stop 1.4×).
+  liquidation_buffer_pct: 2.5
+
+  # Funding rate (Bitget 8-hour rate, decimal: 0.0001 = 0.01%)
+  # Threshold: 0.05% per 8h is elevated; at 20x leverage = 1% margin cost per 8h
+  funding_rate_threshold: 0.0005 # 0.05% per 8h — start reducing leverage
+  funding_rate_penalty: 0.5      # 50% penalty per threshold excess
+
+  # Maintenance Margin
+  maintenance_margin_rate: 0.004 # 0.4% Bitget standard
+
+  # === Leverage Engine (адаптивный движок плеча) ===
+  # Volatility breakpoints: откалиброваны для 1-min USDT-M candles
+  # Эмпирическая калибровка: BTC 1-min ATR/price ≈ 0.0005-0.003 (calm→elevated)
+  leverage_engine:
+    vol_low_atr: 0.001               # ≤ 0.1% ATR/price → mult=1.0 (calm)
+    vol_mid_atr: 0.003               # 0.3% → mult → 0.7 (moderate)
+    vol_high_atr: 0.008              # 0.8% → mult → 0.4 (significant)
+    vol_extreme_atr: 0.02            # 2.0% → mult → 0.2 (flash-crash)
+    vol_floor: 0.10                  # Минимальный множитель волатильности
+    conviction_min_mult: 0.40        # Множитель при нулевом conviction
+    conviction_breakpoint: 0.70      # Порог для бонуса conviction
+    conviction_max_mult: 1.30        # Макс бонус
+    drawdown_floor_mult: 0.10        # Минимум при макс drawdown
+    drawdown_halfpoint_pct: 10.0     # DD% при 50% снижении множителя
+    ema_alpha: 0.3                   # EMA скорость реакции (~5-tick lookback)
+    taker_fee_rate: 0.0006           # 0.06% Bitget futures taker
+    min_leverage_change_delta: 2     # Минимальное изменение для API call
+
+# ─── UNCERTAINTY ENGINE ─────────────────────────────────────────────────────
+# Модуль оценки неопределённости — управляет size, threshold, execution mode
+# Веса научно обоснованы для USDT-M futures scalping:
+#   Execution+Data: высокий приоритет (microstructure = profit margin)
+#   Regime: структурный фактор (Lopez de Prado classification)
+#   ML: ensemble quality (Lakshminarayanan 2017)
+uncertainty:
+  # Веса измерений (сумма = 1.0)
+  w_regime: 0.20
+  w_signal: 0.15
+  w_data_quality: 0.15
+  w_execution: 0.15
+  w_portfolio: 0.10
+  w_ml: 0.10
+  w_correlation: 0.05
+  w_transition: 0.05
+  w_operational: 0.05
+
+  # Пороги уровней (равные квартили [0,1])
+  threshold_low: 0.25            # Low → Moderate
+  threshold_moderate: 0.50       # Moderate → High
+  threshold_high: 0.75           # High → Extreme
+
+  # Гистерезис (асимметричный: понижение инерционнее повышения)
+  hysteresis_up: 0.03
+  hysteresis_down: 0.05
+
+  # EMA-сглаживание persistent score
+  ema_alpha: 0.15
+
+  # Лимиты size/threshold multiplier
+  size_floor: 0.10              # Минимум 10% от номинала
+  threshold_ceiling: 1.3        # Макс множитель (было 2.5 — 0.50×2.5=1.25, невозможный порог!)
+
+  # Cooldown: серия Extreme оценок → пауза
+  consecutive_extreme_for_cooldown: 3
+  cooldown_duration_s: 60        # 60 секунд
+  consecutive_high_for_defensive: 3
+
+  # Liquidity: порог для штрафа за асимметрию стакана
+  liquidity_ratio_penalty_threshold: 0.5
