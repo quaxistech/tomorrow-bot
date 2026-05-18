@@ -1,9 +1,16 @@
 /**
  * @file exit_orchestrator_test.cpp
- * @brief Unit tests for PositionExitOrchestrator (Phase 7)
+ * @brief Unit tests for PositionExitOrchestrator (edge-31 Phase 5 — simplified).
  *
- * Scenarios: continuation value, regime break, funding exit,
- * liquidity exit, stale-data exit, trailing stop, toxic flow.
+ * После edge-31 Phase 5 orchestrator отвечает ТОЛЬКО за emergency-tier exits:
+ *   - check_fixed_capital_stop (hard capital cap)
+ *   - check_toxic_flow (toxic микроструктура)
+ *   - check_stale_data_exit (feed протух)
+ *
+ * Все "alpha-tier" exits (continuation_value, structural_failure,
+ * market_regime_exit, liquidity_deterioration, partial_tp, quick_profit,
+ * funding_carry, price_stop, force_tp_high, fast_adverse_tiered) удалены.
+ * Их функцию закрывает exchange-attached TP/SL + Phase 4 trailing bracket push.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -78,15 +85,19 @@ ExitContext make_base_context() {
     return ctx;
 }
 
-} // namespace
+}  // namespace
 
-TEST_CASE("ExitOrchestrator: healthy position → hold", "[exit][continuation]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Healthy position — orchestrator не должен инициировать exit.
+// Защита целиком на exchange-attached TP/SL.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: healthy position → no emergency exit",
+          "[exit][edge-31]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
-    // Keep profit below partial TP AND quick-profit fee threshold
     ctx.current_price = 60100.0;
     ctx.mid_price = 60100.0;
     ctx.unrealized_pnl = 1.0;
@@ -97,75 +108,36 @@ TEST_CASE("ExitOrchestrator: healthy position → hold", "[exit][continuation]")
     REQUIRE_FALSE(decision.should_reduce);
 }
 
-TEST_CASE("ExitOrchestrator: quick profit waits while continuation is still healthy", "[exit][quick_profit]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Profitable position не закрывается локально — exchange TP делает это.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: large profit не закрывается локально (TP на бирже)",
+          "[exit][edge-31]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
     ctx.entry_price = 100.0;
-    ctx.current_price = 100.90;
-    ctx.mid_price = 100.90;
+    ctx.current_price = 101.50;  // +1.5% gross profit
+    ctx.mid_price = 101.50;
     ctx.position_size = 1.0;
-    ctx.initial_position_size = 1.0;
-    ctx.unrealized_pnl = 0.90;
-    ctx.unrealized_pnl_pct = 0.90;
-    ctx.atr_14 = 0.5;
-    ctx.current_stop_level = 99.40;
-    ctx.partial_tp_taken = true;
-    ctx.ema_20 = 100.40;
-    ctx.ema_50 = 99.80;
-    ctx.macd_histogram = 0.08;
-    ctx.rsi_14 = 58.0;
-    ctx.book_imbalance = 0.15;
-    ctx.regime_stability = 0.75;
-    ctx.uncertainty = 0.20;
-    ctx.p_continue = 0.62;
-    ctx.p_reversal = 0.18;
-    ctx.p_shock = 0.02;
+    ctx.unrealized_pnl = 1.50;
+    ctx.unrealized_pnl_pct = 1.50;
+    ctx.highest_price_since_entry = 101.50;
 
     auto decision = orch.evaluate(ctx);
 
+    // Orchestrator больше не закрывает на profit — это работа exchange TP.
     REQUIRE_FALSE(decision.should_exit);
     REQUIRE_FALSE(decision.should_reduce);
 }
 
-TEST_CASE("ExitOrchestrator: quick profit harvest needs weak continuation and real profit", "[exit][quick_profit]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    ctx.entry_price = 100.0;
-    ctx.current_price = 100.90;
-    ctx.mid_price = 100.90;
-    ctx.position_size = 1.0;
-    ctx.initial_position_size = 1.0;
-    ctx.unrealized_pnl = 0.90;
-    ctx.unrealized_pnl_pct = 0.90;
-    ctx.atr_14 = 0.5;
-    ctx.current_stop_level = 99.40;
-    ctx.partial_tp_taken = true;
-    ctx.ema_20 = 100.40;
-    ctx.ema_50 = 99.80;
-    ctx.macd_histogram = 0.02;
-    ctx.rsi_14 = 78.0;
-    ctx.book_imbalance = -0.55;
-    ctx.depth_usd = 800.0;
-    ctx.regime_stability = 0.18;
-    ctx.regime_confidence = 0.35;
-    ctx.uncertainty = 0.82;
-    ctx.p_continue = 0.20;
-    ctx.p_reversal = 0.46;
-    ctx.p_shock = 0.10;
-
-    auto decision = orch.evaluate(ctx);
-
-    REQUIRE(decision.should_exit);
-    CHECK(decision.explanation.primary_signal == ExitSignalType::QuickProfitHarvest);
-}
-
-TEST_CASE("ExitOrchestrator: hard stop triggers on capital breach", "[exit][risk_kill]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Hard capital stop — safety net на случай отказа exchange SL.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: hard capital stop triggers on capital breach",
+          "[exit][edge-31][risk_kill]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
@@ -185,66 +157,46 @@ TEST_CASE("ExitOrchestrator: hard stop triggers on capital breach", "[exit][risk
     REQUIRE(decision.urgency >= 0.9);
 }
 
-TEST_CASE("ExitOrchestrator: regime change triggers exit", "[exit][regime]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Toxic flow — emergency. VPIN toxic + meaningful loss → exit.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: toxic flow triggers emergency exit",
+          "[exit][edge-31][toxic]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
-    ctx.cusum_regime_change = true;
-    ctx.regime_stability = 0.15;
-    ctx.regime_confidence = 0.3;
-    // Price losing ground
-    ctx.current_price = 59800.0;
-    ctx.unrealized_pnl = -2.0;
-    ctx.unrealized_pnl_pct = -0.33;
-    // Weak continuation
-    ctx.p_continue = 0.30;
-    ctx.p_reversal = 0.45;
-    ctx.hold_ev_bps = -5.0;
-    ctx.close_ev_bps = 2.0;
-
-    auto decision = orch.evaluate(ctx);
-
-    // Should trigger exit or at minimum reduce position
-    REQUIRE((decision.should_exit || decision.should_reduce));
-}
-
-TEST_CASE("ExitOrchestrator: funding carry exit on adverse funding", "[exit][funding]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    // Long position with very high positive funding (paying funding)
-    ctx.funding_rate = 0.003;   // 0.3% — extreme
-    // Position is only marginally in profit
-    ctx.unrealized_pnl = 0.5;
-    ctx.unrealized_pnl_pct = 0.08;
-    // Long hold time
+    ctx.vpin_toxic = true;
+    ctx.book_imbalance = -0.8;
+    ctx.buy_pressure = 0.15;
+    // pnl must satisfy EDGE-24 thresholds: -0.3% min, и hold>5min для меньшей строгости.
+    // Используем hold > 5min с pnl_pct = -0.4%, чтобы capital_stop не сработал первым.
     ctx.entry_time_ns = 0;
-    ctx.now_ns = 3'600'000'000'000LL;  // 1 hour
-    // Low continuation
-    ctx.p_continue = 0.40;
-    ctx.hold_ev_bps = -3.0;
+    ctx.now_ns = 600'000'000'000LL;  // 600s = 10 min hold
+    ctx.unrealized_pnl = -3.5;
+    ctx.unrealized_pnl_pct = -0.4;
+    ctx.current_price = 59760.0;
 
     auto decision = orch.evaluate(ctx);
 
-    // Should at minimum flag funding carry concern
-    if (decision.should_exit) {
-        CHECK(decision.explanation.primary_signal == ExitSignalType::FundingCarryExit);
-    }
+    REQUIRE(decision.should_exit);
+    REQUIRE(decision.explanation.primary_signal == ExitSignalType::ToxicFlowExit);
 }
 
-TEST_CASE("ExitOrchestrator: stale data triggers safety exit", "[exit][stale]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Stale data — emergency. Feed not fresh → safety exit.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: stale data triggers safety exit",
+          "[exit][edge-31][stale]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
     ctx.is_feed_fresh = false;
-    ctx.spread_bps = 50.0;  // Wide spread from stale data
-    ctx.depth_usd = 500.0;  // Thin book puts position at risk
+    ctx.spread_bps = 50.0;
+    ctx.depth_usd = 500.0;
 
     auto decision = orch.evaluate(ctx);
 
@@ -253,189 +205,56 @@ TEST_CASE("ExitOrchestrator: stale data triggers safety exit", "[exit][stale]") 
     REQUIRE(exit_category(decision.explanation.primary_signal) == ExitCategory::StaleData);
 }
 
-TEST_CASE("ExitOrchestrator: toxic flow triggers exit", "[exit][toxic]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Regime change БЕЗ capital breach — orchestrator больше не реагирует.
+// Эту функцию теперь несёт сигнал стратегии (signal-based exit intent).
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: regime change без capital breach НЕ инициирует exit",
+          "[exit][edge-31]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
-    ctx.vpin_toxic = true;
-    // Adverse book pressure
-    ctx.book_imbalance = -0.8;
-    ctx.buy_pressure = 0.15;
-    // Some loss
-    ctx.unrealized_pnl = -5.0;
-    ctx.unrealized_pnl_pct = -0.83;
-    ctx.current_price = 59700.0;
-
-    auto decision = orch.evaluate(ctx);
-
-    REQUIRE((decision.should_exit || decision.should_reduce));
-    if (decision.should_exit) {
-        CHECK(decision.explanation.primary_signal == ExitSignalType::ToxicFlowExit);
-    }
-}
-
-TEST_CASE("ExitOrchestrator: continuation value exit on depleted edge", "[exit][continuation_value]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    // Indicators showing momentum fade
-    ctx.rsi_14 = 70.0;
-    ctx.macd_histogram = -5.0;
-    ctx.ema_8 = 60050.0;  // EMA8 crossing below EMA20
-    ctx.ema_20 = 60100.0;
-    ctx.buy_pressure = 0.35;
-    ctx.adx = 12.0;  // Low trend strength
-    ctx.regime_stability = 0.3;
-    ctx.p_continue = 0.35;
-    ctx.p_reversal = 0.35;
-    ctx.hold_ev_bps = -8.0;
-    ctx.close_ev_bps = 3.0;
-    // Long hold
-    ctx.entry_time_ns = 0;
-    ctx.now_ns = 5'400'000'000'000LL;  // 90 min
-
-    auto decision = orch.evaluate(ctx);
-
-    // Should eventually trigger continuation value exit
-    if (decision.should_exit) {
-        CHECK((decision.explanation.primary_signal == ExitSignalType::ContinuationValueExit ||
-               decision.explanation.primary_signal == ExitSignalType::StructuralFailure));
-    }
-    // Continuation value should be low
-    CHECK(decision.state.continuation_value < 0.5);
-}
-
-TEST_CASE("ExitOrchestrator: continuation exit ignores fresh fee-band churn", "[exit][continuation_value][fees]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    ctx.current_price = 60020.0;
-    ctx.mid_price = 60020.0;
-    ctx.unrealized_pnl = 0.20;          // below round-trip fee threshold
-    ctx.unrealized_pnl_pct = 0.03;
-    ctx.now_ns = ctx.entry_time_ns + 30'000'000'000LL;  // 30s after entry
-    ctx.highest_price_since_entry = 60320.0;            // edge decayed sharply from the peak
-    ctx.rsi_14 = 70.0;
-    ctx.book_imbalance = -0.60;
-    ctx.regime_stability = 0.20;
-    ctx.regime_confidence = 0.20;
-    ctx.uncertainty = 0.80;
-    ctx.p_continue = 0.30;
-    ctx.p_reversal = 0.45;
-    ctx.hold_ev_bps = -8.0;
-    ctx.close_ev_bps = 3.0;
-
-    auto decision = orch.evaluate(ctx);
-
-    REQUIRE_FALSE(decision.should_exit);
-    REQUIRE_FALSE(decision.should_reduce);
-}
-
-TEST_CASE("ExitOrchestrator: continuation exit ignores mature fee-band churn", "[exit][continuation_value][fees]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    ctx.current_price = 59800.0;
-    ctx.mid_price = 59800.0;
-    ctx.unrealized_pnl = -0.80;         // still inside shallow fee-loss band
-    ctx.unrealized_pnl_pct = -0.13;
-    ctx.entry_time_ns = 0;
-    ctx.now_ns = 180'000'000'000LL;     // mature position
-    ctx.highest_price_since_entry = 60320.0;
-    ctx.rsi_14 = 72.0;
-    ctx.book_imbalance = -0.65;
+    ctx.cusum_regime_change = true;
     ctx.regime_stability = 0.15;
-    ctx.regime_confidence = 0.20;
-    ctx.uncertainty = 0.85;
-    ctx.p_continue = 0.25;
-    ctx.p_reversal = 0.50;
-    ctx.hold_ev_bps = -10.0;
-    ctx.close_ev_bps = 4.0;
-
-    auto decision = orch.evaluate(ctx);
-
-    REQUIRE_FALSE(decision.should_exit);
-    REQUIRE_FALSE(decision.should_reduce);
-}
-
-TEST_CASE("ExitOrchestrator: continuation exit still closes materially bad trade", "[exit][continuation_value][fees]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
+    ctx.regime_confidence = 0.3;
     ctx.current_price = 59800.0;
-    ctx.mid_price = 59800.0;
-    ctx.unrealized_pnl = -2.0;          // outside shallow fee-churn band
+    ctx.unrealized_pnl = -2.0;
     ctx.unrealized_pnl_pct = -0.33;
-    ctx.entry_time_ns = 0;
-    ctx.now_ns = 600'000'000'000LL;     // mature position
-    ctx.highest_price_since_entry = 60320.0;
-    ctx.rsi_14 = 72.0;
-    ctx.book_imbalance = -0.65;
-    ctx.regime_stability = 0.15;
-    ctx.regime_confidence = 0.20;
-    ctx.uncertainty = 0.85;
-    ctx.p_continue = 0.25;
-    ctx.p_reversal = 0.50;
-    ctx.hold_ev_bps = -10.0;
-    ctx.close_ev_bps = 4.0;
+    ctx.ema_20 = 59850.0;
+    ctx.ema_50 = 59950.0;
+    ctx.macd_histogram = -3.0;
 
     auto decision = orch.evaluate(ctx);
 
-    REQUIRE(decision.should_exit);
-    CHECK(decision.explanation.primary_signal == ExitSignalType::ContinuationValueExit);
+    // edge-31 Phase 5: regime exit удалён — orchestrator пропускает.
+    REQUIRE_FALSE(decision.should_exit);
+    REQUIRE_FALSE(decision.should_reduce);
 }
 
-TEST_CASE("ExitOrchestrator: trailing stop activates correctly", "[exit][trailing]") {
+// ─────────────────────────────────────────────────────────────────────────────
+// Trailing — update_trailing вычисляет новый SL уровень.
+// (Закрытия НЕ инициирует — это делает bracket SL на бирже после Phase 4 push.)
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("ExitOrchestrator: update_trailing считает новый SL уровень для bracket push",
+          "[exit][edge-31][trailing]") {
     auto logger = logging::create_console_logger(logging::LogLevel::Error);
     auto clk = std::make_shared<TestClock>();
     PositionExitOrchestrator orch(logger, clk);
 
     auto ctx = make_base_context();
-    // Price rallied then fell back through trailing stop
     ctx.entry_price = 60000.0;
-    ctx.highest_price_since_entry = 61000.0;  // +1000 from entry
-    ctx.current_price = 60500.0;              // Pulled back 500 from high
-    ctx.current_stop_level = 60600.0;         // Trailing stop above current price
+    ctx.highest_price_since_entry = 60500.0;
+    ctx.current_price = 60450.0;
     ctx.atr_14 = 200.0;
     ctx.breakeven_activated = true;
-    ctx.unrealized_pnl = 5.0;
-    ctx.unrealized_pnl_pct = 0.83;
+    ctx.unrealized_pnl_pct = 0.75;
 
-    auto decision = orch.evaluate(ctx);
+    auto u = orch.update_trailing(ctx);
 
-    REQUIRE(decision.should_exit);
-    CHECK(decision.explanation.primary_signal == ExitSignalType::TrailingStop);
-}
-
-TEST_CASE("ExitOrchestrator: liquidity deterioration triggers exit", "[exit][liquidity]") {
-    auto logger = logging::create_console_logger(logging::LogLevel::Error);
-    auto clk = std::make_shared<TestClock>();
-    PositionExitOrchestrator orch(logger, clk);
-
-    auto ctx = make_base_context();
-    ctx.depth_usd = 200.0;           // Very thin book (< 500 for 0.8 depth_risk)
-    ctx.spread_bps = 55.0;           // Wide spread (> 50 for 0.8 spread_risk)
-    ctx.book_imbalance = -0.6;       // Against position
-    ctx.cancel_burst_intensity = 0.8;
-    ctx.top_of_book_churn = 0.7;
-    ctx.queue_depletion_bid = 0.9;   // Bid side depleting fast
-    ctx.current_price = 59100.0;     // Consistent with loss
-    ctx.mid_price = 59100.0;
-    ctx.unrealized_pnl = -9.0;
-    ctx.unrealized_pnl_pct = -1.5;   // Must be < -1.0
-
-    auto decision = orch.evaluate(ctx);
-
-    // Should signal exit or reduce on liquidity deterioration
-    REQUIRE((decision.should_exit || decision.should_reduce));
+    // SL должен быть выше начального для long с peak'ом наверху.
+    REQUIRE(u.stop_level > 0.0);
+    REQUIRE(u.highest == 60500.0);
+    REQUIRE(u.breakeven_activated);
 }

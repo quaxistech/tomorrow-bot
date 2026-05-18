@@ -11,6 +11,8 @@
 * `ConfigValidator` — проверка интервалов и обязательных полей (TBD: проверить `config_validator.cpp`).
 * `ConfigHash` — SHA-256 от исходного содержимого файла.
 * `AppConfig` — комплексная структура: trading, exchange, futures, pair_selection, risk, leverage, regime, uncertainty, strategy, decision, ml, execution, persistence, reconciliation, logging, metrics.
+* **edge-31 Phase 2:** `PreTradeGatesConfig` — FreshnessGate (max_signal_age_ms, max_adverse_price_drift_bps, max_spread_widen_pct, min_depth_remain_pct) + NetRRGate (min_net_rr, assumed_slippage_bps_per_leg, taker/maker_fee_bps, include_funding_cost, assumed_hold_minutes).
+* **run90:** `PairSelectionConfig` расширен: `idle_threshold_minutes` (default 5), `idle_check_interval_sec` (30), `min_rescan_interval_minutes` (5) — для idle pipeline rotation.
 
 ## Входы / выходы
 

@@ -8,6 +8,28 @@
 namespace tb::execution {
 
 using tb::common::fees::kDefaultTakerFeePct;
+using tb::common::fees::kDefaultMakerFeePct;
+
+namespace {
+
+/// B11.2 fix: только PostOnly гарантированно maker (биржа отвергает cross).
+/// Plain Limit MAY cross book → начисляем taker как pessimistic estimate.
+/// Реальный fee приходит в OrderFillDetail.fee_amount (если биржа сообщает) —
+/// для парсинга нужна расширенная интеграция с feeDetail в response.
+constexpr double fee_rate_for(OrderType type) {
+    switch (type) {
+        case OrderType::PostOnly:
+            return kDefaultMakerFeePct;
+        case OrderType::Limit:
+        case OrderType::StopLimit:
+        case OrderType::Market:
+        case OrderType::StopMarket:
+        default:
+            return kDefaultTakerFeePct;  // pessimistic
+    }
+}
+
+} // namespace
 
 FillProcessor::FillProcessor(
     OrderRegistry& registry,
@@ -93,7 +115,8 @@ bool FillProcessor::process_market_fill(
     return true;
 }
 
-bool FillProcessor::process_fill_event(const FillEvent& fill) {
+bool FillProcessor::process_fill_event(const FillEvent& fill_const) {
+    FillEvent fill = fill_const;  // mutable копия для fallback price (run86 fix)
     // BUG-S29-04: atomic check-and-mark under one lock to prevent TOCTOU race
     // where two threads (WS + REST) both pass is_trade_id_seen() before either
     // calls mark_trade_id_seen() — causing double portfolio application.
@@ -125,14 +148,34 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
         return false;
     }
 
-    // Guard: if WS fill has price=0 or NaN, skip ALL processing. Don't mark tradeId,
-    // don't transition FSM, don't mark fill_applied. The REST path
-    // (process_market_fill) will handle this fill with the correct price.
-    // Bitget WS fill channel sometimes sends fillPx=0; marking fill_applied
-    // here would block the REST path and leave the portfolio stale.
-    // BUG-S29-01: NaN comparison is always false, so use isfinite instead of <= 0.0.
-    if (!std::isfinite(fill.fill_price.get()) || fill.fill_price.get() <= 0.0) {
-        logger_->warn("FillProcessor", "WS fill с fill_price <= 0 — пропуск, ждём REST подтверждения",
+    // run86 fix (2026-05-16): Bitget WS fill channel часто шлёт fillPx=0 на market
+    // orders (фильтрует данные на их стороне для real-time push). Раньше мы skip'ал
+    // ВСЁ событие — но это:
+    //   1) Блокировало portfolio update → has_open_position() возвращал false →
+    //      anti-pyramiding не работал → дублирующиеся entries на одной паре.
+    //   2) Order оставался в PendingAck → watchdog cancel'ал → но позиция уже
+    //      открыта на бирже → bot теряет sync с реальностью.
+    // Fix: используем fallback price из expected_fill_price / order.price / WS bid.
+    // REST подтверждение потом скорректирует avg_fill_price если есть расхождение.
+    auto order = *opt;
+
+    // run91 critical fix (2026-05-17): AIGENSYNUSDT double-apply bug.
+    // Prev fix применял WS fallback price + apply_incremental_fill → portfolio update.
+    // Затем REST с реальной price → ОПЯТЬ apply (другой trade_id, dedup не сработал) →
+    // total_size 280 vs exchange 140 → phantom cleanup → loss.
+    //
+    // New approach: WS event с price=0 → пропускаем (return false, как было раньше).
+    // REST polling (process_market_fill) подтянет fill с реальной price.
+    // Дополнительная защита: order.created_at старый → watchdog cancel'ит если
+    // REST долго не приходит. Pipeline тогда видит порядок Cancelled → не открывает
+    // новые до получения ack или ручного recovery.
+    //
+    // Trade-off: order может ненадолго (1-3 sec) висеть в PendingAck при market entry.
+    // Это приемлемо — лучше чем double portfolio update который ломает sync с биржей.
+    bool ws_no_price = (!std::isfinite(fill.fill_price.get()) || fill.fill_price.get() <= 0.0);
+    if (ws_no_price) {
+        logger_->warn("FillProcessor",
+            "WS fill с fill_price <= 0 — пропуск, ждём REST подтверждения с реальной ценой",
             {{"order_id", effective_id.get()},
              {"exchange_id", fill.order_id.get()},
              {"fill_qty", std::to_string(fill.fill_quantity.get())},
@@ -141,8 +184,6 @@ bool FillProcessor::process_fill_event(const FillEvent& fill) {
     }
 
     // tradeId already marked seen by check_and_mark_trade_id_seen() above
-
-    auto order = *opt;
 
     // Compute new cumulative fill from delta
     double prev_cost = order.filled_quantity.get() * order.avg_fill_price.get();
@@ -272,7 +313,7 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
         double gross_pnl = compute_gross_pnl(order);
         portfolio_->reduce_position(order.symbol, order.position_side, order.filled_quantity,
                                     order.avg_fill_price, gross_pnl);
-        double fee = order.avg_fill_price.get() * order.filled_quantity.get() * kDefaultTakerFeePct;
+        double fee = order.avg_fill_price.get() * order.filled_quantity.get() * fee_rate_for(order.order_type);
         portfolio_->record_fee(order.symbol, fee, order.order_id);
         journal_fee_event(order.symbol, order.order_id, fee,
                           order.avg_fill_price.get(), order.filled_quantity.get());
@@ -299,7 +340,7 @@ void FillProcessor::apply_fill_to_portfolio(const OrderRecord& order) {
         pos.updated_at = clock_->now();
         portfolio_->open_position(pos);
         portfolio_->release_cash(order.order_id);
-        double fee = order.filled_quantity.get() * order.avg_fill_price.get() * kDefaultTakerFeePct;
+        double fee = order.filled_quantity.get() * order.avg_fill_price.get() * fee_rate_for(order.order_type);
         portfolio_->record_fee(order.symbol, fee, order.order_id);
         journal_fee_event(order.symbol, order.order_id, fee,
                           order.avg_fill_price.get(), order.filled_quantity.get());
@@ -328,7 +369,7 @@ void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillE
         double pnl = compute_incremental_pnl(order, fill_qty, fill_price);
         portfolio_->reduce_position(order.symbol, order.position_side, fill_qty,
                                     fill_price, pnl);
-        double fee = fill_price.get() * fill_qty.get() * kDefaultTakerFeePct;
+        double fee = fill_price.get() * fill_qty.get() * fee_rate_for(order.order_type);
         portfolio_->record_fee(order.symbol, fee, order.order_id);
         journal_fee_event(order.symbol, order.order_id, fee,
                           fill_price.get(), fill_qty.get());
@@ -354,7 +395,7 @@ void FillProcessor::apply_incremental_fill(const OrderRecord& order, const FillE
         pos.updated_at = clock_->now();
         portfolio_->open_position(pos);
         portfolio_->release_cash(order.order_id);
-        double fee = fill_qty.get() * fill_price.get() * kDefaultTakerFeePct;
+        double fee = fill_qty.get() * fill_price.get() * fee_rate_for(order.order_type);
         portfolio_->record_fee(order.symbol, fee, order.order_id);
         journal_fee_event(order.symbol, order.order_id, fee,
                           fill_price.get(), fill_qty.get());

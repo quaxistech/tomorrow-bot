@@ -3,6 +3,7 @@
 #include "normalizer/normalized_events.hpp"
 #include "order_book/order_book.hpp"
 #include "indicators/indicator_engine.hpp"
+#include "indicators/advanced_indicators.hpp"
 #include "buffers/candle_buffer.hpp"
 #include "buffers/trade_buffer.hpp"
 #include "clock/clock.hpp"
@@ -51,6 +52,13 @@ public:
     void on_trade(const normalizer::NormalizedTrade& trade);
     void on_ticker(const normalizer::NormalizedTicker& ticker);
 
+    // run94: external data updates (REST polls).
+    void update_open_interest(const tb::Symbol& symbol, double oi_usdt, int64_t ts_ns);
+    void update_funding_rate(const tb::Symbol& symbol, double rate_8h);
+    /// Bug 5.3 fix: pipeline передаёт фактический leverage (от LeverageEngine
+    /// decision) для корректного estimate_liquidation_clusters.
+    void update_leverage(const tb::Symbol& symbol, double leverage);
+
     // Вычисление полного снимка признаков для символа
     std::optional<FeatureSnapshot> compute_snapshot(
         const tb::Symbol& symbol,
@@ -78,6 +86,13 @@ private:
     mutable std::unordered_map<std::string, buffers::TradeBuffer<1000>> trade_buffers_;
     mutable std::unordered_map<std::string, normalizer::NormalizedTicker> last_tickers_;
     mutable std::unordered_map<std::string, int64_t> last_trade_received_ns_;
+
+    // run94: per-symbol stateful trackers для advanced indicators.
+    mutable std::unordered_map<std::string, indicators::AnchoredVwap> avwap_trackers_;
+    mutable std::unordered_map<std::string, indicators::CvdTracker> cvd_trackers_;
+    mutable std::unordered_map<std::string, indicators::OiTracker> oi_trackers_;
+    mutable std::unordered_map<std::string, double> funding_rates_;  // last 8h funding
+    mutable std::unordered_map<std::string, double> leverages_;       // current leverage per symbol
 
     mutable std::mutex mutex_;
 };

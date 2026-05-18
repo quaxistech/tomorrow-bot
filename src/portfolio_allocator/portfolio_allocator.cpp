@@ -521,9 +521,11 @@ SizingResult HierarchicalAllocator::compute_size_v2(
     // Реальное leverage компьютится позже leverage_engine на основе сигнала.
     // EDGE-30-MARGIN-v3 (run74): 3% → 5% — bot отправлял orders <$5 (Bitget 45110 reject).
     // С leverage 12 (post multipliers): 5% × $14.5 × 12 = $8.7 безопасный notional > $5 min.
-    constexpr double kMarginPerTradePct = 0.05;
-    double margin_per_trade = portfolio.total_capital * kMarginPerTradePct;
-    double target_leverage = std::max(static_cast<double>(config_.max_leverage) * 0.5, 10.0);
+    // B24.1/B24.2 fix: параметры теперь из config (Config::margin_per_trade_pct, target_leverage_multiplier, target_leverage_floor).
+    double margin_per_trade = portfolio.total_capital * config_.margin_per_trade_pct;
+    double target_leverage = std::max(
+        static_cast<double>(config_.max_leverage) * config_.target_leverage_multiplier,
+        config_.target_leverage_floor);
     double target_notional = margin_per_trade * target_leverage;
     double qty = target_notional / price;
 

@@ -602,6 +602,91 @@ TEST_CASE("ExecutionEngine: full execute → market fill", "[execution][engine]"
     REQUIRE(order->avg_fill_price.get() > 0);
 }
 
+// edge-31 TPSL refactor: entry intent с take_profit_price / stop_loss_price
+// должен попадать на биржу как exchange-attached bracket
+// (presetStopSurplusPrice / presetStopLossPrice).
+TEST_CASE("ExecutionEngine: entry intent с TP/SL → attached_tp_sl на OrderRecord",
+          "[execution][engine][tpsl][edge-31]") {
+    auto submitter = std::make_shared<MockOrderSubmitter>();
+    auto log = make_logger();
+    auto clk = make_clock();
+    auto met = make_metrics();
+    auto portfolio = std::make_shared<portfolio::InMemoryPortfolioEngine>(
+        100000.0, log, clk, met);
+
+    ExecutionEngine engine(submitter, portfolio, log, clk, met);
+    engine.set_leverage(10.0);
+
+    auto intent = make_intent("BTCUSDT", Side::Buy, 0.01, 50000.0);
+    intent.stop_loss_price = Price(49500.0);   // 1% downside stop
+    intent.take_profit_price = Price(50750.0); // 1.5% upside target → R:R=1.5
+
+    auto result = engine.execute(
+        intent, make_risk_approved(), make_exec_alpha(), make_uncertainty());
+    REQUIRE(result.has_value());
+
+    auto order = engine.get_order(*result);
+    REQUIRE(order.has_value());
+    REQUIRE(order->attached_tp_sl.has_tp());
+    REQUIRE(order->attached_tp_sl.has_sl());
+    REQUIRE(order->attached_tp_sl.stop_surplus_price.get() == 50750.0);
+    REQUIRE(order->attached_tp_sl.stop_loss_price.get() == 49500.0);
+    REQUIRE(order->attached_tp_sl.trigger_type == TriggerType::MarkPrice);
+}
+
+// Close intent НЕ должен нести bracket — это обратная сторона позиции.
+TEST_CASE("ExecutionEngine: close intent → attached_tp_sl пуст",
+          "[execution][engine][tpsl][edge-31]") {
+    auto submitter = std::make_shared<MockOrderSubmitter>();
+    auto log = make_logger();
+    auto clk = make_clock();
+    auto met = make_metrics();
+    auto portfolio = std::make_shared<portfolio::InMemoryPortfolioEngine>(
+        100000.0, log, clk, met);
+
+    ExecutionEngine engine(submitter, portfolio, log, clk, met);
+    engine.set_leverage(10.0);
+
+    auto intent = make_close_intent("BTCUSDT");
+    // Даже если TP/SL заполнены (ошибочно) — для Close intent они должны игнорироваться.
+    intent.stop_loss_price = Price(49500.0);
+    intent.take_profit_price = Price(50750.0);
+
+    auto result = engine.execute(
+        intent, make_risk_approved(), make_exec_alpha(), make_uncertainty());
+    REQUIRE(result.has_value());
+
+    auto order = engine.get_order(*result);
+    REQUIRE(order.has_value());
+    REQUIRE_FALSE(order->attached_tp_sl.has_any());
+}
+
+// Entry intent без TP/SL → attached_tp_sl остаётся пустым (нет рассыпавшихся значений).
+TEST_CASE("ExecutionEngine: entry без TP/SL → attached_tp_sl пуст",
+          "[execution][engine][tpsl][edge-31]") {
+    auto submitter = std::make_shared<MockOrderSubmitter>();
+    auto log = make_logger();
+    auto clk = make_clock();
+    auto met = make_metrics();
+    auto portfolio = std::make_shared<portfolio::InMemoryPortfolioEngine>(
+        100000.0, log, clk, met);
+
+    ExecutionEngine engine(submitter, portfolio, log, clk, met);
+    engine.set_leverage(10.0);
+
+    auto intent = make_intent();
+    // take_profit_price / stop_loss_price НЕ заполнены.
+
+    auto result = engine.execute(
+        intent, make_risk_approved(), make_exec_alpha(), make_uncertainty());
+    REQUIRE(result.has_value());
+
+    auto order = engine.get_order(*result);
+    REQUIRE(order.has_value());
+    REQUIRE_FALSE(order->attached_tp_sl.has_tp());
+    REQUIRE_FALSE(order->attached_tp_sl.has_sl());
+}
+
 TEST_CASE("ExecutionEngine: risk denied → error", "[execution][engine]") {
     auto submitter = std::make_shared<MockOrderSubmitter>();
     auto log = make_logger();

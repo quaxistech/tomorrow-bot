@@ -19,15 +19,19 @@
 
 ## Структура каталога
 
-* `trading_pipeline.hpp/cpp` (~580 строк header, ~3570 строк implementation).
+* `trading_pipeline.hpp/cpp` (~600 строк header, ~3700 строк implementation).
 * `pipeline_tick_context.hpp` — контекст одного тика.
 * `pipeline_stage_result.hpp` — результаты стадий.
 * `pipeline_latency_tracker.hpp/cpp` — P50/P95/P99.
 * `order_watchdog.hpp/cpp` — мониторинг жизненного цикла ордеров.
-* `exit_orchestrator.hpp/cpp` + `exit_types.hpp` — единый владелец exit-решений.
+* `exit_orchestrator.hpp/cpp` + `exit_types.hpp` — emergency-tier exits (после edge-31 Phase 5: только hard_capital_stop + toxic_flow + stale_data_exit + update_trailing).
+* `pre_trade_gates.hpp/cpp` — **edge-31 Phase 2:** `FreshnessGate` + `NetRRGate` перед entry execute().
+* `protective_bracket_manager.hpp/cpp` — **edge-31 Phase 3:** owner TP/SL bracket lifecycle (verify, fallback standalone plan, update_sl для trailing, release, recover). Orphan cleanup на старте.
+* `periodic_trailing_sl.hpp/cpp` — **run87:** monotonic trailing SL через ProtectiveBracketManager.update_sl(). Chandelier Exit с adaptive multiplier (supertrend/CVD/cascade-aware). Clamp на breakeven+fees (никогда не trigger в loss-zone). Activation min profit 20 bps (run95).
+* `stagnant_position_detector.hpp/cpp` — **run90:** detect "застывшие" позиции (range<12bps/180s, age>15min, hold<30min hard max). Force exit только в loss-zone>30bps (run95 не фиксируем мелкие проседания).
 * `hedge_pair_manager.hpp/cpp` — state machine хедж-позиции.
 * `dual_leg_manager.hpp/cpp` — coordinated long+short pair management.
-* `market_reaction_engine.hpp/cpp` — reactivity to market state changes.
+* `market_reaction_engine.hpp/cpp` — reactivity to market state changes. **run94:** MarketStateVector forwards 10 advanced indicators (supertrend, AVWAP, CVD, OI, liq cascade, spoof, funding).
 * `pair_economics.hpp` — экономика парных позиций.
 * `pair_execution_coordinator.hpp` — координация исполнения пары.
 * `pair_lifecycle_engine.hpp` — lifecycle парной позиции.
@@ -132,18 +136,44 @@
 5. Reset diag counters по period (например, каждые 1000 тиков).
 6. Тест: TSAN на synthetic feed, проверка отсутствия race.
 
-## EDGE-29-EXIT-FIX (2026-05-15, run48 → run49)
+## edge-31 — Two-layer exit/TPSL refactor (2026-05-16)
 
-`exit_orchestrator.cpp::check_continuation_value_exit` (строки 736-820):
+**Идея.** Защита позиции живёт на бирже (exchange-attached TP/SL + standalone plan-ордера), pipeline'у остаются только emergency safety nets и adaptive trailing-push. Все алгоритмические exits, которые перекрывались с TP/SL, удалены.
 
-* `shallow_loss_floor` расширен с `-round_trip_fee × 1.5` → `× 3.0`.
-* `bearish gate threshold` поднят с `cont_val > -0.15` → `> -0.22`.
+### Phase 1 — Foundation (TPSL plumbing)
+* `TradeIntent` обогащён: `take_profit_price`, `stop_loss_price`, `signal_snapshot_ts_ns`, `signal_snapshot_mid`, `signal_snapshot_spread_bps`, `signal_snapshot_depth_usd`.
+* `Setup` (strategy state) обогащён `tp_reference`.
+* `ScalpStrategyConfig` per-setup ATR multipliers (default R:R = 1.5).
+* `ExecutionEngine::create_order_record` копирует `attached_tp_sl` из intent (только для TradeSide::Open). Bitget submitter уже отправляет `presetStopSurplusPrice` / `presetStopLossPrice`.
 
-**Why**: на микро-аккаунте $5-10 notional × 0.06% taker × 2 = 0.012 USDT round-trip = ~0.12% на цене. Market noise сопоставим с fee burden. Run48: 2 consecutive HYPEUSDT trades закрылись continuation_exit при PnL ~-0.011 USDT (cont_val=-0.117 и -0.159) — exit lock-in fees + lock-in adverse noise без шанса recovery. Старый floor 1.5× fee = -0.0098 USDT слишком тесен.
+### Phase 2 — Pre-trade gates (`pre_trade_gates.cpp`)
+* `FreshnessGate`: max_signal_age_ms=500, max_adverse_price_drift_bps=8, max_spread_widen_pct=50, min_depth_remain_pct=50.
+* `NetRRGate`: min_net_rr=0.5 после fees+slippage+funding. Считает gross_rr = TP_dist / SL_dist, вычитает `taker_fee_bps × 2 + slippage_bps × 2 [+ funding_bps if include_funding_cost]`.
+* Запускаются ТОЛЬКО для `TradeSide::Open` сразу перед `execution_engine_->execute()`. Closes/reduces пропускаются.
+* `PreTradeGatesConfig` → `AppConfig.pre_trade_gates` → production.yaml.
 
-**Invariant**: continuation_exit — это **alpha exit**, не hard-risk kill switch. Должен срабатывать только когда:
-1. cont_val ниже dynamic threshold (-0.08 ± regime/uncertainty adj), И
-2. PnL вне economic dead zone (-3× fee … +2.5× fee × quick_profit_multiplier), И
-3. ≥2 bearish confirms ИЛИ cont_val < -0.22.
+### Phase 3 — ProtectiveBracketManager (`protective_bracket_manager.cpp`)
+* `on_position_opened` — после fill регистрирует bracket state (tp_price, sl_price, source = PresetAttached).
+* `verify_brackets(symbol, ps)` — по истечении grace_ms запрашивает open plan-orders на бирже; находит matching loss_plan / profit_plan / pos_tpsl, сохраняет их order_ids.
+* После `max_verify_attempts` если plan не обнаружен → fallback `submit_plan_order(StopMarket)` стандартным путём через `BitgetFuturesOrderSubmitter`.
+* `update_sl(symbol, ps, new_sl_price)` — для trailing (Phase 4): ставит новый standalone plan, затем cancels старого (атомарность "always protected").
+* `release(symbol, ps)` — на закрытии позиции отменяет known plan-ордера (anti-orphan).
+* `recover_from_exchange(open_positions)` — на старте восстанавливает state.
+* Периодический tick verify в `run_periodic_tasks` (интервал 1500ms).
 
-Hard stops (`atr_stop_multiplier × ATR`), trailing stops, EDGE-17/27 fast adverse — отдельные защиты от реального adverse move.
+### Phase 4 — Trailing → bracket SL push
+* `update_trailing_stop` после вычисления `current_stop_level_` проверяет, что новый SL улучшает текущий bracket SL (для long: выше; для short: ниже), и `abs_move_pct ≥ 0.05%`. Тогда `bracket_manager_->update_sl()`.
+* `last_pushed_trailing_sl_` хранит последнее значение для anti-spam.
+* Локальные close-on-trailing-breach триггеры (`check_trailing_stop` в orchestrator) удалены.
+
+### Phase 5 — Exit stack simplification
+* `PositionExitOrchestrator::evaluate()` теперь содержит ТОЛЬКО:
+  1. `check_fixed_capital_stop` — последняя защита на случай отказа exchange SL.
+  2. `check_toxic_flow` — VPIN toxic + meaningful loss.
+  3. `check_stale_data_exit` — feed not fresh + adverse condition.
+* Удалены: `check_price_stop`, `check_trailing_stop`, `check_partial_tp`, `check_quick_profit`, `check_structural_failure`, `check_liquidity_deterioration`, `check_market_regime_exit`, `check_funding_carry_exit`, `compute_continuation_state`, `check_continuation_value_exit`, inline EDGE-30 force_tp_high и fast_adverse_tiered.
+* `update_trailing` сохранён — он вычисляет новый SL для Phase 4 push'а.
+
+### Phase 6 — TradeJournal (`src/telemetry/trade_journal.cpp`)
+* Row-per-trade structured log с `signal_age_ms`, `mfe_bps`, `mae_bps`, `giveback_bps`, `exit_layer`.
+* Lifecycle hooks: `on_entry_filled` после fill, `on_tick` на каждом update_trailing_stop, `on_exit_filled` при position close.

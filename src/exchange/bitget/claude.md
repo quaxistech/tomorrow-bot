@@ -33,7 +33,7 @@
   * аналогично + auth handshake.
 * `class BitgetFuturesOrderSubmitter`:
   * `submit_order(OrderRecord)`, `cancel_order(OrderId, Symbol)`,
-  * `submit_plan_order/cancel_plan_order` (TP/SL),
+  * `submit_plan_order/cancel_plan_order` (TP/SL) — **virtual** для override в unit-tests (run92 ProtectiveBracket tests). Build JSON всегда содержит `planType="normal_plan"` (run90 fix — Bitget API требует обязательно).
   * `query_order_fill_price/detail`,
   * `set_leverage(symbol, leverage, hold_side)`,
   * `set_margin_mode(symbol, "isolated"|"crossed")`,
@@ -41,6 +41,11 @@
   * `set_rules(symbol, ExchangeSymbolRules)`.
 * `class BitgetFuturesQueryAdapter`:
   * `get_open_orders/account_balances/open_positions/order_status/trigger_orders`.
+  * `get_current_funding_rate(symbol) → double` — 8h rate (positive = longs pay shorts).
+  * `get_order_history(symbol, limit) → vector<ExchangeOrderInfo>`.
+  * `get_server_time_ms() → int64_t`.
+  * **edge-31 Phase 3 + run90:** `get_open_plan_orders(symbol) → vector<PlanOrderInfo>` — **virtual** для unit-tests. Парсит `/api/v2/mix/order/orders-plan-pending`, классифицирует plan_type → `PlanOrderKind` (ProfitPlan/LossPlan/PosTPSL/NormalPlan).
+  * DTO: `FuturesPositionInfo`, `PlanOrderInfo`, `PlanOrderKind enum`.
 * `bitget_signing.hpp`: `make_auth_headers(method, path, body, ts, secret, key, passphrase) → headers`.
 
 ## Внутренние компоненты

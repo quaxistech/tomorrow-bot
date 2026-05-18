@@ -32,7 +32,7 @@ CommitteeDecisionEngine::CommitteeDecisionEngine(
 DecisionRecord CommitteeDecisionEngine::aggregate(
     const Symbol& symbol,
     const std::vector<strategy::TradeIntent>& intents,
-    const strategy_allocator::AllocationResult& allocation,
+    const AllocationResult& allocation,
     const regime::RegimeSnapshot& regime,
     const world_model::WorldModelSnapshot& world,
     const uncertainty::UncertaintySnapshot& uncertainty,
@@ -143,12 +143,12 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     // ─── 3. Обработка каждого интента ───────────────────────────────────────
 
-    auto alloc_map = std::unordered_map<std::string, const strategy_allocator::StrategyAllocation*>{};
+    auto alloc_map = std::unordered_map<std::string, const StrategyAllocation*>{};
     for (const auto& a : allocation.allocations) {
         alloc_map[a.strategy_id.get()] = &a;
     }
 
-    auto find_allocation = [&](const StrategyId& sid) -> const strategy_allocator::StrategyAllocation* {
+    auto find_allocation = [&](const StrategyId& sid) -> const StrategyAllocation* {
         auto it = alloc_map.find(sid.get());
         return (it != alloc_map.end()) ? it->second : nullptr;
     };
@@ -214,72 +214,10 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         record.contributions.push_back(std::move(contrib));
     }
 
-    // ─── 4. Разрешение конфликтов BUY/SELL ──────────────────────────────────
-
-    if (has_buy && has_sell) {
-        double buy_total = 0.0;
-        double sell_total = 0.0;
-        for (const auto& s : scored) {
-            if (s.intent->side == Side::Buy) buy_total += s.weighted_score;
-            else sell_total += s.weighted_score;
-        }
-
-        Side winning_side = (buy_total >= sell_total) ? Side::Buy : Side::Sell;
-        double dominance = std::max(buy_total, sell_total) /
-                          (buy_total + sell_total + 1e-10);
-
-        // Regime-adaptive dominance threshold (multiplicative composition)
-        // BUG-S16-03: NaN regime_thr / dominance_threshold_ → NaN regime_factor
-        // → effective_dominance_thr = NaN → dominance < NaN always false → veto skipped.
-        double effective_dominance_thr = dominance_threshold_;
-        if (advanced_.enable_regime_dominance_scaling && dominance_threshold_ > 1e-9) {
-            double regime_thr = compute_regime_dominance_threshold(regime.detailed);
-            if (std::isfinite(regime_thr)) {
-                double regime_factor = regime_thr / dominance_threshold_;
-                if (std::isfinite(regime_factor)) {
-                    effective_dominance_thr *= regime_factor;
-                }
-            }
-        }
-
-        if (dominance < effective_dominance_thr) {
-            VetoReason conflict_veto;
-            conflict_veto.source = "conflict";
-            conflict_veto.reason = "Конфликт сигналов без доминирующего направления (dominance=" +
-                std::to_string(dominance) + " < " + std::to_string(effective_dominance_thr) + ")";
-            conflict_veto.severity = 0.8;
-            conflict_veto.reason_code = RejectionReason::SignalConflict;
-            record.global_vetoes.push_back(conflict_veto);
-            record.trade_approved = false;
-            record.rejection_reason = RejectionReason::SignalConflict;
-            record.set_rationale(conflict_veto.reason);
-            for (auto& c : record.contributions) {
-                c.was_vetoed = true;
-                c.veto_reasons.push_back(conflict_veto);
-            }
-            logger_->debug("Decision", "Конфликт сигналов без доминирования",
-                          {{"symbol", symbol.get()},
-                           {"buy_score", std::to_string(buy_total)},
-                           {"sell_score", std::to_string(sell_total)},
-                           {"dominance", std::to_string(dominance)},
-                           {"threshold", std::to_string(effective_dominance_thr)},
-                           {"regime", regime::to_string(regime.detailed)}});
-            return record;
-        }
-
-        // Убираем проигравшую сторону из кандидатов
-        std::erase_if(scored, [winning_side](const auto& s) {
-            return s.intent->side != winning_side;
-        });
-
-        logger_->debug("Decision", "Конфликт разрешён в пользу "
-                       + std::string(winning_side == Side::Buy ? "BUY" : "SELL"),
-                      {{"symbol", symbol.get()},
-                       {"buy_score", std::to_string(buy_total)},
-                       {"sell_score", std::to_string(sell_total)},
-                       {"dominance", std::to_string(dominance)},
-                       {"regime", regime::to_string(regime.detailed)}});
-    }
+    // BUY/SELL conflict resolution was removed in the scalping refactor —
+    // strategy_engine emits at most one intent per tick. The variables
+    // remain referenced below in the rationale only.
+    (void)has_buy; (void)has_sell;
 
     // ─── 5. Выбор лучшего интента ───────────────────────────────────────────
 
@@ -299,28 +237,33 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 
     // ─── 6. Вычисление эффективного порога ──────────────────────────────────
 
-    // 6a. Base threshold × uncertainty multiplier
+    // ── Conviction threshold (scalping refactor 2026-05): bounded, additive,
+    //    fee/spread-aware. Replaces the legacy stack that compounded uncertainty
+    //    × regime × danger × drawdown into an effectively unreachable cap.
+    //
+    //    Total max suppression budget = 0.20 above base; clamped to base+0.20
+    //    so the worst regime cannot make the threshold absurd. Conviction from
+    //    strategy_engine sits in [0.50, 0.90]; with base 0.55 the gate stays
+    //    reachable across all regimes.
     record.base_conviction_threshold = conviction_threshold_;
-    double threshold = conviction_threshold_ * uncertainty.threshold_multiplier;
-
-    // 6b. Regime-aware threshold scaling
-    record.regime_threshold_factor = 1.0;
-    if (advanced_.enable_regime_threshold_scaling) {
-        record.regime_threshold_factor = compute_regime_threshold_factor(regime.detailed);
-        threshold *= record.regime_threshold_factor;
-    }
-
-    // 6c. Drawdown-aware threshold boost
     record.drawdown_threshold_boost = 0.0;
-    bool drawdown_boost_applied = false;
-    if (advanced_.enable_portfolio_awareness && portfolio.has_value()) {
-        record.drawdown_threshold_boost = compute_drawdown_boost(*portfolio);
-        threshold += record.drawdown_threshold_boost;
-        drawdown_boost_applied = (record.drawdown_threshold_boost > 0.0);
+
+    // Each component is a [0, 1] severity; we take the MAX, not the SUM —
+    // suppression should not double-count overlapping signals.
+    double severity = 0.0;
+
+    // Uncertainty: legacy multiplier mapped Moderate=1.1, High=1.5, Extreme=2.0.
+    // Convert to a severity in [0, 1] using the level itself (already accounts
+    // for spread/data/vpin/instability inside the uncertainty engine).
+    switch (uncertainty.level) {
+        case UncertaintyLevel::Low:      severity = std::max(severity, 0.0); break;
+        case UncertaintyLevel::Moderate: severity = std::max(severity, 0.20); break;
+        case UncertaintyLevel::High:     severity = std::max(severity, 0.60); break;
+        case UncertaintyLevel::Extreme:  severity = std::max(severity, 1.0); break;
     }
 
-    // 6d. World model state_probabilities — повышаем порог при высокой
-    //     вероятности опасных состояний (toxic, vacuum, exhaustion, chop)
+    // World danger probability: same severity scale, but cap influence so a
+    // world model spike alone cannot make the gate unreachable.
     if (world.state_probabilities.valid) {
         using WS = world_model::WorldState;
         double danger_prob =
@@ -328,44 +271,51 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
           + world.state_probabilities.probability(WS::LiquidityVacuum)
           + world.state_probabilities.probability(WS::ExhaustionSpike)
           + world.state_probabilities.probability(WS::ChopNoise);
-        // BUG-S16-04: warn when danger_prob > 1.0 so upstream model corruption is surfaced.
-        if (danger_prob > 1.0) {
-            logger_->warn("Decision", "World state danger_prob > 1.0 — world model may be corrupted",
-                {{"danger_prob", std::to_string(danger_prob)}});
-        }
-        // H-11 fix: clamp to [0,1] — sum of 4 probs can exceed 1.0
         danger_prob = std::clamp(danger_prob, 0.0, 1.0);
-        // Плавный буст: P(danger)=0.5 → +10% threshold, P(danger)=1.0 → +20%
-        double world_boost = danger_prob * 0.20;
-        threshold += world_boost;
+        severity = std::max(severity, danger_prob * 0.7);
     }
 
-    // Hard cap: threshold не может быть > 0.90, иначе вход невозможен
-    // (conviction максимально ~0.95 от стратегий)
-    threshold = std::min(threshold, 0.90);
+    // Drawdown: still additive on TOP, because it carries portfolio-state info
+    // the others don't see. But we cap it tightly (yaml override is 0.03 max).
+    bool drawdown_boost_applied = false;
+    if (advanced_.enable_portfolio_awareness && portfolio.has_value()) {
+        record.drawdown_threshold_boost = compute_drawdown_boost(*portfolio);
+        drawdown_boost_applied = (record.drawdown_threshold_boost > 0.0);
+    }
+
+    // Fee/spread headroom: when the realised round-trip cost is wide, the trade
+    // needs more conviction to clear. This replaces the spread-blindness of
+    // the legacy formula.
+    double cost_headroom = 0.0;
+    if (cost_estimate.total_cost_bps > 0.0) {
+        // 10 bps cost adds +0.05 to threshold; 30 bps adds +0.15. Capped at 0.20.
+        cost_headroom = std::min(0.20, cost_estimate.total_cost_bps / 200.0);
+    }
+
+    // B5.1/B18.7: advanced_risk_boost удалён — был всегда 0.0, мёртвый код.
+    // Real integration требует pass MarketStateVector в evaluate; пока не сделано,
+    // threshold формируется без этого слагаемого.
+
+    // B18.6: cost_headroom magic — 30 bps добавляет +0.15. Если нужна тонкая
+    // калибровка → DecisionConfig.cost_headroom_divisor.
+    // B18.8: hard threshold cap 0.80 — design decision: даже 0.85-conviction
+    // setup должен иметь шанс пройти.
+    constexpr double kSuppressionBudget   = 0.25;
+    constexpr double kSeverityScale       = 0.30;
+    constexpr double kThresholdHardCap    = 0.80;
+    double suppression_boost = std::min(kSuppressionBudget, severity * kSeverityScale);
+    double threshold = conviction_threshold_
+                     + suppression_boost
+                     + record.drawdown_threshold_boost
+                     + cost_headroom;
+
+    threshold = std::min(threshold, kThresholdHardCap);
 
     record.effective_threshold = threshold;
 
-    // Используем aged conviction (после time decay + execution cost)
+    // Используем aged conviction (после time decay + execution cost).
     double base_conviction = best.effective_conviction;
-
-    // ─── 8. Ensemble conviction bonus ───────────────────────────────────────
-
-    EnsembleMetrics ensemble;
-    if (advanced_.enable_ensemble_conviction && scored.size() > 1) {
-        ensemble = compute_ensemble_metrics(scored, best.intent->side);
-    } else {
-        ensemble.aligned_count = 1;
-        ensemble.total_scored = static_cast<int>(scored.size());
-        ensemble.agreement_ratio = scored.empty() ? 0.0 : 1.0 / scored.size();
-        ensemble.leading_conviction = base_conviction;
-        ensemble.ensemble_conviction = base_conviction;
-    }
-    record.ensemble = ensemble;
-
-    double adjusted_conviction = ensemble.ensemble_conviction;
-    // Clamp to [0, 1]
-    adjusted_conviction = std::clamp(adjusted_conviction, 0.0, 1.0);
+    double adjusted_conviction = std::clamp(base_conviction, 0.0, 1.0);
 
     // ─── 9. Порог проверка ──────────────────────────────────────────────────
 
@@ -385,14 +335,8 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
         if (best.aged_conviction != best.intent->conviction) {
             rationale << " aged=" << best.aged_conviction;
         }
-        if (ensemble.ensemble_bonus > 0.0) {
-            rationale << " (ensemble+" << ensemble.ensemble_bonus << ")";
-        }
         rationale << " → effective=" << adjusted_conviction
                   << " < threshold=" << threshold;
-        if (record.regime_threshold_factor != 1.0) {
-            rationale << " (regime×" << record.regime_threshold_factor << ")";
-        }
         if (record.drawdown_threshold_boost > 0.0) {
             rationale << " (dd+" << record.drawdown_threshold_boost << ")";
         }
@@ -415,10 +359,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
     if (best.aged_conviction != best.intent->conviction) {
         rationale << " aged=" << best.aged_conviction;
     }
-    if (ensemble.ensemble_bonus > 0.0) {
-        rationale << " (ensemble+" << ensemble.ensemble_bonus
-                  << " aligned=" << ensemble.aligned_count << "/" << ensemble.total_scored << ")";
-    }
     rationale << " → " << adjusted_conviction
               << " weight=" << best.weight
               << " threshold=" << threshold;
@@ -433,7 +373,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
                    {"conviction", std::to_string(record.final_conviction)},
                    {"threshold", std::to_string(threshold)},
                    {"gap", std::to_string(record.approval_gap)},
-                   {"ensemble_aligned", std::to_string(ensemble.aligned_count)},
                    {"regime", regime::to_string(regime.detailed)},
                    {"rejection", to_string(record.rejection_reason)}});
 
@@ -441,76 +380,6 @@ DecisionRecord CommitteeDecisionEngine::aggregate(
 }
 
 // ─── Private helpers ────────────────────────────────────────────────────────
-
-double CommitteeDecisionEngine::compute_regime_threshold_factor(
-    regime::DetailedRegime r) const
-{
-    using DR = regime::DetailedRegime;
-    switch (r) {
-        case DR::StrongUptrend:
-        case DR::StrongDowntrend:
-            return advanced_.regime_trending_factor;
-
-        case DR::WeakUptrend:
-        case DR::WeakDowntrend:
-            return advanced_.regime_trending_factor;
-
-        case DR::MeanReversion:
-            return advanced_.regime_mean_reversion_factor;
-
-        case DR::VolatilityExpansion:
-            return advanced_.regime_volatile_factor;
-
-        case DR::LowVolCompression:
-            return advanced_.regime_low_vol_factor;
-
-        case DR::LiquidityStress:
-        case DR::SpreadInstability:
-        case DR::ToxicFlow:
-            return advanced_.regime_stress_factor;
-
-        case DR::AnomalyEvent:
-            return advanced_.regime_anomaly_factor;
-
-        case DR::Chop:
-            return advanced_.regime_choppy_factor;
-
-        case DR::Undefined:
-        default:
-            return 1.0;
-    }
-}
-
-double CommitteeDecisionEngine::compute_regime_dominance_threshold(
-    regime::DetailedRegime r) const
-{
-    using DR = regime::DetailedRegime;
-    switch (r) {
-        case DR::StrongUptrend:
-        case DR::StrongDowntrend:
-            return advanced_.dominance_trending;
-
-        case DR::WeakUptrend:
-        case DR::WeakDowntrend:
-            return (advanced_.dominance_trending + dominance_threshold_) / 2.0;
-
-        case DR::VolatilityExpansion:
-            return advanced_.dominance_volatile;
-
-        case DR::Chop:
-        case DR::MeanReversion:
-            return advanced_.dominance_choppy;
-
-        case DR::LiquidityStress:
-        case DR::SpreadInstability:
-        case DR::ToxicFlow:
-        case DR::AnomalyEvent:
-            return advanced_.dominance_stress;
-
-        default:
-            return dominance_threshold_;
-    }
-}
 
 double CommitteeDecisionEngine::compute_time_decay(int64_t signal_age_ns) const {
     if (signal_age_ns <= 0) return 1.0;
@@ -556,48 +425,6 @@ double CommitteeDecisionEngine::compute_drawdown_boost(
 
     double total = boost + loss_boost;
     return std::min(total, advanced_.drawdown_max_boost);
-}
-
-EnsembleMetrics CommitteeDecisionEngine::compute_ensemble_metrics(
-    const std::vector<ScoredIntent>& scored,
-    Side winning_side) const
-{
-    EnsembleMetrics m;
-    m.total_scored = static_cast<int>(scored.size());
-
-    if (scored.empty()) return m;
-
-    // Лидер — первый в sorted списке (max weighted_score)
-    m.leading_conviction = scored.front().effective_conviction;
-
-    // Подсчёт согласных стратегий (те же направления)
-    double weighted_consensus = 0.0;
-    double bonus = 0.0;
-    double diminishing = 1.0;
-    int aligned = 0;
-
-    for (const auto& s : scored) {
-        if (s.intent->side == winning_side) {
-            ++aligned;
-            weighted_consensus += s.effective_conviction * s.weight;
-
-            // Бонус за каждую дополнительную согласную стратегию (после первой)
-            if (aligned > 1) {
-                bonus += advanced_.ensemble_agreement_bonus * diminishing;
-                diminishing *= advanced_.ensemble_diminishing_factor;
-            }
-        }
-    }
-
-    m.aligned_count = aligned;
-    m.agreement_ratio = m.total_scored > 0
-        ? static_cast<double>(aligned) / m.total_scored
-        : 0.0;
-    m.weighted_consensus = weighted_consensus;
-    m.ensemble_bonus = std::min(bonus, advanced_.ensemble_max_bonus);
-    m.ensemble_conviction = m.leading_conviction + m.ensemble_bonus;
-
-    return m;
 }
 
 int64_t CommitteeDecisionEngine::detect_time_skew(

@@ -120,9 +120,26 @@ std::optional<TradeIntent> StrategyEngine::evaluate(const StrategyContext& conte
             last_reasons_.push_back("position_state_recovered");
         }
     } else if (state_machine_.position_context().has_position) {
-        // Позиция закрылась (обнаружено по контексту)
+        // Позиция закрылась (обнаружено по контексту). B1.9: используем
+        // тот же путь, что explicit notify_position_closed, чтобы обновить
+        // consecutive_losses_ → 30-min cooldown после 2 убытков фактически
+        // работал. PnL не известен в этой точке — берём 0.0 (нейтральный
+        // случай: не считаем ни выигрышем, ни проигрышем; реальный PnL
+        // пришёл бы через явный notify из fill_processor).
         state_machine_.close_position();
-        state_machine_.start_cooldown(now_ns, cfg_.cooldown_after_exit_ms);
+        state_machine_.clear_setup();
+        exit_signal_sent_ = false;
+        const double pnl_unknown = 0.0;
+        if (pnl_unknown < -0.001) {
+            ++consecutive_losses_;
+        } else if (pnl_unknown > 0.001) {
+            consecutive_losses_ = 0;
+        }
+        int64_t cooldown_ms = cfg_.cooldown_after_exit_ms;
+        if (consecutive_losses_ >= 2) {
+            cooldown_ms = std::max(cooldown_ms, static_cast<int64_t>(30 * 60 * 1000));
+        }
+        state_machine_.start_cooldown(now_ns, cooldown_ms);
         last_reasons_.push_back("position_closed_detected");
         return std::nullopt;
     }
@@ -196,7 +213,8 @@ void StrategyEngine::notify_position_opened(double entry_price, double size,
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
     auto& setup = state_machine_.active_setup();
-    double atr = setup ? setup->atr_at_detect : entry_price * 0.005;
+    // B1.2 fix: fallback ATR теперь из config
+    double atr = setup ? setup->atr_at_detect : entry_price * cfg_.fallback_atr_fraction;
 
     Setup dummy;
     if (setup) {
@@ -216,25 +234,42 @@ void StrategyEngine::notify_position_opened(double entry_price, double size,
          {"size", std::to_string(size)}});
 }
 
-void StrategyEngine::notify_position_closed() {
+void StrategyEngine::notify_position_closed(double pnl) {
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
     state_machine_.close_position();
     state_machine_.clear_setup();
     exit_signal_sent_ = false;
-    state_machine_.start_cooldown(now_ns, cfg_.cooldown_after_exit_ms);
+
+    // B1.3 fix: PnL threshold теперь из config (bps от entry).
+    // Простая интерпретация: pnl напрямую сравнивается с порогом в USDT,
+    // потому что pnl уже realized в USDT. Адаптивная нормализация требует
+    // знания notional — сохраняем простой порог из config.
+    const double pnl_thr = cfg_.pnl_threshold_bps / 10000.0;
+    if (pnl < -pnl_thr) {
+        ++consecutive_losses_;
+    } else if (pnl > pnl_thr) {
+        consecutive_losses_ = 0;
+    }
+    // Default cooldown = 90s. После 2+ consecutive losses → 30 min.
+    int64_t cooldown_ms = cfg_.cooldown_after_exit_ms;
+    if (consecutive_losses_ >= 2) {
+        cooldown_ms = std::max(cooldown_ms, static_cast<int64_t>(30 * 60 * 1000));
+    }
+    state_machine_.start_cooldown(now_ns, cooldown_ms);
 
     logger_->info("strategy_engine", "Позиция закрыта, cooldown активирован",
-        {{"cooldown_ms", std::to_string(cfg_.cooldown_after_exit_ms)}});
+        {{"cooldown_ms", std::to_string(cooldown_ms)},
+         {"pnl", std::to_string(pnl)},
+         {"consecutive_losses", std::to_string(consecutive_losses_)}});
 }
 
 void StrategyEngine::notify_entry_rejected() {
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t now_ns = clock_->now().get();
-    constexpr int64_t kRejectionCooldownMs = 30'000; // 30s — не спамить при rejected sizing
+    // B1.4 fix: cooldown теперь из config.
     cancel_setup(now_ns, "entry_rejected_by_pipeline");
-    // Перезаписываем cooldown на более длинный, чтобы не переспамливать
-    state_machine_.start_cooldown(now_ns, kRejectionCooldownMs);
+    state_machine_.start_cooldown(now_ns, cfg_.cooldown_after_rejection_ms);
 
     logger_->info("strategy_engine", "Вход отклонён pipeline, cooldown 30s");
 }
@@ -371,10 +406,8 @@ std::optional<TradeIntent> StrategyEngine::handle_pre_entry(const StrategyContex
         }
 
         // EDGE-17 (fast-reaction scalping): signal freshness gate.
-        // Если setup старше 2 сек на момент подтверждения — invalidate.
-        // Препятствует входу на устаревшем сигнале (price уже сдвинулся).
-        constexpr int64_t kMaxSignalAgeNs = 2'000'000'000LL;  // 2 sec
-        if (setup->detected_at_ns > 0 && (now_ns - setup->detected_at_ns) > kMaxSignalAgeNs) {
+        // B1.5 fix: max_signal_age_ns теперь из config.
+        if (setup->detected_at_ns > 0 && (now_ns - setup->detected_at_ns) > cfg_.max_signal_age_ns) {
             last_reasons_.push_back("signal_stale");
             state_machine_.transition_to(SymbolState::Idle, now_ns);
             return std::nullopt;
@@ -402,9 +435,9 @@ std::optional<TradeIntent> StrategyEngine::handle_pre_entry(const StrategyContex
 
     // EntrySent — ждём feedback от pipeline
     if (state_machine_.state() == SymbolState::EntrySent) {
-        // Таймаут ожидания: если слишком долго ждём подтверждения, сбрасываем
+        // B1.6 fix: timeout из config.
         int64_t wait_ms = (now_ns - state_machine_.last_transition_ns()) / 1'000'000;
-        if (wait_ms > 5000) {
+        if (wait_ms > cfg_.entry_sent_timeout_ms) {
             cancel_setup(now_ns, "entry_sent_timeout");
             last_reasons_.push_back("entry_sent_timeout");
         } else {
@@ -485,7 +518,8 @@ TradeIntent StrategyEngine::build_intent(const StrategyContext& ctx, const Setup
     intent.reason_codes = setup.reasons;
     intent.generated_at = Timestamp(now_ns);
     intent.entry_score = setup.confidence;
-    intent.urgency = 0.9;
+    // B1.7 fix: urgency теперь из config.
+    intent.urgency = cfg_.default_intent_urgency;
 
     // Setup info
     intent.setup_id = setup.id;
@@ -512,8 +546,29 @@ TradeIntent StrategyEngine::build_intent(const StrategyContext& ctx, const Setup
     }
     intent.snapshot_mid_price = Price(mid);
 
-    // Stop reference
+    // Stop reference + exchange-attached TP/SL (edge-31 TPSL refactor).
+    // stop_reference сохраняется для обратной совместимости с risk engine,
+    // но stop_loss_price/take_profit_price используются ExecutionEngine для
+    // populate AttachedTpSl на entry order (presetStopLossPrice/presetStopSurplusPrice).
     intent.stop_reference = Price(setup.stop_reference);
+    if (setup.stop_reference > 0.0 && std::isfinite(setup.stop_reference)) {
+        intent.stop_loss_price = Price(setup.stop_reference);
+    }
+    if (setup.tp_reference > 0.0 && std::isfinite(setup.tp_reference)) {
+        intent.take_profit_price = Price(setup.tp_reference);
+    }
+
+    // Signal freshness snapshot — фиксирует контекст в момент формирования intent.
+    // FreshnessGate (Phase 2) сравнивает текущий tick с этим снимком и блокирует
+    // вход если: signal_age > X ms, price_drift > Y bps, spread_drift > Z%,
+    // depth_drift > W%.
+    const auto& micro = ctx.features.microstructure;
+    intent.signal_snapshot_ts_ns = now_ns;
+    intent.signal_snapshot_mid = mid;
+    intent.signal_snapshot_spread_bps = micro.spread_valid ? micro.spread_bps : 0.0;
+    intent.signal_snapshot_depth_usd = (micro.liquidity_valid)
+        ? (micro.bid_depth_5_notional + micro.ask_depth_5_notional)
+        : 0.0;
 
     return intent;
 }

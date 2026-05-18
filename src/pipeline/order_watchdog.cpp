@@ -152,10 +152,17 @@ std::vector<WatchdogReport> OrderWatchdog::run_check() {
 WatchdogOrderAction OrderWatchdog::classify_order(
     const execution::OrderRecord& order, int64_t now_ns) const
 {
-    if (order.last_updated.get() <= 0) return WatchdogOrderAction::Ok;
+    // run86 fix (2026-05-16): пользователь сообщил что unfilled orders висят 4+ минут.
+    // Причина: last_updated обновлялся при каждом WS event (включая no-op), age никогда
+    // не превышал max_open_order_ms. Используем created_at — реальный возраст от
+    // момента отправки ордера. last_updated оставляем как fallback если created_at=0.
+    const int64_t age_base = (order.created_at.get() > 0)
+        ? order.created_at.get()
+        : order.last_updated.get();
+    if (age_base <= 0) return WatchdogOrderAction::Ok;
 
     // BUG-S34-03: clamp to 0 to avoid negative age when NTP backward jump
-    const int64_t age_ms = std::max(int64_t{0}, now_ns - order.last_updated.get()) / 1'000'000LL;
+    const int64_t age_ms = std::max(int64_t{0}, now_ns - age_base) / 1'000'000LL;
 
     switch (order.state) {
         case execution::OrderState::PendingAck:

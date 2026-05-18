@@ -34,6 +34,58 @@ void FeatureEngine::on_trade(const normalizer::NormalizedTrade& trade) {
     const std::string key = trade.envelope.symbol.get();
     trade_buffers_[key].push(trade);
     last_trade_received_ns_[key] = trade.envelope.received_ts.get();
+
+    // run94: update Anchored VWAP and CVD per trade.
+    double price = trade.price.get();
+    double size = trade.size.get();
+    int64_t ts_ns = trade.envelope.exchange_ts.get();
+    if (price > 0.0 && size > 0.0) {
+        // Volume в quote currency (USDT) = price × size.
+        double volume_quote = price * size;
+        // Anchored VWAP — initialise on first trade per symbol.
+        auto av_it = avwap_trackers_.find(key);
+        if (av_it == avwap_trackers_.end()) {
+            av_it = avwap_trackers_.emplace(key, indicators::AnchoredVwap()).first;
+        }
+        av_it->second.on_trade(price, volume_quote, ts_ns);
+
+        // CVD — taker_buy = (side == Buy && !is_aggressive). Bitget: is_aggressive
+        // означает sell-side taker (продавец бьёт). Тогда taker_buy = !is_aggressive
+        // когда side == Buy. Конкретная семантика: side = taker side direction.
+        // Buy taker → buy aggression. Используем side как primary.
+        bool taker_buy = (trade.side == tb::Side::Buy);
+        auto cvd_it = cvd_trackers_.find(key);
+        if (cvd_it == cvd_trackers_.end()) {
+            cvd_it = cvd_trackers_.emplace(key, indicators::CvdTracker(120)).first;
+        }
+        cvd_it->second.on_trade(price, volume_quote, taker_buy, ts_ns);
+    }
+}
+
+void FeatureEngine::update_open_interest(const tb::Symbol& symbol, double oi_usdt, int64_t ts_ns) {
+    std::lock_guard lock(mutex_);
+    const std::string key = symbol.get();
+    auto it = oi_trackers_.find(key);
+    if (it == oi_trackers_.end()) {
+        it = oi_trackers_.emplace(key, indicators::OiTracker(20)).first;
+    }
+    auto last_ticker = last_tickers_.find(key);
+    double price = (last_ticker != last_tickers_.end())
+        ? (last_ticker->second.bid.get() + last_ticker->second.ask.get()) * 0.5
+        : 0.0;
+    it->second.on_oi_update(oi_usdt, price, ts_ns);
+}
+
+void FeatureEngine::update_funding_rate(const tb::Symbol& symbol, double rate_8h) {
+    std::lock_guard lock(mutex_);
+    funding_rates_[symbol.get()] = rate_8h;
+}
+
+void FeatureEngine::update_leverage(const tb::Symbol& symbol, double leverage) {
+    std::lock_guard lock(mutex_);
+    if (leverage > 0.0 && std::isfinite(leverage)) {
+        leverages_[symbol.get()] = leverage;
+    }
 }
 
 void FeatureEngine::on_ticker(const normalizer::NormalizedTicker& ticker) {
@@ -112,6 +164,29 @@ std::optional<FeatureSnapshot> FeatureEngine::compute_snapshot(
     snap.technical = compute_technical(symbol);
     snap.microstructure = compute_microstructure(ticker, book);
     snap.execution_context = compute_execution_context(ticker, book);
+
+    // run94: Spoof detection — нужны данные из microstructure (depth, top of book).
+    if (snap.microstructure.book_imbalance_valid && snap.microstructure.liquidity_valid) {
+        double top_bid_size = 0.0;
+        double top_ask_size = 0.0;
+        if (auto tob = book.top_of_book()) {
+            top_bid_size = tob->bid_size.get() * tob->best_bid.get();
+            top_ask_size = tob->ask_size.get() * tob->best_ask.get();
+        }
+        auto spoof = indicators::detect_spoofing(
+            snap.microstructure.bid_depth_5_notional,
+            snap.microstructure.ask_depth_5_notional,
+            top_bid_size,
+            top_ask_size,
+            snap.microstructure.cancel_burst_intensity,
+            snap.microstructure.refill_asymmetry);
+        if (spoof.valid) {
+            snap.technical.spoof_bid = spoof.spoof_bid_detected;
+            snap.technical.spoof_ask = spoof.spoof_ask_detected;
+            snap.technical.spoof_intensity = spoof.spoof_intensity;
+            snap.technical.spoof_valid = true;
+        }
+    }
 
     return snap;
 }
@@ -246,6 +321,139 @@ TechnicalFeatures FeatureEngine::compute_technical(const tb::Symbol& symbol) con
         tf.momentum_valid = mom5.valid && mom20.valid;
     }
 
+    // run93: Supertrend (10, 3) — ATR trend follower hard filter.
+    {
+        auto st = indicators_->supertrend(high, low, close, 10, 3.0);
+        if (st.valid) {
+            tf.supertrend_value = st.value;
+            tf.supertrend_trend = st.trend;
+            tf.supertrend_flipped = st.flipped;
+            tf.supertrend_valid = true;
+        }
+    }
+
+    // run93: Stochastic (5, 3, 3) — fast scalping oscillator.
+    {
+        auto stoch = indicators_->stochastic(high, low, close, 5, 3, 3);
+        if (stoch.valid) {
+            tf.stoch_k = stoch.k;
+            tf.stoch_d = stoch.d;
+            tf.stoch_overbought = stoch.overbought;
+            tf.stoch_oversold = stoch.oversold;
+            tf.stoch_bull_cross = stoch.bull_cross;
+            tf.stoch_bear_cross = stoch.bear_cross;
+            tf.stoch_valid = true;
+        }
+    }
+
+    // run93: EMA pair (9/21) — micro-trend crossover.
+    {
+        auto ep = indicators_->ema_pair(close, 9, 21);
+        if (ep.valid) {
+            tf.ema_fast_9 = ep.ema_fast;
+            tf.ema_slow_21 = ep.ema_slow;
+            tf.ema_pair_trend = ep.trend;
+            tf.ema_pair_bull_cross = ep.bull_cross;
+            tf.ema_pair_bear_cross = ep.bear_cross;
+            tf.ema_pair_separation_bps = ep.separation_bps;
+            tf.ema_pair_valid = true;
+        }
+    }
+
+    // run94: Anchored VWAP (session/daily).
+    {
+        auto av_it = avwap_trackers_.find(symbol.get());
+        if (av_it != avwap_trackers_.end()) {
+            double cur_price = close.empty() ? 0.0 : close.back();
+            auto r = av_it->second.snapshot(cur_price);
+            if (r.valid) {
+                tf.avwap = r.vwap;
+                tf.avwap_upper_1sigma = r.upper_1sigma;
+                tf.avwap_lower_1sigma = r.lower_1sigma;
+                tf.avwap_upper_2sigma = r.upper_2sigma;
+                tf.avwap_lower_2sigma = r.lower_2sigma;
+                tf.avwap_price_vs_vwap_bps = r.price_vs_vwap_bps;
+                tf.avwap_valid = true;
+            }
+        }
+    }
+
+    // run94: CVD + divergence detection.
+    {
+        auto cvd_it = cvd_trackers_.find(symbol.get());
+        if (cvd_it != cvd_trackers_.end()) {
+            auto r = cvd_it->second.snapshot();
+            if (r.valid) {
+                tf.cvd = r.cvd;
+                tf.cvd_change_recent = r.cvd_change_recent;
+                tf.cvd_normalized = r.cvd_normalized;
+                tf.cvd_bullish_divergence = r.bullish_divergence;
+                tf.cvd_bearish_divergence = r.bearish_divergence;
+                tf.cvd_valid = true;
+            }
+        }
+    }
+
+    // run94: Open Interest tracking.
+    {
+        auto oi_it = oi_trackers_.find(symbol.get());
+        if (oi_it != oi_trackers_.end()) {
+            auto r = oi_it->second.snapshot();
+            if (r.valid) {
+                tf.oi_current = r.oi_current;
+                tf.oi_change_recent_pct = r.oi_change_recent_pct;
+                tf.oi_trend_quadrant = r.trend_quadrant;
+                tf.oi_valid = true;
+            }
+        }
+    }
+
+    // run94: Liquidity Sweep Detector — на последних 20 1m свечах.
+    if (close.size() >= 12 && high.size() == close.size() && low.size() == close.size()) {
+        auto sweep = indicators::detect_liquidity_sweep(high, low, close, 10, 0.5, 0.6);
+        if (sweep.valid) {
+            tf.liq_sweep_high = sweep.sweep_high_detected;
+            tf.liq_sweep_low = sweep.sweep_low_detected;
+            tf.liq_sweep_recovery_pct = sweep.recovery_pct;
+            tf.liq_sweep_valid = true;
+        }
+    }
+
+    // run94: Funding bias.
+    {
+        auto fr_it = funding_rates_.find(symbol.get());
+        if (fr_it != funding_rates_.end()) {
+            auto fb = indicators::evaluate_funding_bias(fr_it->second);
+            if (fb.valid) {
+                tf.funding_rate_8h = fb.funding_rate;
+                tf.funding_crowding_side = fb.crowding_side;
+                tf.funding_crowding_intensity = fb.crowding_intensity;
+                tf.funding_recommended_bias = fb.recommended_bias;
+                tf.funding_valid = true;
+            }
+        }
+    }
+
+    // run94: Liquidation cluster proxy.
+    // Bug 5.3 fix: pass actual leverage from LeverageEngine decision (via update_leverage).
+    // Fallback на 10× (conservative middle ground) если leverage не передан.
+    if (tf.oi_valid && tf.funding_valid && tf.momentum_valid) {
+        double actual_leverage = 10.0;
+        auto lev_it = leverages_.find(symbol.get());
+        if (lev_it != leverages_.end()) {
+            actual_leverage = lev_it->second;
+        }
+        auto liq = indicators::estimate_liquidation_clusters(
+            tf.oi_change_recent_pct, tf.funding_rate_8h, tf.momentum_5, actual_leverage);
+        if (liq.valid) {
+            tf.liq_upside_cluster_pct = liq.upside_liq_cluster_pct;
+            tf.liq_downside_cluster_pct = liq.downside_liq_cluster_pct;
+            tf.liq_cascade_risk_score = liq.cascade_risk_score;
+            tf.liq_dominant_side = liq.dominant_side;
+            tf.liq_valid = true;
+        }
+    }
+
     return tf;
 }
 
@@ -305,8 +513,13 @@ MicrostructureFeatures FeatureEngine::compute_microstructure(
     //   order imbalance объясняет ~65–70% краткосрочных ценовых движений.
     // Weights: 0.7 — imbalance (основной предиктор), 0.3 — spread (вторичный).
     if (mf.book_imbalance_valid && mf.spread_valid) {
-        const double imbalance_component = std::abs(mf.book_imbalance_5) * 0.7;
-        const double spread_component = std::min(mf.spread_bps / 100.0, 1.0) * 0.3;
+        // B33.1/B33.2: Cont, Kukanov & Stoikov (2014) weights — 70/30 imb/spread.
+        // Saturation 100 bps для spread (typical 1m crypto).
+        constexpr double kImbalanceWeight = 0.7;
+        constexpr double kSpreadWeight    = 0.3;
+        constexpr double kSpreadSatBps    = 100.0;
+        const double imbalance_component = std::abs(mf.book_imbalance_5) * kImbalanceWeight;
+        const double spread_component = std::min(mf.spread_bps / kSpreadSatBps, 1.0) * kSpreadWeight;
         mf.book_instability = std::clamp(imbalance_component + spread_component, 0.0, 1.0);
         mf.instability_valid = true;
     } else {
@@ -335,20 +548,29 @@ ExecutionContextFeatures FeatureEngine::compute_execution_context(
     double base_slippage = ticker.spread_bps * 0.5;
     double depth_impact = 0.0;
     if (ec.immediate_liquidity > 0.0) {
-        // Thin book → higher slippage. Uses inverse-depth scaling.
-        // At 1000 USD depth: ~0 extra impact. At 100 USD: +2-3 bps.
+        // B12.1: slippage model — inverse-depth scaling. Threshold $1000 — для
+        // crypto USDT-M futures это типичный depth слой. На micro-account
+        // (ордер $5-10) этот threshold даёт depth_impact=0 → можно ужесточить
+        // через config если требуется.
+        constexpr double kThinDepthThresholdUsd = 1000.0;
+        constexpr double kSlippageImpactMaxBps  = 5.0;
+        constexpr double kSlippageMultiplier    = 1.5;
         double mid_px = (ticker.bid.get() + ticker.ask.get()) * 0.5;
         if (mid_px > 0.0) {
             double depth_usd = ec.immediate_liquidity * mid_px;
-            if (depth_usd < 1000.0 && depth_usd > 0.0) {
-                depth_impact = std::min(5.0, (1000.0 / depth_usd - 1.0) * 1.5);
+            if (depth_usd < kThinDepthThresholdUsd && depth_usd > 0.0) {
+                depth_impact = std::min(kSlippageImpactMaxBps,
+                    (kThinDepthThresholdUsd / depth_usd - 1.0) * kSlippageMultiplier);
             }
         }
     }
     ec.estimated_slippage_bps = base_slippage + depth_impact;
     ec.slippage_valid = (ticker.spread_bps > 0.0);
 
-    // Криптовалютные рынки работают 24/7 — всегда открыты
+    // B12.2: крипто 24/7, но Bitget maintenance windows возможны.
+    // Сейчас полагаемся на data freshness (is_feed_fresh ниже) как proxy:
+    // если данные приходят — market open. Maintenance детектируется через
+    // feed staleness + WS reconnect (gracefully degraded).
     ec.is_market_open = true;
 
     // Свежесть данных: время последнего тикера vs текущее время

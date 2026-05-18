@@ -93,6 +93,9 @@ private:
     /// Валидация настроек модуля неопределённости
     void validate_uncertainty(const UncertaintyConfig& cfg, ValidationResult& result) const;
 
+    /// Валидация pre-trade gates (FreshnessGate + NetRRGate)
+    void validate_pre_trade_gates(const PreTradeGatesConfig& cfg, ValidationResult& result) const;
+
     /// Межкомпонентная валидация (совместимость настроек)
     void validate_cross(const AppConfig& cfg, ValidationResult& result) const;
 };

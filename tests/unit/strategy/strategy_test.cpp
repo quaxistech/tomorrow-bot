@@ -57,6 +57,16 @@ StrategyContext make_context() {
     ctx.features.technical.volatility_20 = 0.008;
     ctx.features.technical.volatility_valid = true;
 
+    // run94+ Bayesian fusion фикстуры — обеспечиваем default neutral signals,
+    // чтобы legacy strategy tests проходили без override каждого indicator.
+    ctx.features.technical.supertrend_trend = 1;   // default bullish для test
+    ctx.features.technical.supertrend_valid = true;
+    ctx.features.technical.ema_pair_trend = 1;
+    ctx.features.technical.ema_pair_valid = true;
+    ctx.features.technical.stoch_k = 50.0;
+    ctx.features.technical.stoch_d = 50.0;
+    ctx.features.technical.stoch_valid = true;
+
     ctx.features.execution_context.is_feed_fresh = true;
 
     return ctx;
@@ -111,6 +121,20 @@ TEST_CASE("StrategyEngine: setup confirms and generates entry", "[strategy][engi
     REQUIRE(result->signal_type == StrategySignalType::EnterLong);
     REQUIRE(!result->setup_id.empty());
     REQUIRE(!result->reason_codes.empty());
+
+    // edge-31 TPSL refactor: BUY intent должен нести exchange-attached bracket.
+    REQUIRE(result->stop_loss_price.has_value());
+    REQUIRE(result->take_profit_price.has_value());
+    REQUIRE(result->stop_loss_price->get() < 50000.0);    // SL ниже mid для BUY
+    REQUIRE(result->take_profit_price->get() > 50000.0);  // TP выше mid для BUY
+    // R:R должен быть ≥ atr_target_mult_momentum / atr_stop_mult_momentum (по умолчанию 1.5).
+    double sl_dist = 50000.0 - result->stop_loss_price->get();
+    double tp_dist = result->take_profit_price->get() - 50000.0;
+    REQUIRE(tp_dist > sl_dist * 1.4);
+
+    // Signal freshness snapshot должен быть populated.
+    REQUIRE(result->signal_snapshot_ts_ns > 0);
+    REQUIRE(result->signal_snapshot_mid > 0.0);
 }
 
 TEST_CASE("StrategyEngine: SELL signal with futures", "[strategy][engine]") {
@@ -129,6 +153,9 @@ TEST_CASE("StrategyEngine: SELL signal with futures", "[strategy][engine]") {
     ctx.features.technical.ema_20 = 49900.0;
     ctx.features.technical.ema_50 = 50100.0;
     ctx.features.technical.momentum_5 = -0.005;
+    // run94 Bayesian fixture: override на bearish для SELL test
+    ctx.features.technical.supertrend_trend = -1;
+    ctx.features.technical.ema_pair_trend = -1;
 
     engine.evaluate(ctx);
     clk->current_time += 1'000'000'000LL;
@@ -137,6 +164,12 @@ TEST_CASE("StrategyEngine: SELL signal with futures", "[strategy][engine]") {
     REQUIRE(result.has_value());
     REQUIRE(result->side == Side::Sell);
     REQUIRE(result->signal_intent == SignalIntent::ShortEntry);
+
+    // edge-31 TPSL refactor: SELL intent — bracket с TP ниже mid, SL выше mid.
+    REQUIRE(result->stop_loss_price.has_value());
+    REQUIRE(result->take_profit_price.has_value());
+    REQUIRE(result->stop_loss_price->get() > 50000.0);    // SL выше mid для SELL
+    REQUIRE(result->take_profit_price->get() < 50000.0);  // TP ниже mid для SELL
 }
 
 // ============================================================

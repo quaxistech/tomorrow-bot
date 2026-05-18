@@ -7,11 +7,20 @@
 
 namespace tb::pipeline {
 
-/// Единый владелец всех exit-решений.
-/// Объединяет trailing stop, hard risk stops, market regime exits,
-/// toxic flow, structural failure, continuation value model.
-/// All exits are market-driven — no time-based gates in the alpha path.
-/// Каждый выход имеет полный reason tree.
+/// Emergency-tier exit safety net (edge-31 Phase 5).
+///
+/// Этот orchestrator теперь отвечает ТОЛЬКО за emergency exits, которые
+/// невозможно реализовать через биржевой TP/SL bracket:
+///   1) hard_capital_stop — последняя защита от catastrophic loss
+///   2) toxic_flow — токсичная микроструктура → fast exit
+///   3) stale_data — feed протух → не торгуем вслепую
+///
+/// Основная защита позиции лежит на двух слоях:
+///   • Layer 1 — exchange-attached TP/SL (presetStop* + ProtectiveBracketManager)
+///   • Layer 2 — adaptive trailing через bracket_manager_->update_sl()
+///
+/// Метод update_trailing() остаётся — он вычисляет новый уровень SL для Phase 4
+/// push'а на биржу. Локальные close-on-trailing-breach trigger'ы удалены.
 class PositionExitOrchestrator {
 public:
     PositionExitOrchestrator(
@@ -34,38 +43,21 @@ public:
     TrailingUpdate update_trailing(const ExitContext& ctx) const;
 
 private:
-    // --- Hard stops (safety net, cannot be overridden) ---
+    // edge-31 Phase 5: Только три emergency-tier exit checks остаются.
+    // Все alpha-tier exits удалены — их функцию закрывает exchange TP/SL + trailing.
+    //
+    // --- Hard capital stop (safety net на случай отказа exchange SL) ---
     ExitDecision check_fixed_capital_stop(const ExitContext& ctx) const;
-    ExitDecision check_price_stop(const ExitContext& ctx) const;
-
-    // --- Trailing / Chandelier ---
-    ExitDecision check_trailing_stop(const ExitContext& ctx) const;
-
-    // --- Quick profit (fee-aware) ---
-    ExitDecision check_quick_profit(const ExitContext& ctx, const ContinuationState& state) const;
-
-    // --- Partial take-profit (market-aware) ---
-    ExitDecision check_partial_tp(const ExitContext& ctx, const ContinuationState& state) const;
-
-    // --- Continuation value model (heart of the system) ---
-    ContinuationState compute_continuation_state(const ExitContext& ctx) const;
-    ExitDecision check_continuation_value_exit(const ExitContext& ctx, const ContinuationState& state) const;
-
-    // --- Structural exits ---
+    // --- Toxic flow emergency ---
     ExitDecision check_toxic_flow(const ExitContext& ctx) const;
-    ExitDecision check_structural_failure(const ExitContext& ctx) const;
-    ExitDecision check_liquidity_deterioration(const ExitContext& ctx, const ContinuationState& state) const;
-
-    // --- Market-driven exits (Phase 2) ---
-    ExitDecision check_market_regime_exit(const ExitContext& ctx, const ContinuationState& state) const;
-    ExitDecision check_funding_carry_exit(const ExitContext& ctx) const;
+    // --- Stale data emergency ---
     ExitDecision check_stale_data_exit(const ExitContext& ctx) const;
 
-    // --- Reason tree builder ---
+    /// Помощник для построения reason tree (используется emergency-tier exits).
     ExitExplanation build_explanation(ExitSignalType signal,
-                                     const std::string& primary,
-                                     const ContinuationState& state,
-                                     const std::string& counterfactual) const;
+                                       const std::string& primary,
+                                       const ContinuationState& state,
+                                       const std::string& counterfactual) const;
 
     std::shared_ptr<logging::ILogger> logger_;
     std::shared_ptr<clock::IClock> clock_;

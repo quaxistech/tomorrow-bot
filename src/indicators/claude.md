@@ -2,27 +2,31 @@
 
 ## Назначение
 
-Каноническая реализация классических технических индикаторов. Нет state — функции принимают полный вектор цен и возвращают результат на последний бар.
+Каноническая реализация классических технических индикаторов + advanced professional indicators для precision сигналов (run93-94 expansion).
 
 ## Границы ответственности
 
-* SMA, EMA, RSI (Wilder, 1978), MACD (Appel, 1979), Bollinger Bands (Bollinger, 2002), ATR/ADX (Wilder), OBV, VWAP, Rolling VWAP, ROC, Z-Score, Volatility (Hull), Momentum.
-* Все параметры по умолчанию следуют каноническим спецификациям (ссылки в комментариях кода).
+* **Classic stateless** (indicator_engine): SMA, EMA, RSI (Wilder), MACD (Appel), Bollinger (Bollinger), ATR/ADX (Wilder), OBV, VWAP, Rolling VWAP, ROC, Z-Score, Volatility (Hull), Momentum.
+* **run93 additions** (indicator_engine): Supertrend (Olson 2008), Stochastic (Lane 1957), EMA pair (9/21) crossover.
+* **run94 advanced** (advanced_indicators): Anchored VWAP, CVD + delta divergence, OI tracker (Wyckoff quadrant), Liquidity Sweep, Queue Position, Spoof Detector, Liquidation Heatmap proxy, Funding Bias, Adaptive Thresholds, Bayesian Signal Combiner.
 
 ## Входы / выходы
 
-* Вход: `std::vector<double>` (prices/highs/lows/closes/volumes) + параметры (period).
-* Выход: `IndicatorResult{value, valid}`, `MacdResult`, `AdxResult`, `BollingerResult`, `VwapResult`.
+* **Classic**: `std::vector<double>` → `IndicatorResult`, `MacdResult`, `AdxResult`, `BollingerResult`, `VwapResult`, `SupertrendResult`, `StochasticResult`, `EmaPairResult`.
+* **Stateful streaming** (run94): `AnchoredVwap`/`CvdTracker`/`OiTracker` — accept on_trade()/on_oi_update() калбэки → snapshot() возвращает текущий state.
+* **Pure helpers**: `detect_liquidity_sweep()`, `estimate_queue_position()`, `detect_spoofing()`, `estimate_liquidation_clusters()`, `evaluate_funding_bias()`, `compute_adaptive_thresholds()`, `combine_signals_bayesian()`.
 
 ## Публичные интерфейсы
 
-* `class IndicatorEngine` — header содержит ~12 методов.
-* DTO: `IndicatorResult`, `AdxResult`, `BollingerResult`, `MacdResult`, `VwapResult` в `indicator_types.hpp`.
+* `class IndicatorEngine` — header содержит ~15 методов (12 classic + Supertrend/Stochastic/EmaPair).
+* DTO classic: `IndicatorResult`, `AdxResult`, `BollingerResult`, `MacdResult`, `VwapResult`, `SupertrendResult`, `StochasticResult`, `EmaPairResult` в `indicator_types.hpp`.
+* DTO advanced: `AnchoredVwapResult`, `CvdResult`, `OiResult`, `LiquiditySweepResult`, `QueuePositionResult`, `SpoofResult`, `LiquidationProxyResult`, `FundingBiasResult`, `AdaptiveThresholds`, `BayesianSignalScore` в `advanced_indicators.hpp`.
 
 ## Внутренние компоненты
 
-* `indicator_engine.hpp/cpp` — реализация.
-* `indicator_types.hpp` — DTO.
+* `indicator_engine.hpp/cpp` — classic + Supertrend/Stochastic/EmaPair.
+* `indicator_types.hpp` — classic DTO.
+* `advanced_indicators.hpp/cpp` — **run94:** Anchored VWAP, CVD, OI, Liquidity Sweep, Queue Position, Spoof, Liquidation, Funding bias, Adaptive thresholds, Bayesian fusion.
 
 ## Зависимости
 

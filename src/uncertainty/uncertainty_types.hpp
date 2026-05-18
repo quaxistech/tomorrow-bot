@@ -38,29 +38,18 @@ namespace tb::uncertainty {
 ///   - Transition (0.05): переходные периоды кратковременны, но с повышенным шумом.
 ///   - Operational (0.05): инфра-проблемы (feed staleness, API latency) — guard.
 ///
-/// Пороги уровней (0.25/0.50/0.75) делят [0,1] на равные квартили.
-/// Hysteresis (up=0.03, down=0.05): асимметрия намеренная — понижение уровня
-///   должно быть более инерционным для предотвращения преждевременного входа.
+/// Scalping refactor 2026-05: 9-мерная композитная модель удалена.
+/// Engine теперь использует max-of-priorities по 4 hard-сигналам
+/// (spread, data freshness, VPIN, book_instability) и среднее по 3 soft-сигналам.
+/// Веса per-dimension (w_*) больше не нужны.
 struct UncertaintyConfig {
-    // --- Веса измерений (должны суммироваться в 1.0) ---
-    double w_regime{0.20};              ///< Вес режимной неопределённости
-    double w_signal{0.15};              ///< Вес сигнальной неопределённости
-    double w_data_quality{0.15};        ///< Вес качества данных
-    double w_execution{0.15};           ///< Вес неопределённости исполнения
-    double w_portfolio{0.10};           ///< Вес портфельной неопределённости
-    double w_ml{0.10};                  ///< Вес ML-неопределённости
-    double w_correlation{0.05};         ///< Вес корреляционной неопределённости
-    double w_transition{0.05};          ///< Вес переходной неопределённости
-    double w_operational{0.05};         ///< Вес операционной неопределённости
-
     // --- Пороги уровней ---
     double threshold_low{0.25};         ///< Граница Low → Moderate
     double threshold_moderate{0.50};    ///< Граница Moderate → High
     double threshold_high{0.75};        ///< Граница High → Extreme
 
     // --- Гистерезис (предотвращает осцилляцию между уровнями) ---
-    double hysteresis_up{0.03};         ///< Дополнительный запас для повышения уровня
-    double hysteresis_down{0.05};       ///< Дополнительный запас для понижения уровня
+    double hysteresis_down{0.05};       ///< Запас для понижения уровня
 
     // --- EMA-сглаживание ---
     double ema_alpha{0.15};             ///< Коэффициент EMA для persistent_score [0,1]
@@ -72,13 +61,6 @@ struct UncertaintyConfig {
     // --- Cooldown ---
     int consecutive_extreme_for_cooldown{3}; ///< Число подряд Extreme для активации кулдауна
     int64_t cooldown_duration_ns{60'000'000'000LL}; ///< Длительность кулдауна (нс)
-    int consecutive_high_for_defensive{3};   ///< Число подряд High для DefensiveOnly
-
-    // --- Execution uncertainty: порог ликвидности ---
-    /// Порог liquidity_ratio для штрафа: если ratio < threshold, исполнение затруднено.
-    /// liquidity_ratio ∈ [0,1] (upstream: min(bid,ask) / 0.5*(bid+ask)).
-    /// Значение 0.5 означает: одна сторона ≤50% средней глубины → асимметрия стакана.
-    double liquidity_ratio_penalty_threshold{0.5};
 };
 
 // ─── Измерения неопределённости ──────────────────────────────────

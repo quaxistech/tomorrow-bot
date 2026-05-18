@@ -1,31 +1,40 @@
-# `src/ml` — ML-компоненты
+# `src/ml` — ML-компоненты (минимальный набор)
 
 ## Назначение
 
-Набор статистических/ML моделей для адаптации стратегии: байесовские параметры, multi-armed bandit (Thompson), entropy filter, microstructure fingerprinting, liquidation cascade detection, multi-asset correlation, regime ensemble, calibration, meta-labeling.
+Набор статистических/ML-моделей для адаптации стратегии: байесовские параметры, multi-armed bandit (Thompson), entropy filter, microstructure fingerprinting, liquidation cascade detection, multi-asset correlation.
 
-## Границы ответственности
+> **Scalping refactor (2026-05):** Удалены неиспользуемые модули `regime_ensemble`, `meta_label`, `calibration` (~1387 LOC + тесты). Они были инициализированы, но не вызывались из pipeline. Активные ML-компоненты — те, что реально гейтят или модулируют решения на каждом тике/входе.
 
-* Подавление шумных сигналов (entropy filter, fingerprint suppress).
-* Адаптация параметров стратегии под наблюдаемое поведение (Bayesian).
-* Выбор момента входа (Thompson sampling: EnterNow/Wait1/Wait2/...).
-* Распознавание мульти-активных режимов (`CorrelationMonitor`).
-* Контроль каскадной ликвидации.
-* Калибровка вероятностей (`calibration`).
-* Meta-labeling (advanced filter сигналов).
+## Активные компоненты
 
-## Публичные интерфейсы (по головным заголовкам)
+| Компонент | Hot-path | Использование |
+|-----------|----------|---------------|
+| `EntropyFilter` | per-tick | блокирует тик при `is_noisy()` (gate в pipeline) |
+| `LiquidationCascadeDetector` | per-tick | блокирует вход при `is_cascade_likely()` |
+| `CorrelationMonitor` | per-tick | модулирует `combined_risk_multiplier` в `MlSignalSnapshot::compute_aggregates()` |
+| `MicrostructureFingerprinter` | per-entry | блокирует вход если `fp_edge < -0.1` |
+| `BayesianAdapter` | per-entry (после ≥20 observations) | адаптирует `conviction_threshold` и `atr_stop_mult` |
+| `ThompsonSampler` | per-entry | выбирает `EnterNow` / `Wait1..N` (multi-armed bandit) |
 
-* `class BayesianAdapter` — обновление параметров стратегии через Bayesian update.
-* `class ThompsonSampler` — multi-armed bandit для выбора `EntryAction ∈ {EnterNow, Wait1..N}`.
-* `class EntropyFilter` — фильтрует сигналы по cross-entropy.
-* `class MicrostructureFingerprinter` — отпечаток рынка (для записи и сравнения).
-* `class LiquidationCascadeDetector` — оценка каскадных ликвидаций.
-* `class CorrelationMonitor` — multi-asset correlation (BTC/ETH reference feeds).
-* `class RegimeEnsemble` — ensemble классификатор поверх `RegimeEngine`.
-* `Calibration` — вероятностная калибровка.
-* `MetaLabel` — meta-labeling (Lopez de Prado).
-* `MlSignalSnapshot` — DTO с агрегированным ML state.
+## Публичные интерфейсы
+
+* `BayesianAdapter` — Bayesian update параметров стратегии.
+* `ThompsonSampler` — multi-armed bandit для `EntryAction ∈ {EnterNow, Wait1..N}`.
+* `EntropyFilter` — cross-entropy фильтрация шумных сигналов.
+* `MicrostructureFingerprinter` — отпечаток рынка для записи + сравнения.
+* `LiquidationCascadeDetector` — оценка каскадных ликвидаций.
+* `CorrelationMonitor` — multi-asset correlation (BTC/ETH reference feeds).
+* `MlSignalSnapshot` — агрегатное DTO для downstream consumer'ов.
+
+## Что было удалено
+
+* `regime_ensemble.{hpp,cpp}` (281 LOC) — не вызывался.
+* `meta_label.{hpp,cpp}` (351 LOC) — не вызывался.
+* `calibration.{hpp,cpp}` (276 LOC) — не вызывался; импортировался только из удалённого `regime_ensemble`.
+* Соответствующие тесты в `tests/unit/ml/`.
+
+`MlSignalSnapshot` сохранил структуру для downstream consumer'ов — поля, специфичные для удалённых компонентов, удалены либо игнорируются.
 
 ## Внутренние компоненты
 
@@ -35,10 +44,7 @@
 * `microstructure_fingerprint.hpp/cpp`.
 * `liquidation_cascade.hpp/cpp`.
 * `correlation_monitor.hpp/cpp`.
-* `regime_ensemble.hpp/cpp`.
-* `calibration.hpp/cpp`.
-* `meta_label.hpp/cpp`.
-* `ml_signal_types.hpp` — DTO + `EntryAction`.
+* `ml_signal_types.hpp` — `MlSignalSnapshot`, `EntryAction`.
 
 ## Зависимости
 
@@ -49,52 +55,32 @@
 
 ```
 TradingPipeline на каждом тике:
-  bayesian_adapter_.update(features, last_outcome)
-  fingerprint = fingerprinter_.compute(features)
-  cascade_signal = cascade_detector_.detect(...)
-  correlation_signal = correlation_monitor_.update(price, ref_prices_BTC_ETH)
-  ml_snapshot = aggregate to MlSignalSnapshot
-  ...
-  decision → если conviction > threshold:
-    entropy_filter_.allow(intent) → bool
-    fingerprint_suppress?
-    thompson_sampler_.select_action(intent.symbol) → {EnterNow, Wait1, ...}
+  entropy_filter_.update(features) → is_noisy? → gate
+  cascade_detector_.on_tick(features) → is_cascade_likely? → gate
+  correlation_monitor_.on_tick(symbol, price, ref_btc, ref_eth) → multiplier
+  fingerprinter_.compute(features) → snapshot field
+  → MlSignalSnapshot (aggregate)
+
+На входе (после decision approval):
+  fingerprinter_.lookup_edge(intent) → fp_edge → gate (< -0.1)
+  if observations ≥ 20: bayesian_adapter_.adapt(...) → modulate threshold/atr_stop
+  thompson_sampler_.select_action(symbol) → EnterNow / Wait1..N
 ```
 
-## Race conditions
+## Concurrency
 
-Каждый компонент имеет собственное состояние, защищённое mutex (или atomic).
+Каждый компонент имеет собственное состояние, защищённое mutex или atomic.
 
-## Ошибки проектирования
+## Текущие риски
 
-* **D-ml-1 (HIGH).** Thompson sampling: `pulls` инкрементируется только на закрытие сделки. До первой сделки `pulls = 0` → exploration deadlock. Исправлено в session 4: «всегда EnterNow до первого feedback».
-* **D-ml-2 (MEDIUM).** Множество ML компонентов агрегируется в `MlSignalSnapshot` — если хотя бы один не готов, весь snapshot имеет `is_valid = false` (требует верификации).
-* **D-ml-3 (MEDIUM).** `MicrostructureFingerprinter` — fingerprint может приобретать high cardinality (зависит от bucketing). Memory bound TBD.
-* **D-ml-4 (LOW).** Калибровка вероятностей не имеет явного recipe для retraining (offline procedure).
+* **D-ml-1 (RESOLVED).** Thompson sampling exploration deadlock (раньше `pulls = 0` → 4/5 arms давали Wait) — исправлено в session 4 (всегда EnterNow до первого feedback). См. memory `session4_fixes.md`.
+* **D-ml-2 (MEDIUM).** Несколько ML-компонентов агрегируются в `MlSignalSnapshot` — при сбое одного `is_valid = false` влияет на весь snapshot.
+* **D-ml-3 (MEDIUM).** `MicrostructureFingerprinter` — fingerprint cardinality зависит от bucketing; memory bound TBD.
 * **D-ml-5 (LOW).** Reference prices для `CorrelationMonitor` обновляются раз в 30 сек через background thread; в gap'ах коррелация замирает.
-
-## Контракты
-
-### `ThompsonSampler::select_action(symbol) → EntryAction`
-
-* **Pre.** Symbol зарегистрирован.
-* **Post.** Возвращена одна из 5 действий. Если `total_pulls = 0` → `EnterNow` (см. D-ml-1).
-* **Invariant.** За многими вызовами с одним symbol распределение действий стремится к Bayesian-optimal mix.
-
-### `EntropyFilter::allow(intent, ...)` → `bool`
-
-* **Pre.** Intent валидный.
-* **Post.** True/False. False — сигнал шумный (high entropy).
-
-## Производственные риски
-
-* **R-ml-1.** Любая модель из ML-стека может «зависнуть» в неверном состоянии (стейл данные, плохой fingerprint). Mitigation: `OperationalGuard` + явный reset на reconcile mismatch.
-* **R-ml-2.** ML-компоненты увеличивают coupling между модулями.
 
 ## Рекомендации
 
-1. Standard ML interface: `class IMlComponent { update(snapshot); query(...); reset(); }`.
-2. Per-component health check: `is_ready()`/`is_drifting()`.
+1. Стандартный ML interface: `class IMlComponent { update(snapshot); query(...); reset(); }`.
+2. Per-component health check: `is_ready()` / `is_drifting()`.
 3. Метрики: thompson distribution, entropy filter accept rate, fingerprint cluster count.
-4. Test: regression на исторических трейсах, comparing decisions с/без каждого ML компонента.
-5. Документировать тренинг пайплайн (если есть offline training).
+4. Регрессия на исторических трейсах, comparing decisions с/без каждого активного ML-компонента.

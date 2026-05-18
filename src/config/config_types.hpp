@@ -71,6 +71,15 @@ struct RiskConfig {
     double max_realized_daily_loss_pct{1.5};      ///< Макс реализованный дневной убыток (%)
     double max_intraday_drawdown_pct{3.0};         ///< Макс внутридневная просадка (%)
     int    utc_cutoff_hour{-1};                   ///< Час UTC прекращения торговли (-1 = отключено)
+    /// B24.1 fix: % капитала, рискуемый margin'ом на одну сделку.
+    /// Раньше hardcoded 0.05 (5%) в portfolio_allocator. С учётом leverage даёт
+    /// notional = capital * pct * leverage. 0.05 на micro-account оптимален.
+    double margin_per_trade_pct{0.05};
+    /// B24.2 fix: target leverage multiplier (от max_leverage) для стабильного notional.
+    /// 0.5 = используем половину max_leverage как target.
+    double target_leverage_multiplier{0.5};
+    /// B24.2 fix: floor для target leverage.
+    double target_leverage_floor{10.0};
 };
 
 /// Настройки режима торговли
@@ -117,36 +126,42 @@ struct PairSelectionConfig {
     double min_liquidity_depth_usdt{50'000.0};   ///< Мин. глубина ликвидности
     bool enable_diversification{true};           ///< Включить диверсификацию корзины
     ScorerConfig scorer;                         ///< Конфигурация scorer-а (вложенный)
+
+    // run90 user request (2026-05-17): idle threshold для замены простаивающих pipelines.
+    /// Минуты без активности, после которых pipeline считается idle (для замены).
+    int idle_threshold_minutes{5};
+    /// Интервал проверки idle pipelines (секунды).
+    int idle_check_interval_sec{30};
+    /// Минимальный интервал между rescans (минуты).
+    int min_rescan_interval_minutes{5};
 };
 
-/// Настройки движка принятия решений (conviction, конфликт-разрешение, advanced features).
-/// Все дефолты калиброваны для USDT-M фьючерсного скальпинга.
+/// Настройки движка принятия решений.
+/// Дефолты калиброваны для USDT-M фьючерсного скальпинга. После scalping
+/// refactor 2026-05 удалены: enable_regime_threshold_scaling, enable_regime_
+/// dominance_scaling, conflict_dominance_threshold, enable_ensemble_conviction,
+/// ensemble_agreement_bonus, ensemble_max_bonus (single-strategy bot).
 struct DecisionConfig {
-    /// Мин. conviction для одобрения сделки.
-    /// Aldridge (2013) «High-Frequency Trading»: сигнал-к-шуму ≥ 0.4–0.6 для прибыльного входа
-    /// в леверидж-инструменты. 0.45 — минимум; production рекомендует ≥ 0.62.
+    /// Мин. conviction для одобрения сделки. Strategy эмитит conviction ∈ [0.50, 0.90];
+    /// 0.45 — базовый порог, фактический threshold адаптируется через severity,
+    /// drawdown_boost и cost_headroom, capped 0.80.
     double min_conviction_threshold{0.45};
-    double conflict_dominance_threshold{0.60};  ///< Мин. доминирование одного направления (BUY/SELL) при конфликте
 
-    // === Advanced features (professional-grade) ===
-    bool enable_regime_threshold_scaling{true};   ///< Адаптивный порог по режиму рынка
-    bool enable_regime_dominance_scaling{true};   ///< Адаптивный порог доминирования по режиму
     bool enable_time_decay{true};                 ///< Time decay для stale-сигналов
     /// Hasbrouck (2007): информационное полувремя ордер-бука 100–1000 мс.
     double time_decay_halflife_ms{500.0};
-    bool enable_ensemble_conviction{true};        ///< Ансамблевый бонус при согласии стратегий
-    /// Breiman (2001): выигрыш ансамбля падает с ростом корреляции. 6% — консервативно.
-    double ensemble_agreement_bonus{0.06};
-    double ensemble_max_bonus{0.15};              ///< Макс. бонус от ансамбля
+
     bool enable_portfolio_awareness{true};        ///< Учёт просадки/серии убытков в пороге
     /// Thorp (2006) «Kelly Criterion»: пропорционально снижаем ставку при просадке.
     double drawdown_boost_scale{0.02};
-    double drawdown_max_boost{0.08};               ///< Макс. повышение порога от просадки
+    double drawdown_max_boost{0.08};              ///< Макс. повышение порога от просадки
     /// Aronson (2007): серии 5–8 убытков нормальны в прибыльных скальп-системах.
     double consecutive_loss_boost{0.005};
-    bool enable_execution_cost_modeling{true};     ///< Пенальти conviction за spread/slippage
+
+    bool enable_execution_cost_modeling{true};    ///< Пенальти conviction за spread/slippage
     /// Bitget taker ≈ 6 bps + spread 2–5 bps ≈ 10 bps нормы. 50 bps — запас.
     double max_acceptable_cost_bps{50.0};
+
     bool enable_time_skew_detection{true};        ///< Детекция рассинхронизации состояний
 };
 
@@ -322,6 +337,10 @@ struct LeverageEngineConfig {
 
     // Fee rate for liquidation price calc (Bitget USDT-M taker fee)
     double taker_fee_rate{0.0006};       ///< 0.06% Bitget futures taker
+    double maker_fee_rate{0.0002};       ///< 0.02% Bitget futures maker
+    /// Buffer над round-trip fee для recalculation breakeven SL в trailing (bps).
+    /// Используется PeriodicTrailingSl чтобы SL не двигался ниже точки безубытка.
+    double trailing_safety_bps{3.0};
 
     // Leverage change debounce
     int min_leverage_change_delta{2};    ///< Минимальное изменение для API call
@@ -358,6 +377,49 @@ struct FuturesConfig {
     LeverageEngineConfig leverage_engine;     ///< Параметры адаптивного движка плеча
 };
 
+/// Pre-trade gates: signal freshness + net R:R (edge-31 TPSL refactor, Phase 2).
+/// Reject устаревшие сигналы и сделки, у которых net-RR после fees/slippage/funding
+/// слабее минимума.
+struct PreTradeGatesConfig {
+    // ── FreshnessGate ────────────────────────────────────────────────────
+    /// Max возраст сигнала (ms). Сигнал был сформирован в strategy → его контекст
+    /// фиксирован. Если до execute() прошло больше этого окна — сигнал stale.
+    int64_t max_signal_age_ms{500};
+    /// Max ценовой дрейф от signal_snapshot_mid (в bps). Если цена ушла за
+    /// этот порог в неблагоприятную сторону — entry рискует получить fill при
+    /// уже-сместившейся структуре.
+    double max_adverse_price_drift_bps{8.0};
+    /// Max расширение спреда относительно snapshot (в % от исходного значения).
+    /// +50% = спред мог удвоиться → execution cost резко вырос.
+    double max_spread_widen_pct{50.0};
+    /// Min остаток глубины относительно snapshot (в % от исходного значения).
+    /// 50% = доступная глубина книги упала вдвое → ликвидность ушла.
+    double min_depth_remain_pct{50.0};
+
+    // ── NetRRGate ────────────────────────────────────────────────────────
+    /// Минимальный net Risk:Reward после всех costs.
+    /// Скальпинговый порог: 0.5 — допускает короткие движения, где R:R брутто 1.5
+    /// проседает до 0.6-0.8 после fees.
+    double min_net_rr{0.5};
+    /// Предполагаемое проскальзывание на entry+exit (bps на каждом плече).
+    double assumed_slippage_bps_per_leg{2.0};
+    /// Taker-fee в bps (Bitget USDT-M futures: 0.06% = 6 bps).
+    double taker_fee_bps{6.0};
+    /// Maker-fee в bps (Bitget: 0.02% = 2 bps).
+    double maker_fee_bps{2.0};
+    /// Учитывать ли funding rate в стоимости (для коротких scalp — обычно 0).
+    bool include_funding_cost{false};
+    /// Предполагаемое hold time (минуты) для расчёта funding-стоимости.
+    /// Используется только если include_funding_cost=true.
+    double assumed_hold_minutes{2.0};
+
+    // ── Глобальный switch ────────────────────────────────────────────────
+    /// Включить FreshnessGate (default: on).
+    bool freshness_enabled{true};
+    /// Включить NetRRGate (default: on).
+    bool net_rr_enabled{true};
+};
+
 /// Полная конфигурация приложения
 struct AppConfig {
     ExchangeConfig       exchange;         ///< Настройки биржи
@@ -375,6 +437,7 @@ struct AppConfig {
     FuturesConfig        futures;          ///< Настройки фьючерсной торговли
     UncertaintyConfig    uncertainty;      ///< Настройки модуля неопределённости
     OperationalSafetyConfig operational_safety; ///< Operational safety (deadman, sync gates)
+    PreTradeGatesConfig  pre_trade_gates;  ///< Pre-trade gates (freshness + net-RR)
     std::string          config_hash;      ///< SHA-256 хеш файла конфигурации (для аудита)
 };
 

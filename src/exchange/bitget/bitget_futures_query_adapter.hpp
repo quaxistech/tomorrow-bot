@@ -38,6 +38,30 @@ struct FuturesPositionInfo {
     std::string margin_mode;           ///< "isolated" или "crossed"
 };
 
+/// Тип плана (TPSL/обычный stop)
+enum class PlanOrderKind {
+    Unknown,
+    ProfitPlan,   ///< profit_plan / preset TP
+    LossPlan,     ///< loss_plan / preset SL
+    NormalPlan,   ///< обычный trigger plan order
+    PosTPSL       ///< позиция-attached TPSL (pos_profit / pos_loss)
+};
+
+/// Информация о plan-ордере (Bitget orders-plan-pending)
+struct PlanOrderInfo {
+    OrderId order_id{OrderId("")};      ///< plan-orderId биржи
+    OrderId client_order_id{OrderId("")};
+    Symbol symbol{Symbol("")};
+    PositionSide position_side{PositionSide::Long};
+    PlanOrderKind kind{PlanOrderKind::Unknown};
+    Price trigger_price{Price(0.0)};
+    Price execute_price{Price(0.0)};    ///< 0 = market on trigger
+    Quantity size{Quantity(0.0)};
+    std::string trigger_type;           ///< "mark_price" / "fill_price"
+    std::string plan_type;              ///< raw string from API
+    int64_t created_at_ms{0};
+};
+
 /// Адаптер Bitget Mix (Futures) REST API → IExchangeQueryService
 class BitgetFuturesQueryAdapter : public reconciliation::IExchangeQueryService {
 public:
@@ -85,6 +109,19 @@ public:
     /// Прокси к BitgetRestClient::get_server_time_ms().
     [[nodiscard]] int64_t get_server_time_ms();
 
+    /// Получить открытые plan-ордера (preset TP/SL, trigger stop orders) для символа.
+    /// Bitget endpoint: GET /api/v2/mix/order/orders-plan-pending
+    /// @param symbol Фильтр по символу (пустой = все).
+    /// @return Список plan-ордеров с их order_id, trigger_price, plan_type, position_side.
+    /// Virtual для возможности override в unit-тестах ProtectiveBracketManager.
+    [[nodiscard]] virtual Result<std::vector<PlanOrderInfo>>
+    get_open_plan_orders(const Symbol& symbol = Symbol(""));
+
+    /// Bug 2.1 fix: получить Open Interest для символа.
+    /// Bitget endpoint: GET /api/v2/mix/market/open-interest
+    /// @return OI в USDT-эквиваленте (holdingAmount × last_price). 0.0 при ошибке.
+    [[nodiscard]] double get_open_interest_usdt(const Symbol& symbol);
+
 private:
     /// Разобрать JSON-объект ордера → ExchangeOrderInfo
     [[nodiscard]] static reconciliation::ExchangeOrderInfo
@@ -93,6 +130,10 @@ private:
     /// Разобрать JSON-объект позиции → FuturesPositionInfo
     [[nodiscard]] static FuturesPositionInfo
     parse_futures_position(const boost::json::object& obj);
+
+    /// Разобрать JSON-объект plan-ордера → PlanOrderInfo
+    [[nodiscard]] static PlanOrderInfo
+    parse_plan_order(const boost::json::object& obj);
 
     /// Безопасно извлечь строковое поле из JSON-объекта
     [[nodiscard]] static std::string json_str(

@@ -118,7 +118,11 @@ void ThompsonSampler::record_reward(EntryAction action, double reward) {
             // EnterNow. reward_count counts only actual reward observations.
             ++arm.reward_count;
 
-            const double mag = std::min(std::abs(reward), 1.0);
+            // B19.1: reward magnitude cap. На крипто-scalping reward'ы обычно
+            // в bps (-50...+200), но в текущей системе передаются нормализованные
+            // [-1, 1]. Cap=1 сохраняет shape Beta distribution.
+            constexpr double kRewardMagCap = 1.0;
+            const double mag = std::min(std::abs(reward), kRewardMagCap);
             if (reward > config_.reward_threshold) {
                 arm.alpha += 1.0 + config_.magnitude_bonus * mag;
                 arm.consecutive_losses = 0;
@@ -162,14 +166,22 @@ std::vector<BetaArm> ThompsonSampler::get_arms() const {
 EntryAction ThompsonSampler::best_action() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Лучшее действие по среднему α/(α+β) — ожидаемая вероятность успеха
-    double best_mean = -1.0;
+    // B19.5 fix: используем lower confidence bound вместо чистого mean.
+    // На малых выборках LCB штрафует руки с малым числом наблюдений,
+    // защищая от ложного "лучший action" с 1 удачным trade'ом.
+    double best_lcb = -1.0;
     EntryAction best = EntryAction::EnterNow;
 
     for (const auto& arm : arms_) {
-        double mean = numeric::safe_div(arm.alpha, arm.alpha + arm.beta, 0.0);
-        if (mean > best_mean) {
-            best_mean = mean;
+        const double n = arm.alpha + arm.beta;
+        const double mean = numeric::safe_div(arm.alpha, n, 0.0);
+        // Стандартное отклонение Beta: sqrt(αβ / [(α+β)²·(α+β+1)])
+        const double var = (arm.alpha * arm.beta) / (n * n * (n + 1.0));
+        const double sd = numeric::safe_sqrt(var);
+        // LCB: mean − 1.96·sd (95% lower CI). На большой выборке sd→0, LCB→mean.
+        const double lcb = mean - 1.96 * sd;
+        if (lcb > best_lcb) {
+            best_lcb = lcb;
             best = arm.action;
         }
     }

@@ -4,6 +4,16 @@
 
 Единственный шлюз отправки ордеров на биржу. Принимает `TradeIntent + RiskDecision + ExecutionAlphaResult + UncertaintySnapshot`, делегирует подсистемам (registry, planner, fill_processor, cancel_manager, recovery_manager, exec_metrics), вызывает `IOrderSubmitter`, возвращает `OrderId`.
 
+> **Maker-first execution (scalping refactor 2026-05):**
+> * `ExecutionPlanner::choose_style` теперь маппит `ExecutionStyle::PostOnly`/`Passive` в `PlannedExecutionStyle::PostOnlyLimit` (раньше шло в `PassiveLimit`/`Limit` без `force=post_only` — фактически терялась maker-гарантия).
+> * `FillProcessor` различает maker/taker fees: для `OrderType::PostOnly`/`Limit`/`StopLimit` используется `kDefaultMakerFeePct = 0.0002` (2 bps), для `Market`/`StopMarket` — `kDefaultTakerFeePct = 0.0006` (6 bps). Раньше всё считалось как taker → искажённый PnL для maker-fills.
+> * Defaults: `urgency_aggressive_threshold = 0.80` (раньше 0.50), `postonly_spread_threshold_bps = 12.0` (раньше 8.0). С `intent.urgency = 0.30` от strategy_engine EV-modeling в execution_alpha теперь по умолчанию выбирает PostOnly.
+
+> **edge-31 — Exchange-attached TP/SL (2026-05-16):**
+> * `ExecutionEngine::create_order_record` копирует `attached_tp_sl` из `intent.take_profit_price` / `intent.stop_loss_price` ТОЛЬКО для `TradeSide::Open`. Close/Reduce ордера не несут bracket.
+> * `BitgetFuturesOrderSubmitter::build_place_order_json` сериализует `presetStopSurplusPrice` / `presetStopLossPrice` если `attached_tp_sl.has_any()`. Trigger type — MarkPrice (защита от wick stop hunts).
+> * `submit_plan_order` / `cancel_plan_order` помечены `virtual` — используются `ProtectiveBracketManager` для standalone fallback и trailing cancel-and-replace.
+
 ## Границы ответственности
 
 * Валидация input'ов (intent vs risk vs exec_alpha consistency).

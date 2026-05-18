@@ -16,10 +16,14 @@ SymbolScore PairRanker::compute(const SymbolFeatures& features,
     s.orderbook_score = features.orderbook.score;
     s.trend_quality_score = features.trend_quality.score;
 
-    // Execution quality: combines spread + depth + vol/spread ratio
+    // Execution quality: combines spread + depth + vol/spread ratio.
+    // B13.1/B13.2: saturation thresholds можно вынести в ScannerConfig для
+    // per-market калибровки.
+    constexpr double kDepthSaturationUsdt = 200'000.0;
+    constexpr double kVolSpreadSaturation = 10.0;
     s.execution_quality_score = (features.spread.score * 0.4 +
-                                  std::min(features.liquidity.total_depth_near_mid / 200'000.0, 1.0) * 0.3 +
-                                  std::min(features.volatility.vol_to_spread_ratio / 10.0, 1.0) * 0.3);
+        std::min(features.liquidity.total_depth_near_mid / kDepthSaturationUsdt, 1.0) * 0.3 +
+        std::min(features.volatility.vol_to_spread_ratio / kVolSpreadSaturation, 1.0) * 0.3);
 
     // Penalties
     s.trap_risk_penalty = traps.total_risk;
@@ -60,8 +64,9 @@ SymbolScore PairRanker::compute(const SymbolFeatures& features,
         depth_comp = std::clamp(depth_comp, 0.0, 1.0);
         double resiliency_comp = std::clamp(features.orderbook.resiliency_score, 0.0, 1.0);
         double vol_quality_comp = std::clamp(features.volatility.vol_quality_score, 0.0, 1.0);
-        // Trade flow: trade_count_1m saturates at 200
-        double trade_flow_comp = std::clamp(features.trend_quality.trade_count_1m / 200.0, 0.0, 1.0);
+        // Trade flow: trade_count_1m saturates at 200. B13.2: эмпирический порог.
+        constexpr double kTradeFlowSaturation = 200.0;
+        double trade_flow_comp = std::clamp(features.trend_quality.trade_count_1m / kTradeFlowSaturation, 0.0, 1.0);
         // Microstructure: body × (1-wick)
         double micro_comp = std::clamp(features.trend_quality.body_to_range_ratio, 0.0, 1.0)
                           * std::max(0.0, 1.0 - features.trend_quality.wick_ratio);
@@ -69,7 +74,9 @@ SymbolScore PairRanker::compute(const SymbolFeatures& features,
         double exec_q_comp = sp.hg_max_slippage_at_10usdt_bps > 0.0
             ? std::clamp(1.0 - features.orderbook.slippage_at_10usdt_bps / sp.hg_max_slippage_at_10usdt_bps, 0.0, 1.0)
             : 0.5;
-        // Regime match — placeholder: high momentum bonus
+        // B5.2: regime_match сейчас аппроксимируется через momentum_persistence.
+        // Полный regime classifier требует pass'a regime snapshot — оставлено
+        // как простой proxy чтобы не блокировать ranking, но это документировано.
         double regime_match_comp = std::clamp(features.trend_quality.momentum_persistence, 0.0, 1.0);
 
         double scalp_positive =

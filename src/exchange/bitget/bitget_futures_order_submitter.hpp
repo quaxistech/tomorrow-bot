@@ -46,13 +46,22 @@ public:
     execution::OrderFillDetail query_order_fill_detail(const OrderId& exchange_order_id, const Symbol& symbol) override;
 
     /// Отправить plan/trigger ордер (exchange-level TP/SL).
-    /// Endpoint: POST /api/v2/mix/order/place-plan
+    /// Endpoint: POST /api/v2/mix/order/place-plan-order
     /// Используется для StopMarket и StopLimit ордеров.
-    execution::OrderSubmitResult submit_plan_order(const execution::OrderRecord& order);
+    /// Virtual для возможности override в unit-тестах ProtectiveBracketManager.
+    virtual execution::OrderSubmitResult submit_plan_order(const execution::OrderRecord& order);
 
     /// Отменить plan/trigger ордер.
     /// Endpoint: POST /api/v2/mix/order/cancel-plan-order
-    bool cancel_plan_order(const OrderId& order_id, const Symbol& symbol);
+    /// Bitget v2 требует обязательное поле planType, которое должно ТОЧНО
+    /// соответствовать типу отменяемого ордера. Значения: normal_plan (наши
+    /// standalone fallback и trailing replace), profit_plan, loss_plan,
+    /// pos_profit, pos_loss (preset TPSL по позиции), track_plan, moving_plan.
+    /// Если передать неверный — биржа отвечает 40812 / 22002, ордер не
+    /// отменяется и остаётся висеть как orphan.
+    /// Virtual для возможности override в unit-тестах ProtectiveBracketManager.
+    virtual bool cancel_plan_order(const OrderId& order_id, const Symbol& symbol,
+                                    const std::string& plan_type = "normal_plan");
 
     /// Установить правила инструмента (precision, min notional, min qty)
     void set_rules(const Symbol& symbol, const ExchangeSymbolRules& rules);

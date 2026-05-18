@@ -247,7 +247,16 @@ struct TradeIntent {
     std::string setup_id;                    ///< Идентификатор сетапа
     SetupType setup_type{SetupType::MomentumContinuation};
     std::optional<Price> stop_reference;     ///< Предлагаемый уровень стопа
+    std::optional<Price> take_profit_price;  ///< Предлагаемый take-profit для exchange-attached TP
+    std::optional<Price> stop_loss_price;    ///< Предлагаемый stop-loss для exchange-attached SL (обычно = stop_reference)
     StrategySignalType signal_type{StrategySignalType::Skip};
+
+    // Signal freshness snapshot — фиксируется в момент формирования intent.
+    // Используется FreshnessGate для отклонения устаревших сигналов перед отправкой ордера.
+    int64_t signal_snapshot_ts_ns{0};        ///< Время снимка контекста (моноклок ns)
+    double signal_snapshot_mid{0.0};         ///< mid_price в момент снимка
+    double signal_snapshot_spread_bps{0.0};  ///< spread в bps в момент снимка
+    double signal_snapshot_depth_usd{0.0};   ///< Доступная глубина USD на 5 уровней в момент снимка
 };
 
 /// Контекст стратегии — входные данные для оценки

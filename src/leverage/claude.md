@@ -2,7 +2,9 @@
 
 ## Назначение
 
-Расчёт оптимального плеча для каждой новой позиции на основе 7 множителей: regime, volatility, drawdown, conviction, funding, adversarial, uncertainty. Накладывается Kelly cap (Half-Kelly per Thorp 2006) и EMA сглаживание. Также рассчитывает `liquidation_price` для isolated margin.
+Расчёт оптимального плеча для каждой новой позиции на основе семи множителей: regime, volatility, drawdown, conviction, funding, adversarial, uncertainty. Накладывается Kelly cap (Half-Kelly per Thorp 2006) и EMA сглаживание. Также рассчитывает `liquidation_price` для isolated margin.
+
+> **Scalping refactor (2026-05):** `uncertainty_multiplier()` нейтрализован для Low/Moderate/High (возвращает 1.0), оставлен только Extreme=0.6 (crisis dampening). Раньше Moderate→0.80, High→0.55, Extreme→0.25 — это double-counted с `uncertainty.size_multiplier`, который применяется в pipeline allocator. Размер уменьшался дважды (size × leverage_factor) и сжимал notional ниже min_notional на малом аккаунте.
 
 ## Границы ответственности
 
@@ -68,10 +70,11 @@ compute_leverage(ctx):
 
 ## Ошибки проектирования
 
-* **D-lev-1 (HIGH).** В pipeline параметр `adversarial_severity` всегда подаётся 0.0 (см. Defect-D1 в корне — adversarial_defense не интегрирован). Эффективно `adv_factor = 1.0` всегда → защита не работает.
-* **D-lev-2 (MEDIUM).** EMA smoothing с фиксированным α = 0.3 — не настраивается из config. При резких изменениях rolling stats EMA лагает.
+* **D-lev-1 (RESOLVED 2026-05).** `adversarial_severity` вычисляется inline в `trading_pipeline.cpp:3944+` (compute_adversarial_severity лямбда) и передаётся в `LeverageContext`. Раньше всегда 0; теперь используется реальный сигнал.
+* **D-lev-2 (UNCERTAINTY DOUBLE-COUNT, RESOLVED 2026-05).** `uncertainty_multiplier()` подавлял leverage параллельно с `uncertainty.size_multiplier` в pipeline allocator. На малом аккаунте это сжимало notional ниже min_notional. Сейчас функция возвращает 1.0 для Low/Moderate/High и 0.6 только для Extreme (crisis dampening) — другие уровни обрабатываются через size в allocator, не через leverage.
 * **D-lev-3 (LOW).** `update_edge_stats` принимает `win_rate ∈ [0,1]` без валидации — bad input может привести к нелогичному kelly_cap.
-* **D-lev-4 (LOW).** `compute_liquidation_price` использует только `mmr` и `taker_fee_rate` — игнорирует funding accrued. Для долгих hold'ов (что не скальпинг, но защита от ошибок) формула неточна.
+* **D-lev-4 (LOW).** `compute_liquidation_price` игнорирует funding accrued. Для скальпинга (hold < 5 min) практически неважно.
+* **D-lev-5 (CONTEXT).** После `EDGE-30-LEV-AUTO` (см. root `claude.md`) в pipeline на каждый order leverage **поднимается** автоматически до значения, при котором `actual_notional / leverage ≈ target_margin (3% от total_capital)`. То есть выход `LeverageEngine` фактически — нижняя граница; при крошечном notional pipeline сам поднимает leverage до `min_leverage` (11×) и выше.
 
 ## Контракты
 

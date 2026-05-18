@@ -328,6 +328,19 @@ struct ScannerResult {
         for (const auto& p : top_pairs) result.push_back(p.symbol);
         return result;
     }
+
+    /// run96: только TRADE_ALLOWED pairs (для финального watchlist).
+    /// NEUTRAL/DoNotTrade pairs занимают pipeline без profit'а.
+    std::vector<std::string> selected_tradable_symbols() const {
+        std::vector<std::string> result;
+        result.reserve(top_pairs.size());
+        for (const auto& p : top_pairs) {
+            if (p.trade_state == TradeState::TradeAllowed) {
+                result.push_back(p.symbol);
+            }
+        }
+        return result;
+    }
 };
 
 // ─── String Conversions ───────────────────────────────────────────────────────

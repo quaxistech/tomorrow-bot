@@ -18,7 +18,8 @@ struct ScalpStrategyConfig {
     // multi-bp альтсы. Калибровка: confidence 0.65 (значимо но не overfit), spread 15bps,
     // expected_move/spread 3× (вместо 5×).
     // EDGE-15 (active trading 2026-05-14): relax conf для active opportunity hunting.
-    double min_setup_confidence{0.55};                 ///< 0.65 → 0.55 (был run15 0.50 в profitable)
+    // run89 calibration (2026-05-17): 0.62 → 0.65 — чуть строже после 3 losses.
+    double min_setup_confidence{0.65};
     double max_trap_risk_for_entry{0.65};               ///< 0.55 → 0.65 (allow moderate manipulation)
     double max_spread_bps_for_entry{15.0};              ///< 12 → 15 bps
     double min_liquidity_ratio{0.3};                    ///< 0.4 → 0.3
@@ -101,6 +102,54 @@ struct ScalpStrategyConfig {
     // ─── Rejection параметры ─────────────────────────────────────────────
     double rejection_bb_extreme{0.85};
     double rejection_min_reversal_momentum{0.002};
+
+    // ─── ATR-based stop / take-profit multipliers (§17 ТЗ, edge-31 TPSL refactor) ──
+    // Stop = mid ∓ atr × stop_mult; TP = mid ± atr × target_mult.
+    //
+    // run95 calibration (2026-05-17): observed slippage 46 bps avg на market close.
+    // SL ATR×0.8 (~70-80 bps) + slippage 40 bps = real loss 110-120 bps.
+    // Решение: wider SL (atr×1.0) → меньше slippage hits, но wider TP сохраняет R:R.
+    // New: SL=ATR×1.0, TP=ATR×1.8. R:R=1.8. Real loss с slippage 10 bps = 110 bps.
+    // Net R:R after costs (12 bps fees + 20 bps slip total) = (180-32)/(100+10) = 1.35.
+    double atr_stop_mult_momentum{1.0};
+    double atr_target_mult_momentum{1.8};
+    double atr_stop_mult_retest{1.2};
+    double atr_target_mult_retest{2.2};
+    double atr_stop_mult_pullback{1.0};
+    double atr_target_mult_pullback{1.8};
+    double atr_stop_mult_rejection{1.2};
+    double atr_target_mult_rejection{2.2};
+
+    // === run106 (audit fix bundle): magic numbers → config ===
+    /// B1.2: fallback ATR при отсутствии setup (fraction от entry).
+    double fallback_atr_fraction{0.005};
+    /// B1.3: порог в bps от entry для классификации PnL win/loss.
+    /// 1 bps = 0.01% — устойчиво к различным размерам позиций.
+    double pnl_threshold_bps{1.0};
+    /// B1.4: cooldown после rejection pipeline (ms).
+    int64_t cooldown_after_rejection_ms{30000};
+    /// B1.5: максимальный возраст setup при подтверждении (ns).
+    int64_t max_signal_age_ns{2'000'000'000LL};
+    /// B1.6: таймаут EntrySent (ms).
+    int64_t entry_sent_timeout_ms{5000};
+    /// B1.7: urgency для intent (для execution_alpha).
+    double default_intent_urgency{0.30};
+    /// B22.1: baseline volatility для adaptive thresholds.
+    double adaptive_baseline_vol{0.003};
+    /// B22.2: divisor для imbalance strength normalization.
+    double imbalance_strength_divisor{0.5};
+    /// B22.3: коэффициенты confidence boost.
+    double imb_strength_weight{0.20};
+    double bayesian_confidence_weight{0.25};
+    /// B22.4: минимальная Bayesian posterior для пропуска фильтра.
+    double bayesian_min_confidence{0.55};
+    /// B22.5: Volume Profile POC проксимити и бонус.
+    double poc_close_distance{0.3};
+    double poc_far_distance{0.8};
+    double poc_close_bonus{0.03};
+    double poc_far_penalty{0.02};
+    /// B22.6: добавочный ADX при SIDEWAYS HTF.
+    double adx_sideways_boost{3.0};
 };
 
 } // namespace tb::strategy

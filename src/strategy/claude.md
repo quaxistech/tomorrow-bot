@@ -2,15 +2,21 @@
 
 ## Назначение
 
-Единственная торговая стратегия системы — скальпинг с 4 внутренними сетапами (Momentum Continuation, Retest, Pullback in Microtrend, Rejection). Реализует `IStrategy` для backward compat. Внутри — state machine, setup detector/validator, position manager.
+Единственная торговая стратегия системы — скальпинг (`StrategyId("scalp_engine")`) с настраиваемым набором сетапов. На production включён только `MomentumContinuation` (EDGE-13/EDGE-15/EDGE-29 в root claude.md). Сетапы `Retest`, `PullbackInMicrotrend`, `Rejection` остаются в коде, но disabled-by-default через `ScalpStrategyConfig::enable_*_scenarios = false` — отключены по data-driven evidence (отрицательный PF).
+
+Реализует `IStrategy` для backward compat. Внутри — state machine, setup detector/validator, position manager.
+
+> **Maker-first execution (scalping refactor 2026-05):** `build_intent` устанавливает `intent.urgency = 0.30` (раньше 0.9). Это позволяет execution_alpha выбрать `PostOnly` через EV-modeling вместо принудительного `Aggressive` (market). Round-trip maker fees 4 bps vs taker 12 bps — ключевое для $15 аккаунта. `build_exit_intent` оставляет urgency 0.9 (1.0 для emergency) — выходы должны быстро crossить spread.
+
+> **edge-31 — TP/SL plumbing (2026-05-16):** `Setup` несёт `tp_reference` (вычисленный по per-setup ATR multipliers, default R:R = 1.5). `build_intent` копирует `setup.stop_reference`/`tp_reference` в `intent.stop_loss_price`/`take_profit_price` для exchange-attached bracket. Дополнительно фиксирует `signal_snapshot_*` (ts/mid/spread/depth) — используется `FreshnessGate` для отклонения stale signals перед execute().
 
 ## Границы ответственности
 
 * State machine SymbolState (11 состояний: Idle→Candidate→…→PositionOpen→…→Cooldown).
-* Setup detection (4 типа).
+* Setup detection (4 типа, на production активен только MomentumContinuation).
 * Setup validation (правила инвалидации).
 * Position management (hold/reduce/exit).
-* Build `TradeIntent` (НЕ ордер!).
+* Build `TradeIntent` (НЕ ордер!) с `urgency = 0.30` для entry, `0.9..1.0` для exit.
 * Notify-API: `notify_position_opened/closed/entry_rejected`.
 
 ## Структура каталога
@@ -27,7 +33,7 @@
 * `class IStrategy` (interface).
 * `class StrategyEngine : IStrategy` — main.
 * `StrategyContext` — input DTO (features + regime + world + uncertainty + position info + risk summary + HTF context).
-* `TradeIntent` — output DTO (НЕ order). Содержит signal_intent, suggested_quantity, conviction, optional limit_price, setup_type, stop_reference.
+* `TradeIntent` — output DTO (НЕ order). Содержит signal_intent, suggested_quantity, conviction, optional limit_price, setup_type, stop_reference, **edge-31:** `take_profit_price`, `stop_loss_price` (exchange-attached bracket prices) + signal freshness snapshot (`signal_snapshot_ts_ns`, `signal_snapshot_mid`, `signal_snapshot_spread_bps`, `signal_snapshot_depth_usd`).
 * `StrategyMeta`, `StrategySignalType`, `SetupType`, `ExitReason`, `SymbolState`, `MarketContextQuality`.
 * `class StrategyRegistry` — реестр (для multi-strategy сценариев, фактически 1).
 
@@ -100,10 +106,11 @@ TradingPipeline → strategy_->evaluate(StrategyContext)
 * **Pre.** Был сгенерирован `EnterLong`/`EnterShort` ранее. State = `EntrySent`.
 * **Post.** State → `PositionOpen`. Position info обновляется в внутреннем state.
 
-### `notify_position_closed()`
+### `notify_position_closed(double pnl = 0.0)`
 
-* **Pre.** State ∈ {`PositionOpen`, `PositionManaging`, `ExitPending`}.
+* **Pre.** State ∈ {`PositionOpen`, `PositionManaging`, `ExitPending`}. Pipeline вызывает с realized PnL.
 * **Post.** State → `Cooldown`. Reset trailing-related state.
+* **run95 consecutive losses tracking**: если `pnl < -0.001` → `consecutive_losses_++`. Если `pnl > 0.001` → reset. При 2+ consecutive losses → cooldown расширяется до 30 min (вместо 90s). Защита от back-to-back wrong-direction repeats на одной паре (SAHARA×2, OPG×2 в run95).
 
 ## Производственные риски
 

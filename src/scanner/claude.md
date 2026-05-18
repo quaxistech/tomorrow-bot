@@ -141,6 +141,20 @@ struct ScalpingProfile {
 
 `scalping.enabled = false` → legacy ranking. Существующие интерфейсы `ScannerResult` и `ScannerEngine::scan()` не изменены.
 
+## run90 calibration (2026-05-17): thin orderbook filter
+
+После анализа FFUSDT/OPGUSDT (висели часами на тонкой ликвидности с OB score 0.04-0.07):
+
+```cpp
+// scanner_config.hpp
+double min_orderbook_depth_usdt{30'000.0};      // 20k → 30k (run90)
+double micro_min_orderbook_depth_usdt{5'000.0}; // 1500 → 5000 (run90)
+```
+
+В `production.yaml`:
+- `min_volume_usdt: 2000000` (было 800k) — для реальной активности
+- micro orderbook depth применяется при `capital < micro_account_capital_threshold_usdt=$100`
+
 ## Future work (Phase 3+)
 
 - `MarketRegimeDetector` (BTC/ETH 5m → global tag)

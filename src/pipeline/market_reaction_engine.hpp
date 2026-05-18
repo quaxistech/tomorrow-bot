@@ -84,6 +84,21 @@ struct MarketStateVector {
 
     // ── Price ──
     double mid_price{0.0};
+
+    // ── run94: Advanced indicators (forwarded from FeatureSnapshot) ──
+    int supertrend_trend{0};            ///< +1/-1/0
+    double avwap{0.0};
+    double avwap_price_vs_vwap_bps{0.0};
+    double cvd_normalized{0.0};
+    bool cvd_bullish_divergence{false};
+    bool cvd_bearish_divergence{false};
+    int oi_trend_quadrant{0};
+    double liq_cascade_risk{0.0};
+    int liq_dominant_side{0};
+    double spoof_intensity{0.0};
+    bool funding_valid{false};
+    int funding_recommended_bias{0};
+    double funding_crowding_intensity{0.0};
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -160,7 +175,10 @@ struct EntryQuality {
 // ═══════════════════════════════════════════════════════════════════════════════
 class MarketReactionEngine {
 public:
-    explicit MarketReactionEngine(std::shared_ptr<logging::ILogger> logger);
+    /// B4.1 fix: taker_fee_pct идёт из config.futures.taker_fee_rate.
+    /// 0.06 = default (0.0006 fraction × 100); VIP пользователи передают меньше.
+    explicit MarketReactionEngine(std::shared_ptr<logging::ILogger> logger,
+                                   double taker_fee_pct = 0.06);
 
     MarketStateVector build_state(
         const features::FeatureSnapshot& snapshot,
@@ -209,6 +227,7 @@ private:
         double lo_shock, double lo_mean_revert);
 
     std::shared_ptr<logging::ILogger> logger_;
+    double taker_fee_pct_{0.06};  ///< B4.1: from config.futures.taker_fee_rate
 };
 
 inline const char* to_string(MarketAction a) {

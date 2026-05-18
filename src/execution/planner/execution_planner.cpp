@@ -158,23 +158,24 @@ PlannedExecutionStyle ExecutionPlanner::choose_style(
         return PlannedExecutionStyle::ReduceOnly;
     }
 
-    // §14: Учесть рекомендацию execution alpha
+    // §14: honour the execution-alpha recommendation.
+    // For a small-account scalper, "Passive" must mean true maker — emit a
+    // PostOnly limit so the exchange cancels rather than letting the order
+    // cross and pay taker (6 bps × 2 round-trip kills our edge).
     using ES = execution_alpha::ExecutionStyle;
     switch (exec_alpha.recommended_style) {
         case ES::Aggressive:
             return PlannedExecutionStyle::AggressiveMarket;
         case ES::PostOnly:
-            // Post-only alpha signal maps to passive limit planning.
-            return PlannedExecutionStyle::PassiveLimit;
+            return PlannedExecutionStyle::PostOnlyLimit;
         case ES::NoExecution:
-            // Не должен дойти сюда (отфильтровано выше), но на всякий случай
             return PlannedExecutionStyle::AggressiveMarket;
         case ES::Passive:
         case ES::Hybrid:
-            break;  // Дальше решаем по спреду/urgency
+            break;
     }
 
-    // §14: Решение по спреду и urgency
+    // §14: Спред-/urgency-fallback.
     double urgency = exec_alpha.urgency_score;
     double spread = market.spread_bps;
 
@@ -183,15 +184,15 @@ PlannedExecutionStyle ExecutionPlanner::choose_style(
     }
 
     if (spread < config_.spread_bps_passive_threshold && urgency < config_.urgency_passive_threshold) {
-        return PlannedExecutionStyle::PassiveLimit;
+        return PlannedExecutionStyle::PostOnlyLimit;
     }
 
-    // §14: Smart fallback — начать с limit, при таймауте → market
+    // Default: SmartFallback (limit-then-market) only if explicitly enabled.
     if (config_.enable_market_fallback) {
         return PlannedExecutionStyle::SmartFallback;
     }
 
-    return PlannedExecutionStyle::AggressiveMarket;
+    return PlannedExecutionStyle::PostOnlyLimit;
 }
 
 OrderType ExecutionPlanner::style_to_order_type(PlannedExecutionStyle style) const {

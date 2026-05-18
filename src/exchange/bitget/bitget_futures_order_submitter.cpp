@@ -390,13 +390,21 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     std::string api_trade_side;
 
     // VERIFIED 2026-05-09 against real Bitget mainnet (см. docs/testnet_validation.md):
-    // В hedge_mode `side` ВСЕГДА совпадает с holdSide direction независимо от tradeSide:
-    //   * close LONG требует side=buy + tradeSide=close + holdSide=long
-    //     (попытка side=sell + close + long даёт code:22002 "No position to close")
-    //   * close SHORT требует side=sell + tradeSide=close + holdSide=short
+    // В hedge_mode v2 биржа определяет позицию ТОЛЬКО по `side`+`tradeSide`
+    // (без `holdSide` в body запроса). `side` ВСЕГДА совпадает с holdSide direction:
+    //   * open  LONG:  side=buy  + tradeSide=open
+    //   * close LONG:  side=buy  + tradeSide=close (попытка side=sell даёт 22002)
+    //   * open  SHORT: side=sell + tradeSide=open
+    //   * close SHORT: side=sell + tradeSide=close
     // Это противоположно one-way mode и интуитивному "close = opposite direction".
-    // Предыдущий комментарий "BUG-S9-01: opposite direction" описывал ИНВЕРТИРОВАННОЕ
-    // поведение, что приводило к 100% rejection всех close-orders. Empirically fixed.
+    // `holdSide` отправляется только для set-leverage / set-margin-mode endpoints.
+    // O2.1 fix: `order.side` (Buy/Sell) ИГНОРИРУЕТСЯ в hedge_mode v2 — биржа
+    // определяет позицию по комбинации `api_side` + `tradeSide`. Маппинг:
+    //   Long  open:  api_side=buy  + tradeSide=open
+    //   Long  close: api_side=buy  + tradeSide=close (verified empirically)
+    //   Short open:  api_side=sell + tradeSide=open
+    //   Short close: api_side=sell + tradeSide=close
+    // `order.side` используется только локально (portfolio.reduce_position для PnL).
     if (order.position_side == PositionSide::Long) {
         api_side = "buy";
     } else {
@@ -464,14 +472,24 @@ std::string BitgetFuturesOrderSubmitter::build_place_order_json(
     }
 
     // === Attached TP/SL (Bitget exchange-level protection) ===
+    // O3.1 fix v2: правильное имя поля по Bitget v2 spec —
+    // `presetStopSurplusTriggerType` / `presetStopLossTriggerType` (не "Type").
+    // Это видно в response orders-plan-pending: поле `stopLossTriggerType`.
+    // По умолчанию Bitget использует "fill_price" (last trade) → SL/TP срабатывают
+    // на wicks. mark_price стабильнее и предотвращает stop-hunts.
     if (order.attached_tp_sl.has_any()) {
+        const char* trig_type_str =
+            (order.attached_tp_sl.trigger_type == execution::TriggerType::MarkPrice)
+            ? "mark_price" : "fill_price";
         if (order.attached_tp_sl.has_tp()) {
             obj["presetStopSurplusPrice"] =
                 sym_rules.format_price(order.attached_tp_sl.stop_surplus_price.get());
+            obj["presetStopSurplusTriggerType"] = trig_type_str;
         }
         if (order.attached_tp_sl.has_sl()) {
             obj["presetStopLossPrice"] =
                 sym_rules.format_price(order.attached_tp_sl.stop_loss_price.get());
+            obj["presetStopLossTriggerType"] = trig_type_str;
         }
     }
 
@@ -559,10 +577,18 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
             result.success = false;
             result.error_message = "Bitget Futures API: [" + code + "] " + msg;
 
-            // Classify API error for structured handling
-            if (code == "40768" || code == "40769") {
-                // Insufficient margin / would trigger liquidation — not retryable
-                logger_->error(kComp, "Ордер отклонён: недостаточная маржа",
+            // Classify API error for structured handling (B2.2 fix: + 40766/22002/40808)
+            if (code == "40768" || code == "40769" || code == "40766") {
+                // Insufficient margin / would trigger liquidation / position size exceeds — not retryable
+                logger_->error(kComp, "Ордер отклонён: недостаточная маржа / position size",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else if (code == "22002") {
+                // Order not found (cancel-side) — likely already filled/cancelled
+                logger_->warn(kComp, "Cancel: ордер уже исполнен/отменён (22002)",
+                    {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
+            } else if (code == "40808") {
+                // Trigger price too close to mark price — not retryable
+                logger_->error(kComp, "Plan: trigger price слишком близко к mark",
                     {{"code", code}, {"msg", msg}, {"symbol", order.symbol.get()}});
             } else if (code == "40773") {
                 // Quantity too small — not retryable
@@ -602,9 +628,9 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_order(
 bool BitgetFuturesOrderSubmitter::cancel_order(const OrderId& order_id, const Symbol& symbol) {
     try {
         boost::json::object obj;
+        // O2.3 fix: marginCoin не требуется для cancel-order по Bitget v2 docs.
         obj["symbol"]      = symbol.get();
         obj["productType"] = futures_config_.product_type;
-        obj["marginCoin"]  = futures_config_.margin_coin;
         obj["orderId"]     = order_id.get();
 
         std::string body = boost::json::serialize(obj);
@@ -882,23 +908,51 @@ std::string BitgetFuturesOrderSubmitter::build_plan_order_json(
         obj["orderType"] = "market";
     } else if (order.order_type == OrderType::StopLimit) {
         obj["orderType"] = "limit";
-        if (order.plan_params.execute_price.get() > 0.0) {
-            obj["executePrice"] = sym_rules.format_price(order.plan_params.execute_price.get());
-        } else if (order.price.get() > 0.0) {
-            obj["executePrice"] = sym_rules.format_price(order.price.get());
-        } else {
+        double exec_price = order.plan_params.execute_price.get();
+        if (exec_price <= 0.0 && order.price.get() > 0.0) {
+            exec_price = order.price.get();
+        }
+        if (exec_price <= 0.0) {
             logger_->error(kComp, "StopLimit plan ордер без execute price",
                 {{"order_id", order.order_id.get()}});
             return "{}";
         }
+        // B2.1 fix: проверяем геометрию trigger vs execute, Bitget отвергнет
+        // невалидную комбинацию через 40766/22002.
+        const double trig = order.plan_params.trigger_price.get();
+        const bool is_close_sell = (order.side == Side::Sell);  // closing long: trigger > execute
+        const bool is_close_buy  = (order.side == Side::Buy);   // closing short: trigger < execute
+        if (is_close_sell && exec_price > trig) {
+            logger_->error(kComp, "StopLimit SELL: executePrice должна быть <= triggerPrice",
+                {{"order_id", order.order_id.get()},
+                 {"trigger", std::to_string(trig)},
+                 {"execute", std::to_string(exec_price)}});
+            return "{}";
+        }
+        if (is_close_buy && exec_price < trig) {
+            logger_->error(kComp, "StopLimit BUY: executePrice должна быть >= triggerPrice",
+                {{"order_id", order.order_id.get()},
+                 {"trigger", std::to_string(trig)},
+                 {"execute", std::to_string(exec_price)}});
+            return "{}";
+        }
+        obj["executePrice"] = sym_rules.format_price(exec_price);
     } else {
         logger_->error(kComp, "Некорректный тип ордера для plan order",
             {{"order_type", std::string(to_string(order.order_type))}});
         return "{}";
     }
 
-    // Self-Trade Prevention for plan/TPSL orders
-    obj["stpMode"] = "cancel_taker";
+    // Bitget Mix v2 требует обязательное поле planType.
+    // Для standalone trigger stop (наш use case через ProtectiveBracketManager
+    // fallback и Phase 4 trailing replace) используем "normal_plan" — обычный
+    // trigger order по триггерной цене с market/limit исполнением.
+    obj["planType"] = "normal_plan";
+
+    // B2.3 fix: для plan-order STP убран. Plan-order — это trigger,
+    // на исполнении становится либо market (taker), либо limit. STP "cancel_taker"
+    // имеет смысл для одновременного выставления двух противоположных ордеров,
+    // которые редки на нашей стороне. Опускаем поле — Bitget default OK.
 
     return boost::json::serialize(obj);
 }
@@ -984,7 +1038,8 @@ execution::OrderSubmitResult BitgetFuturesOrderSubmitter::submit_plan_order(
 // ==================== cancel_plan_order ====================
 
 bool BitgetFuturesOrderSubmitter::cancel_plan_order(
-    const OrderId& order_id, const Symbol& symbol)
+    const OrderId& order_id, const Symbol& symbol,
+    const std::string& plan_type)
 {
     try {
         boost::json::object obj;
@@ -992,6 +1047,11 @@ bool BitgetFuturesOrderSubmitter::cancel_plan_order(
         obj["productType"] = futures_config_.product_type;
         obj["marginCoin"]  = futures_config_.margin_coin;
         obj["orderId"]     = order_id.get();
+        // Bitget v2 обязательно требует planType, и он должен СОВПАДАТЬ с типом
+        // отменяемого ордера. Раньше всегда слали "normal_plan" → отмена preset
+        // TPSL (pos_profit/pos_loss) проваливалась, ордера оставались висеть и
+        // накапливались как orphans (4 поз → 16+ pending).
+        obj["planType"]    = plan_type.empty() ? std::string("normal_plan") : plan_type;
 
         std::string body = boost::json::serialize(obj);
 
@@ -1016,9 +1076,21 @@ bool BitgetFuturesOrderSubmitter::cancel_plan_order(
             return true;
         }
 
+        // O5.1 fix: terminal-state коды должны trеаting as success.
+        // 22002 = No order to cancel (already executed/cancelled)
+        // 40729 = Related plan order not found
+        // 40762 = Order in inactive state
+        // 43011/43012 = order не активен (variant codes)
+        if (code == "22002" || code == "40729" || code == "40762"
+            || code == "43011" || code == "43012") {
+            logger_->info(kComp, "Plan ордер уже в терминальном состоянии",
+                {{"order_id", order_id.get()}, {"code", code}});
+            return true;
+        }
+
         std::string msg = resp_obj.contains("msg")
             ? std::string(resp_obj.at("msg").as_string()) : "";
-        logger_->error(kComp, "Отмена plan ордера отклонена биржей",
+        logger_->warn(kComp, "Отмена plan ордера отклонена биржей",
             {{"code", code}, {"msg", msg}});
         return false;
 

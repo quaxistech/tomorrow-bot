@@ -99,6 +99,37 @@ public:
     IndicatorResult momentum(const std::vector<double>& prices,
                              int period = 20) const;
 
+    // --- run93: New indicators for signal precision ------------------------
+
+    /// Supertrend (Olson, 2008): ATR-based trend follower.
+    /// Принцип: основан на ATR bands around HL2. Trend flips когда цена
+    /// пересекает opposite band. multiplier=3 standard для swing,
+    /// 2.5 для scalping (более чувствительно к change).
+    SupertrendResult supertrend(const std::vector<double>& high,
+                                 const std::vector<double>& low,
+                                 const std::vector<double>& close,
+                                 int atr_period = 10,
+                                 double multiplier = 3.0) const;
+
+    /// Stochastic Oscillator (Lane, 1957): %K and %D in N-bar window.
+    /// %K = (close - low_N) / (high_N - low_N) × 100
+    /// %D = SMA(%K, smooth_d_period)
+    /// Defaults: k_period=14, smooth_k=3, smooth_d=3 — стандарт для дневной
+    /// торговли. Для scalping: 5,3,3.
+    StochasticResult stochastic(const std::vector<double>& high,
+                                 const std::vector<double>& low,
+                                 const std::vector<double>& close,
+                                 int k_period = 14,
+                                 int smooth_k = 3,
+                                 int smooth_d = 3) const;
+
+    /// EMA pair (fast/slow) для micro-trend detection.
+    /// Бычий crossover: fast just crossed above slow (transitioned to up).
+    /// Defaults: 9/21 — стандартная пара для scalping fast micro-trend.
+    EmaPairResult ema_pair(const std::vector<double>& prices,
+                            int fast_period = 9,
+                            int slow_period = 21) const;
+
 private:
     // Computes full EMA series; output[i] valid for i >= period-1
     std::vector<double> ema_series(const std::vector<double>& prices, int period) const;

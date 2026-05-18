@@ -1,5 +1,6 @@
 #include "execution_alpha/execution_alpha_engine.hpp"
 #include "uncertainty/uncertainty_types.hpp"
+#include "indicators/advanced_indicators.hpp"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -424,19 +425,22 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
     double directional_imbalance) const
 {
     switch (style) {
-        case ExecutionStyle::Aggressive:
-            // IOC/Market на ликвидных perpetual futures (~95% full fill учитывая
-            // latency miss и partial fill сценарии; Moallemi & Saglam 2013).
-            return 0.95;
+        case ExecutionStyle::Aggressive: {
+            // B20.1: 95% — типичный IOC fill rate на ликвидных perpetual.
+            // Moallemi & Saglam 2013. Зависит от opposite-side depth — на тонкой
+            // книге partial fill реальнее, но мы не учитываем это здесь.
+            constexpr double kAggressiveFillRate = 0.95;
+            return kAggressiveFillRate;
+        }
 
         case ExecutionStyle::NoExecution:
             return 0.0;
 
         case ExecutionStyle::Passive:
         case ExecutionStyle::PostOnly: {
-            // Базовая вероятность passive fill на крипто-perpetual: ~60%
-            // (Cont & Kukanov 2017: limit order fill rate at best level 40-65%)
-            double fp = 0.60;
+            // B20.2: 60% — base passive fill на crypto perpetual (Cont-Kukanov 2017).
+            constexpr double kPassiveBaseFp = 0.60;
+            double fp = kPassiveBaseFp;
 
             // ── Штраф за широкий спред ─────────────────────────────────
             // BUG-S15-03: max_spread_bps_passive=0 → spread/0 = Inf → fp degraded to -Inf
@@ -481,6 +485,27 @@ double RuleBasedExecutionAlpha::estimate_fill_probability(
                 // Top-of-book churn: unstable best price = harder to stay at front
                 fp -= std::clamp(features.microstructure.top_of_book_churn, 0.0, 1.0)
                     * config_.churn_penalty;
+
+                // Bug 2.3 fix: integrate QueuePositionEstimator. Учитывает наш order_size
+                // относительно best-level depth и queue depletion velocity для расчёта
+                // p_fill_30s. Если below 0.3 — сильно понижаем fp (вряд ли filled).
+                if (features.microstructure.liquidity_valid) {
+                    double order_notional = intent.suggested_quantity.get()
+                                          * features.mid_price.get();
+                    double our_side_depth = (intent.side == Side::Buy)
+                        ? features.microstructure.bid_depth_5_notional
+                        : features.microstructure.ask_depth_5_notional;
+                    // Depletion velocity USD/sec на нашей стороне.
+                    double depletion_usd_per_sec = our_depletion * (our_side_depth / 60.0);
+                    auto qp = indicators::estimate_queue_position(
+                        order_notional, std::max(our_side_depth, 1.0),
+                        depletion_usd_per_sec, 30);
+                    if (qp.valid) {
+                        // Blend Cont-Larrard p_fill в наш fp (weight 0.30).
+                        double blend = 0.30;
+                        fp = fp * (1.0 - blend) + qp.p_fill_30s * blend;
+                    }
+                }
             }
 
             // ── Execution feedback: blend with historical fill rate ──

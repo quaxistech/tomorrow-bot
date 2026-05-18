@@ -332,6 +332,12 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_tracked( "pair_selection.min_liquidity_depth_usdt", "50000"), 50000.0, "pair_selection.min_liquidity_depth_usdt");
     cfg.pair_selection.enable_diversification = parse_bool(
         get_tracked( "pair_selection.enable_diversification", "true"), true, "pair_selection.enable_diversification");
+    cfg.pair_selection.idle_threshold_minutes = parse_int(
+        get_tracked( "pair_selection.idle_threshold_minutes", "5"), 5, "pair_selection.idle_threshold_minutes");
+    cfg.pair_selection.idle_check_interval_sec = parse_int(
+        get_tracked( "pair_selection.idle_check_interval_sec", "30"), 30, "pair_selection.idle_check_interval_sec");
+    cfg.pair_selection.min_rescan_interval_minutes = parse_int(
+        get_tracked( "pair_selection.min_rescan_interval_minutes", "5"), 5, "pair_selection.min_rescan_interval_minutes");
 
     // ScorerConfig (вложенный в pair_selection) — только живые поля, влияющие на runtime
     auto& sc = cfg.pair_selection.scorer;
@@ -346,24 +352,13 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     // ============================================================
     cfg.decision.min_conviction_threshold = parse_double(
         get_tracked( "decision.min_conviction_threshold", "0.45"), 0.45, "decision.min_conviction_threshold");
-    cfg.decision.conflict_dominance_threshold = parse_double(
-        get_tracked( "decision.conflict_dominance_threshold", "0.60"), 0.60, "decision.conflict_dominance_threshold");
 
-    // Advanced decision features
-    cfg.decision.enable_regime_threshold_scaling = parse_bool(
-        get_tracked( "decision.enable_regime_threshold_scaling", "true"), true, "decision.enable_regime_threshold_scaling");
-    cfg.decision.enable_regime_dominance_scaling = parse_bool(
-        get_tracked( "decision.enable_regime_dominance_scaling", "true"), true, "decision.enable_regime_dominance_scaling");
+    // Scalping refactor 2026-05: conflict_dominance_threshold, regime/dominance
+    // scaling и ensemble bonus удалены вместе с committee voting.
     cfg.decision.enable_time_decay = parse_bool(
         get_tracked( "decision.enable_time_decay", "true"), true, "decision.enable_time_decay");
     cfg.decision.time_decay_halflife_ms = parse_double(
         get_tracked( "decision.time_decay_halflife_ms", "500"), 500.0, "decision.time_decay_halflife_ms");
-    cfg.decision.enable_ensemble_conviction = parse_bool(
-        get_tracked( "decision.enable_ensemble_conviction", "true"), true, "decision.enable_ensemble_conviction");
-    cfg.decision.ensemble_agreement_bonus = parse_double(
-        get_tracked( "decision.ensemble_agreement_bonus", "0.06"), 0.06, "decision.ensemble_agreement_bonus");
-    cfg.decision.ensemble_max_bonus = parse_double(
-        get_tracked( "decision.ensemble_max_bonus", "0.15"), 0.15, "decision.ensemble_max_bonus");
     cfg.decision.enable_portfolio_awareness = parse_bool(
         get_tracked( "decision.enable_portfolio_awareness", "true"), true, "decision.enable_portfolio_awareness");
     cfg.decision.drawdown_boost_scale = parse_double(
@@ -433,6 +428,44 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_tracked( "operational_safety.venue_degraded_flatten_ms", "8000"), 8000, "operational_safety.venue_degraded_flatten_ms"));
     cfg.operational_safety.operational_deadman_minutes = static_cast<int>(parse_double(
         get_tracked( "operational_safety.operational_deadman_minutes", "45"), 45, "operational_safety.operational_deadman_minutes"));
+
+    // ── Pre-trade gates (edge-31 TPSL refactor, Phase 2) ──────────────────
+    cfg.pre_trade_gates.max_signal_age_ms = static_cast<int64_t>(parse_double(
+        get_tracked("pre_trade_gates.max_signal_age_ms", "500"), 500.0,
+        "pre_trade_gates.max_signal_age_ms"));
+    cfg.pre_trade_gates.max_adverse_price_drift_bps = parse_double(
+        get_tracked("pre_trade_gates.max_adverse_price_drift_bps", "8.0"), 8.0,
+        "pre_trade_gates.max_adverse_price_drift_bps");
+    cfg.pre_trade_gates.max_spread_widen_pct = parse_double(
+        get_tracked("pre_trade_gates.max_spread_widen_pct", "50.0"), 50.0,
+        "pre_trade_gates.max_spread_widen_pct");
+    cfg.pre_trade_gates.min_depth_remain_pct = parse_double(
+        get_tracked("pre_trade_gates.min_depth_remain_pct", "50.0"), 50.0,
+        "pre_trade_gates.min_depth_remain_pct");
+    cfg.pre_trade_gates.min_net_rr = parse_double(
+        get_tracked("pre_trade_gates.min_net_rr", "0.5"), 0.5,
+        "pre_trade_gates.min_net_rr");
+    cfg.pre_trade_gates.assumed_slippage_bps_per_leg = parse_double(
+        get_tracked("pre_trade_gates.assumed_slippage_bps_per_leg", "2.0"), 2.0,
+        "pre_trade_gates.assumed_slippage_bps_per_leg");
+    cfg.pre_trade_gates.taker_fee_bps = parse_double(
+        get_tracked("pre_trade_gates.taker_fee_bps", "6.0"), 6.0,
+        "pre_trade_gates.taker_fee_bps");
+    cfg.pre_trade_gates.maker_fee_bps = parse_double(
+        get_tracked("pre_trade_gates.maker_fee_bps", "2.0"), 2.0,
+        "pre_trade_gates.maker_fee_bps");
+    cfg.pre_trade_gates.include_funding_cost = parse_bool(
+        get_tracked("pre_trade_gates.include_funding_cost", "false"), false,
+        "pre_trade_gates.include_funding_cost");
+    cfg.pre_trade_gates.assumed_hold_minutes = parse_double(
+        get_tracked("pre_trade_gates.assumed_hold_minutes", "2.0"), 2.0,
+        "pre_trade_gates.assumed_hold_minutes");
+    cfg.pre_trade_gates.freshness_enabled = parse_bool(
+        get_tracked("pre_trade_gates.freshness_enabled", "true"), true,
+        "pre_trade_gates.freshness_enabled");
+    cfg.pre_trade_gates.net_rr_enabled = parse_bool(
+        get_tracked("pre_trade_gates.net_rr_enabled", "true"), true,
+        "pre_trade_gates.net_rr_enabled");
 
     // ── Исполнительная альфа (execution_alpha) ────────────────────────────
     cfg.execution_alpha.max_spread_bps_passive = parse_double(
@@ -626,28 +659,11 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_tracked( "world_model.exhaustion_spike.momentum_abs_min", std::to_string(cfg.world_model.exhaustion.momentum_abs_min)),
         cfg.world_model.exhaustion.momentum_abs_min, "world_model.exhaustion_spike.momentum_abs_min");
 
-    cfg.world_model.fragile_breakout.bb_percent_b_upper = parse_double(
-        get_tracked( "world_model.fragile_breakout.bb_percent_b_upper", std::to_string(cfg.world_model.fragile_breakout.bb_percent_b_upper)),
-        cfg.world_model.fragile_breakout.bb_percent_b_upper, "world_model.fragile_breakout.bb_percent_b_upper");
-    cfg.world_model.fragile_breakout.bb_percent_b_lower = parse_double(
-        get_tracked( "world_model.fragile_breakout.bb_percent_b_lower", std::to_string(cfg.world_model.fragile_breakout.bb_percent_b_lower)),
-        cfg.world_model.fragile_breakout.bb_percent_b_lower, "world_model.fragile_breakout.bb_percent_b_lower");
-    cfg.world_model.fragile_breakout.volatility_5_min = parse_double(
-        get_tracked( "world_model.fragile_breakout.volatility_5_min", std::to_string(cfg.world_model.fragile_breakout.volatility_5_min)),
-        cfg.world_model.fragile_breakout.volatility_5_min, "world_model.fragile_breakout.volatility_5_min");
-    cfg.world_model.fragile_breakout.book_imbalance_abs_min = parse_double(
-        get_tracked( "world_model.fragile_breakout.book_imbalance_abs_min", std::to_string(cfg.world_model.fragile_breakout.book_imbalance_abs_min)),
-        cfg.world_model.fragile_breakout.book_imbalance_abs_min, "world_model.fragile_breakout.book_imbalance_abs_min");
-
-    cfg.world_model.compression.bb_bandwidth_max = parse_double(
-        get_tracked( "world_model.compression.bb_bandwidth_max", std::to_string(cfg.world_model.compression.bb_bandwidth_max)),
-        cfg.world_model.compression.bb_bandwidth_max, "world_model.compression.bb_bandwidth_max");
-    cfg.world_model.compression.atr_normalized_max = parse_double(
-        get_tracked( "world_model.compression.atr_normalized_max", std::to_string(cfg.world_model.compression.atr_normalized_max)),
-        cfg.world_model.compression.atr_normalized_max, "world_model.compression.atr_normalized_max");
-    cfg.world_model.compression.volatility_5_max = parse_double(
-        get_tracked( "world_model.compression.volatility_5_max", std::to_string(cfg.world_model.compression.volatility_5_max)),
-        cfg.world_model.compression.volatility_5_max, "world_model.compression.volatility_5_max");
+    // Scalping refactor 2026-05: world_model.fragile_breakout / .compression /
+    // .fragility / .hysteresis / .history / .feedback / .persistence / .suitability
+    // удалены вместе с старой адаптивной машиной. Парсинг этих ключей убран.
+    // YAML loader тихо игнорирует unknown keys, поэтому существующие production
+    // configs не ломаются.
 
     cfg.world_model.stable_trend.adx_min = parse_double(
         get_tracked( "world_model.stable_trend.adx_min", std::to_string(cfg.world_model.stable_trend.adx_min)),
@@ -672,66 +688,10 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         get_tracked( "world_model.chop_noise.spread_bps_max", std::to_string(cfg.world_model.chop_noise.spread_bps_max)),
         cfg.world_model.chop_noise.spread_bps_max, "world_model.chop_noise.spread_bps_max");
 
-    cfg.world_model.fragility.spread_stress_weight = parse_double(
-        get_tracked( "world_model.fragility.spread_stress_weight", std::to_string(cfg.world_model.fragility.spread_stress_weight)),
-        cfg.world_model.fragility.spread_stress_weight, "world_model.fragility.spread_stress_weight");
-    cfg.world_model.fragility.book_instability_weight = parse_double(
-        get_tracked( "world_model.fragility.book_instability_weight", std::to_string(cfg.world_model.fragility.book_instability_weight)),
-        cfg.world_model.fragility.book_instability_weight, "world_model.fragility.book_instability_weight");
-    cfg.world_model.fragility.volatility_accel_weight = parse_double(
-        get_tracked( "world_model.fragility.volatility_accel_weight", std::to_string(cfg.world_model.fragility.volatility_accel_weight)),
-        cfg.world_model.fragility.volatility_accel_weight, "world_model.fragility.volatility_accel_weight");
-    cfg.world_model.fragility.liquidity_imbalance_weight = parse_double(
-        get_tracked( "world_model.fragility.liquidity_imbalance_weight", std::to_string(cfg.world_model.fragility.liquidity_imbalance_weight)),
-        cfg.world_model.fragility.liquidity_imbalance_weight, "world_model.fragility.liquidity_imbalance_weight");
-    cfg.world_model.fragility.transition_instability_weight = parse_double(
-        get_tracked( "world_model.fragility.transition_instability_weight", std::to_string(cfg.world_model.fragility.transition_instability_weight)),
-        cfg.world_model.fragility.transition_instability_weight, "world_model.fragility.transition_instability_weight");
-    cfg.world_model.fragility.vpin_toxicity_weight = parse_double(
-        get_tracked( "world_model.fragility.vpin_toxicity_weight", std::to_string(cfg.world_model.fragility.vpin_toxicity_weight)),
-        cfg.world_model.fragility.vpin_toxicity_weight, "world_model.fragility.vpin_toxicity_weight");
-
-    cfg.world_model.hysteresis.enabled = parse_bool(
-        get_tracked( "world_model.hysteresis.enabled", cfg.world_model.hysteresis.enabled ? "true" : "false"),
-        cfg.world_model.hysteresis.enabled, "world_model.hysteresis.enabled");
-    cfg.world_model.hysteresis.confirmation_ticks = static_cast<int>(parse_double(
-        get_tracked( "world_model.hysteresis.confirmation_ticks", std::to_string(cfg.world_model.hysteresis.confirmation_ticks)),
-        static_cast<double>(cfg.world_model.hysteresis.confirmation_ticks), "world_model.hysteresis.confirmation_ticks"));
-    cfg.world_model.hysteresis.min_dwell_ticks = static_cast<int>(parse_double(
-        get_tracked( "world_model.hysteresis.min_dwell_ticks", std::to_string(cfg.world_model.hysteresis.min_dwell_ticks)),
-        static_cast<double>(cfg.world_model.hysteresis.min_dwell_ticks), "world_model.hysteresis.min_dwell_ticks"));
-
-    // ── world_model: feedback, history, persistence, suitability ──────────
-    cfg.world_model.feedback.enabled = parse_bool(
-        get_tracked( "world_model.feedback.enabled", cfg.world_model.feedback.enabled ? "true" : "false"),
-        cfg.world_model.feedback.enabled, "world_model.feedback.enabled");
-    cfg.world_model.feedback.ema_alpha = parse_double(
-        get_tracked( "world_model.feedback.ema_alpha", std::to_string(cfg.world_model.feedback.ema_alpha)),
-        cfg.world_model.feedback.ema_alpha, "world_model.feedback.ema_alpha");
-
-    cfg.world_model.history.max_entries = static_cast<size_t>(parse_double(
-        get_tracked( "world_model.history.max_entries", std::to_string(cfg.world_model.history.max_entries)),
-        static_cast<double>(cfg.world_model.history.max_entries), "world_model.history.max_entries"));
-    cfg.world_model.history.tendency_lookback = static_cast<size_t>(parse_double(
-        get_tracked( "world_model.history.tendency_lookback", std::to_string(cfg.world_model.history.tendency_lookback)),
-        static_cast<double>(cfg.world_model.history.tendency_lookback), "world_model.history.tendency_lookback"));
-
-    cfg.world_model.persistence.history_blend_weight = parse_double(
-        get_tracked( "world_model.persistence.history_blend_weight", std::to_string(cfg.world_model.persistence.history_blend_weight)),
-        cfg.world_model.persistence.history_blend_weight, "world_model.persistence.history_blend_weight");
-    cfg.world_model.persistence.min_history_for_empirical = static_cast<size_t>(parse_double(
-        get_tracked( "world_model.persistence.min_history_for_empirical", std::to_string(cfg.world_model.persistence.min_history_for_empirical)),
-        static_cast<double>(cfg.world_model.persistence.min_history_for_empirical), "world_model.persistence.min_history_for_empirical"));
-
-    cfg.world_model.suitability.feedback_blend_weight = parse_double(
-        get_tracked( "world_model.suitability.feedback_blend_weight", std::to_string(cfg.world_model.suitability.feedback_blend_weight)),
-        cfg.world_model.suitability.feedback_blend_weight, "world_model.suitability.feedback_blend_weight");
+    // suitability.hard_veto_threshold кепт для совместимости (engine ignores).
     cfg.world_model.suitability.hard_veto_threshold = parse_double(
         get_tracked( "world_model.suitability.hard_veto_threshold", std::to_string(cfg.world_model.suitability.hard_veto_threshold)),
         cfg.world_model.suitability.hard_veto_threshold, "world_model.suitability.hard_veto_threshold");
-    cfg.world_model.suitability.min_trades_for_feedback = static_cast<size_t>(parse_double(
-        get_tracked( "world_model.suitability.min_trades_for_feedback", std::to_string(cfg.world_model.suitability.min_trades_for_feedback)),
-        static_cast<double>(cfg.world_model.suitability.min_trades_for_feedback), "world_model.suitability.min_trades_for_feedback"));
 
     // ── Секция futures ───────────────────────────────────────────────────
     {
@@ -826,36 +786,11 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     }
 
     // ── Секция uncertainty ───────────────────────────────────────────────
+    // Scalping refactor 2026-05: per-dimension weights (w_*) и dormant флаги
+    // (hysteresis_up, consecutive_high_for_defensive, liquidity_ratio_penalty_threshold)
+    // удалены вместе с 9-мерной моделью.
     {
         auto& u = cfg.uncertainty;
-        u.w_regime = parse_double(
-            get_tracked( "uncertainty.w_regime", std::to_string(u.w_regime)),
-            u.w_regime, "uncertainty.w_regime");
-        u.w_signal = parse_double(
-            get_tracked( "uncertainty.w_signal", std::to_string(u.w_signal)),
-            u.w_signal, "uncertainty.w_signal");
-        u.w_data_quality = parse_double(
-            get_tracked( "uncertainty.w_data_quality", std::to_string(u.w_data_quality)),
-            u.w_data_quality, "uncertainty.w_data_quality");
-        u.w_execution = parse_double(
-            get_tracked( "uncertainty.w_execution", std::to_string(u.w_execution)),
-            u.w_execution, "uncertainty.w_execution");
-        u.w_portfolio = parse_double(
-            get_tracked( "uncertainty.w_portfolio", std::to_string(u.w_portfolio)),
-            u.w_portfolio, "uncertainty.w_portfolio");
-        u.w_ml = parse_double(
-            get_tracked( "uncertainty.w_ml", std::to_string(u.w_ml)),
-            u.w_ml, "uncertainty.w_ml");
-        u.w_correlation = parse_double(
-            get_tracked( "uncertainty.w_correlation", std::to_string(u.w_correlation)),
-            u.w_correlation, "uncertainty.w_correlation");
-        u.w_transition = parse_double(
-            get_tracked( "uncertainty.w_transition", std::to_string(u.w_transition)),
-            u.w_transition, "uncertainty.w_transition");
-        u.w_operational = parse_double(
-            get_tracked( "uncertainty.w_operational", std::to_string(u.w_operational)),
-            u.w_operational, "uncertainty.w_operational");
-
         u.threshold_low = parse_double(
             get_tracked( "uncertainty.threshold_low", std::to_string(u.threshold_low)),
             u.threshold_low, "uncertainty.threshold_low");
@@ -866,9 +801,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
             get_tracked( "uncertainty.threshold_high", std::to_string(u.threshold_high)),
             u.threshold_high, "uncertainty.threshold_high");
 
-        u.hysteresis_up = parse_double(
-            get_tracked( "uncertainty.hysteresis_up", std::to_string(u.hysteresis_up)),
-            u.hysteresis_up, "uncertainty.hysteresis_up");
         u.hysteresis_down = parse_double(
             get_tracked( "uncertainty.hysteresis_down", std::to_string(u.hysteresis_down)),
             u.hysteresis_down, "uncertainty.hysteresis_down");
@@ -889,13 +821,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
         u.cooldown_duration_ns = static_cast<int64_t>(parse_double(
             get_tracked( "uncertainty.cooldown_duration_s", "60"),
             60.0, "uncertainty.cooldown_duration_s") * 1'000'000'000.0);
-        u.consecutive_high_for_defensive = static_cast<int>(parse_double(
-            get_tracked( "uncertainty.consecutive_high_for_defensive", std::to_string(u.consecutive_high_for_defensive)),
-            static_cast<double>(u.consecutive_high_for_defensive), "uncertainty.consecutive_high_for_defensive"));
-
-        u.liquidity_ratio_penalty_threshold = parse_double(
-            get_tracked( "uncertainty.liquidity_ratio_penalty_threshold", std::to_string(u.liquidity_ratio_penalty_threshold)),
-            u.liquidity_ratio_penalty_threshold, "uncertainty.liquidity_ratio_penalty_threshold");
     }
 
     // Fail-fast: если при парсинге обнаружены невалидные значения — не запускаться

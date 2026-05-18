@@ -381,9 +381,20 @@ struct BitgetWsClient::Impl {
                     }
                 }
             }
-            for (const auto& sub_json : retry_channels) {
-                logger->warn(kComp, "Subscription unconfirmed after 5s — retrying");
-                do_subscribe_direct(sub_json);
+            // B9.2/B9.4 fix: batch single-line warning + детали каналов в одной записи.
+            // Раньше каждый ретрай был отдельной WARN строкой.
+            if (!retry_channels.empty()) {
+                std::string ch_list;
+                for (const auto& sub_json : retry_channels) {
+                    if (!ch_list.empty()) ch_list += "; ";
+                    ch_list += sub_json;
+                }
+                logger->warn(kComp, "Subscription unconfirmed after 5s — retrying batch",
+                    {{"count", std::to_string(retry_channels.size())},
+                     {"channels", ch_list.substr(0, 256)}});
+                for (const auto& sub_json : retry_channels) {
+                    do_subscribe_direct(sub_json);
+                }
             }
 
             do_send_on_strand("ping");

@@ -7,6 +7,8 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <cmath>
+#include <cstdio>
 
 namespace tb::execution {
 
@@ -155,7 +157,14 @@ Result<OrderId> ExecutionEngine::execute(
         bool active{true};
         ~CashReservationGuard() {
             if (active && needs_release && portfolio) {
-                try { portfolio->release_cash(order_id); } catch (...) {}
+                // B7.2: исключение в release_cash проглатывается в dtor (RAII semantics),
+                // но запишем в stderr — потеря margin критична и должна быть видна.
+                try { portfolio->release_cash(order_id); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "[CRITICAL] release_cash threw in destructor: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[CRITICAL] release_cash threw unknown in destructor\n");
+                }
             }
         }
     } cash_guard{portfolio_.get(), order.order_id, requires_margin_reserve(order)};
@@ -178,6 +187,33 @@ Result<OrderId> ExecutionEngine::execute(
         registry_.update_order(order);
         // CashGuard release при выходе из scope → атомарная очистка margin.
         exec_metrics_.record_rejection(order, submit_result.error_message);
+
+        // CRITICAL FIX (run115 2026-05-18): обнаружить phantom через 22002 ("No
+        // position to close") и сразу очистить local portfolio чтобы остановить
+        // infinite-loop close-attempts. Биржа авторитет — если "No position",
+        // позиция РЕАЛЬНО закрыта (биржевой SL/TP сработал).
+        if (order.trade_side == TradeSide::Close && portfolio_ &&
+            submit_result.error_message.find("22002") != std::string::npos) {
+            // Очищаем local portfolio для этой стороны позиции — даём ей exchange-truth.
+            auto local_pos = portfolio_->get_position(order.symbol, order.position_side);
+            if (local_pos && local_pos->size.get() > 0.0) {
+                double entry = local_pos->avg_entry_price.get();
+                double size  = local_pos->size.get();
+                double mark  = order.price.get() > 0.0 ? order.price.get() : entry;
+                double pnl_est = (order.position_side == PositionSide::Long)
+                    ? (mark - entry) * size
+                    : (entry - mark) * size;
+                logger_->warn("Execution",
+                    "22002 phantom — local portfolio синхронизируется (exchange-truth)",
+                    {{"symbol", order.symbol.get()},
+                     {"position_side", order.position_side == PositionSide::Long ? "Long" : "Short"},
+                     {"local_size", std::to_string(size)},
+                     {"pnl_estimate", std::to_string(pnl_est)}});
+                portfolio_->close_position(order.symbol, order.position_side,
+                                            Price(mark), pnl_est);
+            }
+        }
+
         logger_->warn("Execution", "Ордер отклонён биржей",
             {{"order_id", order_id_str},
              {"reason", submit_result.error_message}});
@@ -224,10 +260,16 @@ Result<OrderId> ExecutionEngine::execute(
         // Запрашиваем реальный статус fill с биржи через REST order/detail.
         // Если запрос не удался — fallback к оптимистичной оценке (как раньше).
 
+        // B2.4 fix: retry loop с короткими интервалами. Биржа может не успеть
+        // зарегистрировать fill сразу (50-200ms лаг). До 3 попыток с 50/100/150ms backoff.
         OrderFillDetail fill_detail;
         exec_lock.unlock();
-        fill_detail = submitter_->query_order_fill_detail(
-            order.exchange_order_id, order.symbol);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            fill_detail = submitter_->query_order_fill_detail(
+                order.exchange_order_id, order.symbol);
+            if (fill_detail.success && fill_detail.filled_qty.get() > 0.0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+        }
         exec_lock.lock();
 
         Price confirmed_price = market_fill_price;
@@ -721,6 +763,25 @@ OrderRecord ExecutionEngine::create_order_record(
     record.execution_info.fill_policy = default_fill_policy_;
     record.execution_info.expected_fill_price = plan.planned_price;
     record.execution_info.client_order_id = record.order_id.get();
+
+    // edge-31 TPSL refactor: на entry-ордерах прикрепляем биржевой TP/SL
+    // (presetStopSurplusPrice / presetStopLossPrice). Это гарантирует, что
+    // защитные брекеты живут на бирже, а не в локальном tick-loop.
+    // Reduce/Close ордера не должны нести bracket — их роль обратная.
+    if (intent.trade_side == TradeSide::Open) {
+        if (intent.take_profit_price.has_value()
+            && intent.take_profit_price->get() > 0.0
+            && std::isfinite(intent.take_profit_price->get())) {
+            record.attached_tp_sl.stop_surplus_price = *intent.take_profit_price;
+        }
+        if (intent.stop_loss_price.has_value()
+            && intent.stop_loss_price->get() > 0.0
+            && std::isfinite(intent.stop_loss_price->get())) {
+            record.attached_tp_sl.stop_loss_price = *intent.stop_loss_price;
+        }
+        // MarkPrice — устойчивее к манипуляциям ленты сделок (avoid wick stop hunts).
+        record.attached_tp_sl.trigger_type = TriggerType::MarkPrice;
+    }
 
     return record;
 }

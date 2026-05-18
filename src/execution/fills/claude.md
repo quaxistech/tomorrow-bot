@@ -65,6 +65,15 @@ ExecutionEngine::on_fill_event(fill):
   * Иначе: registry FSM обновлен, portfolio обновлён, mark_fill_applied вызван (для terminal fills).
 * **Invariant.** Inv-3 (идемпотентность fills) — нарушение → kill switch.
 
+## run92 critical fix: WS fill price=0 handling
+
+Bitget WS fill channel периодически шлёт `fillPx=0` для market orders. **Раньше (run91)** мы применяли fallback price из `order.execution_info.expected_fill_price`. Это создало **double-apply bug** (AIGENSYNUSDT):
+1. WS event с price=0 → fallback applied → portfolio size=140
+2. REST confirmation через 3ms с реальной ценой → REST process apply (другой trade_id, dedup не сработал) → portfolio size=280
+3. На бирже реально 140 → phantom cleanup через 2 мин обнулил local → exchange-attached SL trigger потом = loss с unreported PnL.
+
+**Решение (run92):** WS event с price=0 теперь **просто skip** (`return false`). REST polling (`process_market_fill`) подтянет fill с реальной ценой однократно. Trade-off: market order может ненадолго (1-3s) висеть в PendingAck до REST confirmation — приемлемо vs sync break.
+
 ## Производственные риски
 
 * **R-fp-1.** Inconsistency между registry и portfolio при partial failure.

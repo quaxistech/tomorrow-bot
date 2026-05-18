@@ -1,12 +1,83 @@
 # Refactor Plan — Tomorrow Bot
 
-**Статус (обновлено 2026-05-07): ВСЕ ДЕФЕКТЫ D1-D14 РЕАЛИЗОВАНЫ В КОДЕ.**
+**Статус (обновлено 2026-05-16, edge-31 exit/TPSL refactor):**
 
-* Сборка clean: `g++-14 -std=c++23 -O3 -DNDEBUG`, 4/4 main targets + 34/34 test targets.
-* Тесты: 690 / 698 passed. 8 failures (idempotency cleanup × 2, file_secret_provider × 2, hedge_pair_manager × 4) — pre-existing, не связаны с правками D1-D14 (мои файлы их не касаются).
-* Дополнительно исправлен pre-existing CMake bug: `tb_resilience` не публиковала `Boost::json` в PUBLIC link interface (нужно для `retry_executor.cpp::classify_error`).
+* Сборка clean: `g++-14 -std=c++23`, все таргеты.
+* Тесты: **659 / 659 passed.**
+* Все D1-D14 + scalping refactor (2026-05-16 первая итерация) сохраняются: реализация описана ниже как design-документ.
 
-Документ ниже фиксирует **дизайны и фактические результаты** реализации.
+## edge-31 — Exit / Position management refactor (2026-05-16)
+
+Полная переработка exit/protection layer на двухслойную архитектуру:
+
+* **Layer 1 — Exchange-attached protection.** Entry order несёт `presetStopLossPrice` /
+  `presetStopSurplusPrice` (Phase 1). Bitget автоматически создаёт pos-attached TP/SL
+  плэн-ордера. `ProtectiveBracketManager` (Phase 3) после fill verify'ит их на бирже,
+  fallback'ит standalone plan если preset не сработал, восстанавливает state при рестарте.
+* **Layer 2 — Adaptive trailing.** `update_trailing_stop` вычисляет новый SL уровень и
+  через `bracket_manager_->update_sl()` (Phase 4) пушит cancel+replace plan-ордер.
+  Локальный close-on-trailing-breach trigger в orchestrator удалён.
+* **Pre-trade gates (Phase 2).** Перед `execution_engine_->execute()` стоят
+  `FreshnessGate` (max_signal_age_ms, adverse_price_drift_bps, spread_widen_pct,
+  depth_remain_pct) и `NetRRGate` (net R:R после fees+slippage+funding).
+* **Exit stack simplification (Phase 5).** Из `PositionExitOrchestrator` удалены 10
+  overlapping exits: `check_price_stop`, `check_trailing_stop`, `check_partial_tp`,
+  `check_quick_profit`, `check_structural_failure`, `check_liquidity_deterioration`,
+  `check_market_regime_exit`, `check_funding_carry_exit`, `compute_continuation_state`,
+  `check_continuation_value_exit`, плюс inline EDGE-30 force_tp_high и
+  fast_adverse_tiered. Остались только 3 emergency-tier: `check_fixed_capital_stop`,
+  `check_toxic_flow`, `check_stale_data_exit`.
+* **TradeJournal (Phase 6).** Row-per-trade телеметрия с `signal_age_ms`, `mfe_bps`,
+  `mae_bps`, `giveback_bps`, `exit_layer` (HardCapital / ExchangeTP / ExchangeSL /
+  TrailingSL / ToxicFlow / StaleData / SignalDriven / Manual).
+
+### Новые модули
+
+* `src/pipeline/pre_trade_gates.{hpp,cpp}` — `FreshnessGate`, `NetRRGate`.
+* `src/pipeline/protective_bracket_manager.{hpp,cpp}` — owner bracket lifecycle.
+* `src/telemetry/trade_journal.{hpp,cpp}` — row-per-trade journal.
+
+### Структурные правки
+
+* `TradeIntent` (`strategy_types.hpp`): добавлены `take_profit_price`, `stop_loss_price`,
+  `signal_snapshot_ts_ns`, `signal_snapshot_mid`, `signal_snapshot_spread_bps`,
+  `signal_snapshot_depth_usd`.
+* `Setup` (`setup_models.hpp`): добавлено `tp_reference`.
+* `ScalpStrategyConfig`: per-setup ATR multipliers (`atr_{stop,target}_mult_{momentum,retest,pullback,rejection}`).
+* `ExecutionEngine::create_order_record` (`execution_engine_new.cpp`): копирует
+  `attached_tp_sl` из intent (только для `TradeSide::Open`).
+* `BitgetFuturesOrderSubmitter::submit_plan_order` / `cancel_plan_order` — `virtual`
+  (для unit-test override).
+* `BitgetFuturesQueryAdapter::get_open_plan_orders` — новый метод (endpoint
+  `/api/v2/mix/order/orders-plan-pending`).
+* `PreTradeGatesConfig` секция в `AppConfig` + production.yaml + config_loader/validator.
+
+### Тесты
+
+* `tests/unit/pipeline/pre_trade_gates_test.cpp` — 18 тестов (FreshnessGate, NetRRGate).
+* `tests/unit/pipeline/protective_bracket_manager_test.cpp` — 10 тестов (lifecycle).
+* `tests/unit/telemetry/trade_journal_test.cpp` — 5 тестов.
+* `tests/unit/execution/execution_test.cpp` — 3 новых TPSL-теста.
+* `tests/unit/pipeline/exit_orchestrator_test.cpp` — переписан под simplified path (7 тестов).
+* Всего: **+36 новых тестов, ~10 obsolete тестов удалены**.
+
+
+
+**Scalping refactor (2026-05-16) — поверх D1-D14:**
+
+* Удалены модули `src/ml/{regime_ensemble,meta_label,calibration}` (~1387 LOC + тесты): zero внешних ссылок.
+* Удалён `src/strategy_allocator/` (~373 LOC + тесты): degenerate при N=1 active strategy. Типы `AllocationResult`/`StrategyAllocation` перенесены в `src/decision/strategy_allocation.hpp`. Вес считается inline в `trading_pipeline.cpp:2911+`.
+* `src/world_model/` переписан (1998→722 LOC, −64%): 9-state адаптивная машина с гистерезисом, transition matrix 9×9, feedback-EMA, multi-driver scoring заменена pure-stateless классификатором. `world_model_history.hpp` удалён.
+* `src/uncertainty/` переписан (1134→539 LOC, −52%): 9-мерная композитная модель → 4 hard-сигнала + 3 soft.
+* `src/decision/` surgical cleanup: BUY/SELL conflict resolution, ensemble bonus, `compute_regime_threshold_factor`, `compute_regime_dominance_threshold` удалены. Conviction threshold переписан в bounded severity-max + cost-headroom формулу с hard cap 0.80.
+* `src/leverage/leverage_engine.cpp::uncertainty_multiplier` нейтрализован для Low/Moderate/High (был double-counted с `uncertainty.size_multiplier`).
+* Maker-first execution path: `intent.urgency` 0.9→0.30; `ExecutionPlanner` маппит `PostOnly`/`Passive` → `PostOnlyLimit`; `FillProcessor` использует maker/taker fee rate по `order_type`. `production.yaml` пере-tюнен (urgency_aggressive_threshold 0.50→0.80, postonly_spread_threshold_bps 8→12).
+* `AdvancedDecisionConfig`/`DecisionConfig`/`UncertaintyConfig`/`WorldModelConfig` очищены от dormant полей; `config_loader`/`config_validator`/`production.yaml` синхронизированы.
+* 5 устаревших EDGE-30-эпохи exit_orchestrator-тестов обновлены под текущую калибровку.
+
+Объёмы: ~−3500 LOC src/ + ~−750 LOC устаревших тестов = ~−4250 LOC чистого сокращения.
+
+Документ ниже фиксирует **дизайны и фактические результаты** D1-D14.
 
 ## Сводка реализаций
 

@@ -127,11 +127,15 @@ TwapOrder SmartTwapExecutor::create_twap_plan(
     double avg_qty = total / static_cast<double>(num_slices);
     std::vector<double> slice_qtys(num_slices);
 
+    // B40.1: front-loading factor — первый slice 120%, последний 80%.
+    constexpr double kFrontloadFirstFactor = 1.2;
+    constexpr double kFrontloadLastFactor  = 0.8;
+    constexpr double kFrontloadRange = kFrontloadFirstFactor - kFrontloadLastFactor;
     for (size_t i = 0; i < num_slices; ++i) {
-        // Линейная интерполяция: первый 1.2×, последний 0.8×
         double factor = 1.0;
         if (num_slices > 1) {
-            factor = 1.2 - 0.4 * static_cast<double>(i) / static_cast<double>(num_slices - 1);
+            factor = kFrontloadFirstFactor - kFrontloadRange *
+                static_cast<double>(i) / static_cast<double>(num_slices - 1);
         }
         slice_qtys[i] = avg_qty * factor;
     }

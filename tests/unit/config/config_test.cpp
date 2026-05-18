@@ -305,14 +305,8 @@ TEST_CASE("Config: DecisionNegativeConvictionFails", "[config]") {
     REQUIRE_FALSE(result.has_value());
 }
 
-TEST_CASE("Config: DecisionEnsembleMaxLessThanBonusFails", "[config]") {
-    ConfigValidator validator;
-    auto cfg = make_valid_config();
-    cfg.decision.ensemble_agreement_bonus = 0.15;
-    cfg.decision.ensemble_max_bonus = 0.05; // < agreement_bonus
-    auto result = validator.validate(cfg);
-    REQUIRE_FALSE(result.has_value());
-}
+// Removed in scalping refactor 2026-05: ensemble bonus path (committee voting)
+// was retired; DecisionConfig.ensemble_* fields no longer exist.
 
 TEST_CASE("Config: DecisionZeroTimeDecayFails", "[config]") {
     ConfigValidator validator;

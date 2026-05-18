@@ -820,4 +820,188 @@ IndicatorResult IndicatorEngine::momentum(const std::vector<double>& prices, int
     return result;
 }
 
+// =============================================================================
+// run93: Supertrend / Stochastic / EMA pair
+// =============================================================================
+
+SupertrendResult IndicatorEngine::supertrend(const std::vector<double>& high,
+                                              const std::vector<double>& low,
+                                              const std::vector<double>& close,
+                                              int atr_period,
+                                              double multiplier) const {
+    SupertrendResult res;
+    const size_t n = close.size();
+    if (high.size() != n || low.size() != n) {
+        res.status = IndicatorStatus::InvalidInput;
+        return res;
+    }
+    if (static_cast<int>(n) < atr_period + 1) {
+        res.status = IndicatorStatus::InsufficientData;
+        return res;
+    }
+
+    std::vector<double> tr(n, 0.0);
+    for (size_t i = 1; i < n; ++i) {
+        double a = high[i] - low[i];
+        double b = std::abs(high[i] - close[i-1]);
+        double c = std::abs(low[i] - close[i-1]);
+        tr[i] = std::max({a, b, c});
+    }
+    std::vector<double> atr(n, 0.0);
+    double sum = 0.0;
+    for (int i = 1; i <= atr_period; ++i) sum += tr[i];
+    atr[atr_period] = sum / atr_period;
+    for (size_t i = atr_period + 1; i < n; ++i) {
+        atr[i] = (atr[i-1] * (atr_period - 1) + tr[i]) / atr_period;
+    }
+
+    std::vector<double> upper_band(n, 0.0);
+    std::vector<double> lower_band(n, 0.0);
+    std::vector<double> final_upper(n, 0.0);
+    std::vector<double> final_lower(n, 0.0);
+    std::vector<int> trend(n, 0);
+    std::vector<double> st(n, 0.0);
+
+    for (size_t i = atr_period; i < n; ++i) {
+        double hl2 = (high[i] + low[i]) / 2.0;
+        upper_band[i] = hl2 + multiplier * atr[i];
+        lower_band[i] = hl2 - multiplier * atr[i];
+
+        if (i == static_cast<size_t>(atr_period)) {
+            final_upper[i] = upper_band[i];
+            final_lower[i] = lower_band[i];
+            trend[i] = (close[i] > final_upper[i]) ? 1 : -1;
+            st[i] = (trend[i] == 1) ? final_lower[i] : final_upper[i];
+            continue;
+        }
+
+        if (upper_band[i] < final_upper[i-1] || close[i-1] > final_upper[i-1]) {
+            final_upper[i] = upper_band[i];
+        } else {
+            final_upper[i] = final_upper[i-1];
+        }
+        if (lower_band[i] > final_lower[i-1] || close[i-1] < final_lower[i-1]) {
+            final_lower[i] = lower_band[i];
+        } else {
+            final_lower[i] = final_lower[i-1];
+        }
+
+        if (trend[i-1] == 1) {
+            trend[i] = (close[i] < final_lower[i]) ? -1 : 1;
+        } else {
+            trend[i] = (close[i] > final_upper[i]) ? 1 : -1;
+        }
+        st[i] = (trend[i] == 1) ? final_lower[i] : final_upper[i];
+    }
+
+    res.valid = true;
+    res.status = IndicatorStatus::Ok;
+    res.value = st[n-1];
+    res.trend = trend[n-1];
+    res.flipped = (n >= 2 && trend[n-1] != 0 && trend[n-2] != 0 && trend[n-1] != trend[n-2]);
+    res.sample_count = static_cast<int>(n);
+    return res;
+}
+
+StochasticResult IndicatorEngine::stochastic(const std::vector<double>& high,
+                                               const std::vector<double>& low,
+                                               const std::vector<double>& close,
+                                               int k_period,
+                                               int smooth_k,
+                                               int smooth_d) const {
+    StochasticResult res;
+    const size_t n = close.size();
+    if (high.size() != n || low.size() != n) {
+        res.status = IndicatorStatus::InvalidInput;
+        return res;
+    }
+    const int min_required = k_period + smooth_k + smooth_d;
+    if (static_cast<int>(n) < min_required) {
+        res.status = IndicatorStatus::InsufficientData;
+        return res;
+    }
+
+    std::vector<double> raw_k(n, 50.0);
+    for (size_t i = k_period - 1; i < n; ++i) {
+        double hh = high[i - k_period + 1];
+        double ll = low[i - k_period + 1];
+        for (size_t j = i - k_period + 2; j <= i; ++j) {
+            hh = std::max(hh, high[j]);
+            ll = std::min(ll, low[j]);
+        }
+        double range = hh - ll;
+        raw_k[i] = (range > 1e-12) ? ((close[i] - ll) / range * 100.0) : 50.0;
+    }
+
+    std::vector<double> smoothed_k(n, 50.0);
+    for (size_t i = k_period + smooth_k - 2; i < n; ++i) {
+        double sum_k = 0.0;
+        for (int j = 0; j < smooth_k; ++j) sum_k += raw_k[i - j];
+        smoothed_k[i] = sum_k / smooth_k;
+    }
+
+    std::vector<double> d(n, 50.0);
+    for (size_t i = k_period + smooth_k + smooth_d - 3; i < n; ++i) {
+        double sum_d = 0.0;
+        for (int j = 0; j < smooth_d; ++j) sum_d += smoothed_k[i - j];
+        d[i] = sum_d / smooth_d;
+    }
+
+    res.valid = true;
+    res.status = IndicatorStatus::Ok;
+    res.k = smoothed_k[n-1];
+    res.d = d[n-1];
+    res.overbought = res.k > 80.0;
+    res.oversold = res.k < 20.0;
+
+    if (n >= 2) {
+        double k_prev = smoothed_k[n-2];
+        double d_prev = d[n-2];
+        bool was_below = k_prev < d_prev;
+        bool is_above = res.k > res.d;
+        res.bull_cross = (was_below && is_above && k_prev < 30.0);
+        res.bear_cross = (!was_below && !is_above && k_prev > 70.0);
+    }
+    res.sample_count = static_cast<int>(n);
+    return res;
+}
+
+EmaPairResult IndicatorEngine::ema_pair(const std::vector<double>& prices,
+                                          int fast_period,
+                                          int slow_period) const {
+    EmaPairResult res;
+    if (fast_period >= slow_period) {
+        res.status = IndicatorStatus::InvalidInput;
+        return res;
+    }
+    if (static_cast<int>(prices.size()) < slow_period + 1) {
+        res.status = IndicatorStatus::InsufficientData;
+        return res;
+    }
+
+    auto fast_series = ema_series(prices, fast_period);
+    auto slow_series = ema_series(prices, slow_period);
+
+    size_t n = prices.size();
+    res.ema_fast = fast_series[n-1];
+    res.ema_slow = slow_series[n-1];
+    res.trend = (res.ema_fast > res.ema_slow) ? 1 : -1;
+    res.valid = true;
+    res.status = IndicatorStatus::Ok;
+    res.sample_count = static_cast<int>(n);
+
+    if (n >= 2 && fast_series[n-2] > 0.0 && slow_series[n-2] > 0.0) {
+        bool was_below = fast_series[n-2] < slow_series[n-2];
+        bool is_above = res.ema_fast > res.ema_slow;
+        res.bull_cross = (was_below && is_above);
+        res.bear_cross = (!was_below && !is_above);
+    }
+
+    double price = prices[n-1];
+    if (price > 0.0) {
+        res.separation_bps = std::abs(res.ema_fast - res.ema_slow) / price * 10000.0;
+    }
+    return res;
+}
+
 } // namespace tb::indicators

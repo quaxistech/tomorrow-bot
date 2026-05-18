@@ -4,7 +4,8 @@ add_library(tb_telemetry STATIC
     file_telemetry_sink.cpp
     incident_detector.cpp
     research_telemetry.cpp
+    trade_journal.cpp
 )
 target_include_directories(tb_telemetry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-target_link_libraries(tb_telemetry PUBLIC tb_common tb_logging tb_metrics Boost::json)
+target_link_libraries(tb_telemetry PUBLIC tb_common tb_clock tb_logging tb_metrics Boost::json)
 target_compile_features(tb_telemetry PUBLIC cxx_std_23)

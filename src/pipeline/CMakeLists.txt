@@ -10,7 +10,11 @@ add_library(tb_pipeline STATIC
     dual_leg_manager.cpp
     pair_lifecycle_engine.cpp
     pair_execution_coordinator.cpp
+    periodic_trailing_sl.cpp
+    pre_trade_gates.cpp
+    protective_bracket_manager.cpp
     rest_worker_pool.cpp
+    stagnant_position_detector.cpp
 )
 
 target_include_directories(tb_pipeline PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -30,7 +34,6 @@ target_link_libraries(tb_pipeline PUBLIC
     tb_regime
     tb_uncertainty
     tb_strategy
-    tb_strategy_allocator
     tb_decision
     tb_portfolio_allocator
     tb_portfolio

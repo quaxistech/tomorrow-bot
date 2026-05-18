@@ -1,8 +1,108 @@
 #include "strategy/setups/setup_lifecycle.hpp"
+#include "indicators/advanced_indicators.hpp"
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 namespace tb::strategy {
+
+namespace {
+
+/// Bug 4.1 fix: extracted Bayesian fusion helper для использования всеми detect_*.
+/// Анализирует 10 advanced indicators через likelihood ratios → posterior P(bullish/bearish).
+/// Возвращает результат Bayesian fusion + полное число signals для caller'а.
+/// caller сам решает reject/accept based on его direction.
+struct BayesianFilterResult {
+    double p_bullish{0.5};
+    double p_bearish{0.5};
+    double confidence{0.0};
+    int signals_count{0};
+};
+
+[[nodiscard]] BayesianFilterResult run_bayesian_indicator_filter(
+    const features::TechnicalFeatures& tech,
+    double mid_price)
+{
+    std::vector<indicators::SignalLikelihood> bayes_signals;
+    auto push_signal = [&](double lr_bullish, double lr_bearish) {
+        if (lr_bullish > 0.0 && lr_bearish > 0.0
+            && std::isfinite(lr_bullish) && std::isfinite(lr_bearish)) {
+            bayes_signals.push_back({lr_bullish, lr_bearish});
+        }
+    };
+
+    // 1. Supertrend trend — hard primary filter.
+    if (tech.supertrend_valid) {
+        if (tech.supertrend_trend == 1)       push_signal(2.0, 0.5);
+        else if (tech.supertrend_trend == -1) push_signal(0.5, 2.0);
+    }
+    // 2. EMA pair (9/21).
+    if (tech.ema_pair_valid) {
+        if (tech.ema_pair_trend == 1)        push_signal(1.7, 0.6);
+        else if (tech.ema_pair_trend == -1)  push_signal(0.6, 1.7);
+    }
+    // 3. Stochastic — overbought/oversold + crossovers.
+    if (tech.stoch_valid) {
+        if (tech.stoch_oversold)              push_signal(1.5, 0.7);
+        else if (tech.stoch_overbought)       push_signal(0.7, 1.5);
+        if (tech.stoch_bull_cross)            push_signal(1.8, 0.6);
+        if (tech.stoch_bear_cross)            push_signal(0.6, 1.8);
+    }
+    // 4. Anchored VWAP — bias + 2σ extremes (mean revert).
+    if (tech.avwap_valid) {
+        if (tech.avwap_price_vs_vwap_bps > 0.0)      push_signal(1.4, 0.7);
+        else if (tech.avwap_price_vs_vwap_bps < 0.0) push_signal(0.7, 1.4);
+        if (mid_price > tech.avwap_upper_2sigma)     push_signal(0.5, 1.8);
+        else if (mid_price < tech.avwap_lower_2sigma) push_signal(1.8, 0.5);
+    }
+    // 5. CVD — taker pressure + divergences.
+    if (tech.cvd_valid) {
+        if (tech.cvd_normalized > 0.2)             push_signal(1.6, 0.6);
+        else if (tech.cvd_normalized < -0.2)       push_signal(0.6, 1.6);
+        if (tech.cvd_bullish_divergence)           push_signal(2.0, 0.5);
+        if (tech.cvd_bearish_divergence)           push_signal(0.5, 2.0);
+    }
+    // 6. Open Interest 4-quadrant Wyckoff.
+    if (tech.oi_valid) {
+        switch (tech.oi_trend_quadrant) {
+            case 1: push_signal(1.5, 0.7); break;
+            case 2: push_signal(0.7, 1.5); break;
+            case 3: push_signal(0.9, 1.2); break;
+            case 4: push_signal(1.2, 0.9); break;
+            default: break;
+        }
+    }
+    // 7. Liquidity sweep — fade wick direction.
+    if (tech.liq_sweep_valid) {
+        if (tech.liq_sweep_high) push_signal(0.4, 2.0);
+        if (tech.liq_sweep_low)  push_signal(2.0, 0.4);
+    }
+    // 8. Funding bias mean revert.
+    if (tech.funding_valid && tech.funding_crowding_intensity > 0.5) {
+        if (tech.funding_recommended_bias == 1)        push_signal(1.4, 0.7);
+        else if (tech.funding_recommended_bias == -1)  push_signal(0.7, 1.4);
+    }
+    // 9. Spoof detection — degrade both directions.
+    if (tech.spoof_valid && tech.spoof_intensity > 0.7) {
+        push_signal(0.85, 0.85);
+    }
+    // 10. Liquidation cascade risk.
+    if (tech.liq_valid && tech.liq_cascade_risk_score > 0.7) {
+        if (tech.liq_dominant_side == 1)       push_signal(0.6, 1.3);
+        else if (tech.liq_dominant_side == -1) push_signal(1.3, 0.6);
+    }
+
+    auto bayes = indicators::combine_signals_bayesian(bayes_signals, 0.5);
+    BayesianFilterResult r;
+    r.p_bullish = bayes.p_bullish;
+    r.p_bearish = bayes.p_bearish;
+    r.confidence = bayes.confidence;
+    r.signals_count = static_cast<int>(bayes_signals.size());
+    return r;
+}
+
+}  // namespace
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SetupDetector
@@ -47,6 +147,12 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
 
     if (!tech.adx_valid || tech.adx < cfg_.adx_min) return std::nullopt;
     if (!tech.momentum_valid) return std::nullopt;
+    // Bug 9.1 fix: hard guard на ATR. Без verified ATR расчёт SL/TP unsafe.
+    // Раньше fallback `mid * 0.005` давал 50 bps SL — слишком tight для high-vol,
+    // слишком wide для stable pairs. Симметрично с другими detect_* которые имеют guard.
+    if (!tech.atr_valid || !std::isfinite(tech.atr_14) || tech.atr_14 <= 0.0) {
+        return std::nullopt;
+    }
 
     double imb = micro.book_imbalance_5;
     double bsr = micro.buy_sell_ratio;
@@ -78,9 +184,13 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
 
     if (!buy_signal && !sell_signal) return std::nullopt;
 
-    // RSI guards
-    if (buy_signal && tech.rsi_valid && tech.rsi_14 > cfg_.rsi_upper_guard) return std::nullopt;
-    if (sell_signal && tech.rsi_valid && tech.rsi_14 < cfg_.rsi_lower_guard) return std::nullopt;
+    // Bug 2.2 fix: Adaptive RSI thresholds — wider при high vol, tighter при low vol.
+    // B22.1 fix: baseline_vol теперь из config.
+    auto adapt = indicators::compute_adaptive_thresholds(
+        tech.volatility_valid ? tech.volatility_5 : cfg_.adaptive_baseline_vol,
+        cfg_.adaptive_baseline_vol);
+    if (buy_signal && tech.rsi_valid && tech.rsi_14 > adapt.rsi_overbought) return std::nullopt;
+    if (sell_signal && tech.rsi_valid && tech.rsi_14 < adapt.rsi_oversold) return std::nullopt;
 
     // BB guards
     if (buy_signal && tech.bb_valid && tech.bb_percent_b > cfg_.bb_max_buy) return std::nullopt;
@@ -93,14 +203,17 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     }
 
     // HTF тренд guard: блокируем вход против СИЛЬНОГО тренда старшего ТФ
-    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
+    // run95 fix: 0.7 → 0.5 — жёстче блокируем counter-trend для уменьшения wrong-direction sigals
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.5) {
         // BUY при очень сильном HTF DOWN — запрещено
         if (buy_signal && ctx.htf_trend_direction == -1) return std::nullopt;
         // SELL при очень сильном HTF UP — запрещено
         if (sell_signal && ctx.htf_trend_direction == 1) return std::nullopt;
     }
-    // При SIDEWAYS HTF — требуем чуть более строгий ADX на рабочем ТФ
-    if (cfg_.block_counter_trend && ctx.htf_trend_direction == 0 && tech.adx < cfg_.adx_min + 3.0) {
+    // При SIDEWAYS HTF — требуем чуть более строгий ADX на рабочем ТФ.
+    // B22.6 fix: boost из config.
+    if (cfg_.block_counter_trend && ctx.htf_trend_direction == 0 &&
+        tech.adx < cfg_.adx_min + cfg_.adx_sideways_boost) {
         return std::nullopt;
     }
 
@@ -110,37 +223,46 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
         if (!ctx.position.has_position) return std::nullopt;
     }
 
+    // Bug 4.1 fix: Bayesian fusion 10 advanced indicators через helper.
+    // B22.4 fix: threshold из config.
+    auto bayes = run_bayesian_indicator_filter(tech, mid);
+    if (buy_signal && bayes.p_bullish < cfg_.bayesian_min_confidence) return std::nullopt;
+    if (sell_signal && bayes.p_bearish < cfg_.bayesian_min_confidence) return std::nullopt;
+
     Side side = buy_signal ? Side::Buy : Side::Sell;
 
-    // Расчёт confidence
-    double imb_strength = std::min(std::abs(imb) / 0.5, 1.0);
+    // Confidence: combine base imbalance strength + Bayesian fusion confidence.
+    // B22.2/B22.3 fix: divisor и weights из config.
+    double imb_strength = std::min(std::abs(imb) / cfg_.imbalance_strength_divisor, 1.0);
     double spread_factor = std::clamp(1.0 - micro.spread_bps / cfg_.max_spread_bps_for_entry, 0.0, 1.0);
-    double confidence = cfg_.base_conviction + imb_strength * spread_factor * 0.3;
+    double confidence = cfg_.base_conviction
+        + imb_strength * spread_factor * cfg_.imb_strength_weight
+        + bayes.confidence * cfg_.bayesian_confidence_weight;
     if (tech.ema_valid) {
         bool trend_aligned = buy_signal ? (tech.ema_20 > tech.ema_50) : (tech.ema_20 < tech.ema_50);
         if (trend_aligned) confidence += cfg_.trend_bonus;
     }
 
-    // ИСПРАВЛЕНИЕ M5: Volume Profile — цена у POC = высоколиквидная зона → усиливает conviction.
-    // Dalton (1990) "Mind Over Markets": POC = fair value, цена тяготеет к нему.
-    // Вход около POC имеет лучший risk/reward, чем на краях value area.
+    // Volume Profile: цена у POC = высоколиквидная зона.
+    // B22.5 fix: POC distances/bonuses теперь из config.
     if (tech.vp_valid && mid > 0.0) {
-        double poc_dist = std::abs(tech.vp_price_vs_poc);  // 0..1: 0=at POC, 1=at VA edge
-        if (poc_dist < 0.3) {
-            // Цена у POC — сильная зона. Бонус за вход с поддержкой Volume Profile.
-            confidence += 0.03;
-        } else if (poc_dist > 0.8) {
-            // Цена на краю Value Area — против VP. Вход рискованнее, снижаем.
-            confidence -= 0.02;
+        double poc_dist = std::abs(tech.vp_price_vs_poc);
+        if (poc_dist < cfg_.poc_close_distance) {
+            confidence += cfg_.poc_close_bonus;
+        } else if (poc_dist > cfg_.poc_far_distance) {
+            confidence -= cfg_.poc_far_penalty;
         }
     }
 
     confidence = std::min(confidence, cfg_.max_conviction);
 
-    // Стоп = ATR-based
-    double atr = (tech.atr_valid && std::isfinite(tech.atr_14) && tech.atr_14 > 0.0)
-                     ? tech.atr_14 : mid * 0.005;
-    double stop = buy_signal ? mid - atr * 2.0 : mid + atr * 2.0;
+    // Стоп = ATR-based, TP = R:R-симметричный (см. edge-31 TPSL refactor).
+    // Bug 9.1 fix: ATR guarded в начале функции — здесь tech.atr_14 always valid.
+    double atr = tech.atr_14;
+    double stop = buy_signal ? mid - atr * cfg_.atr_stop_mult_momentum
+                              : mid + atr * cfg_.atr_stop_mult_momentum;
+    double tp   = buy_signal ? mid + atr * cfg_.atr_target_mult_momentum
+                              : mid - atr * cfg_.atr_target_mult_momentum;
 
     Setup setup;
     setup.id = id;
@@ -149,6 +271,7 @@ std::optional<Setup> SetupDetector::detect_momentum(const StrategyContext& ctx,
     setup.confidence = confidence;
     setup.reference_price = mid;
     setup.stop_reference = stop;
+    setup.tp_reference = tp;
     setup.entry_reference = mid;
     setup.detected_at_ns = now_ns;
     setup.last_check_ns = now_ns;
@@ -205,7 +328,8 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     }
 
     // HTF тренд guard для retest: только при очень сильном тренде
-    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
+    // run95 fix: 0.7 → 0.5 — жёстче блокируем counter-trend для уменьшения wrong-direction sigals
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.5) {
         if (buy_retest && ctx.htf_trend_direction == -1) return std::nullopt;
         if (sell_retest && ctx.htf_trend_direction == 1) return std::nullopt;
     }
@@ -220,6 +344,13 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     if (buy_retest && tech.rsi_valid && tech.rsi_14 > cfg_.rsi_upper_guard) return std::nullopt;
     if (sell_retest && tech.rsi_valid && tech.rsi_14 < cfg_.rsi_lower_guard) return std::nullopt;
 
+    // Bug 4.1 fix: Bayesian fusion 10 advanced indicators.
+    {
+        auto bayes = run_bayesian_indicator_filter(tech, mid);
+        if (buy_retest && bayes.p_bullish < 0.55) return std::nullopt;
+        if (sell_retest && bayes.p_bearish < 0.55) return std::nullopt;
+    }
+
     Side side = buy_retest ? Side::Buy : Side::Sell;
 
     double confidence = cfg_.base_conviction + 0.05;  // Ретест = умеренная уверенность
@@ -229,7 +360,10 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     }
     confidence = std::min(confidence, cfg_.max_conviction);
 
-    double stop = buy_retest ? mid - atr * 2.5 : mid + atr * 2.5;
+    double stop = buy_retest ? mid - atr * cfg_.atr_stop_mult_retest
+                              : mid + atr * cfg_.atr_stop_mult_retest;
+    double tp   = buy_retest ? mid + atr * cfg_.atr_target_mult_retest
+                              : mid - atr * cfg_.atr_target_mult_retest;
 
     Setup setup;
     setup.id = id;
@@ -238,6 +372,7 @@ std::optional<Setup> SetupDetector::detect_retest(const StrategyContext& ctx,
     setup.confidence = confidence;
     setup.reference_price = mid;
     setup.stop_reference = stop;
+    setup.tp_reference = tp;
     setup.entry_reference = mid;
     setup.detected_at_ns = now_ns;
     setup.last_check_ns = now_ns;
@@ -286,7 +421,8 @@ std::optional<Setup> SetupDetector::detect_pullback(const StrategyContext& ctx,
     if (!buy_pullback && !sell_pullback) return std::nullopt;
 
     // HTF тренд guard для pullback: только при очень сильном тренде
-    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.7) {
+    // run95 fix: 0.7 → 0.5 — жёстче блокируем counter-trend для уменьшения wrong-direction sigals
+    if (cfg_.block_counter_trend && std::isfinite(ctx.htf_trend_strength) && ctx.htf_trend_strength > 0.5) {
         if (buy_pullback && ctx.htf_trend_direction == -1) return std::nullopt;
         if (sell_pullback && ctx.htf_trend_direction == 1) return std::nullopt;
     }
@@ -300,9 +436,19 @@ std::optional<Setup> SetupDetector::detect_pullback(const StrategyContext& ctx,
 
     if (sell_pullback && !ctx.futures_enabled && !ctx.position.has_position) return std::nullopt;
 
+    // Bug 4.1 fix: Bayesian fusion 10 advanced indicators.
+    {
+        auto bayes = run_bayesian_indicator_filter(tech, mid);
+        if (buy_pullback && bayes.p_bullish < 0.55) return std::nullopt;
+        if (sell_pullback && bayes.p_bearish < 0.55) return std::nullopt;
+    }
+
     Side side = buy_pullback ? Side::Buy : Side::Sell;
     double atr = tech.atr_14;
-    double stop = buy_pullback ? mid - atr * 2.0 : mid + atr * 2.0;
+    double stop = buy_pullback ? mid - atr * cfg_.atr_stop_mult_pullback
+                                : mid + atr * cfg_.atr_stop_mult_pullback;
+    double tp   = buy_pullback ? mid + atr * cfg_.atr_target_mult_pullback
+                                : mid - atr * cfg_.atr_target_mult_pullback;
 
     double confidence = cfg_.base_conviction + 0.08;  // Пулбэк в тренде = хорошая уверенность
     confidence += cfg_.trend_bonus;  // Тренд всегда подтверждён для pullback
@@ -315,6 +461,7 @@ std::optional<Setup> SetupDetector::detect_pullback(const StrategyContext& ctx,
     setup.confidence = confidence;
     setup.reference_price = mid;
     setup.stop_reference = stop;
+    setup.tp_reference = tp;
     setup.entry_reference = mid;
     setup.detected_at_ns = now_ns;
     setup.last_check_ns = now_ns;
@@ -359,11 +506,21 @@ std::optional<Setup> SetupDetector::detect_rejection(const StrategyContext& ctx,
     if (buy_rejection && tech.rsi_valid && tech.rsi_14 > 35.0) return std::nullopt;
     if (sell_rejection && tech.rsi_valid && tech.rsi_14 < 65.0) return std::nullopt;
 
+    // Bug 4.1 fix: Bayesian fusion 10 advanced indicators.
+    {
+        auto bayes = run_bayesian_indicator_filter(tech, mid);
+        if (buy_rejection && bayes.p_bullish < 0.55) return std::nullopt;
+        if (sell_rejection && bayes.p_bearish < 0.55) return std::nullopt;
+    }
+
     if (sell_rejection && !ctx.futures_enabled && !ctx.position.has_position) return std::nullopt;
 
     Side side = buy_rejection ? Side::Buy : Side::Sell;
     double atr = tech.atr_14;
-    double stop = buy_rejection ? mid - atr * 2.5 : mid + atr * 2.5;
+    double stop = buy_rejection ? mid - atr * cfg_.atr_stop_mult_rejection
+                                 : mid + atr * cfg_.atr_stop_mult_rejection;
+    double tp   = buy_rejection ? mid + atr * cfg_.atr_target_mult_rejection
+                                 : mid - atr * cfg_.atr_target_mult_rejection;
 
     // Rejection = более низкая уверенность (контр-трендовый)
     double confidence = cfg_.base_conviction - 0.02;
@@ -376,6 +533,7 @@ std::optional<Setup> SetupDetector::detect_rejection(const StrategyContext& ctx,
     setup.confidence = confidence;
     setup.reference_price = mid;
     setup.stop_reference = stop;
+    setup.tp_reference = tp;
     setup.entry_reference = mid;
     setup.detected_at_ns = now_ns;
     setup.last_check_ns = now_ns;

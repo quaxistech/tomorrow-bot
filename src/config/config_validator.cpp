@@ -31,6 +31,7 @@ ValidationResult ConfigValidator::validate_detailed(const AppConfig& cfg) const 
     validate_regime(cfg.regime, result);
     validate_futures(cfg.futures, result);
     validate_uncertainty(cfg.uncertainty, result);
+    validate_pre_trade_gates(cfg.pre_trade_gates, result);
     validate_cross(cfg, result);
 
     return result;
@@ -265,20 +266,8 @@ void ConfigValidator::validate_decision(
     if (cfg.min_conviction_threshold <= 0.0 || cfg.min_conviction_threshold >= 1.0) {
         result.add_error("decision.min_conviction_threshold должен быть в диапазоне (0, 1)");
     }
-    if (cfg.conflict_dominance_threshold <= 0.0 || cfg.conflict_dominance_threshold >= 1.0) {
-        result.add_error("decision.conflict_dominance_threshold должен быть в диапазоне (0, 1)");
-    }
     if (cfg.time_decay_halflife_ms <= 0.0) {
         result.add_error("decision.time_decay_halflife_ms должен быть > 0");
-    }
-    if (cfg.ensemble_agreement_bonus < 0.0 || cfg.ensemble_agreement_bonus > 1.0) {
-        result.add_error("decision.ensemble_agreement_bonus должен быть в диапазоне [0, 1]");
-    }
-    if (cfg.ensemble_max_bonus < 0.0 || cfg.ensemble_max_bonus > 1.0) {
-        result.add_error("decision.ensemble_max_bonus должен быть в диапазоне [0, 1]");
-    }
-    if (cfg.ensemble_max_bonus < cfg.ensemble_agreement_bonus) {
-        result.add_error("decision.ensemble_max_bonus не может быть < ensemble_agreement_bonus");
     }
     if (cfg.drawdown_boost_scale < 0.0 || cfg.drawdown_boost_scale > 1.0) {
         result.add_error("decision.drawdown_boost_scale должен быть в диапазоне [0, 1]");
@@ -699,32 +688,7 @@ void ConfigValidator::validate_futures(const FuturesConfig& cfg, ValidationResul
 void ConfigValidator::validate_uncertainty(
     const UncertaintyConfig& cfg, ValidationResult& result) const {
 
-    // Weights must be positive
-    auto check_weight = [&](double w, const char* name) {
-        if (w < 0.0 || w > 1.0) {
-            result.add_error(std::format("uncertainty.{} {} вне диапазона [0, 1]", name, w));
-        }
-    };
-    check_weight(cfg.w_regime, "w_regime");
-    check_weight(cfg.w_signal, "w_signal");
-    check_weight(cfg.w_data_quality, "w_data_quality");
-    check_weight(cfg.w_execution, "w_execution");
-    check_weight(cfg.w_portfolio, "w_portfolio");
-    check_weight(cfg.w_ml, "w_ml");
-    check_weight(cfg.w_correlation, "w_correlation");
-    check_weight(cfg.w_transition, "w_transition");
-    check_weight(cfg.w_operational, "w_operational");
-
-    // Weights should sum to ~1.0 (tolerance 0.01)
-    double total = cfg.w_regime + cfg.w_signal + cfg.w_data_quality + cfg.w_execution +
-                   cfg.w_portfolio + cfg.w_ml + cfg.w_correlation + cfg.w_transition +
-                   cfg.w_operational;
-    if (std::abs(total - 1.0) > 0.01) {
-        result.add_warning(std::format(
-            "uncertainty: сумма весов = {} (ожидается ~1.0)", total));
-    }
-
-    // Thresholds must be ordered: 0 < low < moderate < high <= 1
+    // Thresholds must be ordered: 0 < low < moderate < high <= 1.
     if (cfg.threshold_low <= 0.0 || cfg.threshold_low >= cfg.threshold_moderate) {
         result.add_error("uncertainty: threshold_low должен быть в (0, threshold_moderate)");
     }
@@ -735,30 +699,22 @@ void ConfigValidator::validate_uncertainty(
         result.add_error("uncertainty: threshold_high должен быть <= 1.0");
     }
 
-    // Hysteresis
-    if (cfg.hysteresis_up < 0.0 || cfg.hysteresis_up > 0.2) {
-        result.add_error(std::format("uncertainty.hysteresis_up {} вне [0, 0.2]", cfg.hysteresis_up));
-    }
     if (cfg.hysteresis_down < 0.0 || cfg.hysteresis_down > 0.2) {
         result.add_error(std::format("uncertainty.hysteresis_down {} вне [0, 0.2]", cfg.hysteresis_down));
     }
 
-    // EMA alpha
     if (cfg.ema_alpha <= 0.0 || cfg.ema_alpha >= 1.0) {
         result.add_error(std::format("uncertainty.ema_alpha {} вне (0, 1)", cfg.ema_alpha));
     }
 
-    // Size floor
     if (cfg.size_floor < 0.0 || cfg.size_floor > 0.5) {
         result.add_error(std::format("uncertainty.size_floor {} вне [0, 0.5]", cfg.size_floor));
     }
 
-    // Threshold ceiling
     if (cfg.threshold_ceiling < 1.0 || cfg.threshold_ceiling > 5.0) {
         result.add_error(std::format("uncertainty.threshold_ceiling {} вне [1, 5]", cfg.threshold_ceiling));
     }
 
-    // Cooldown
     if (cfg.consecutive_extreme_for_cooldown < 1 || cfg.consecutive_extreme_for_cooldown > 20) {
         result.add_error(std::format("uncertainty.consecutive_extreme_for_cooldown {} вне [1, 20]",
                                      cfg.consecutive_extreme_for_cooldown));
@@ -766,15 +722,45 @@ void ConfigValidator::validate_uncertainty(
     if (cfg.cooldown_duration_ns < 1'000'000'000LL || cfg.cooldown_duration_ns > 600'000'000'000LL) {
         result.add_error("uncertainty.cooldown_duration_ns вне [1s, 600s]");
     }
-    if (cfg.consecutive_high_for_defensive < 1 || cfg.consecutive_high_for_defensive > 20) {
-        result.add_error(std::format("uncertainty.consecutive_high_for_defensive {} вне [1, 20]",
-                                     cfg.consecutive_high_for_defensive));
-    }
+}
 
-    // Liquidity ratio threshold
-    if (cfg.liquidity_ratio_penalty_threshold <= 0.0 || cfg.liquidity_ratio_penalty_threshold > 1.0) {
-        result.add_error(std::format("uncertainty.liquidity_ratio_penalty_threshold {} вне (0, 1]",
-                                     cfg.liquidity_ratio_penalty_threshold));
+void ConfigValidator::validate_pre_trade_gates(
+    const PreTradeGatesConfig& cfg, ValidationResult& result) const {
+
+    if (cfg.max_signal_age_ms < 50 || cfg.max_signal_age_ms > 10000) {
+        result.add_error(std::format(
+            "pre_trade_gates.max_signal_age_ms {} вне [50, 10000]", cfg.max_signal_age_ms));
+    }
+    if (cfg.max_adverse_price_drift_bps < 0.0 || cfg.max_adverse_price_drift_bps > 500.0) {
+        result.add_error(std::format(
+            "pre_trade_gates.max_adverse_price_drift_bps {} вне [0, 500]",
+            cfg.max_adverse_price_drift_bps));
+    }
+    if (cfg.max_spread_widen_pct < 0.0 || cfg.max_spread_widen_pct > 10000.0) {
+        result.add_error(std::format(
+            "pre_trade_gates.max_spread_widen_pct {} вне [0, 10000]",
+            cfg.max_spread_widen_pct));
+    }
+    if (cfg.min_depth_remain_pct < 0.0 || cfg.min_depth_remain_pct > 100.0) {
+        result.add_error(std::format(
+            "pre_trade_gates.min_depth_remain_pct {} вне [0, 100]",
+            cfg.min_depth_remain_pct));
+    }
+    if (cfg.min_net_rr < 0.0 || cfg.min_net_rr > 10.0) {
+        result.add_error(std::format(
+            "pre_trade_gates.min_net_rr {} вне [0, 10]", cfg.min_net_rr));
+    }
+    if (cfg.assumed_slippage_bps_per_leg < 0.0 || cfg.assumed_slippage_bps_per_leg > 200.0) {
+        result.add_error("pre_trade_gates.assumed_slippage_bps_per_leg вне [0, 200]");
+    }
+    if (cfg.taker_fee_bps < 0.0 || cfg.taker_fee_bps > 100.0) {
+        result.add_error("pre_trade_gates.taker_fee_bps вне [0, 100]");
+    }
+    if (cfg.maker_fee_bps < -50.0 || cfg.maker_fee_bps > 100.0) {
+        result.add_error("pre_trade_gates.maker_fee_bps вне [-50, 100] (rebates допустимы)");
+    }
+    if (cfg.assumed_hold_minutes < 0.0 || cfg.assumed_hold_minutes > 1440.0) {
+        result.add_error("pre_trade_gates.assumed_hold_minutes вне [0, 1440]");
     }
 }
 

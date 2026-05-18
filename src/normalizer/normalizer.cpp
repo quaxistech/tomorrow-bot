@@ -414,6 +414,14 @@ std::optional<NormalizedTrade> BitgetNormalizer::parse_trade(
     NormalizedTrade trade;
     fill_envelope(trade.envelope, raw.symbol, raw.ts, received_ns);
 
+    // B15.4 fix: empty trade_id → reject (нужен для dedupe).
+    if (raw.trade_id.empty()) {
+        ++rejected_count_;
+        logger_->warn("BitgetNormalizer", "Trade rejected: empty trade_id",
+            {{"symbol", raw.symbol}});
+        return std::nullopt;
+    }
+
     trade.trade_id = raw.trade_id;
     trade.price    = tb::Price{price_val};
     trade.size     = tb::Quantity{size_val};
@@ -445,10 +453,16 @@ std::optional<NormalizedOrderBook> BitgetNormalizer::parse_order_book(
     fill_envelope(book.envelope, raw.symbol, raw.ts, received_ns);
 
     // Bitget USDT-M: action = "snapshot" | "update"
+    // B15.1 fix: явный whitelist, неизвестный action → reject.
     if (iequals(raw.action, "snapshot")) {
         book.update_type = BookUpdateType::Snapshot;
-    } else {
+    } else if (iequals(raw.action, "update")) {
         book.update_type = BookUpdateType::Delta;
+    } else {
+        ++rejected_count_;
+        logger_->warn("BitgetNormalizer", "Unknown book action — rejected",
+            {{"symbol", raw.symbol}, {"action", raw.action}});
+        return std::nullopt;
     }
     book.sequence = raw.sequence;
 
@@ -470,13 +484,24 @@ std::optional<NormalizedOrderBook> BitgetNormalizer::parse_order_book(
     }
 
     // BUG-S25-01: reject one-sided books; downstream accesses both sides unconditionally.
+    // B15.2 fix: WARN + rejected_count счётчик при one-sided book.
     if (book.bids.empty() || book.asks.empty()) {
-        return std::nullopt;  // one-sided orderbook — discard
+        ++rejected_count_;
+        logger_->warn("BitgetNormalizer", "One-sided book — discarded",
+            {{"symbol", raw.symbol},
+             {"bids", std::to_string(book.bids.size())},
+             {"asks", std::to_string(book.asks.size())}});
+        return std::nullopt;
     }
 
-    // Crossed book validation: best_bid must be < best_ask
+    // B15.3 fix: crossed book → WARN + counter.
     if (book.bids.front().price.get() >= book.asks.front().price.get()) {
-        return std::nullopt;  // crossed/locked book — discard
+        ++rejected_count_;
+        logger_->warn("BitgetNormalizer", "Crossed book — discarded",
+            {{"symbol", raw.symbol},
+             {"best_bid", std::to_string(book.bids.front().price.get())},
+             {"best_ask", std::to_string(book.asks.front().price.get())}});
+        return std::nullopt;
     }
 
     return book;

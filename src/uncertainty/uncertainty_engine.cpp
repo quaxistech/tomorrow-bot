@@ -1,16 +1,12 @@
 #include "uncertainty/uncertainty_engine.hpp"
 #include "portfolio/portfolio_types.hpp"
 #include "ml/ml_signal_types.hpp"
-
 #include <algorithm>
 #include <cmath>
-#include <sstream>
 
 namespace tb::uncertainty {
 
-// ============================================================
-// Преобразования
-// ============================================================
+// ─── Serialization helpers (preserved for telemetry) ────────────────────────
 
 std::string to_string(UncertaintyAction action) {
     switch (action) {
@@ -32,9 +28,22 @@ std::string to_string(ExecutionModeRecommendation mode) {
     return "Normal";
 }
 
-// ============================================================
-// Constructor
-// ============================================================
+// ─── Engine ─────────────────────────────────────────────────────────────────
+//
+// Scalping refactor (2026-05): the 9-dimensional uncertainty machine
+// (regime / signal / data_quality / execution / portfolio / ml / correlation /
+// transition / operational) was replaced with a deterministic 4-signal gate
+// that targets the only failure modes a $15-account Bitget scalper actually
+// suffers from:
+//
+//   1. Wide spread        — fee-margin gets eaten before any move.
+//   2. Stale market feed  — entries on snapshot price ≠ live price.
+//   3. Toxic VPIN flow    — informed traders on the other side.
+//   4. Book instability   — pre-cascade conditions.
+//
+// Levels, multipliers and the cooldown mechanism are preserved at the type
+// level for downstream compatibility, but their calculation is now a single
+// pass over the four signals.
 
 RuleBasedUncertaintyEngine::RuleBasedUncertaintyEngine(
     UncertaintyConfig config,
@@ -42,760 +51,239 @@ RuleBasedUncertaintyEngine::RuleBasedUncertaintyEngine(
     std::shared_ptr<clock::IClock> clock)
     : config_(std::move(config))
     , logger_(std::move(logger))
-    , clock_(std::move(clock))
-    , diagnostics_{}
-{}
-
-// ============================================================
-// v1 assess() — делегирует в v2 с нейтральными снэпшотами
-// ============================================================
+    , clock_(std::move(clock)) {}
 
 UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     const features::FeatureSnapshot& features,
     const regime::RegimeSnapshot& regime,
     const world_model::WorldModelSnapshot& world) {
 
-    portfolio::PortfolioSnapshot neutral_portfolio;
-
+    // Minimal v1 path: build neutral portfolio/ML snapshots and delegate.
+    portfolio::PortfolioSnapshot empty_pf;
     ml::MlSignalSnapshot neutral_ml;
-    neutral_ml.overall_health = ml::MlComponentHealth::Healthy;
-
-    return assess(features, regime, world, neutral_portfolio, neutral_ml);
+    return assess(features, regime, world, empty_pf, neutral_ml);
 }
-
-// ============================================================
-// v2 assess() — полная оценка (CORE)
-// ============================================================
 
 UncertaintySnapshot RuleBasedUncertaintyEngine::assess(
     const features::FeatureSnapshot& features,
     const regime::RegimeSnapshot& regime,
     const world_model::WorldModelSnapshot& world,
-    const portfolio::PortfolioSnapshot& portfolio,
+    const portfolio::PortfolioSnapshot& /*portfolio*/,
     const ml::MlSignalSnapshot& ml_signals) {
 
-    const auto now = clock_->now();
-    const auto now_ns = now.get();
+    std::lock_guard lk(mutex_);
+    const int64_t now_ns = clock_ ? static_cast<int64_t>(clock_->now().get()) : 0;
+    const std::string& sym_key = features.symbol.get();
+    auto& state = states_[sym_key];
 
-    // 1. Compute all 9 dimensions
-    UncertaintyDimensions dims;
-    dims.regime_uncertainty        = compute_regime_uncertainty(regime);
-    dims.signal_uncertainty        = compute_signal_uncertainty(features);
-    dims.data_quality_uncertainty  = compute_data_quality_uncertainty(features);
-    dims.execution_uncertainty     = compute_execution_uncertainty(features);
-    dims.portfolio_uncertainty     = compute_portfolio_uncertainty(portfolio);
-    dims.ml_uncertainty            = compute_ml_uncertainty(ml_signals);
-    dims.correlation_uncertainty   = compute_correlation_uncertainty(ml_signals);
-    dims.transition_uncertainty    = compute_transition_uncertainty(regime);
-    dims.operational_uncertainty   = compute_operational_uncertainty(features);
+    UncertaintySnapshot out;
+    out.symbol = features.symbol;
+    out.computed_at = clock_ ? clock_->now() : Timestamp(0);
 
-    // 2. Aggregate with regime-specific weight adjustment
-    double agg = aggregate(dims, regime);
+    const auto& m = features.microstructure;
+    const auto& exec_ctx = features.execution_context;
 
-    // 3. World fragility stress amplifier
-    if (world.fragility.valid && world.fragility.value > 0.7) {
-        agg = std::min(1.0, agg + 0.1);
+    // ── 1. Per-signal sub-scores ──
+    // Each sub-score is in [0, 1]; raw values are clamped to keep the
+    // aggregate bounded even when upstream feeds emit garbage.
+    auto clamp01 = [](double x) { return std::clamp(x, 0.0, 1.0); };
+
+    // B23.1: Spread — saturation at 25 bps (typical 1m crypto upper bound).
+    // Если нужна параметризация → добавить в UncertaintyConfig.
+    constexpr double kSpreadSatBps = 25.0;
+    const double spread_u = (m.spread_valid && std::isfinite(m.spread_bps))
+        ? clamp01(m.spread_bps / kSpreadSatBps) : 0.5;
+
+    // B23.2: stale-feed weight 0.8 — сильный сигнал но не Extreme (0.85+).
+    // Если нужно усилить gate → UncertaintyConfig.stale_feed_severity.
+    constexpr double kStaleFeedSeverity = 0.8;
+    const double data_u = exec_ctx.is_feed_fresh ? 0.0 : kStaleFeedSeverity;
+
+    // B23.3: VPIN — toxic flag → 0.85 (high but not absolute);
+    // линейный non-toxic mapping от 0.4 (lower toxicity threshold).
+    // Easley-Lopez de Prado 2012 → эмпирические пороги.
+    constexpr double kVpinToxicSeverity = 0.85;
+    constexpr double kVpinNonToxicLowerThr = 0.4;
+    constexpr double kVpinNonToxicRange = 0.4;
+    double vpin_u = 0.0;
+    if (m.vpin_valid) {
+        if (m.vpin_toxic) vpin_u = kVpinToxicSeverity;
+        else vpin_u = clamp01((m.vpin - kVpinNonToxicLowerThr) / kVpinNonToxicRange);
     }
 
-    // MEDIUM-9 fix: hold the mutex across the complete read-modify-write cycle for
-    // SymbolState so that concurrent calls for the same symbol cannot interleave their
-    // reads and writes, which would cause lost updates.
-    SymbolState state;
-    {
-        std::lock_guard lock(mutex_);
+    // Book instability: pre-cascade conditions.
+    const double instability_u = clamp01(m.book_instability);
 
-        // 4. Retrieve SymbolState under lock
-        state = states_[features.symbol.get()];
+    // Regime confirmation deficit (acts as a soft signal): low regime
+    // confidence is a small contributor; we no longer treat it as a
+    // first-class dimension.
+    const double regime_u = std::isfinite(regime.confidence)
+        ? clamp01(1.0 - regime.confidence) * 0.5 : 0.25;
 
-        // 5. Determine level via hysteresis (on pre-update state for consistent thresholds)
-        // (apply_hysteresis and update_state are pure functions on the local copy — no lock needed,
-        //  but we must not release the lock between the read and write-back.)
-        auto level_inner = apply_hysteresis(agg, state);
+    // World adversarial / disruption — fragility from the slim world model.
+    const double world_u = world.fragility.valid
+        ? clamp01(world.fragility.value) : 0.3;
 
-        // 6. Update state FIRST — so cooldown and execution_mode see current tick's
-        //    consecutive counters. This fixes the one-tick lag in cooldown activation.
-        update_state(state, agg, level_inner, now_ns);
+    // ML-side disruption: cascade probability + correlation regime break.
+    double ml_u = 0.0;
+    ml_u = std::max(ml_u, clamp01(ml_signals.cascade_probability));
+    // B23.4: correlation_break — single-flag impulse, ~0.7 (high but not max).
+    constexpr double kCorrelationBreakSeverity = 0.7;
+    if (ml_signals.correlation_break) ml_u = std::max(ml_u, kCorrelationBreakSeverity);
 
-        // Write state back atomically with the read — no other thread can interleave.
-        states_[features.symbol.get()] = state;
+    // ── 2. Aggregate ──
+    // B23.5: weighting 70% hard signals (gating) + 30% soft signals (modifier).
+    // Этот split — фундаментальный design choice; параметризовать через config
+    // если нужно ослабить gating priority.
+    constexpr double kHardSignalWeight = 0.7;
+    constexpr double kSoftSignalWeight = 0.3;
+    const double hard_max = std::max({spread_u, data_u, vpin_u, instability_u});
+    const double soft_avg = (regime_u + world_u + ml_u) / 3.0;
+    double raw_score = kHardSignalWeight * hard_max + kSoftSignalWeight * soft_avg;
+    raw_score = clamp01(raw_score);
+
+    // EMA smoothing on persistent score; spike score is the raw delta.
+    const double alpha = std::clamp(config_.ema_alpha, 0.01, 1.0);
+    state.ema_score = (1.0 - alpha) * state.ema_score + alpha * raw_score;
+    out.persistent_score = state.ema_score;
+    out.spike_score = std::max(0.0, raw_score - state.ema_score);
+    out.aggregate_score = raw_score;
+
+    // ── 3. Level + hysteresis ──
+    UncertaintyLevel new_level;
+    if (raw_score >= config_.threshold_high)          new_level = UncertaintyLevel::Extreme;
+    else if (raw_score >= config_.threshold_moderate) new_level = UncertaintyLevel::High;
+    else if (raw_score >= config_.threshold_low)      new_level = UncertaintyLevel::Moderate;
+    else                                              new_level = UncertaintyLevel::Low;
+
+    // Simple hysteresis: require a small margin to step down.
+    if (new_level < state.prev_level) {
+        const double down_bias = config_.hysteresis_down;
+        if (state.prev_level == UncertaintyLevel::Extreme && raw_score > config_.threshold_high - down_bias)
+            new_level = UncertaintyLevel::Extreme;
+        else if (state.prev_level == UncertaintyLevel::High && raw_score > config_.threshold_moderate - down_bias)
+            new_level = UncertaintyLevel::High;
+    }
+    out.level = new_level;
+
+    // ── 4. Action / sizing / threshold multipliers ──
+    switch (new_level) {
+        case UncertaintyLevel::Low:
+            out.recommended_action = UncertaintyAction::Normal;
+            out.size_multiplier = 1.0;
+            out.threshold_multiplier = 1.0;
+            break;
+        case UncertaintyLevel::Moderate:
+            out.recommended_action = UncertaintyAction::ReducedSize;
+            out.size_multiplier = 0.7;
+            out.threshold_multiplier = 1.1;
+            break;
+        case UncertaintyLevel::High:
+            out.recommended_action = UncertaintyAction::HigherThreshold;
+            out.size_multiplier = 0.4;
+            out.threshold_multiplier = 1.5;
+            break;
+        case UncertaintyLevel::Extreme:
+            out.recommended_action = UncertaintyAction::NoTrade;
+            out.size_multiplier = config_.size_floor;
+            out.threshold_multiplier = std::min(config_.threshold_ceiling, 2.0);
+            break;
     }
 
-    // Re-derive level from the updated state (needed for the rest of the function).
-    // apply_hysteresis is const and side-effect-free, so calling it again is safe.
-    auto level = state.prev_level;
+    // ── 5. Dimensions (preserved for telemetry; populated minimally) ──
+    out.dimensions.regime_uncertainty       = regime_u;
+    out.dimensions.signal_uncertainty       = vpin_u;
+    out.dimensions.data_quality_uncertainty = data_u;
+    out.dimensions.execution_uncertainty    = spread_u;
+    out.dimensions.portfolio_uncertainty    = 0.0;
+    out.dimensions.ml_uncertainty           = ml_u;
+    out.dimensions.correlation_uncertainty  = ml_signals.correlation_break ? 0.7 : 0.0;
+    out.dimensions.transition_uncertainty   = regime_u;
+    out.dimensions.operational_uncertainty  = data_u;
 
-    // 7. EMA smoothing → persistent_score (use updated ema_score)
-    double persistent = state.ema_score;
-
-    // 8. spike_score
-    double spike = std::max(0.0, agg - persistent);
-
-    // 9. recommended_action from level
-    UncertaintyAction action;
-    switch (level) {
-        case UncertaintyLevel::Low:      action = UncertaintyAction::Normal; break;
-        case UncertaintyLevel::Moderate:  action = UncertaintyAction::ReducedSize; break;
-        case UncertaintyLevel::High:      action = UncertaintyAction::HigherThreshold; break;
-        case UncertaintyLevel::Extreme:   action = UncertaintyAction::NoTrade; break;
+    // ── 6. Execution mode ──
+    if (new_level == UncertaintyLevel::Extreme) {
+        out.execution_mode = ExecutionModeRecommendation::HaltNewEntries;
+    } else if (new_level == UncertaintyLevel::High) {
+        out.execution_mode = ExecutionModeRecommendation::DefensiveOnly;
+    } else if (new_level == UncertaintyLevel::Moderate) {
+        out.execution_mode = ExecutionModeRecommendation::Conservative;
+    } else {
+        out.execution_mode = ExecutionModeRecommendation::Normal;
     }
 
-    // 10. size_multiplier
-    double size_mult = std::max(config_.size_floor, 1.0 - agg);
-
-    // 11. threshold_multiplier
-    double threshold_mult = std::min(config_.threshold_ceiling, 1.0 + agg);
-
-    // 12. execution_mode — uses updated state with current consecutive counts
-    auto exec_mode = determine_execution_mode(level, agg, state);
-
-    // 13. cooldown — uses updated state
-    auto cooldown = compute_cooldown(state, now_ns);
-
-    // 14. top_drivers (top-3)
-    auto drivers = compute_drivers(dims);
-
-    // Build explanation
-    std::ostringstream explanation;
-    explanation << "Uncertainty: " << agg << " ("
-                << "regime=" << dims.regime_uncertainty
-                << ", signal=" << dims.signal_uncertainty
-                << ", data=" << dims.data_quality_uncertainty
-                << ", exec=" << dims.execution_uncertainty
-                << ", portfolio=" << dims.portfolio_uncertainty
-                << ", ml=" << dims.ml_uncertainty
-                << ", corr=" << dims.correlation_uncertainty
-                << ", trans=" << dims.transition_uncertainty
-                << ", ops=" << dims.operational_uncertainty << ")";
-
-    if (world.fragility.valid && world.fragility.value > 0.7) {
-        explanation << " | fragility=" << world.fragility.value;
+    // ── 7. Cooldown (consecutive-extreme counter) ──
+    if (new_level == UncertaintyLevel::Extreme) {
+        ++state.consecutive_extreme;
+        state.consecutive_high = 0;
+    } else if (new_level == UncertaintyLevel::High) {
+        ++state.consecutive_high;
+        state.consecutive_extreme = 0;
+    } else {
+        state.consecutive_extreme = 0;
+        state.consecutive_high = 0;
+    }
+    if (state.consecutive_extreme >= config_.consecutive_extreme_for_cooldown) {
+        state.cooldown_until_ns = now_ns + config_.cooldown_duration_ns;
+        ++diagnostics_.cooldown_activations;
+    }
+    if (state.cooldown_until_ns > now_ns) {
+        out.cooldown.active = true;
+        out.cooldown.remaining_ns = state.cooldown_until_ns - now_ns;
+        out.cooldown.decay_factor = 0.5;
+        out.cooldown.trigger_reason = "consecutive_extreme";
+        // Force action to NoTrade while cooldown is active.
+        out.recommended_action = UncertaintyAction::NoTrade;
+        out.execution_mode = ExecutionModeRecommendation::HaltNewEntries;
     }
 
-    // Build snapshot
-    UncertaintySnapshot result;
-    result.level                  = level;
-    result.aggregate_score        = agg;
-    result.dimensions             = dims;
-    result.recommended_action     = action;
-    result.size_multiplier        = size_mult;
-    result.threshold_multiplier   = threshold_mult;
-    result.explanation            = explanation.str();
-    result.computed_at            = now;
-    result.symbol                 = features.symbol;
-    result.top_drivers            = std::move(drivers);
-    result.execution_mode         = exec_mode;
-    result.cooldown               = cooldown;
-    result.persistent_score       = persistent;
-    result.spike_score            = spike;
-
-    // Update diagnostics & cache snapshot
-    // (state write-back already done in the read-modify-write block above)
-    {
-        std::lock_guard lock(mutex_);
-        diagnostics_.total_assessments++;
-        if (action == UncertaintyAction::NoTrade) {
-            diagnostics_.veto_count++;
-        }
-        if (cooldown.active) {
-            diagnostics_.cooldown_activations++;
-        }
-        double n = static_cast<double>(diagnostics_.total_assessments);
-        diagnostics_.avg_aggregate_score =
-            diagnostics_.avg_aggregate_score * ((n - 1.0) / n) + agg / n;
-        diagnostics_.last_assessment = now;
-
-        snapshots_[features.symbol.get()] = result;
+    // ── 8. Top drivers (lightweight; just the three dominant ones) ──
+    struct D { const char* name; double value; };
+    const std::array<D, 4> drivers = {{
+        {"spread",       spread_u},
+        {"data",         data_u},
+        {"vpin",         vpin_u},
+        {"instability",  instability_u},
+    }};
+    std::vector<UncertaintyDriver> top;
+    top.reserve(3);
+    auto sorted = drivers;
+    std::sort(sorted.begin(), sorted.end(), [](const D& a, const D& b) {
+        return a.value > b.value;
+    });
+    for (size_t i = 0; i < std::min<size_t>(3, sorted.size()); ++i) {
+        UncertaintyDriver d;
+        d.dimension = sorted[i].name;
+        d.raw_value = sorted[i].value;
+        d.contribution = sorted[i].value;
+        top.push_back(std::move(d));
     }
+    out.top_drivers = std::move(top);
 
-    // Log
-    logger_->debug("Uncertainty",
-                   "uncertainty=" + to_string(action) +
-                   " score=" + std::to_string(agg),
-                   {{"level",      std::to_string(static_cast<int>(level))},
-                    {"aggregate",  std::to_string(agg)},
-                    {"action",     to_string(action)},
-                    {"exec_mode",  to_string(exec_mode)},
-                    {"persistent", std::to_string(persistent)},
-                    {"spike",      std::to_string(spike)}});
+    state.prev_level = new_level;
+    state.last_assess_ns = now_ns;
+    snapshots_[sym_key] = out;
 
-    return result;
+    ++diagnostics_.total_assessments;
+    if (out.recommended_action == UncertaintyAction::NoTrade) ++diagnostics_.veto_count;
+    diagnostics_.last_assessment = out.computed_at;
+    // Rolling average over a small effective window.
+    diagnostics_.avg_aggregate_score =
+        0.95 * diagnostics_.avg_aggregate_score + 0.05 * raw_score;
+
+    return out;
 }
 
-// ============================================================
-// Queries
-// ============================================================
-
 UncertaintyDiagnostics RuleBasedUncertaintyEngine::diagnostics() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lk(mutex_);
     return diagnostics_;
 }
 
-// ============================================================
-// Lifecycle
-// ============================================================
-
 void RuleBasedUncertaintyEngine::reset_state() {
-    std::lock_guard lock(mutex_);
-    snapshots_.clear();
+    std::lock_guard lk(mutex_);
     states_.clear();
+    snapshots_.clear();
     diagnostics_ = UncertaintyDiagnostics{};
-}
-
-// ============================================================
-// Dimension computors
-// ============================================================
-
-double RuleBasedUncertaintyEngine::compute_regime_uncertainty(
-    const regime::RegimeSnapshot& regime) const {
-    return std::clamp(1.0 - regime.confidence, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_signal_uncertainty(
-    const features::FeatureSnapshot& features) const {
-
-    const auto& tech = features.technical;
-    double uncertainty = 0.3;
-
-    // Конфликт RSI и MACD
-    if (tech.rsi_valid && tech.macd_valid) {
-        bool rsi_overbought = tech.rsi_14 > 70.0;
-        bool rsi_oversold   = tech.rsi_14 < 30.0;
-        bool macd_positive  = tech.macd_histogram > 0.0;
-        bool macd_negative  = tech.macd_histogram < 0.0;
-
-        if ((rsi_overbought && macd_positive) || (rsi_oversold && macd_negative)) {
-            uncertainty -= 0.15;
-        }
-        if ((rsi_overbought && macd_negative) || (rsi_oversold && macd_positive)) {
-            uncertainty += 0.2;
-        }
-    }
-
-    // Конфликт EMA тренда и RSI
-    if (tech.ema_valid && tech.rsi_valid) {
-        bool ema_uptrend    = tech.ema_20 > tech.ema_50;
-        bool rsi_oversold   = tech.rsi_14 < 30.0;
-        bool rsi_overbought = tech.rsi_14 > 70.0;
-
-        if ((ema_uptrend && rsi_overbought) || (!ema_uptrend && rsi_oversold)) {
-            uncertainty += 0.1;
-        }
-    }
-
-    // ATR-based volatility: high normalized ATR = wider stops = less certainty for scalping
-    if (tech.atr_valid && tech.atr_14_normalized > 0.03) {
-        uncertainty += std::min(0.2, (tech.atr_14_normalized - 0.03) * 5.0);
-    }
-
-    // Мало валидных индикаторов
-    int valid_count = 0;
-    if (tech.rsi_valid)  ++valid_count;
-    if (tech.macd_valid) ++valid_count;
-    if (tech.adx_valid)  ++valid_count;
-    if (tech.bb_valid)   ++valid_count;
-    if (tech.ema_valid)  ++valid_count;
-
-    if (valid_count < 3) {
-        uncertainty += 0.2;
-    }
-
-    return std::clamp(uncertainty, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_data_quality_uncertainty(
-    const features::FeatureSnapshot& features) const {
-
-    double uncertainty = 0.0;
-
-    if (features.book_quality != tb::order_book::BookQuality::Valid) {
-        uncertainty += 0.3;
-    }
-    if (!features.execution_context.is_feed_fresh) {
-        uncertainty += 0.3;
-    }
-    if (features.microstructure.spread_valid &&
-        features.microstructure.spread_bps > 30.0) {
-        uncertainty += 0.2;
-    }
-    if (!features.technical.sma_valid) {
-        uncertainty += 0.1;
-    }
-    if (!features.microstructure.spread_valid) {
-        uncertainty += 0.1;
-    }
-
-    // VPIN toxicity: high toxicity = informed traders dominating
-    // (Easley, Lopez de Prado, O'Hara 2012: "Flow Toxicity and Liquidity")
-    if (features.microstructure.vpin_valid && features.microstructure.vpin_toxic) {
-        uncertainty += 0.2;
-    }
-
-    // Book instability: unstable book = unreliable levels
-    if (features.microstructure.instability_valid &&
-        features.microstructure.book_instability > 0.7) {
-        uncertainty += 0.15;
-    }
-
-    return std::clamp(uncertainty, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_execution_uncertainty(
-    const features::FeatureSnapshot& features) const {
-
-    double uncertainty = 0.0;
-
-    // Spread: for scalping 10 bps = significant portion of profit
-    if (features.microstructure.spread_valid) {
-        uncertainty += std::min(0.4, features.microstructure.spread_bps / 100.0);
-    }
-
-    // Estimated slippage
-    if (features.execution_context.slippage_valid) {
-        uncertainty += std::min(0.3,
-            features.execution_context.estimated_slippage_bps / 50.0);
-    }
-
-    // Liquidity ratio: min(bid_depth, ask_depth) / avg(bid_depth, ask_depth)
-    // Range [0, 1]. Low value = order book asymmetry = adverse selection risk.
-    // When ratio < threshold (default 0.5): linear penalty up to +0.3
-    if (features.microstructure.liquidity_valid) {
-        double ratio = features.microstructure.liquidity_ratio;
-        if (ratio < config_.liquidity_ratio_penalty_threshold) {
-            double penalty = 0.3 * (1.0 - ratio / config_.liquidity_ratio_penalty_threshold);
-            uncertainty += penalty;
-        }
-    }
-
-    return std::clamp(uncertainty, 0.0, 1.0);
-}
-
-// ============================================================
-// Portfolio, ML, correlation, transition, operational dimensions
-// ============================================================
-
-double RuleBasedUncertaintyEngine::compute_portfolio_uncertainty(
-    const portfolio::PortfolioSnapshot& portfolio) const {
-
-    if (portfolio.positions.empty()) {
-        return 0.0;
-    }
-
-    double base = 0.0;
-
-    // Concentration risk: single position > 40% or > 60% of capital
-    if (portfolio.total_capital > 0.0) {
-        for (const auto& pos : portfolio.positions) {
-            double pct = std::abs(pos.notional.get()) / portfolio.total_capital;
-            if (pct > 0.6) {
-                base += 0.5;
-                break;
-            } else if (pct > 0.4) {
-                base += 0.3;
-                break;
-            }
-        }
-    }
-
-    // Exposure crowding (capital_utilization_pct is 0-100 %)
-    if (portfolio.capital_utilization_pct > 90.0) {
-        base += 0.4;
-    } else if (portfolio.capital_utilization_pct > 70.0) {
-        base += 0.2;
-    }
-
-    // Drawdown: daily realized P&L as fraction of capital
-    if (portfolio.total_capital > 0.0) {
-        double daily_pnl_pct =
-            portfolio.pnl.realized_pnl_today / portfolio.total_capital;
-        if (daily_pnl_pct < -0.02) {
-            base += 0.4;
-        } else if (daily_pnl_pct < -0.01) {
-            base += 0.2;
-        }
-    }
-
-    // Current drawdown from peak
-    if (portfolio.pnl.current_drawdown_pct > 5.0) {
-        base += 0.3;
-    } else if (portfolio.pnl.current_drawdown_pct > 3.0) {
-        base += 0.15;
-    }
-
-    // Many concurrent positions
-    if (static_cast<int>(portfolio.positions.size()) > 4) {
-        base += 0.1;
-    }
-
-    return std::clamp(base, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_ml_uncertainty(
-    const ml::MlSignalSnapshot& ml_signals) const {
-
-    if (ml_signals.overall_health == ml::MlComponentHealth::Failed ||
-        ml_signals.overall_health == ml::MlComponentHealth::Stale) {
-        return 0.7;
-    }
-
-    double base = 1.0 - ml_signals.signal_quality;
-
-    if (ml_signals.cascade_imminent) {
-        base += 0.3;
-    } else {
-        base += ml_signals.cascade_probability * 0.3;
-    }
-
-    // should_block_trading is a strong ML-level aggregate signal
-    if (ml_signals.should_block_trading) {
-        base += 0.3;
-    }
-
-    if (ml_signals.recommended_wait_periods < 0) {
-        base += 0.2;
-    }
-
-    return std::clamp(base, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_correlation_uncertainty(
-    const ml::MlSignalSnapshot& ml_signals) const {
-
-    if (ml_signals.correlation_break) {
-        return 0.8;
-    }
-
-    double base = 1.0 - ml_signals.correlation_risk_multiplier;
-    return std::clamp(base, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_transition_uncertainty(
-    const regime::RegimeSnapshot& regime) const {
-
-    double base = 0.0;
-    if (regime.last_transition.has_value()) {
-        double confidence = regime.last_transition->confidence;
-        base = 0.3 + 0.4 * (1.0 - confidence);
-    }
-
-    if (regime.stability < 0.3) {
-        base += 0.2;
-    }
-
-    return std::clamp(base, 0.0, 1.0);
-}
-
-double RuleBasedUncertaintyEngine::compute_operational_uncertainty(
-    const features::FeatureSnapshot& features) const {
-
-    if (!features.execution_context.is_feed_fresh) {
-        return 0.7;
-    }
-
-    double base = 0.0;
-
-    if (features.book_quality != tb::order_book::BookQuality::Valid) {
-        base += 0.3;
-    }
-    if (features.execution_context.slippage_valid &&
-        features.execution_context.estimated_slippage_bps > 20.0) {
-        base += 0.2;
-    }
-
-    return std::clamp(base, 0.0, 1.0);
-}
-
-// ============================================================
-// aggregate() — regime-adjusted weighted mean + tail stress
-// ============================================================
-
-double RuleBasedUncertaintyEngine::aggregate(
-    const UncertaintyDimensions& dims,
-    const regime::RegimeSnapshot& regime) const {
-
-    double w_regime      = config_.w_regime;
-    double w_signal      = config_.w_signal;
-    double w_data        = config_.w_data_quality;
-    double w_execution   = config_.w_execution;
-    double w_portfolio   = config_.w_portfolio;
-    double w_ml          = config_.w_ml;
-    double w_correlation = config_.w_correlation;
-    double w_transition  = config_.w_transition;
-    double w_operational = config_.w_operational;
-
-    // Regime-specific amplifiers
-    if (regime.label == RegimeLabel::Volatile) {
-        w_data      *= 1.5;
-        w_execution *= 1.5;
-        w_signal    *= 0.8;
-    } else if (regime.label == RegimeLabel::Unclear) {
-        w_regime      *= 1.2;
-        w_signal      *= 1.2;
-        w_data        *= 1.2;
-        w_execution   *= 1.2;
-        w_portfolio   *= 1.2;
-        w_ml          *= 1.2;
-        w_correlation *= 1.2;
-        w_transition  *= 1.2;
-        w_operational *= 1.2;
-    }
-
-    // Normalize
-    double total_w = w_regime + w_signal + w_data + w_execution + w_portfolio +
-                     w_ml + w_correlation + w_transition + w_operational;
-    if (total_w <= 0.0) {
-        return 0.5;
-    }
-
-    // BUG-S16-01: a single NaN dimension poisons the entire aggregate.
-    // Use conservative fallback (0.7) for any non-finite dimension.
-    auto safe_dim = [](double d) { return std::isfinite(d) ? d : 0.7; };
-
-    double result = (w_regime      * safe_dim(dims.regime_uncertainty)       +
-                     w_signal      * safe_dim(dims.signal_uncertainty)       +
-                     w_data        * safe_dim(dims.data_quality_uncertainty) +
-                     w_execution   * safe_dim(dims.execution_uncertainty)    +
-                     w_portfolio   * safe_dim(dims.portfolio_uncertainty)    +
-                     w_ml          * safe_dim(dims.ml_uncertainty)           +
-                     w_correlation * safe_dim(dims.correlation_uncertainty)  +
-                     w_transition  * safe_dim(dims.transition_uncertainty)   +
-                     w_operational * safe_dim(dims.operational_uncertainty)) / total_w;
-
-    // Tail-stress amplifier: each dimension > 0.8 adds 0.05
-    const double raw_dims[] = {
-        dims.regime_uncertainty,       dims.signal_uncertainty,
-        dims.data_quality_uncertainty, dims.execution_uncertainty,
-        dims.portfolio_uncertainty,    dims.ml_uncertainty,
-        dims.correlation_uncertainty,  dims.transition_uncertainty,
-        dims.operational_uncertainty
-    };
-    for (double d : raw_dims) {
-        if (d > 0.8) {
-            result += 0.05;
-        }
-    }
-
-    return std::clamp(result, 0.0, 1.0);
-}
-
-// ============================================================
-// apply_hysteresis() — prevents oscillation around thresholds
-// ============================================================
-
-UncertaintyLevel RuleBasedUncertaintyEngine::apply_hysteresis(
-    double score, const SymbolState& state) const {
-
-    auto prev = state.prev_level;
-
-    // Raw level without hysteresis
-    UncertaintyLevel raw_level;
-    if (score < config_.threshold_low) {
-        raw_level = UncertaintyLevel::Low;
-    } else if (score < config_.threshold_moderate) {
-        raw_level = UncertaintyLevel::Moderate;
-    } else if (score < config_.threshold_high) {
-        raw_level = UncertaintyLevel::High;
-    } else {
-        raw_level = UncertaintyLevel::Extreme;
-    }
-
-    if (raw_level == prev) {
-        return prev;
-    }
-
-    // Raising level: need score >= threshold + hysteresis_up
-    if (static_cast<int>(raw_level) > static_cast<int>(prev)) {
-        double threshold = 0.0;
-        switch (raw_level) {
-            case UncertaintyLevel::Moderate: threshold = config_.threshold_low;      break;
-            case UncertaintyLevel::High:     threshold = config_.threshold_moderate;  break;
-            case UncertaintyLevel::Extreme:  threshold = config_.threshold_high;      break;
-            default: break;
-        }
-        if (score >= threshold + config_.hysteresis_up) {
-            return raw_level;
-        }
-        return prev;
-    }
-
-    // Lowering level: need score < threshold - hysteresis_down
-    double threshold = 0.0;
-    switch (prev) {
-        case UncertaintyLevel::Moderate: threshold = config_.threshold_low;      break;
-        case UncertaintyLevel::High:     threshold = config_.threshold_moderate;  break;
-        case UncertaintyLevel::Extreme:  threshold = config_.threshold_high;      break;
-        default: break;
-    }
-    if (score < threshold - config_.hysteresis_down) {
-        return raw_level;
-    }
-    return prev;
-}
-
-// ============================================================
-// update_state() — per-symbol tracking
-//
-// Called BEFORE compute_cooldown() and determine_execution_mode()
-// so that consecutive counters reflect the current tick.
-// ============================================================
-
-void RuleBasedUncertaintyEngine::update_state(
-    SymbolState& state, double raw_score,
-    UncertaintyLevel new_level, int64_t now_ns) {
-
-    // BUG-S16-02: NaN ema_score (from NaN raw_score via BUG-S16-01 chain) makes
-    // shock_memory NaN → cooldown comparisons silently fail → never activates.
-    if (!std::isfinite(state.ema_score)) state.ema_score = raw_score;
-
-    state.ema_score =
-        config_.ema_alpha * raw_score +
-        (1.0 - config_.ema_alpha) * state.ema_score;
-
-    state.peak_score = std::max(state.peak_score * 0.95, raw_score);
-
-    double shock_delta = std::isfinite(raw_score) && std::isfinite(state.ema_score)
-        ? std::max(0.0, raw_score - state.ema_score) : 0.0;
-    state.shock_memory = std::max(state.shock_memory * 0.98, shock_delta);
-
-    if (state.prev_level != new_level) {
-        state.last_level_change_ns = now_ns;
-    }
-
-    state.prev_level    = new_level;
-    state.last_assess_ns = now_ns;
-
-    if (new_level == UncertaintyLevel::Extreme) {
-        state.consecutive_extreme++;
-    } else {
-        state.consecutive_extreme = 0;
-    }
-
-    if (new_level == UncertaintyLevel::High ||
-        new_level == UncertaintyLevel::Extreme) {
-        state.consecutive_high++;
-    } else {
-        state.consecutive_high = 0;
-    }
-
-    // N consecutive extreme -> activate cooldown
-    if (state.consecutive_extreme >= config_.consecutive_extreme_for_cooldown) {
-        state.cooldown_until_ns = now_ns + config_.cooldown_duration_ns;
-    }
-}
-
-// ============================================================
-// compute_cooldown()
-// ============================================================
-
-CooldownRecommendation RuleBasedUncertaintyEngine::compute_cooldown(
-    const SymbolState& state, int64_t now_ns) const {
-
-    CooldownRecommendation cd;
-
-    if (now_ns < state.cooldown_until_ns) {
-        cd.active       = true;
-        cd.remaining_ns = state.cooldown_until_ns - now_ns;
-        double ratio = static_cast<double>(cd.remaining_ns) /
-                       static_cast<double>(config_.cooldown_duration_ns);
-        cd.decay_factor    = 0.5 + 0.5 * std::clamp(1.0 - ratio, 0.0, 1.0);
-        cd.trigger_reason  = "Серия экстремальных оценок (>=" +
-                             std::to_string(config_.consecutive_extreme_for_cooldown) +
-                             " подряд)";
-    } else {
-        cd.active       = false;
-        cd.remaining_ns = 0;
-        cd.decay_factor = 1.0;
-    }
-
-    return cd;
-}
-
-// ============================================================
-// determine_execution_mode()
-// ============================================================
-
-ExecutionModeRecommendation RuleBasedUncertaintyEngine::determine_execution_mode(
-    UncertaintyLevel level, double score, const SymbolState& state) const {
-
-    if (level == UncertaintyLevel::Extreme) {
-        return ExecutionModeRecommendation::HaltNewEntries;
-    }
-    if (level == UncertaintyLevel::High &&
-        state.consecutive_high >= config_.consecutive_high_for_defensive) {
-        return ExecutionModeRecommendation::DefensiveOnly;
-    }
-    if (level == UncertaintyLevel::High) {
-        return ExecutionModeRecommendation::Conservative;
-    }
-    if (score > 0.4) {
-        return ExecutionModeRecommendation::Conservative;
-    }
-    return ExecutionModeRecommendation::Normal;
-}
-
-// ============================================================
-// compute_drivers() — top-3 uncertainty drivers
-// ============================================================
-
-std::vector<UncertaintyDriver> RuleBasedUncertaintyEngine::compute_drivers(
-    const UncertaintyDimensions& dims) const {
-
-    struct DimEntry {
-        const char* name;
-        double weight;
-        double raw;
-        const char* desc;
-    };
-
-    const DimEntry entries[] = {
-        {"regime_uncertainty",       config_.w_regime,
-         dims.regime_uncertainty,
-         "Высокая неопределённость режима"},
-        {"signal_uncertainty",       config_.w_signal,
-         dims.signal_uncertainty,
-         "Конфликтующие торговые сигналы"},
-        {"data_quality_uncertainty", config_.w_data_quality,
-         dims.data_quality_uncertainty,
-         "Низкое качество данных"},
-        {"execution_uncertainty",    config_.w_execution,
-         dims.execution_uncertainty,
-         "Высокая неопределённость исполнения"},
-        {"portfolio_uncertainty",    config_.w_portfolio,
-         dims.portfolio_uncertainty,
-         "Портфельный риск (концентрация/просадка)"},
-        {"ml_uncertainty",           config_.w_ml,
-         dims.ml_uncertainty,
-         "Деградация ML-моделей"},
-        {"correlation_uncertainty",  config_.w_correlation,
-         dims.correlation_uncertainty,
-         "Нарушение корреляционной структуры"},
-        {"transition_uncertainty",   config_.w_transition,
-         dims.transition_uncertainty,
-         "Нестабильность: вероятный переход режима"},
-        {"operational_uncertainty",  config_.w_operational,
-         dims.operational_uncertainty,
-         "Операционные проблемы (фид, инфраструктура)"},
-    };
-
-    std::vector<UncertaintyDriver> drivers;
-    drivers.reserve(9);
-    for (const auto& e : entries) {
-        UncertaintyDriver d;
-        d.dimension    = e.name;
-        d.contribution = e.weight * e.raw;
-        d.raw_value    = e.raw;
-        d.description  = e.desc;
-        drivers.push_back(std::move(d));
-    }
-
-    std::sort(drivers.begin(), drivers.end(),
-              [](const UncertaintyDriver& a, const UncertaintyDriver& b) {
-                  return a.contribution > b.contribution;
-              });
-
-    if (drivers.size() > 3) {
-        drivers.resize(3);
-    }
-    return drivers;
 }
 
 } // namespace tb::uncertainty

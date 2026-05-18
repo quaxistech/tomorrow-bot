@@ -154,10 +154,13 @@ PairDecision PairLifecycleEngine::evaluate_compression(const PairMarketInput& in
         };
     }
 
-    // Quality degradation — consider rebalance or exit
-    if (quality < config_.min_pair_quality * 0.7) {
+    // Quality degradation — consider rebalance or exit.
+    // B14.2: 0.7 quality fraction + 0.15 leg ratio drift — empirical thresholds.
+    constexpr double kQualityDegradedFraction = 0.7;
+    constexpr double kHedgeRatioDriftThreshold = 0.15;
+    if (quality < config_.min_pair_quality * kQualityDegradedFraction) {
         double ratio = compute_hedge_ratio(input);
-        if (std::abs(ratio - state_.long_leg.size / std::max(state_.short_leg.size, 1e-9)) > 0.15) {
+        if (std::abs(ratio - state_.long_leg.size / std::max(state_.short_leg.size, 1e-9)) > kHedgeRatioDriftThreshold) {
             return PairDecision{
                 .action = PairAction::RebalancePair,
                 .hedge_ratio = ratio,

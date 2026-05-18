@@ -74,6 +74,14 @@ public:
         // === Liquidity ===
         double max_adv_participation_pct{0.02};   ///< Макс доля от среднедневного объёма (2%)
         double max_book_participation_pct{0.10};  ///< Макс доля от глубины стакана (10%)
+
+        // === Margin sizing (B24.1, B24.2 fix) ===
+        /// % капитала, рискуемый margin'ом на одну сделку (notional = pct × capital × leverage).
+        double margin_per_trade_pct{0.05};
+        /// Multiplier на max_leverage для target leverage.
+        double target_leverage_multiplier{0.5};
+        /// Floor для target leverage.
+        double target_leverage_floor{10.0};
     };
 
     HierarchicalAllocator(Config config,

@@ -43,43 +43,19 @@ inline std::string to_string(RejectionReason r) {
 
 // ─── Расширенная конфигурация движка решений ────────────────────────────────
 
-/// Конфигурация профессионального уровня — все фичи включаются поэлементно.
-/// Все дефолты калиброваны для USDT-M фьючерсного скальпинга.
+/// Decision-engine configuration.
+///
+/// Scalping refactor 2026-05 removed three feature blocks that were degenerate
+/// after collapsing the bot to a single strategy with at most one intent per
+/// tick: (1) regime-aware threshold scaling, (2) regime-aware dominance scaling
+/// (no BUY/SELL conflict to resolve), (3) ensemble conviction bonus.
 struct AdvancedDecisionConfig {
-    // ── Regime-aware threshold scaling ───────────────────────────────────
-    bool enable_regime_threshold_scaling{true};
-    double regime_trending_factor{1.0};          ///< Множитель порога для trending (нейтральный)
-    double regime_choppy_factor{1.10};           ///< Множитель для choppy/noise (+10%, осторожнее но не блокируя)
-    double regime_volatile_factor{0.90};         ///< Множитель для vol expansion (−10%, волатильность = возможность)
-    /// Порог повышен при ликвидном стрессе: slippage и adverse selection растут
-    double regime_stress_factor{1.05};           ///< Множитель для stress (+5%, лёгкая осторожность)
-    double regime_mean_reversion_factor{1.0};    ///< Множитель для mean reversion (нейтральный)
-    double regime_low_vol_factor{1.0};           ///< Множитель для low vol compression (нейтральный)
-    double regime_anomaly_factor{1.10};          ///< Множитель для anomaly event (+10%, осторожность)
-
-    // ── Regime-aware dominance scaling ───────────────────────────────────
-    bool enable_regime_dominance_scaling{true};
-    double dominance_trending{0.55};             ///< В тренде нужно 55% доминирования
-    double dominance_choppy{0.60};               ///< В шуме нужно 60% (было 72% — слишком строго)
-    double dominance_volatile{0.55};             ///< В расширении волатильности 55%
-    double dominance_stress{0.65};               ///< В стрессе нужно 65% (было 80% — блокировало)
-
     // ── Time decay ──────────────────────────────────────────────────────
     bool enable_time_decay{true};
-    /// Период полураспада conviction (мс).
-    /// Hasbrouck (2007) "Empirical Market Microstructure": информационное
-    /// полувремя ордер-бука 100–1000 мс в зависимости от ликвидности.
+    /// Период полураспада conviction (мс). Hasbrouck (2007) "Empirical Market
+    /// Microstructure": информационное полувремя ордер-бука 100–1000 мс.
     /// 500 мс — консервативный выбор для ликвидных USDT-M пар.
     double time_decay_halflife_ms{500.0};
-
-    // ── Ensemble conviction ─────────────────────────────────────────────
-    bool enable_ensemble_conviction{true};
-    /// Бонус за каждую дополнительную согласную стратегию.
-    /// Breiman (2001) "Random Forests": выигрыш ансамбля уменьшается с ростом
-    /// корреляции базовых классификаторов. 6% — консервативный бонус.
-    double ensemble_agreement_bonus{0.06};
-    double ensemble_max_bonus{0.15};             ///< Макс. бонус от ансамбля
-    double ensemble_diminishing_factor{0.6};     ///< Затухание бонуса (60% от предыдущего)
 
     // ── Portfolio awareness ─────────────────────────────────────────────
     bool enable_portfolio_awareness{true};
@@ -137,19 +113,6 @@ struct StrategyContribution {
     std::vector<VetoReason> veto_reasons;
 };
 
-// ─── Метрики ансамбля ───────────────────────────────────────────────────────
-
-/// Агрегированные метрики ансамбля стратегий
-struct EnsembleMetrics {
-    int aligned_count{0};           ///< Сколько стратегий согласны с направлением
-    int total_scored{0};            ///< Общее число оценённых стратегий
-    double agreement_ratio{0.0};    ///< Доля согласных [0,1]
-    double ensemble_bonus{0.0};     ///< Бонус за ансамблевое согласие
-    double leading_conviction{0.0}; ///< Conviction лидера (без бонуса)
-    double ensemble_conviction{0.0};///< Итоговая conviction (лидер + бонус)
-    double weighted_consensus{0.0}; ///< Взвешенный консенсус Σ(conviction × weight)
-};
-
 // ─── Метрики стоимости исполнения ───────────────────────────────────────────
 
 /// Оценка стоимости исполнения на момент принятия решения
@@ -187,12 +150,9 @@ struct DecisionRecord {
 
     // Пороги (для воспроизводимости и аудита)
     double base_conviction_threshold{0.0};    ///< Базовый порог conviction
-    double regime_threshold_factor{1.0};      ///< Множитель порога от режима
     double drawdown_threshold_boost{0.0};     ///< Повышение порога от просадки
-    double effective_threshold{0.0};          ///< Итоговый порог (base × regime × uncertainty + drawdown)
+    double effective_threshold{0.0};          ///< Итоговый порог после всех корректировок
 
-    // Ансамбль
-    EnsembleMetrics ensemble;                 ///< Метрики ансамблевого согласия
     ExecutionCostEstimate execution_cost;     ///< Оценка стоимости исполнения
 
     // Вклады стратегий

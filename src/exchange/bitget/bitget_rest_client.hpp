@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace tb::exchange::bitget {
 
@@ -125,10 +126,14 @@ private:
     mutable std::mutex rate_mutex_;
     std::unordered_map<int, TokenBucket> rate_buckets_;  ///< keyed by RateCategory
 
-    /// Persistent connection state (connection pooling)
-    struct ConnectionPool;
-    std::unique_ptr<ConnectionPool> conn_pool_;
-    mutable std::mutex conn_pool_mutex_;
+    /// Persistent connection state (connection pooling).
+    /// B16.1 fix: pool из нескольких connections для parallel REST.
+    /// Каждое соединение имеет свой mutex; round-robin распределение
+    /// устраняет serialization "всё через один mutex".
+    static constexpr int kPoolSize = 4;
+    struct PooledConnection;
+    std::vector<std::unique_ptr<PooledConnection>> conn_pool_;
+    std::atomic<size_t> next_conn_idx_{0};
 };
 
 } // namespace tb::exchange::bitget

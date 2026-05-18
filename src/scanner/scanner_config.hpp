@@ -71,7 +71,8 @@ struct ScannerConfig {
     int api_retry_base_delay_ms{200};
 
     // ── Pre-filter (before detailed analysis) ──
-    double prefilter_min_volume_usdt{500'000.0};
+    // run103: 500k → 300k для max coverage.
+    double prefilter_min_volume_usdt{300'000.0};
     double prefilter_max_spread_bps{100.0};
     int max_candidates_detailed{30};
 
@@ -79,9 +80,9 @@ struct ScannerConfig {
     double min_volume_usdt{1'000'000.0};
     double max_spread_bps{20.0};              // scalping: 20 bps max (Cartea et al. §4.3)
     double min_open_interest_usdt{500'000.0};
-    // EDGE-15 (active trading mode 2026-05-14): scanner overfiltering — 13/30 rejected
-    // by trap_risk>70%, 9/30 by depth<5000. Relaxed для active opportunity hunting.
-    double min_orderbook_depth_usdt{20'000.0};   ///< 50k → 20k (alts depth realistic)
+    // run100 calibration: 30k → 20k — micro_min_orderbook_depth_usdt доминирует
+    // (для micro account override). 20k = original baseline.
+    double min_orderbook_depth_usdt{20'000.0};
     double max_trap_risk{0.85};                  ///< 0.70 → 0.85 (allow moderate manipulation)
     double max_noise_level{0.85};                ///< 0.80 → 0.85
     double min_volatility_pct{0.10};           // realized vol < 0.1% on 5m = dead instrument
@@ -124,7 +125,10 @@ struct ScannerConfig {
 
     // ── Trade state thresholds ──
     double trade_state_max_trap_risk{0.6};
-    double trade_state_min_score{0.3};
+    // run102: 0.40 → 0.30 — user хочет 15-20 pairs в watchlist.
+    // Финальная защита от bad setups через Bayesian fusion / freshness / NetRR gates
+    // в strategy + execution path. Scanner — только pre-screening.
+    double trade_state_min_score{0.30};
     double trade_state_min_confidence{0.4};
 
     // ── Bias detector (§9) ──
@@ -154,11 +158,13 @@ struct ScannerConfig {
     /// Защита от ситуации, когда ордера ботa ($5–$10) не проходят строгие сетевые
     /// фильтры рассчитанные на $1K+ позиции. Применяется в `apply_capital_scaling`.
     double micro_account_capital_threshold_usdt{100.0};
-    /// EDGE-15 (active mode 2026-05-14): scanner thin_orderbook blocked 9/30 candidates.
-    /// На micro-account ($18) наши ордера $5-10, реально нужно depth >= нашему ордеру × 5.
-    double micro_min_orderbook_depth_usdt{1'500.0};   ///< 5000 → 1500 (alts realistic)
+    /// run100 calibration: 8k → 5k — pre-filter rejected 91/100 pairs, лучше дать
+    /// больше pairs пройти hard gates, фильтровать по composite score (trade_state).
+    double micro_min_orderbook_depth_usdt{5'000.0};
     /// Ослабленный порог Open Interest для микро-аккаунта.
-    double micro_min_open_interest_usdt{50'000.0};    ///< 100k → 50k
+    /// run101 calibration: 50k → 25k для micro — больше алткоинов пройдёт hard gate.
+    /// Бот торгует $5-10 ордерами, не нужны $500k+ OI pairs.
+    double micro_min_open_interest_usdt{25'000.0};
 
     // ── EDGE-31 Scalping profile ──
     ScalpingProfile scalping;

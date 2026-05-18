@@ -18,7 +18,6 @@
 #include "uncertainty/uncertainty_engine.hpp"
 #include "strategy/strategy_registry.hpp"
 #include "strategy/strategy_engine.hpp"
-#include "strategy_allocator/strategy_allocator.hpp"
 #include "decision/decision_aggregation_engine.hpp"
 #include "portfolio_allocator/portfolio_allocator.hpp"
 #include "portfolio/portfolio_engine.hpp"
@@ -45,7 +44,11 @@
 #include "pipeline/pipeline_tick_context.hpp"
 #include "pipeline/pipeline_stage_result.hpp"
 #include "pipeline/pipeline_latency_tracker.hpp"
+#include "pipeline/periodic_trailing_sl.hpp"
+#include "pipeline/pre_trade_gates.hpp"
+#include "pipeline/protective_bracket_manager.hpp"
 #include "pipeline/rest_worker_pool.hpp"
+#include "pipeline/stagnant_position_detector.hpp"
 #include "pipeline/trading_history_stats.hpp"
 #include "pipeline/funding_rate_tracker.hpp"
 #include "pipeline/htf_trend_state.hpp"
@@ -63,6 +66,7 @@
 #include "telemetry/file_telemetry_sink.hpp"
 #include "telemetry/incident_detector.hpp"
 #include "telemetry/observability_panels.hpp"
+#include "telemetry/trade_journal.hpp"
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -129,6 +133,18 @@ public:
     int64_t last_activity_time_ns() const { return last_activity_ns_.load(std::memory_order_relaxed); }
 
 private:
+    /// O9.1 fix: helper для построения close-intent.
+    /// Заполняет все необходимые поля для closing-операции с корректной семантикой
+    /// для hedge_mode v2 (см. O2.1). Использовать вместо ad-hoc заполнения в 3+ местах.
+    strategy::TradeIntent build_close_intent(
+        const Symbol& symbol,
+        PositionSide position_side,
+        double close_qty,
+        double mid_price,
+        const std::string& strategy_id,
+        const std::string& reason_tag,
+        double urgency = 1.0) const;
+
     /// Callback от MarketDataGateway при готовом FeatureSnapshot
     void on_feature_snapshot(features::FeatureSnapshot snapshot);
 
@@ -161,7 +177,6 @@ private:
 
     // Стратегии
     std::shared_ptr<strategy::StrategyRegistry> strategy_registry_;
-    std::shared_ptr<strategy_allocator::IStrategyAllocator> strategy_allocator_;
     std::shared_ptr<decision::IDecisionAggregationEngine> decision_engine_;
 
     // Исполнение
@@ -301,6 +316,41 @@ private:
     /// Единый владелец всех exit-решений
     std::unique_ptr<PositionExitOrchestrator> exit_orchestrator_;
 
+    // ==================== edge-31: Pre-trade gates ========================
+    /// Signal freshness gate — отклоняет stale сигналы перед execute().
+    std::unique_ptr<FreshnessGate> freshness_gate_;
+    /// Net Risk:Reward gate — отклоняет входы с недостаточным net-RR
+    /// после fees+slippage+funding.
+    std::unique_ptr<NetRRGate> net_rr_gate_;
+    /// Диагностика блокировок pre-trade gates.
+    int diag_freshness_block_{0};
+    int diag_net_rr_block_{0};
+
+    // ==================== edge-31: Protective bracket manager =============
+    /// Владелец lifecycle TP/SL bracket: верификация на бирже после fill,
+    /// fallback standalone plan-ордера, trailing-replace (Phase 4), release
+    /// на закрытии позиции, recovery после рестарта.
+    std::shared_ptr<ProtectiveBracketManager> bracket_manager_;
+    /// Timestamp последней попытки verify (для throttling периодических verify).
+    std::atomic<int64_t> last_bracket_verify_ns_{0};
+    /// Интервал между периодическими verify (после grace_period_ms).
+    static constexpr int64_t kBracketVerifyIntervalNs = 1'500'000'000LL;  // 1.5 s
+    /// run96: periodic orphan plan-orders cleanup (every 5 min). Bug 10.1: atomic.
+    std::atomic<int64_t> last_orphan_cleanup_ns_{0};
+    static constexpr int64_t kOrphanCleanupIntervalNs = 300'000'000'000LL;  // 5 min
+
+    // ==================== run87: Periodic Trailing SL =====================
+    /// Periodic monotonic trailing SL — каждые 5 сек пересчитывает SL по
+    /// Chandelier Exit для всех открытых позиций. SL двигается ТОЛЬКО в
+    /// сторону прибыли (monotonic), минимизирует unexpected losses.
+    std::unique_ptr<PeriodicTrailingSl> trailing_sl_;
+
+    // ==================== run90: Stagnant Position Detector ===============
+    /// Detect позиции на низкоактивных парах (FFUSDT case). Если за окно
+    /// (default 120s) range < 8 bps и position > 180s — force exit для
+    /// освобождения капитала.
+    std::unique_ptr<StagnantPositionDetector> stagnant_detector_;
+
     /// Cached regime snapshot (updated every tick, used by build_exit_context)
     regime::RegimeSnapshot cached_regime_snapshot_{};
     /// Cached uncertainty snapshot (updated every tick, used by build_exit_context)
@@ -312,7 +362,8 @@ private:
     /// Timestamp последней проверки watchdog
     int64_t last_watchdog_ns_{0};
     /// Интервал проверки watchdog: 10 секунд
-    static constexpr int64_t kWatchdogIntervalNs = 10'000'000'000LL;
+    // run86 fix: 10s → 3s для быстрого реагирования на зависшие limit-ордера.
+    static constexpr int64_t kWatchdogIntervalNs = 3'000'000'000LL;
 
     // ==================== Phase 4: Continuous Reconciliation ==============
     /// Движок reconciliation для непрерывной проверки состояния ордеров/позиций
@@ -416,9 +467,15 @@ private:
     double current_trail_mult_{2.0};
     /// Время входа в позицию (nanoseconds) — used for telemetry and hedge duration tracking
     int64_t position_entry_time_ns_{0};
+    /// edge-31 Phase 4: последний SL, отправленный в ProtectiveBracketManager.
+    /// Используется для троттлинга update_sl() — пушим обновление только если
+    /// новый SL ощутимо лучше старого (≥ 0.05% движения), чтобы не спамить API.
+    double last_pushed_trailing_sl_{0.0};
+    /// Min относительное движение SL для повторной отправки на биржу (% от цены).
+    static constexpr double kTrailingSlPushMinPct = 0.05;
 
     /// Обновить trailing stop для текущей позиции
-    void update_trailing_stop(const features::FeatureSnapshot& snapshot);
+    // Bug 1.2 fix: метод удалён, заменён PeriodicTrailingSl.
     /// Сбросить все поля trailing stop при закрытии/открытии позиции
     void reset_trailing_state();
 
@@ -459,6 +516,14 @@ private:
     /// (см. pipeline/funding_rate_tracker.hpp).  Атомарный read/write,
     /// маркер in-flight для async обновлений (D2). Интервал refresh = 5 минут.
     FundingRateTracker funding_tracker_{300'000'000'000LL};
+
+    // run94: periodic OI update tracking. Bug 10.1 fix: atomic для safety.
+    std::atomic<int64_t> last_oi_update_ns_{0};
+    static constexpr int64_t kOiUpdateIntervalNs = 30'000'000'000LL;  // 30s
+
+    // Bug 14.1 fix: defer bracket recovery until bracket_manager_ is built.
+    bool pending_bracket_recovery_{false};
+    std::vector<std::pair<Symbol, PositionSide>> recovered_positions_for_brackets_;
 
     // ==================== Rolling Trade Statistics ====================
     /// D6 fix: вынесено в отдельный класс TradingHistoryStats
@@ -512,6 +577,8 @@ private:
     std::unique_ptr<telemetry::IncidentDetector> incident_detector_;
     /// Observability panel metrics (7 panels)
     telemetry::ObservabilityPanels obs_panels_;
+    /// edge-31 Phase 6: row-per-trade journal (signal_age, MFE, MAE, giveback, exit_layer).
+    std::unique_ptr<telemetry::TradeJournal> trade_journal_;
     /// Monotonic sequence ID for telemetry envelopes
     std::atomic<uint64_t> telemetry_seq_{0};
     /// Timestamp of last incident check

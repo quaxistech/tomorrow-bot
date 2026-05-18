@@ -72,11 +72,16 @@ BitgetRestClient::BitgetRestClient(
     rate_buckets_.emplace(static_cast<int>(RateCategory::Query), TokenBucket(20.0, 20.0));
     rate_buckets_.emplace(static_cast<int>(RateCategory::Public), TokenBucket(20.0, 20.0));
 
-    // Initialize connection pool
-    conn_pool_ = std::make_unique<ConnectionPool>();
+    // B16.1 fix: pool из kPoolSize персистентных соединений вместо single conn.
+    // Round-robin распределение устраняет serialization REST запросов.
+    conn_pool_.reserve(kPoolSize);
+    for (int i = 0; i < kPoolSize; ++i) {
+        conn_pool_.emplace_back(std::make_unique<PooledConnection>());
+    }
 
     logger_->info(kComp, "REST клиент создан",
-        {{"host", host_}, {"port", port_}, {"timeout_ms", std::to_string(timeout_ms_)}});
+        {{"host", host_}, {"port", port_}, {"timeout_ms", std::to_string(timeout_ms_)},
+         {"pool_size", std::to_string(kPoolSize)}});
 }
 
 BitgetRestClient::~BitgetRestClient() = default;
@@ -84,13 +89,14 @@ BitgetRestClient::~BitgetRestClient() = default;
 // ==================== Connection Pool ====================
 
 /// Persistent SSL connection for connection reuse (keep-alive)
-struct BitgetRestClient::ConnectionPool {
+struct BitgetRestClient::PooledConnection {
     std::unique_ptr<net::io_context> ioc;
     std::unique_ptr<ssl::context> ssl_ctx;
     std::unique_ptr<beast::ssl_stream<beast::tcp_stream>> stream;
     bool connected{false};
     std::chrono::steady_clock::time_point last_used{};
     int requests_on_connection{0};
+    std::mutex mtx;  ///< per-connection lock — потоки на разные conn идут параллельно
     static constexpr int kMaxRequestsPerConnection = 100;
     static constexpr auto kMaxIdleTime = std::chrono::seconds(25);
 };
@@ -172,6 +178,17 @@ RestResponse BitgetRestClient::get(const std::string& path,
                                     const std::string& query_params) {
     std::string full_path = path;
     if (!query_params.empty()) {
+        // B16.2 fix: проверяем что в query нет небезопасных символов. Все наши
+        // query составляются из латиницы/цифр/`=`/`&`, поэтому encoding не нужен,
+        // но если когда-нибудь попадут спецсимволы — логируем WARN.
+        for (char c : query_params) {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+                  c == '=' || c == '&' || c == '_' || c == '-' || c == '.')) {
+                logger_->warn(kComp, "Unsafe character in query — может требоваться URL-encode",
+                    {{"path", path}, {"char", std::string(1, c)}});
+                break;
+            }
+        }
         full_path += "?" + query_params;
     }
     return execute("GET", full_path, "");
@@ -320,8 +337,11 @@ RestResponse BitgetRestClient::execute(const std::string& method,
             break;
         }
 
-        // Exponential backoff with jitter: base * 3^attempt + uniform[-50, +50]ms
+        // B16.5 fix: на 429 удлиняем backoff (rate limit hit — нужна пауза).
         int backoff_ms = kBaseBackoffMs * static_cast<int>(std::pow(3, attempt));
+        if (response.status_code == 429) {
+            backoff_ms = std::max(backoff_ms, 1000);  // мин 1с при rate limit
+        }
         backoff_ms = std::min(backoff_ms, kMaxBackoffMs);
         std::uniform_int_distribution<int> jitter(-50, 50);
         backoff_ms = std::max(50, backoff_ms + jitter(rng));
@@ -346,7 +366,12 @@ RestResponse BitgetRestClient::execute_once(const std::string& method,
                                              const std::string& path,
                                              const std::string& body) {
     RestResponse response;
-    std::unique_lock<std::mutex> pool_lock(conn_pool_mutex_);
+    // B16.1 fix: round-robin выбор соединения из pool. Каждое имеет свой mutex,
+    // потоки на разные conn идут параллельно. Bitget держит до 16 одновременных
+    // request'ов на IP, pool=4 безопасен.
+    const size_t idx = next_conn_idx_.fetch_add(1, std::memory_order_relaxed) % kPoolSize;
+    auto& pool = *conn_pool_[idx];
+    std::unique_lock<std::mutex> pool_lock(pool.mtx);
 
     try {
         // 1. Подписать запрос (fresh timestamp every attempt — critical for retry)
@@ -355,11 +380,10 @@ RestResponse BitgetRestClient::execute_once(const std::string& method,
                                        clock_offset_ms_.load(std::memory_order_relaxed));
 
         // 2. Check if persistent connection is still usable
-        auto& pool = *conn_pool_;
         auto now = std::chrono::steady_clock::now();
         bool need_reconnect = !pool.connected
-            || pool.requests_on_connection >= ConnectionPool::kMaxRequestsPerConnection
-            || (now - pool.last_used) > ConnectionPool::kMaxIdleTime;
+            || pool.requests_on_connection >= PooledConnection::kMaxRequestsPerConnection
+            || (now - pool.last_used) > PooledConnection::kMaxIdleTime;
 
         if (need_reconnect) {
             // Tear down old connection
@@ -480,8 +504,8 @@ RestResponse BitgetRestClient::execute_once(const std::string& method,
         }
 
     } catch (const std::exception& ex) {
-        // Connection failed — mark pool as disconnected for next attempt
-        conn_pool_->connected = false;
+        // Connection failed — mark this connection as disconnected for next attempt
+        pool.connected = false;
         response.success = false;
         response.status_code = 0;  // Mark as network-level failure (enables retry)
         response.error_message = ex.what();

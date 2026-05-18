@@ -33,8 +33,8 @@ public:
     virtual void notify_position_opened(double /*entry_price*/, double /*size*/,
                                          Side /*side*/, PositionSide /*pos_side*/) {}
 
-    /// Уведомить о закрытии позиции
-    virtual void notify_position_closed() {}
+    /// Уведомить о закрытии позиции. pnl — realized PnL.
+    virtual void notify_position_closed(double pnl = 0.0) { (void)pnl; }
 };
 
 } // namespace tb::strategy

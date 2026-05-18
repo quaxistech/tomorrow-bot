@@ -224,8 +224,12 @@ double LeverageEngine::compute_liquidation_price(const LiquidationParams& params
         return liq;
     } else {
         double liq = params.entry_price * (1.0 + inv_lev - params.maintenance_margin_rate - params.taker_fee_rate);
-        // For shorts, liq must be above entry_price; if not, config is invalid.
-        if (liq <= params.entry_price) return std::numeric_limits<double>::max();
+        // For shorts, liq must be above entry_price; if not — конфигурация невалидна,
+        // возвращаем 0.0 как sentinel "unsafe" (зеркально long-ветви). is_liquidation_safe
+        // увидит liquidation_price=0 и вернёт false, что корректно сигнализирует "опасно".
+        // Возврат numeric_limits::max() инвертировал бы смысл — distance стал бы огромным
+        // и is_safe вернул бы true для невалидной конфигурации (B1.1 — CRITICAL).
+        if (liq <= params.entry_price) return 0.0;
         return liq;
     }
 }
@@ -376,9 +380,9 @@ double LeverageEngine::adversarial_multiplier(double severity) {
     //   0.9  → 0.25
     //   1.0  → 0.15 (максимальная угроза)
 
-    // BUG-S7-04: std::clamp(NaN, ...) returns NaN on x86 (comparisons with NaN are false).
-    // Guard before clamp so downstream lerp() never receives NaN → NaN position size.
-    if (!std::isfinite(severity)) return 0.5;
+    // B1.10 fix: NaN severity → neutral (1.0), не 0.5. 0.5 произвольное "снижение".
+    // 1.0 = "не знаем — не штрафуем"; вся логика остаётся consistent.
+    if (!std::isfinite(severity)) return 1.0;
     severity = std::clamp(severity, 0.0, 1.0);
     return lerp(1.0, 0.15, severity);
 }
@@ -386,16 +390,22 @@ double LeverageEngine::adversarial_multiplier(double severity) {
 // ==================== Множитель от неопределённости ====================
 
 double LeverageEngine::uncertainty_multiplier(UncertaintyLevel level) {
-    // Дискретные уровни (enum), но значения подобраны для согласованности
-    // с другими множителями. Uncertainty — системный фактор, а не рыночный,
-    // поэтому плавная интерполяция здесь не применяется.
+    // Scalping refactor 2026-05: uncertainty is already applied via
+    // uncertainty.size_multiplier in the pipeline allocator (single
+    // source of truth for size scaling). Repeating it here as a leverage
+    // multiplier double-counts the same signal and compresses notional
+    // far below min_notional on a small account.
+    //
+    // We retain a gentle dampening only at Extreme level so the bot
+    // doesn't open positions with maximal leverage during a crisis,
+    // but Moderate/High are now neutral.
     switch (level) {
         case UncertaintyLevel::Low:      return 1.0;
-        case UncertaintyLevel::Moderate: return 0.80;
-        case UncertaintyLevel::High:     return 0.55;
-        case UncertaintyLevel::Extreme:  return 0.25;
+        case UncertaintyLevel::Moderate: return 1.0;
+        case UncertaintyLevel::High:     return 1.0;
+        case UncertaintyLevel::Extreme:  return 0.6;
     }
-    return 0.50;
+    return 1.0;
 }
 
 } // namespace tb::leverage

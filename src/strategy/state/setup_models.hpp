@@ -19,6 +19,7 @@ struct Setup {
     double confidence{0.0};                  ///< [0, 1]
     double reference_price{0.0};             ///< Цена при обнаружении
     double stop_reference{0.0};              ///< Предлагаемый стоп
+    double tp_reference{0.0};                ///< Предлагаемый take-profit (0 = не задан)
     double entry_reference{0.0};             ///< Ожидаемая точка входа
 
     int64_t detected_at_ns{0};               ///< Время обнаружения

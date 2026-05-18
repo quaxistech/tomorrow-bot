@@ -73,11 +73,26 @@ bool MarketDataGateway::is_connected() const {
 }
 
 bool MarketDataGateway::is_feed_fresh() const {
+    // B25.1: 1 sec freshness threshold — defining constant.
+    constexpr int64_t kFeedFreshnessNs = 1'000'000'000LL;
     int64_t now_ns  = clock_->now().get();
     int64_t last_ts = last_message_ts_.load();
     int64_t diff    = now_ns - last_ts;
-    if (diff < 0) return false; // clock skew: future timestamp — treat as stale
-    return diff < 1'000'000'000LL;
+    if (diff < 0) {
+        // B25.3: clock skew (future timestamp) — log WARN rate-limited.
+        // Используем static rate limiter чтобы не спамить.
+        static std::atomic<int64_t> last_skew_warn_ns{0};
+        const int64_t kSkewWarnIntervalNs = 60'000'000'000LL;  // 1/min
+        const int64_t prev = last_skew_warn_ns.load(std::memory_order_relaxed);
+        if (now_ns - prev > kSkewWarnIntervalNs) {
+            last_skew_warn_ns.store(now_ns, std::memory_order_relaxed);
+            logger_->warn("MarketDataGateway",
+                "Clock skew detected (future timestamp в last_message_ts)",
+                {{"diff_ns", std::to_string(diff)}});
+        }
+        return false;
+    }
+    return diff < kFeedFreshnessNs;
 }
 
 void MarketDataGateway::on_raw_message(exchange::bitget::RawWsMessage msg) {

@@ -23,6 +23,7 @@
 #include "scanner/scanner_engine.hpp"
 #include "common/constants.hpp"
 #include "common/exchange_rules.hpp"
+#include "exchange/bitget/bitget_futures_order_submitter.hpp"
 #include "exchange/bitget/bitget_futures_query_adapter.hpp"
 #include "exchange/bitget/bitget_rest_client.hpp"
 #include "security/secret_provider.hpp"
@@ -31,7 +32,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <csignal>
+#include <exception>
 #include <iostream>
 #include <span>
 #include <sstream>
@@ -126,6 +129,20 @@ void print_version() {
 } // anonymous namespace
 
 int main(int argc, const char* argv[]) {
+    // B7.4 fix: глобальный terminate handler логирует fatal перед crash.
+    std::set_terminate([]() {
+        std::fprintf(stderr, "[FATAL] std::terminate() called\n");
+        try {
+            auto eptr = std::current_exception();
+            if (eptr) std::rethrow_exception(eptr);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[FATAL] uncaught: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[FATAL] uncaught: unknown\n");
+        }
+        std::abort();
+    });
+
     // ---- 1. Парсинг аргументов ----
     auto args = parse_args(std::span<const char*>{argv, static_cast<std::size_t>(argc)});
 
@@ -428,7 +445,7 @@ int main(int argc, const char* argv[]) {
 
         for (int attempt = 1; attempt <= kMaxScanRetries; ++attempt) {
             scanner_result = market_scanner->scan();
-            active_symbols = scanner_result.selected_symbols();
+            active_symbols = scanner_result.selected_tradable_symbols();
 
             if (!active_symbols.empty()) {
                 for (const auto& p : scanner_result.top_pairs) {
@@ -477,6 +494,7 @@ int main(int argc, const char* argv[]) {
                     tb::exchange::bitget::BitgetFuturesQueryAdapter futures_query{
                         auth_rest, logger, config.futures};
                     auto open_positions = futures_query.get_open_positions();
+                    std::unordered_set<std::string> protected_symbols;
                     if (!open_positions.has_value()) {
                         logger->warn("main", "Не удалось загрузить открытые фьючерсные позиции",
                             {{"error", tb::TbErrorCategory::instance().message(
@@ -488,6 +506,7 @@ int main(int argc, const char* argv[]) {
                             if (symbol.empty() || position.size.get() <= 0.0) {
                                 continue;
                             }
+                            protected_symbols.insert(symbol);
 
                             if (!positions_str.empty()) {
                                 positions_str += ", ";
@@ -516,6 +535,100 @@ int main(int argc, const char* argv[]) {
                         if (!positions_str.empty()) {
                             logger->info("main", "Открытые фьючерсные позиции на бирже: " + positions_str);
                         }
+                    }
+
+                    // ---- Глобальный startup wipe (SMART v3 — CONSERVATIVE) ----
+                    // Стратегия:
+                    //   • protected_pos = (symbol, side) с открытой позицией.
+                    //   • Plan-orders для protected_pos → ВООБЩЕ НЕ ТРОГАЕМ.
+                    //     Они могут быть нужны для защиты позиции (preset TPSL,
+                    //     standalone fallback, trailing replace). Если есть лишние —
+                    //     periodic cleanup_orphans разберётся (с tracked_ids защитой).
+                    //   • Plan-orders НЕ для protected → ВСЕ отменяем (orphans).
+                    //   • Regular pending orders → ВСЕ отменяем (orphans entry).
+                    //
+                    // Это безопасный подход: лучше иметь несколько duplicate plan-orders
+                    // для активных позиций, чем оставить позицию без защиты.
+                    try {
+                        auto submitter = std::make_shared<
+                            tb::exchange::bitget::BitgetFuturesOrderSubmitter>(
+                            auth_rest, logger, config.futures);
+
+                        struct PositionKey {
+                            std::string symbol;
+                            tb::PositionSide side;
+                            bool operator==(const PositionKey& o) const {
+                                return symbol == o.symbol && side == o.side;
+                            }
+                        };
+                        struct PositionKeyHash {
+                            size_t operator()(const PositionKey& k) const {
+                                return std::hash<std::string>{}(k.symbol)
+                                     ^ (static_cast<size_t>(k.side) << 1);
+                            }
+                        };
+                        std::unordered_set<PositionKey, PositionKeyHash> protected_pos;
+                        std::unordered_set<std::string> protected_symbols_set;
+                        if (open_positions.has_value()) {
+                            for (const auto& pos : open_positions.value()) {
+                                if (pos.symbol.get().empty() || pos.size.get() <= 0.0) continue;
+                                const tb::PositionSide ps = (pos.side == tb::Side::Buy)
+                                    ? tb::PositionSide::Long : tb::PositionSide::Short;
+                                protected_pos.insert({pos.symbol.get(), ps});
+                                protected_symbols_set.insert(pos.symbol.get());
+                            }
+                        }
+
+                        int wiped_plans = 0, wiped_regs = 0, kept_plans = 0;
+
+                        auto plans = futures_query.get_open_plan_orders(tb::Symbol(""));
+                        if (plans) {
+                            for (const auto& p : *plans) {
+                                PositionKey pk{p.symbol.get(), p.position_side};
+                                if (protected_pos.count(pk) > 0) {
+                                    // НЕ ТРОГАЕМ — может быть нашей защитой.
+                                    ++kept_plans;
+                                    continue;
+                                }
+                                const std::string& pt = p.plan_type.empty()
+                                    ? std::string("normal_plan") : p.plan_type;
+                                if (submitter->cancel_plan_order(p.order_id, p.symbol, pt)) {
+                                    ++wiped_plans;
+                                }
+                            }
+                        }
+
+                        auto regs = futures_query.get_open_orders(tb::Symbol(""));
+                        if (regs) {
+                            for (const auto& o : *regs) {
+                                // Regular pending — даже для protected positions это
+                                // entry orders которые могли застрять. Отменяем все.
+                                if (submitter->cancel_order(o.order_id, o.symbol)) {
+                                    ++wiped_regs;
+                                }
+                            }
+                        }
+
+                        if (wiped_plans > 0 || wiped_regs > 0 || kept_plans > 0) {
+                            std::string prot_str;
+                            for (const auto& pk : protected_pos) {
+                                if (!prot_str.empty()) prot_str += ",";
+                                prot_str += pk.symbol + ":" +
+                                    (pk.side == tb::PositionSide::Long ? "Long" : "Short");
+                            }
+                            logger->warn("main",
+                                "Global startup wipe (smart v3: conservative)",
+                                {{"plan_cancelled", std::to_string(wiped_plans)},
+                                 {"plan_kept_for_positions", std::to_string(kept_plans)},
+                                 {"regular_cancelled", std::to_string(wiped_regs)},
+                                 {"protected_positions", prot_str}});
+                        } else {
+                            logger->info("main",
+                                "Global startup wipe: висящих ордеров не найдено");
+                        }
+                    } catch (const std::exception& e) {
+                        logger->warn("main", "Global startup wipe не выполнен",
+                            {{"error", e.what()}});
                     }
                 }
             }
@@ -686,7 +799,7 @@ int main(int argc, const char* argv[]) {
     // Ротация через новый ScannerEngine (только в auto режиме)
     if (config.pair_selection.mode != tb::config::PairSelectionMode::Manual) {
         market_scanner->start_rotation([&logger](const tb::scanner::ScannerResult& result) {
-            auto syms = result.selected_symbols();
+            auto syms = result.selected_tradable_symbols();
             std::string symbols_str;
             for (const auto& s : syms) {
                 if (!symbols_str.empty()) symbols_str += ", ";
@@ -736,12 +849,12 @@ int main(int argc, const char* argv[]) {
     // (нет торговли > 30 мин) и нет открытых позиций — пересканировать рынок
     // и заменить pipeline на новые символы.
     const bool rotation_enabled = (config.pair_selection.mode != tb::config::PairSelectionMode::Manual);
-    // EDGE-26 (active hunter mode 2026-05-15): rotation interval 3min, idle threshold 10min
-    // = pipelines не ротировались. Снижаем idle threshold до 3min (соответствует rotation),
-    // check interval 30s, rescan 3min.
-    constexpr int64_t kIdleThresholdNs = 3LL * 60 * 1'000'000'000LL;  // 3 мин — соответствует rotation
-    constexpr int kIdleCheckIntervalSec = 30;                          // 30s между проверками
-    constexpr int64_t kMinRescanIntervalNs = 3LL * 60 * 1'000'000'000LL; // 3 мин между ресканами
+    // run90: thresholds теперь из config. Дефолты: idle 5 min, check 30s, rescan 5 min.
+    const int64_t kIdleThresholdNs =
+        static_cast<int64_t>(config.pair_selection.idle_threshold_minutes) * 60LL * 1'000'000'000LL;
+    const int kIdleCheckIntervalSec = config.pair_selection.idle_check_interval_sec;
+    const int64_t kMinRescanIntervalNs =
+        static_cast<int64_t>(config.pair_selection.min_rescan_interval_minutes) * 60LL * 1'000'000'000LL;
 
     std::atomic<bool> idle_monitor_running{true};
     int64_t last_rescan_ns = comp.clock->now().get();
@@ -799,10 +912,47 @@ int main(int argc, const char* argv[]) {
             try {
                 // Используем новый ScannerEngine для ресканирования
                 auto rescan_v2 = market_scanner->scan();
-                auto rescan_syms = rescan_v2.selected_symbols();
+
+                // PROFESSIONAL ROTATION POOL (user 2026-05-18):
+                // На тихом рынке top_pairs может быть пуст или совпадать с active.
+                // Собираем полный pool кандидатов:
+                //   1. top_pairs (TradeAllowed) — лучшие по score
+                //   2. rejected_pairs (Neutral) — следующие по качеству
+                //   3. rejected_pairs (DoNotTrade) — последний резерв (только если рынок мёртв)
+                // Сортируем по score descending — даём idle slots самых перспективных
+                // кандидатов даже если они не прошли strict-фильтры.
+                struct PoolEntry {
+                    std::string symbol;
+                    double score;
+                    int tier;  // 0=top, 1=rejected-neutral, 2=rejected-donottrade
+                };
+                std::vector<PoolEntry> rotation_pool;
+                rotation_pool.reserve(rescan_v2.top_pairs.size() + rescan_v2.rejected_pairs.size());
+                for (const auto& sa : rescan_v2.top_pairs) {
+                    rotation_pool.push_back({sa.symbol, sa.score.total, 0});
+                }
+                for (const auto& sa : rescan_v2.rejected_pairs) {
+                    const int tier = (sa.trade_state == tb::scanner::TradeState::Neutral) ? 1 : 2;
+                    rotation_pool.push_back({sa.symbol, sa.score.total, tier});
+                }
+                // Сортировка: сначала по tier (top > neutral > donottrade), потом по score.
+                std::sort(rotation_pool.begin(), rotation_pool.end(),
+                    [](const PoolEntry& a, const PoolEntry& b) {
+                        if (a.tier != b.tier) return a.tier < b.tier;
+                        return a.score > b.score;
+                    });
+
+                std::vector<std::string> rescan_syms;
+                rescan_syms.reserve(rotation_pool.size());
+                for (const auto& e : rotation_pool) rescan_syms.push_back(e.symbol);
+
+                logger->info("main", "Rescan pool собран",
+                    {{"top", std::to_string(rescan_v2.top_pairs.size())},
+                     {"rejected", std::to_string(rescan_v2.rejected_pairs.size())},
+                     {"total_pool", std::to_string(rescan_syms.size())}});
 
                 if (rescan_syms.empty()) {
-                    logger->warn("main", "Ресканирование не нашло подходящих пар");
+                    logger->warn("main", "Ресканирование не нашло НИ ОДНОЙ пары (биржа недоступна?)");
                     last_rescan_ns = comp.clock->now().get();
                     continue;
                 }

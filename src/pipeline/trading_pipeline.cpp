@@ -265,30 +265,28 @@ TradingPipeline::TradingPipeline(
     strategy_registry_->register_strategy(
         std::make_shared<strategy::StrategyEngine>(logger_, clock_));
 
-    // 5. Аллокация стратегий и решения
-    strategy_allocator_ = std::make_shared<strategy_allocator::RegimeAwareAllocator>(logger_, clock_);
+    // 5. Решения (allocator removed in scalping refactor — weight computed inline below)
 
-    // Advanced decision config — маппинг из AppConfig
+    // Advanced decision config — маппинг из AppConfig. После scalping refactor
+    // 2026-05 убраны ensemble/regime-threshold/dominance ветки (single-strategy).
     decision::AdvancedDecisionConfig adv_decision;
-    adv_decision.enable_regime_threshold_scaling = config_.decision.enable_regime_threshold_scaling;
-    adv_decision.enable_regime_dominance_scaling = config_.decision.enable_regime_dominance_scaling;
-    adv_decision.enable_time_decay = config_.decision.enable_time_decay;
-    adv_decision.time_decay_halflife_ms = config_.decision.time_decay_halflife_ms;
-    adv_decision.enable_ensemble_conviction = config_.decision.enable_ensemble_conviction;
-    adv_decision.ensemble_agreement_bonus = config_.decision.ensemble_agreement_bonus;
-    adv_decision.ensemble_max_bonus = config_.decision.ensemble_max_bonus;
-    adv_decision.enable_portfolio_awareness = config_.decision.enable_portfolio_awareness;
-    adv_decision.drawdown_boost_scale = config_.decision.drawdown_boost_scale;
-    adv_decision.drawdown_max_boost = config_.decision.drawdown_max_boost;
-    adv_decision.consecutive_loss_boost = config_.decision.consecutive_loss_boost;
+    adv_decision.enable_time_decay              = config_.decision.enable_time_decay;
+    adv_decision.time_decay_halflife_ms         = config_.decision.time_decay_halflife_ms;
+    adv_decision.enable_portfolio_awareness     = config_.decision.enable_portfolio_awareness;
+    adv_decision.drawdown_boost_scale           = config_.decision.drawdown_boost_scale;
+    adv_decision.drawdown_max_boost             = config_.decision.drawdown_max_boost;
+    adv_decision.consecutive_loss_boost         = config_.decision.consecutive_loss_boost;
     adv_decision.enable_execution_cost_modeling = config_.decision.enable_execution_cost_modeling;
-    adv_decision.max_acceptable_cost_bps = config_.decision.max_acceptable_cost_bps;
-    adv_decision.enable_time_skew_detection = config_.decision.enable_time_skew_detection;
+    adv_decision.max_acceptable_cost_bps        = config_.decision.max_acceptable_cost_bps;
+    adv_decision.enable_time_skew_detection     = config_.decision.enable_time_skew_detection;
 
+    // The 4-arg constructor still expects a `dominance_threshold` legacy param;
+    // we feed a neutral 0.5. It is unused inside aggregate() after the refactor
+    // but kept on the ctor for binary compatibility with existing callers.
     decision_engine_ = std::make_shared<decision::CommitteeDecisionEngine>(
         logger_, clock_,
         config_.decision.min_conviction_threshold,
-        config_.decision.conflict_dominance_threshold,
+        0.5,
         adv_decision);
 
     // Общий PostgreSQL storage — создаём один раз, передаём всем компонентам.
@@ -334,6 +332,11 @@ TradingPipeline::TradingPipeline(
 
         obs_panels_ = telemetry::ObservabilityPanels::create(metrics_);
     }
+
+    // edge-31 Phase 6: TradeJournal — row-per-trade телеметрия.
+    trade_journal_ = std::make_unique<telemetry::TradeJournal>(logger_, clock_);
+    logger_->info("pipeline",
+        "TradeJournal инициализирован (signal_age + MFE/MAE/giveback + exit_layer)");
 
     // 5.5. Продвинутые features (CUSUM, VPIN, Volume Profile, Time-of-Day)
     features::VpinConfig vpin_cfg;
@@ -646,6 +649,20 @@ TradingPipeline::TradingPipeline(
     // ==================== Phase 2: Exit Orchestrator ====================
     exit_orchestrator_ = std::make_unique<PositionExitOrchestrator>(logger_, clock_);
 
+    // ==================== edge-31: Pre-trade gates ========================
+    freshness_gate_ = std::make_unique<FreshnessGate>(config_.pre_trade_gates);
+    net_rr_gate_    = std::make_unique<NetRRGate>(config_.pre_trade_gates);
+    logger_->info("pipeline",
+        "Pre-trade gates инициализированы (FreshnessGate + NetRRGate)",
+        {{"max_signal_age_ms", std::to_string(config_.pre_trade_gates.max_signal_age_ms)},
+         {"max_adverse_drift_bps", std::to_string(config_.pre_trade_gates.max_adverse_price_drift_bps)},
+         {"min_net_rr", std::to_string(config_.pre_trade_gates.min_net_rr)},
+         {"freshness_enabled", config_.pre_trade_gates.freshness_enabled ? "yes" : "no"},
+         {"net_rr_enabled", config_.pre_trade_gates.net_rr_enabled ? "yes" : "no"}});
+
+    // ==================== edge-31: Protective bracket manager =============
+    // Конструируется позже, после инициализации futures_query_adapter_.
+
     // ==================== Phase 3: Hedge Pair Manager ====================
     hedge_manager_ = std::make_unique<HedgePairManager>(logger_);
 
@@ -672,6 +689,65 @@ TradingPipeline::TradingPipeline(
         reconciliation_engine_ = std::make_shared<reconciliation::ReconciliationEngine>(
             rec_cfg, futures_query_adapter_, logger_, clock_, metrics_);
         logger_->info("pipeline", "Continuous reconciliation engine инициализирован (Futures режим)");
+
+        // edge-31: ProtectiveBracketManager — после futures_query_adapter_ готов.
+        if (futures_submitter_) {
+            ProtectiveBracketConfig bracket_cfg;  // defaults: grace 3000ms, 6 attempts
+            bracket_manager_ = std::make_shared<ProtectiveBracketManager>(
+                futures_submitter_, futures_query_adapter_, logger_, clock_, bracket_cfg);
+            logger_->info("pipeline",
+                "ProtectiveBracketManager инициализирован (verify+fallback+recovery)",
+                {{"grace_ms", std::to_string(bracket_cfg.verify_grace_ms)},
+                 {"max_attempts", std::to_string(bracket_cfg.max_verify_attempts)}});
+
+            // run87: Periodic monotonic trailing SL — каждые 5 сек tighten SL
+            // вверх (LONG) / вниз (SHORT) только в сторону прибыли.
+            PeriodicTrailingConfig trail_cfg;  // defaults: 5s interval, ATR×1.2
+            trailing_sl_ = std::make_unique<PeriodicTrailingSl>(
+                bracket_manager_, logger_, clock_, trail_cfg);
+            logger_->info("pipeline",
+                "PeriodicTrailingSl инициализирован (monotonic Chandelier Exit)",
+                {{"interval_ms", std::to_string(trail_cfg.min_interval_ms)},
+                 {"atr_mult", std::to_string(trail_cfg.atr_trail_multiplier)},
+                 {"min_move_bps", std::to_string(trail_cfg.min_sl_move_bps)},
+                 {"activation_min_profit_bps", std::to_string(trail_cfg.activation_min_profit_bps)}});
+        }
+
+        // run90: Stagnant position detector.
+        StagnantPositionConfig stagnant_cfg;  // defaults: 120s window, 8 bps range, 180s min age
+        stagnant_detector_ = std::make_unique<StagnantPositionDetector>(
+            logger_, clock_, stagnant_cfg);
+        logger_->info("pipeline",
+            "StagnantPositionDetector инициализирован (force exit for low-activity pairs)",
+            {{"window_sec", std::to_string(stagnant_cfg.stagnant_check_window_sec)},
+             {"min_range_bps", std::to_string(stagnant_cfg.min_range_bps)},
+             {"min_age_sec", std::to_string(stagnant_cfg.min_position_age_sec)}});
+
+        // Bug 14.1 fix: сначала recover bracket state для existing позиций
+        // (ДО cleanup_orphans, иначе active brackets будут отменены как orphans).
+        if (bracket_manager_ && pending_bracket_recovery_
+            && !recovered_positions_for_brackets_.empty()) {
+            int recovered = bracket_manager_->recover_from_exchange(
+                recovered_positions_for_brackets_);
+            logger_->info("pipeline", "Bracket state восстановлен с биржи",
+                {{"symbol", symbol_.get()},
+                 {"recovered_positions", std::to_string(recovered_positions_for_brackets_.size())},
+                 {"recovered_brackets", std::to_string(recovered)}});
+            pending_bracket_recovery_ = false;
+        }
+
+        // CRITICAL FIX (20:01 incident): per-symbol startup_wipe_pendings УБРАН.
+        // Global startup wipe (smart v2) в main.cpp выполняется ДО создания
+        // pipeline и уже отменяет orphans + сохраняет 1 newest TP+SL для
+        // protected positions. Per-symbol wipe здесь вызывался с has_position=false
+        // (portfolio ещё не sync) → отменял НАШИ ЖЕ сохранённые preset TPSL для
+        // существующих позиций → позиции оставались без защиты до первого
+        // нового verify_brackets.
+        //
+        // Recovery state preset TPSL делается через recover_from_exchange() выше.
+        // Если recovery подцепил preset — они tracked, periodic cleanup_orphans
+        // их сохранит. Если нет — preset cancel'нутся через periodic cleanup и
+        // первый verify создаст новые через fallback.
 
         recovery::RecoveryConfig recovery_cfg;
         recovery_cfg.enabled = true;
@@ -726,8 +802,73 @@ TradingPipeline::TradingPipeline(
                     {{"exchange_balance", std::to_string(recovery_result.recovered_cash_balance)},
                      {"leveraged_budget", std::to_string(real_budget)}});
             }
+
+            // Bug 14.1 fix: восстановить bracket state для recovered позиций.
+            // Если позиция была открыта в прошлой сессии — preset TPSL уже на бирже.
+            // bracket_manager_->recover_from_exchange() запросит plan-orders и
+            // привяжет их order_ids к нашему bracket state. Без этого periodic
+            // cleanup отменит активную защиту как orphan.
+            // Bracket_manager создаётся ниже в ctor — отложим вызов через флаг.
+            pending_bracket_recovery_ = !recovery_result.recovered_positions.empty();
+            recovered_positions_for_brackets_.clear();
+            for (const auto& pos : recovery_result.recovered_positions) {
+                if (pos.symbol.get() == symbol_.get()) {
+                    // B17.1 fix: при resolution=="needs_close" логируем CRITICAL —
+                    // orphan позиция требует ручного закрытия. Pipeline не имеет
+                    // прямой возможности закрыть позицию вне strategy цикла,
+                    // но операторская видимость даёт возможность реагировать.
+                    if (pos.resolution == "needs_close") {
+                        logger_->error("recovery",
+                            "ORPHAN POSITION needs manual close — bot не управляет ею",
+                            {{"symbol", pos.symbol.get()},
+                             {"side", pos.side == Side::Buy ? "Long" : "Short"},
+                             {"size", std::to_string(pos.size.get())},
+                             {"resolution", pos.resolution}});
+                        // Принудительно добавим в tracked для bracket recovery —
+                        // если есть preset TPSL на бирже, они защитят позицию.
+                    }
+                    // RecoveredPosition имеет Side, derive PositionSide.
+                    PositionSide ps = (pos.side == Side::Buy)
+                        ? PositionSide::Long : PositionSide::Short;
+                    recovered_positions_for_brackets_.emplace_back(pos.symbol, ps);
+                }
+            }
         }
     }
+}
+
+// O9.1 fix: централизованный билдер close-intent (вместо 3 дублей в pipeline).
+strategy::TradeIntent TradingPipeline::build_close_intent(
+    const Symbol& symbol,
+    PositionSide position_side,
+    double close_qty,
+    double mid_price,
+    const std::string& strategy_id,
+    const std::string& reason_tag,
+    double urgency) const
+{
+    strategy::TradeIntent intent;
+    intent.symbol = symbol;
+    intent.trade_side = TradeSide::Close;
+    intent.position_side = position_side;
+    // side используется ТОЛЬКО для local portfolio accounting (reduce_position).
+    // Submitter в hedge_mode игнорирует это поле (см. O2.1).
+    intent.side = (position_side == PositionSide::Long) ? Side::Sell : Side::Buy;
+    intent.signal_intent = (position_side == PositionSide::Long)
+        ? strategy::SignalIntent::LongExit : strategy::SignalIntent::ShortExit;
+    intent.conviction = 1.0;
+    intent.urgency = urgency;
+    intent.suggested_quantity = Quantity(close_qty);
+    intent.limit_price = Price(mid_price);
+    intent.snapshot_mid_price = Price(mid_price);
+    intent.strategy_id = StrategyId(strategy_id);
+    intent.correlation_id = CorrelationId(reason_tag + "-" +
+        std::to_string(clock_ ? clock_->now().get() : 0));
+    intent.generated_at = clock_ ? clock_->now() : Timestamp(0);
+    // O3.4: TP/SL не для close intent.
+    intent.take_profit_price.reset();
+    intent.stop_loss_price.reset();
+    return intent;
 }
 
 TradingPipeline::~TradingPipeline() {
@@ -1049,20 +1190,71 @@ void TradingPipeline::sync_balance_from_exchange() {
                          {"side", leg.side == PositionSide::Long ? "long" : "short"},
                          {"size", std::to_string(leg.qty)}});
                 } else {
-                    // Нет позиций на бирже — очистить фантомы из портфеля
+                    // Нет позиций на бирже — очистить фантомы из портфеля.
+                    // run92 fix (2026-05-17): фантом обычно означает что биржа закрыла
+                    // позицию (TP/SL trigger), а локальный portfolio об этом не узнал.
+                    // Используем current mark price для расчёта realized PnL —
+                    // лучше чем zero, который маскирует loss/profit и ломает Kelly stats.
                     auto phantom_long = portfolio_->get_position(symbol_, PositionSide::Long);
                     auto phantom_short = portfolio_->get_position(symbol_, PositionSide::Short);
+
+                    double mark_price = cached_market_state_.mid_price;
+                    // Fallback на entry price если mid недоступен (не двигаемая позиция).
+                    if (mark_price <= 0.0 || !std::isfinite(mark_price)) {
+                        mark_price = 0.0;  // явный zero — отметим что cleanup без price
+                    }
+
                     if (phantom_long.has_value()) {
-                        logger_->warn("pipeline", "Фантомная long позиция — очистка",
+                        double entry = phantom_long->avg_entry_price.get();
+                        double qty = phantom_long->size.get();
+                        // LONG PnL = (close - entry) × qty
+                        double realized = (mark_price > 0.0 && entry > 0.0)
+                            ? (mark_price - entry) * qty : 0.0;
+                        logger_->warn("pipeline",
+                            "Фантомная long позиция — очистка (биржа закрыла, sync)",
                             {{"symbol", symbol_.get()},
-                             {"size", std::to_string(phantom_long->size.get())}});
-                        portfolio_->close_position(symbol_, PositionSide::Long, Price(0.0), 0.0);
+                             {"size", std::to_string(qty)},
+                             {"entry", std::to_string(entry)},
+                             {"assumed_close", std::to_string(mark_price)},
+                             {"realized_pnl_estimate", std::to_string(realized)}});
+                        portfolio_->close_position(symbol_, PositionSide::Long,
+                                                    Price(mark_price), realized);
+                        // O4.1 fix: release bracket — иначе stale state + 22002 при cancel.
+                        if (bracket_manager_) {
+                            (void)bracket_manager_->release(symbol_, PositionSide::Long);
+                        }
+                        // run95: notify strategy с pnl для consecutive losses tracking.
+                        if (strategy_registry_) {
+                            for (const auto& s : strategy_registry_->active()) {
+                                s->notify_position_closed(realized);
+                            }
+                        }
                     }
                     if (phantom_short.has_value()) {
-                        logger_->warn("pipeline", "Фантомная short позиция — очистка",
+                        double entry = phantom_short->avg_entry_price.get();
+                        double qty = phantom_short->size.get();
+                        // SHORT PnL = (entry - close) × qty
+                        double realized = (mark_price > 0.0 && entry > 0.0)
+                            ? (entry - mark_price) * qty : 0.0;
+                        logger_->warn("pipeline",
+                            "Фантомная short позиция — очистка (биржа закрыла, sync)",
                             {{"symbol", symbol_.get()},
-                             {"size", std::to_string(phantom_short->size.get())}});
-                        portfolio_->close_position(symbol_, PositionSide::Short, Price(0.0), 0.0);
+                             {"size", std::to_string(qty)},
+                             {"entry", std::to_string(entry)},
+                             {"assumed_close", std::to_string(mark_price)},
+                             {"realized_pnl_estimate", std::to_string(realized)}});
+                        portfolio_->close_position(symbol_, PositionSide::Short,
+                                                    Price(mark_price), realized);
+                        // O4.1 fix: release bracket — иначе stale state + 22002 при cancel.
+                        if (bracket_manager_) {
+                            (void)bracket_manager_->release(symbol_, PositionSide::Short);
+                        }
+                        // run95: notify strategy с pnl.
+                        if (strategy_registry_) {
+                            for (const auto& s : strategy_registry_->active()) {
+                                s->notify_position_closed(realized);
+                            }
+                        }
                     }
                 }
             }
@@ -1486,6 +1678,7 @@ void TradingPipeline::reset_trailing_state() {
     initial_position_size_ = 0.0;
     current_trail_mult_ = config_.trading_params.atr_stop_multiplier;
     position_entry_time_ns_ = 0;
+    last_pushed_trailing_sl_ = 0.0;
     if (hedge_manager_) {
         hedge_manager_->reset();
     }
@@ -1519,12 +1712,14 @@ double TradingPipeline::evaluate_exit_score(const features::FeatureSnapshot& sna
     const bool is_long = (for_side == PositionSide::Long);
 
     // ── 1. Momentum (вес 0.25) ─────────────────────────────────────────
-    // Скорость и направление ценового движения — ключевой индикатор для скальпинга
+    // Скорость и направление ценового движения — ключевой индикатор для скальпинга.
+    // Bug 1.4 fix: 0.005 (50 bps) — нормализующий strong momentum threshold.
+    // Wilder (1978) momentum is conceptual; 50 bps = типичный 5m крипто move.
     if (snapshot.technical.momentum_valid) {
+        constexpr double kStrongMomentumThreshold = 0.005;  // 50 bps per period
         double mom = snapshot.technical.momentum_5;
         double mom_signal = is_long ? mom : -mom;
-        // Нормализация: ±0.005 = сильный сигнал
-        score += std::clamp(mom_signal / 0.005, -1.0, 1.0) * 0.25;
+        score += std::clamp(mom_signal / kStrongMomentumThreshold, -1.0, 1.0) * 0.25;
         ++signals;
     }
 
@@ -1976,60 +2171,6 @@ bool TradingPipeline::check_hedge_recovery(const features::FeatureSnapshot& snap
     return hedge_active_;
 }
 
-void TradingPipeline::update_trailing_stop(const features::FeatureSnapshot& snapshot) {
-    auto port_snap = portfolio_->snapshot();
-    if (port_snap.positions.empty()) {
-        reset_trailing_state();
-        return;
-    }
-
-    for (const auto& pos : port_snap.positions) {
-        if (pos.symbol.get() != symbol_.get()) continue;
-        double price = pos.current_price.get();
-        double entry = pos.avg_entry_price.get();
-        if (entry <= 0.0 || price <= 0.0) continue;
-
-        // Запоминаем начальный размер и время входа при первом обновлении
-        if (initial_position_size_ <= 0.0) {
-            initial_position_size_ = pos.size.get();
-            position_entry_time_ns_ = (pos.opened_at.get() > 0)
-                ? pos.opened_at.get() : clock_->now().get();
-            logger_->info("pipeline", "Position entry time записано",
-                {{"symbol", symbol_.get()},
-                 {"size", std::to_string(initial_position_size_)},
-                 {"opened_at_ns", std::to_string(position_entry_time_ns_)}});
-        }
-
-        // MAE update
-        bool is_long = (current_position_side_ == PositionSide::Long);
-        if (is_long) {
-            highest_price_since_entry_ = std::max(highest_price_since_entry_, price);
-        } else {
-            lowest_price_since_entry_ = std::min(lowest_price_since_entry_, price);
-        }
-        update_current_mae(price, is_long);
-
-        // Delegate trailing update to exit orchestrator
-        auto ctx = build_exit_context(snapshot, pos);
-        auto update = exit_orchestrator_->update_trailing(ctx);
-
-        bool was_breakeven = breakeven_activated_;
-        current_trail_mult_ = update.trail_mult;
-        breakeven_activated_ = update.breakeven_activated;
-        current_stop_level_ = update.stop_level;
-        highest_price_since_entry_ = update.highest;
-        lowest_price_since_entry_ = update.lowest;
-
-        if (!was_breakeven && breakeven_activated_) {
-            logger_->info("pipeline", "Breakeven + Trailing активирован",
-                {{"entry", std::to_string(entry)},
-                 {"stop", std::to_string(current_stop_level_)},
-                 {"trail_mult", std::to_string(current_trail_mult_)},
-                 {"side", is_long ? "long" : "short"},
-                 {"symbol", symbol_.get()}});
-        }
-    }
-}
 
 // ==================== Стоп-лосс позиций ====================
 
@@ -2100,7 +2241,7 @@ bool TradingPipeline::check_position_stop_loss(const features::FeatureSnapshot& 
             }
             if (actual_qty <= 0.0) actual_qty = pos.size.get();
         }
-        if (actual_qty < 0.00001) {
+        if (actual_qty < std::max(exchange_rules_.min_quantity, 1e-8)) {
             logger_->info("pipeline", "Стоп-лосс: актив уже продан, очищаем позицию из портфеля",
                 {{"qty", std::to_string(actual_qty)},
                  {"symbol", symbol_.get()}});
@@ -2616,10 +2757,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     {
         auto ingress_stage = tick_profiler.scope(TickStageProfiler::Stage::Ingress);
 
-        // Refresh trailing/protective stop state before hedge decisions.
-        // Hedge recovery must see the current stop distance; otherwise ATR stops can
-        // flatten the primary leg before the opposite hedge ever gets a chance.
-        update_trailing_stop(snapshot);
+        // Trailing SL handled by PeriodicTrailingSl через ProtectiveBracketManager
+        // (биржевой plan-ордер, monotonic). Bug 1.2 fix: удалили устаревший
+        // local update_trailing_stop, два параллельных trailing вызывали конфликты.
 
         // 0a. HEDGE RECOVERY: проверяем хедж-позицию ПЕРЕД стоп-лоссом.
         // Если хедж активен — он управляет закрытием, обычный стоп-лосс отключён.
@@ -2793,7 +2933,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // Полная блокировка в Chop делала бот неактивным (крипто ~60-70% времени в боковике).
     pre_trade_portfolio = portfolio_->snapshot();
     for (const auto& pos : pre_trade_portfolio.positions) {
-        if (pos.symbol.get() == symbol_.get() && pos.size.get() >= 0.00001) {
+        if (pos.symbol.get() == symbol_.get() && pos.size.get() >= std::max(exchange_rules_.min_quantity, 1e-8)) {
             pre_trade_has_position = true;
             break;
         }
@@ -2909,9 +3049,47 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     {
         auto signal_stage = tick_profiler.scope(TickStageProfiler::Stage::Signal);
 
-        // 6. Аллокация стратегий по текущему режиму
-        auto allocation = strategy_allocator_->allocate(
-            strategy_registry_->active(), regime, world, uncertainty);
+        // 6. Inline allocation (scalping refactor 2026-05): SINGLE source of
+        //    size scaling. The legacy stack (regime × world × uncertainty)
+        //    compounded to ~3% of base on bad ticks and killed orders below
+        //    min_notional on a $15 account.
+        //
+        //    Uncertainty engine already reads regime/world as inputs, so its
+        //    size_multiplier alone is authoritative. Regime hard-disable
+        //    (should_enable=false) is still honoured as a veto, but the
+        //    weight_multiplier multiplication is gone.
+        decision::AllocationResult allocation;
+        allocation.computed_at = clock_->now();
+        for (const auto& strat : strategy_registry_->active()) {
+            if (!strat) continue;
+            const auto& sid = strat->meta().id;
+            decision::StrategyAllocation a;
+            a.strategy_id = sid;
+            a.is_enabled = strat->is_active();
+            a.size_multiplier = std::isfinite(uncertainty.size_multiplier)
+                ? std::clamp(uncertainty.size_multiplier, 0.0, 1.5) : 0.0;
+            a.weight = a.is_enabled ? a.size_multiplier : 0.0;
+
+            // Regime can hard-veto the strategy; no soft multiplier path.
+            if (a.is_enabled) {
+                for (const auto& hint : regime.strategy_hints) {
+                    if (hint.strategy_id.get() == sid.get() && !hint.should_enable) {
+                        a.weight = 0.0;
+                        a.is_enabled = false;
+                        a.reason = "regime_veto";
+                        break;
+                    }
+                }
+            }
+
+            if (!a.is_enabled || a.weight < 1e-5) {
+                if (a.reason.empty()) a.reason = "weight_below_floor";
+                a.is_enabled = false;
+            } else {
+                ++allocation.enabled_count;
+            }
+            allocation.allocations.push_back(std::move(a));
+        }
 
         // 7. Оценка каждой активной стратегии
         std::vector<strategy::TradeIntent> intents;
@@ -2920,11 +3098,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         // Фьючерсы: допускаются все сигналы (LongEntry, LongExit, ShortEntry, ShortExit).
         for (const auto& pos : pre_trade_portfolio.positions) {
             if (pos.symbol.get() == symbol_.get()) {
-                if (pos.side == Side::Buy && pos.size.get() >= 0.00001) {
+                if (pos.side == Side::Buy && pos.size.get() >= std::max(exchange_rules_.min_quantity, 1e-8)) {
                     has_long_position = true;
                     long_position = &pos;
                 }
-                if (pos.side == Side::Sell && pos.size.get() >= 0.00001) {
+                if (pos.side == Side::Sell && pos.size.get() >= std::max(exchange_rules_.min_quantity, 1e-8)) {
                     has_short_position = true;
                     short_position = &pos;
                 }
@@ -3424,6 +3602,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 //   1. Позиция в плюсе (фиксируем профит) → всегда закрыть
                 //   2. Убыток > pnl_gate_loss_pct капитала → cut losses
                 //   3. Малый убыток → НЕ закрывать, пусть trailing stop решит
+                // B4.7: fallback (если config не указан) 0.5% — консервативный threshold.
                 constexpr double kPnlGateLossPctFallback = 0.5;
                 const double pnl_gate_threshold = config_.trading_params.pnl_gate_loss_pct > 0.0
                     ? config_.trading_params.pnl_gate_loss_pct : kPnlGateLossPctFallback;
@@ -3447,6 +3626,26 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 }
 
                 // Закрытие существующей позиции
+                // O2.4 fix: для hedge mode определяем position_side из signal_intent
+                // (LongExit/ShortExit), а не из current_position_side_ — последняя
+                // могла быть перезаписана при открытии противоположной стороны.
+                PositionSide target_side = current_position_side_;
+                if (intent.signal_intent == strategy::SignalIntent::LongExit) {
+                    target_side = PositionSide::Long;
+                } else if (intent.signal_intent == strategy::SignalIntent::ShortExit) {
+                    target_side = PositionSide::Short;
+                }
+
+                // O2.5 fix: проверяем что position для target_side реально существует
+                // и size > 0. Иначе reject — биржа отдаст 40780 / 40766.
+                if (position_size.get() <= 0.0) {
+                    logger_->debug("pipeline",
+                        "Пропуск close: позиция уже закрыта (size=0)",
+                        {{"symbol", symbol_.get()},
+                         {"target_side", target_side == PositionSide::Long ? "Long" : "Short"}});
+                    return;
+                }
+
                 is_closing_position = true;
                 closing_qty = position_size;
                 if (is_partial_reduce_signal && intent.suggested_quantity.get() > 0.0) {
@@ -3454,13 +3653,19 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 }
                 position_size_for_log = position_size.get();
 
-                // Устанавливаем trade_side=Close и корректную position_side
                 intent.trade_side = TradeSide::Close;
-                intent.position_side = current_position_side_;
+                intent.position_side = target_side;
 
-                // Корректируем side для API: закрытие long=sell, закрытие short=buy
-                intent.side = (current_position_side_ == PositionSide::Long)
+                // `side` для local accounting (portfolio.reduce_position):
+                // close-Long → Sell, close-Short → Buy. Submitter игнорирует это
+                // поле в hedge_mode (см. O2.1) — биржа использует position_side.
+                intent.side = (target_side == PositionSide::Long)
                     ? Side::Sell : Side::Buy;
+
+                // O3.4 fix: очищаем TP/SL для close-intent (они не отправляются,
+                // но могут вводить в заблуждение downstream consumers).
+                intent.take_profit_price.reset();
+                intent.stop_loss_price.reset();
 
             } else if (is_exit_signal && !has_position) {
                 // Сигнал закрытия, но позиции нет — пропускаем
@@ -3521,12 +3726,14 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     risk::RiskDecision risk_decision;
     risk_decision.decided_at = clock_->now();
 
-    // Для маленьких аккаунтов (< $100) гарантируем быстрое исполнение:
-    // urgency >= 0.8 → Aggressive → market order.
-    // Стоимость проскальзывания на $15 ордере ~ 0.01%, стоимость
-    // незаполненного лимитного ордера (потерянный вход) гораздо выше.
-    if (intent.side == Side::Buy && pre_trade_portfolio.total_capital < 100.0) {
-        intent.urgency = std::max(intent.urgency, 0.8);
+    // run85 fix (2026-05-16): BUG — `intent.side == Side::Buy` фильтр блокировал
+    // SHORT entries. 22 ордера было отправлено как PostOnly limit (urgency 0.30),
+    // 22 отменены watchdog'ом, 0 fills → нулевая активность.
+    // На скальпинге с $15 капиталом стоимость taker fees 12 bps на round-trip
+    // ничтожна (target TP=1.5×ATR = 150+ bps), а потерянный вход на хорошем сигнале
+    // стоит весь TP. Делаем market entries на ВСЕ сделки (BUY+SELL) для small accounts.
+    if (pre_trade_portfolio.total_capital < 100.0) {
+        intent.urgency = std::max(intent.urgency, 0.85);
     }
 
     // Execution alpha — вычисляем один раз для всех ветвей
@@ -3584,10 +3791,19 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             }
         }
 
-        // Минимальный ордер Bitget: 0.00001 BTC (или ~$5)
-        if (closing_qty.get() < 0.00001) {
+        // Bug 1.1 fix: использовать exchange_rules_.min_quantity per symbol
+        // (BTC=0.00001, ATOM=0.01, OPG=1, etc). B14.3: fallback 1e-8 → если rules
+        // не загружены, мы НЕ должны торговать — это симптом misconfiguration.
+        if (exchange_rules_.min_quantity <= 0.0) {
+            logger_->error("pipeline",
+                "exchange_rules.min_quantity не загружен — закрытие позиции невозможно",
+                {{"symbol", symbol_.get()}});
+            return;
+        }
+        if (closing_qty.get() < exchange_rules_.min_quantity) {
             logger_->warn("pipeline", "Размер позиции слишком мал для закрытия",
-                {{"qty", std::to_string(closing_qty.get())}});
+                {{"qty", std::to_string(closing_qty.get())},
+                 {"min_qty", std::to_string(exchange_rules_.min_quantity)}});
             return;
         }
 
@@ -4028,6 +4244,26 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             return;
         }
 
+        // run86 fix (2026-05-17): дополнительная защита — блокируем Open если по
+        // символу уже есть НЕзавершённый ордер (PendingAck/Open/PartiallyFilled).
+        // Иначе на каждый strategy signal генерим новый ордер до того как
+        // предыдущий filled → "2 ордера на пару" симптом.
+        if (intent.trade_side == TradeSide::Open && execution_engine_) {
+            auto active_orders = execution_engine_->active_orders();
+            for (const auto& o : active_orders) {
+                if (o.symbol.get() == symbol_.get() && o.trade_side == TradeSide::Open) {
+                    logger_->warn("pipeline",
+                        "BLOCK Open: уже есть активный entry-ордер на этом символе",
+                        {{"symbol", symbol_.get()},
+                         {"existing_order_id", o.order_id.get()},
+                         {"existing_state", std::string(execution::to_string(o.state))},
+                         {"existing_age_ms",
+                          std::to_string((clock_->now().get() - o.created_at.get()) / 1'000'000)}});
+                    return;
+                }
+            }
+        }
+
         // Для открывающего ордера синхронизируем leverage с execution engine
         // и устанавливаем плечо на бирже.
         if (intent.trade_side == TradeSide::Open) {
@@ -4037,9 +4273,9 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             const int min_delta = config_.futures.leverage_engine.min_leverage_change_delta;
 
             // EDGE-30-LEV-AUTO (run75): авто-подъём leverage чтобы margin был FIXED 3%.
-            // Если actual_notional > target_notional (exchange filter bumped до min), leverage
-            // должен увеличиться чтобы margin = actual_notional / leverage = target_margin.
-            constexpr double kTargetMarginPct = 0.03;
+            // B4.8: target margin % через config.risk.margin_per_trade_pct (default 5%, но для
+            // лeверidge auto-adjust мы используем более жёсткий target).
+            const double kTargetMarginPct = config_.risk.margin_per_trade_pct * 0.6;  // 60% от per-trade
             double target_margin = pre_trade_portfolio.total_capital * kTargetMarginPct;
             double actual_notional = risk_decision.approved_quantity.get() * snapshot.mid_price.get();
             if (target_margin > 0.0 && actual_notional > 0.0) {
@@ -4089,6 +4325,11 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             if (execution_engine_) {
                 execution_engine_->set_leverage(static_cast<double>(lev_decision.leverage));
             }
+            // Bug 5.3 fix: pass actual leverage в feature_engine для liquidation estimate.
+            if (feature_engine_) {
+                feature_engine_->update_leverage(symbol_,
+                    static_cast<double>(lev_decision.leverage));
+            }
 
             logger_->debug("pipeline", "Плечо установлено на бирже",
                 {{"leverage", std::to_string(lev_decision.leverage)},
@@ -4135,6 +4376,70 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
     // 12b. Anti-fingerprinting: small jitter applied at exchange client level.
     // Removed synchronous sleep from pipeline thread — blocking here delays
     // stop-loss/trailing stop evaluation for up to 300ms on every order.
+
+    // 12c. Pre-trade gates (edge-31 TPSL refactor, Phase 2).
+    //      Финальная защита перед отправкой ордера: stale signal + net-RR.
+    //      Применяются только к entries — closes/reduces обходят гейты
+    //      (за это отвечает их собственный exit path / risk engine).
+    if (intent.trade_side == TradeSide::Open) {
+        const int64_t now_ns_gates = clock_->now().get();
+
+        // FreshnessGate
+        auto fresh = freshness_gate_->evaluate(intent, snapshot, now_ns_gates);
+        if (!fresh.passed) {
+            ++diag_freshness_block_;
+            logger_->warn("pipeline",
+                "Pre-trade gate FRESHNESS отклонил intent",
+                {{"symbol", symbol_.get()},
+                 {"reason_code", fresh.reason_code},
+                 {"detail", fresh.reason_detail},
+                 {"signal_age_ms", std::to_string(fresh.signal_age_ms)},
+                 {"price_drift_bps", std::to_string(fresh.price_drift_bps)},
+                 {"spread_widen_pct", std::to_string(fresh.spread_widen_pct)},
+                 {"depth_remain_pct", std::to_string(fresh.depth_remain_pct)},
+                 {"diag_count", std::to_string(diag_freshness_block_)}});
+            for (const auto& s : strategy_registry_->active()) {
+                s->notify_entry_rejected();
+            }
+            return;
+        }
+
+        // NetRRGate — taker assumption когда execution alpha рекомендует Aggressive,
+        // иначе maker. exec_alpha.recommended_style — главный сигнал.
+        const bool is_taker =
+            (exec_alpha.recommended_style != execution_alpha::ExecutionStyle::PostOnly);
+        const double current_mid = snapshot.mid_price.get();
+        const double funding_rate_8h = funding_tracker_.current_rate();
+
+        auto net_rr = net_rr_gate_->evaluate(intent, current_mid, funding_rate_8h, is_taker);
+        if (!net_rr.passed) {
+            ++diag_net_rr_block_;
+            logger_->warn("pipeline",
+                "Pre-trade gate NET_RR отклонил intent",
+                {{"symbol", symbol_.get()},
+                 {"reason_code", net_rr.reason_code},
+                 {"detail", net_rr.reason_detail},
+                 {"gross_rr", std::to_string(net_rr.gross_rr)},
+                 {"net_rr", std::to_string(net_rr.net_rr)},
+                 {"total_cost_bps", std::to_string(net_rr.total_cost_bps)},
+                 {"is_taker", is_taker ? "yes" : "no"},
+                 {"diag_count", std::to_string(diag_net_rr_block_)}});
+            for (const auto& s : strategy_registry_->active()) {
+                s->notify_entry_rejected();
+            }
+            return;
+        }
+
+        // Telemetry: запишем гейты как пройденные для journaling.
+        logger_->debug("pipeline",
+            "Pre-trade gates PASS",
+            {{"symbol", symbol_.get()},
+             {"signal_age_ms", std::to_string(fresh.signal_age_ms)},
+             {"price_drift_bps", std::to_string(fresh.price_drift_bps)},
+             {"gross_rr", std::to_string(net_rr.gross_rr)},
+             {"net_rr", std::to_string(net_rr.net_rr)},
+             {"total_cost_bps", std::to_string(net_rr.total_cost_bps)}});
+    }
 
     // Устанавливаем cooldown ПЕРЕД отправкой — чтобы даже при ошибке
     // не спамить биржу повторными запросами.
@@ -4199,6 +4504,40 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             persist_position_event("PositionOpened", symbol_,
                 intent.position_side, snapshot.mid_price.get(), 0.0,
                 risk_decision.approved_quantity.get(), intent.strategy_id.get());
+
+            // edge-31 Phase 3: регистрация bracket. presetStop* был отправлен в entry
+            // ордере через AttachedTpSl. Менеджер verify'нет наличие plan-ордеров на
+            // бирже после grace period и поставит fallback если preset не сработал.
+            if (bracket_manager_) {
+                const double tp_for_bracket = intent.take_profit_price.has_value()
+                    ? intent.take_profit_price->get() : 0.0;
+                const double sl_for_bracket = intent.stop_loss_price.has_value()
+                    ? intent.stop_loss_price->get() : 0.0;
+                bracket_manager_->on_position_opened(
+                    symbol_,
+                    intent.position_side,
+                    entry_price,
+                    risk_decision.approved_quantity.get(),
+                    tp_for_bracket,
+                    sl_for_bracket);
+            }
+            // run90: stagnant tracker initialization.
+            if (stagnant_detector_) {
+                stagnant_detector_->on_position_opened(symbol_, clock_->now().get());
+            }
+
+            // edge-31 Phase 6: trade journal — фиксируем entry context.
+            if (trade_journal_) {
+                trade_journal_->on_entry_filled(
+                    symbol_,
+                    intent.position_side,
+                    entry_price,
+                    risk_decision.approved_quantity.get(),
+                    intent.signal_snapshot_ts_ns,
+                    intent.strategy_id.get(),
+                    intent.signal_name,
+                    intent.conviction);
+            }
         }
 
         // Сброс trailing state при полном закрытии позиции
@@ -4254,15 +4593,59 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 leverage_engine_->update_edge_stats(trade_stats_.win_rate(), trade_stats_.win_loss_ratio());
             }
 
-            // Feedback: уведомить стратегию что позиция закрыта → PositionManaging → Cooldown
+            // Feedback: уведомить стратегию что позиция закрыта → PositionManaging → Cooldown.
+            // run95: передаём pnl для tracking consecutive losses.
             for (const auto& s : strategy_registry_->active()) {
-                s->notify_position_closed();
+                s->notify_position_closed(closing_pnl);
             }
 
             // Persist position close event
             persist_position_event("PositionClosed", symbol_,
                 current_position_side_, snapshot.mid_price.get(), closing_pnl,
                 0.0, current_position_strategy_.get());
+
+            // edge-31 Phase 3: освободить bracket — отменить known plan-ордера.
+            // Bitget автоматически закрывает pos-attached TPSL при size=0, но
+            // явный release устраняет orphans на случай рассинхронизации.
+            if (bracket_manager_) {
+                (void)bracket_manager_->release(symbol_, current_position_side_);
+            }
+            // run90: stagnant tracker reset.
+            if (stagnant_detector_) {
+                stagnant_detector_->on_position_closed(symbol_);
+            }
+
+            // edge-31 Phase 6: trade journal — финализируем row при закрытии.
+            // exit_layer определяется по intent.exit_reason / signal_name —
+            // SignalDriven по умолчанию (стратегия выпустила exit intent).
+            // Layer'ы emergency (toxic/stale/hard-capital) обрабатываются через
+            // check_position_stop_loss path, который отдельно вызывает journal.
+            if (trade_journal_) {
+                telemetry::ExitLayer layer = telemetry::ExitLayer::SignalDriven;
+                if (intent.exit_reason == strategy::ExitReason::TakeProfit) {
+                    layer = telemetry::ExitLayer::ExchangeTP;
+                } else if (intent.exit_reason == strategy::ExitReason::StopLoss
+                        || intent.exit_reason == strategy::ExitReason::TrailingStop) {
+                    layer = telemetry::ExitLayer::ExchangeSL;
+                } else if (intent.exit_reason == strategy::ExitReason::EmergencyExit) {
+                    layer = telemetry::ExitLayer::HardCapitalStop;
+                }
+                double fees = 0.0;
+                if (snapshot.mid_price.get() > 0.0 && closing_qty.get() > 0.0) {
+                    fees = snapshot.mid_price.get() * closing_qty.get()
+                         * config_.trading_params.quick_profit_fee_multiplier > 0.0
+                         ? snapshot.mid_price.get() * closing_qty.get() * 0.0006  // taker round-trip approx
+                         : 0.0;
+                }
+                trade_journal_->on_exit_filled(
+                    symbol_,
+                    current_position_side_,
+                    snapshot.mid_price.get(),
+                    closing_pnl,
+                    fees,
+                    layer,
+                    intent.signal_name);
+            }
 
             reset_trailing_state();
         }
@@ -4565,6 +4948,10 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
                     if (risk_engine_) {
                         risk_engine_->set_funding_rate(new_rate);
                     }
+                    // run94: feed funding rate в feature_engine для funding_bias filter.
+                    if (feature_engine_) {
+                        feature_engine_->update_funding_rate(symbol_, new_rate);
+                    }
                 } catch (const std::exception& e) {
                     logger_->error("pipeline",
                         "funding_rate_update async упала с исключением",
@@ -4573,6 +4960,31 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
                 funding_tracker_.end_refresh();
             });
         }
+    }
+
+    // Bug 2.1/5.5 fix: реальный OI update через Bitget /api/v2/mix/market/open-interest.
+    // OI feed нужен для:
+    //   - 4-quadrant Wyckoff trend analysis (OI ↑/↓ × Price ↑/↓)
+    //   - Liquidation cluster estimation (большой OI + extreme funding = cascade risk)
+    //   - Bayesian fusion в strategy.detect_momentum (Bug 4.1 fix)
+    if (futures_query_adapter_ && rest_pool_ && feature_engine_
+        && (now_ns - last_oi_update_ns_.load(std::memory_order_relaxed)) >= kOiUpdateIntervalNs) {
+        last_oi_update_ns_.store(now_ns, std::memory_order_relaxed);
+        rest_pool_->submit("oi_update", [this] {
+            try {
+                double oi_base = futures_query_adapter_->get_open_interest_usdt(symbol_);
+                if (oi_base <= 0.0) return;
+                // Конвертация base coin → USDT через cached_market_state_.mid_price
+                // (поток pipeline tick обновляет cached_market_state_; здесь read-only).
+                double mid = cached_market_state_.mid_price;
+                if (mid <= 0.0) return;  // нет cached price → skip update
+                double oi_usdt = oi_base * mid;
+                feature_engine_->update_open_interest(symbol_, oi_usdt, clock_->now().get());
+            } catch (const std::exception& e) {
+                logger_->debug("pipeline", "oi_update упал",
+                    {{"what", e.what()}, {"symbol", symbol_.get()}});
+            }
+        });
     }
 
     // Экспорт latency-метрик каждые 60 секунд
@@ -4619,6 +5031,144 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
     // Phase 8: Flush telemetry buffers periodically
     if (telemetry_) {
         telemetry_->flush();
+    }
+
+    // edge-31 Phase 3: периодический verify protective brackets.
+    // Если есть unverified bracket — пробуем найти его на бирже. После
+    // max_verify_attempts менеджер сам fallback'нет на standalone plan.
+    if (bracket_manager_
+        && (now_ns - last_bracket_verify_ns_.load(std::memory_order_relaxed)) >= kBracketVerifyIntervalNs) {
+        last_bracket_verify_ns_.store(now_ns, std::memory_order_relaxed);
+        for (const auto& st : bracket_manager_->list_active()) {
+            if (!st.verified) {
+                (void)bracket_manager_->verify_brackets(st.symbol, st.position_side);
+            }
+        }
+    }
+
+    // run96: periodic orphan plan-orders cleanup. Bug 4.2 fix: has_open_position()
+    // вызывается ВНУТРИ lambda для актуального snapshot на момент выполнения task
+    // (избегаем race с заполняющейся позицией между submit и execution).
+    if (bracket_manager_ && rest_pool_
+        && (now_ns - last_orphan_cleanup_ns_.load(std::memory_order_relaxed)) >= kOrphanCleanupIntervalNs) {
+        last_orphan_cleanup_ns_.store(now_ns, std::memory_order_relaxed);
+        rest_pool_->submit("orphan_cleanup", [this] {
+            try {
+                const bool has_pos = has_open_position();
+                int cancelled = bracket_manager_->cleanup_orphans_for_symbol(symbol_, has_pos);
+                if (cancelled > 0) {
+                    logger_->warn("pipeline",
+                        "Periodic orphan plan-orders cleanup",
+                        {{"symbol", symbol_.get()},
+                         {"cancelled", std::to_string(cancelled)},
+                         {"has_position", has_pos ? "yes" : "no"}});
+                }
+            } catch (const std::exception& e) {
+                logger_->debug("pipeline", "orphan_cleanup упал",
+                    {{"what", e.what()}, {"symbol", symbol_.get()}});
+            }
+        });
+    }
+
+    // run87 Periodic Trailing SL: monotonic подтягивание SL для текущей позиции.
+    // Использует данные tick'а (current price + entry tracking) — не блокирует
+    // pipeline (внутренний throttle min_interval_ms=5000).
+    if (trailing_sl_ && bracket_manager_ && has_open_position()
+        && initial_position_size_ > 0.0) {
+        TrailingPositionSnapshot snap;
+        snap.symbol = symbol_;
+        snap.position_side = current_position_side_;
+        // entry_price — из локального state (set при on_position_opened)
+        // current_price — из snapshot cached
+        // highest/lowest — peak prices с момента entry (tracking в pipeline)
+        // atr — из snapshot.technical
+        // Note: эти поля читаются через cached_market_state_, но для
+        // simplicity передаём минимум — trailing проверит профитность.
+        snap.entry_price = 0.0;  // заполнено ниже если есть position info
+        if (portfolio_) {
+            auto positions = portfolio_->snapshot();
+            for (const auto& p : positions.positions) {
+                if (p.symbol.get() == symbol_.get()) {
+                    snap.entry_price = p.avg_entry_price.get();
+                    break;
+                }
+            }
+        }
+        snap.current_price = cached_market_state_.mid_price;
+        snap.highest_since_entry = highest_price_since_entry_;
+        snap.lowest_since_entry = lowest_price_since_entry_;
+        snap.atr = cached_market_state_.atr_14;
+        // run94: contextual indicators for adaptive trail multiplier.
+        snap.supertrend_trend = cached_market_state_.supertrend_trend;
+        snap.cvd_bullish_div = cached_market_state_.cvd_bullish_divergence;
+        snap.cvd_bearish_div = cached_market_state_.cvd_bearish_divergence;
+        snap.liq_cascade_risk = cached_market_state_.liq_cascade_risk;
+
+        if (snap.entry_price > 0.0 && snap.current_price > 0.0 && snap.atr > 0.0) {
+            (void)trailing_sl_->tick(snap);
+        }
+
+        // run90: stagnant position check. Если pair "застыла" (range < 8 bps
+        // за 120s window и position > 180s) — force exit для освобождения
+        // капитала. Pipeline вернётся в idle → soft rotation заберёт его на
+        // активную пару. Pair НЕ blacklist'ится — может вернуться через scanner.
+        if (stagnant_detector_ && snap.current_price > 0.0 && !close_order_pending_) {
+            bool stagnant = stagnant_detector_->tick(symbol_, snap.current_price, now_ns,
+                                                       snap.entry_price, current_position_side_);
+            if (stagnant) {
+                logger_->warn("pipeline",
+                    "STAGNANT POSITION → emergency close (cancel TP/SL + market close)",
+                    {{"symbol", symbol_.get()},
+                     {"position_side", current_position_side_ == PositionSide::Long ? "long" : "short"},
+                     {"entry_price", std::to_string(snap.entry_price)},
+                     {"current_price", std::to_string(snap.current_price)}});
+
+                // 1. Cancel TP/SL plan ордера на бирже.
+                if (bracket_manager_) {
+                    (void)bracket_manager_->release(symbol_, current_position_side_);
+                }
+
+                // 2. Emit market close через execution engine.
+                strategy::TradeIntent close_intent;
+                close_intent.symbol = symbol_;
+                close_intent.position_side = current_position_side_;
+                close_intent.trade_side = TradeSide::Close;
+                close_intent.side = (current_position_side_ == PositionSide::Long) ? Side::Sell : Side::Buy;
+                close_intent.signal_intent = (current_position_side_ == PositionSide::Long)
+                    ? strategy::SignalIntent::LongExit : strategy::SignalIntent::ShortExit;
+                close_intent.exit_reason = strategy::ExitReason::EmergencyExit;
+                close_intent.signal_name = "stagnant_exit";
+                close_intent.suggested_quantity = Quantity(initial_position_size_);
+                close_intent.conviction = 1.0;
+                close_intent.urgency = 1.0;
+                close_intent.limit_price = Price(snap.current_price);
+                close_intent.snapshot_mid_price = Price(snap.current_price);
+                close_intent.strategy_id = current_position_strategy_;
+                close_intent.correlation_id = CorrelationId(
+                    "STAG-" + symbol_.get() + "-" + std::to_string(now_ns));
+
+                risk::RiskDecision rd;
+                rd.decided_at = clock_->now();
+                rd.approved_quantity = Quantity(initial_position_size_);
+                rd.verdict = risk::RiskVerdict::Approved;
+                rd.summary = "STAGNANT: force exit для освобождения капитала";
+
+                execution_alpha::ExecutionAlphaResult ea;
+                ea.should_execute = true;
+                ea.recommended_style = execution_alpha::ExecutionStyle::Aggressive;
+                ea.urgency_score = 1.0;
+                ea.rationale = "stagnant_position";
+
+                auto r = execution_engine_->execute(close_intent, rd, ea, cached_uncertainty_snapshot_);
+                if (r) {
+                    close_order_pending_ = true;
+                    risk_engine_->record_order_sent();
+                    logger_->warn("pipeline", "STAGNANT: market close отправлен",
+                        {{"order_id", r->get()}, {"symbol", symbol_.get()}});
+                }
+                stagnant_detector_->reset(symbol_);
+            }
+        }
     }
 }
 
@@ -4723,6 +5273,15 @@ void TradingPipeline::run_continuous_reconciliation(int64_t now_ns) {
         (now_ns - last_pos_balance_reconciliation_ns_) >= kPosBalReconcileIntervalNs) {
         last_pos_balance_reconciliation_ns_ = now_ns;
 
+        // B10.1 fix: явная проверка invariants portfolio перед reconciliation.
+        // Раньше check_invariants определялась, но никогда не вызывалась — margin leak'и
+        // могли копиться скрытно. Сейчас даём ERROR на нарушение, чтобы оператор увидел.
+        if (!portfolio_->check_invariants()) {
+            logger_->error("reconciliation",
+                "Portfolio invariants violation detected",
+                {{"symbol", symbol_.get()}});
+        }
+
         auto snap = portfolio_->snapshot();
         double local_cash = snap.cash.total_cash;
         auto pos_result = reconciliation_engine_->reconcile_positions_and_balance(
@@ -4754,20 +5313,60 @@ void TradingPipeline::run_continuous_reconciliation(int64_t now_ns) {
                         break;
                     }
                     case reconciliation::ResolutionAction::UpdateLocalState: {
-                        // Позиция в системе, но нет на бирже — закрываем локально
+                        // Позиция в системе, но нет на бирже — закрываем локально.
+                        // CRITICAL FIX 2026-05-18: используем last known mark_price
+                        // вместо 0.0, чтобы realized_pnl был правильно посчитан.
+                        // Также вызываем bracket_manager.release() чтобы orphan
+                        // plan-orders ушли с биржи.
                         if (mismatch.type == reconciliation::MismatchType::PositionExistsOnlyLocally) {
-                            // A2 fix: используем leg-aware close если known side
+                            // Получаем актуальную mark price из portfolio (последняя update_price)
+                            const PositionSide ps = mismatch.position_side.value_or(current_position_side_);
+                            auto local_pos = portfolio_->get_position(symbol_, ps);
+                            double mark_price = 0.0;
+                            double entry_price = 0.0;
+                            double size = 0.0;
+                            if (local_pos) {
+                                mark_price = local_pos->current_price.get();
+                                entry_price = local_pos->avg_entry_price.get();
+                                size = local_pos->size.get();
+                            }
+                            // pnl_estimate: если mark_price > 0, считаем реальный
+                            // gross PnL; иначе 0 (для consistency).
+                            double pnl_est = 0.0;
+                            if (mark_price > 0.0 && entry_price > 0.0 && size > 0.0) {
+                                pnl_est = (ps == PositionSide::Long)
+                                    ? (mark_price - entry_price) * size
+                                    : (entry_price - mark_price) * size;
+                            }
+
                             if (mismatch.position_side.has_value()) {
-                                portfolio_->close_position(symbol_, *mismatch.position_side, Price(0.0), 0.0);
+                                portfolio_->close_position(symbol_, *mismatch.position_side,
+                                    Price(mark_price), pnl_est);
                                 logger_->warn("reconciliation",
                                     "Локальная позиция закрыта leg-aware (нет на бирже)",
                                     {{"symbol", symbol_.get()},
-                                     {"side", *mismatch.position_side == PositionSide::Long ? "Long" : "Short"}});
+                                     {"side", *mismatch.position_side == PositionSide::Long ? "Long" : "Short"},
+                                     {"mark_price", std::to_string(mark_price)},
+                                     {"pnl_estimate", std::to_string(pnl_est)}});
                             } else {
-                                portfolio_->close_position(symbol_, Price(0.0), 0.0);
+                                portfolio_->close_position(symbol_, Price(mark_price), pnl_est);
                                 logger_->warn("reconciliation",
                                     "Локальная позиция закрыта (нет на бирже)",
-                                    {{"symbol", symbol_.get()}});
+                                    {{"symbol", symbol_.get()},
+                                     {"mark_price", std::to_string(mark_price)},
+                                     {"pnl_estimate", std::to_string(pnl_est)}});
+                            }
+                            // CRITICAL: release bracket — иначе orphan plan-orders
+                            // останутся на бирже до periodic cleanup_orphans (или
+                            // навсегда если pipeline ротируется).
+                            if (bracket_manager_) {
+                                (void)bracket_manager_->release(symbol_, ps);
+                            }
+                            // Notify strategy с реальным PnL для consecutive_losses tracking.
+                            if (strategy_registry_) {
+                                for (const auto& s : strategy_registry_->active()) {
+                                    s->notify_position_closed(pnl_est);
+                                }
                             }
                             if (hedge_active_) reset_hedge_state();
                             reset_trailing_state();

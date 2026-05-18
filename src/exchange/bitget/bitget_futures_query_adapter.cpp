@@ -565,4 +565,234 @@ int64_t BitgetFuturesQueryAdapter::get_server_time_ms()
     return rest_client_->get_server_time_ms();
 }
 
+// ============================================================
+// parse_plan_order (Bitget plan-pending JSON → PlanOrderInfo)
+// ============================================================
+
+PlanOrderInfo BitgetFuturesQueryAdapter::parse_plan_order(const boost::json::object& obj)
+{
+    PlanOrderInfo info;
+    info.order_id = OrderId(json_str(obj, "orderId"));
+    info.client_order_id = OrderId(json_str(obj, "clientOid"));
+    info.symbol = Symbol(json_str(obj, "symbol"));
+
+    // posSide: "long" / "short" (hedge), "net" (one-way).
+    // O6.1 fix: для "net" (one-way mode) пытаемся определить через side+tradeSide.
+    // В hedge_mode у нас всегда явные long/short.
+    const std::string pos_side = json_str(obj, "posSide");
+    if (pos_side == "short") {
+        info.position_side = PositionSide::Short;
+    } else if (pos_side == "long") {
+        info.position_side = PositionSide::Long;
+    } else {
+        // "net" или пусто — определяем через side: buy=Long, sell=Short
+        const std::string s = json_str(obj, "side");
+        info.position_side = (s == "sell") ? PositionSide::Short : PositionSide::Long;
+    }
+
+    info.trigger_price = Price(json_dbl(obj, "triggerPrice"));
+    info.execute_price = Price(json_dbl(obj, "executePrice"));
+    info.size = Quantity(json_dbl(obj, "size"));
+    info.trigger_type = json_str(obj, "triggerType");
+    info.plan_type = json_str(obj, "planType");
+
+    // Bitget planType values: "normal_plan", "profit_plan", "loss_plan",
+    //                        "pos_profit", "pos_loss", "moving_plan", "track_plan".
+    if (info.plan_type == "profit_plan") {
+        info.kind = PlanOrderKind::ProfitPlan;
+    } else if (info.plan_type == "loss_plan") {
+        info.kind = PlanOrderKind::LossPlan;
+    } else if (info.plan_type == "pos_profit" || info.plan_type == "pos_loss") {
+        info.kind = PlanOrderKind::PosTPSL;
+    } else if (info.plan_type == "normal_plan") {
+        info.kind = PlanOrderKind::NormalPlan;
+    } else {
+        info.kind = PlanOrderKind::Unknown;
+    }
+
+    // cTime — created timestamp (ms)
+    const std::string c_time = json_str(obj, "cTime");
+    if (!c_time.empty()) {
+        try { info.created_at_ms = std::stoll(c_time); }
+        catch (...) { info.created_at_ms = 0; }
+    }
+
+    return info;
+}
+
+// ============================================================
+// get_open_plan_orders — Bitget v2 /api/v2/mix/order/orders-plan-pending
+//
+// Endpoint один, planType дискриминирует. Допустимые значения для запроса:
+//
+//   - normal_plan  — trigger plan (создаются через place-plan-order;
+//                    наши standalone SL/TP fallback и trailing replacement).
+//   - track_plan   — trailing trigger plan (не используем сейчас).
+//   - profit_loss  — preset TPSL по позиции (создаются через presetStop*Price
+//                    при основном ордере). В ответе каждая запись приходит
+//                    с реальным planType ∈ {profit_plan, loss_plan,
+//                    pos_profit, pos_loss, moving_plan}.
+//
+// История фиксов:
+//   - run100 (Bug 5.1): один запрос без planType → 40789 "planType empty".
+//   - run104 (v2):      три запроса (normal_plan + pos_profit + pos_loss) →
+//                       40812 на двух последних (pos_* — это значения
+//                       ОТВЕТА, не валидные значения ЗАПРОСА).
+//   - run105 (v3):      попытка использовать orders-tpsl-pending → 40404
+//                       (такого endpoint у Bitget v2 нет).
+//   - run106 (v4 — текущий): два запроса по valid planType:
+//                       normal_plan + profit_loss. Покрывает 100% наших
+//                       пользовательских plan-ордеров.
+// ============================================================
+
+Result<std::vector<PlanOrderInfo>>
+BitgetFuturesQueryAdapter::get_open_plan_orders(const Symbol& symbol)
+{
+    auto fetch = [&](const char* path, const std::string& plan_type)
+        -> std::vector<PlanOrderInfo>
+    {
+        std::vector<PlanOrderInfo> out;
+        std::string query = "productType=" + futures_config_.product_type;
+        if (!plan_type.empty()) {
+            query += "&planType=" + plan_type;
+        }
+        if (!symbol.get().empty()) {
+            query += "&symbol=" + symbol.get();
+        }
+        auto resp = rest_client_->get(path, query);
+        if (!resp.success) {
+            if (logger_) {
+                logger_->debug("FuturesQuery", "plan-orders HTTP fail",
+                    {{"endpoint", path}, {"plan_type", plan_type},
+                     {"symbol", symbol.get()}});
+            }
+            return out;
+        }
+        try {
+            auto doc = boost::json::parse(resp.body);
+            const auto& root = doc.as_object();
+            const auto code = json_str(root, "code");
+            if (code != "00000") {
+                if (logger_) {
+                    logger_->debug("FuturesQuery", "plan-orders API fail",
+                        {{"endpoint", path}, {"plan_type", plan_type},
+                         {"code", code}, {"msg", json_str(root, "msg")}});
+                }
+                return out;
+            }
+            const auto data_val = root.at("data");
+            const boost::json::array* arr = nullptr;
+            if (data_val.is_object()) {
+                const auto& data = data_val.as_object();
+                auto it_entrusted = data.find("entrustedList");
+                if (it_entrusted != data.end() && it_entrusted->value().is_array()) {
+                    arr = &it_entrusted->value().as_array();
+                } else {
+                    auto it_list = data.find("list");
+                    if (it_list != data.end() && it_list->value().is_array()) {
+                        arr = &it_list->value().as_array();
+                    }
+                }
+            } else if (data_val.is_array()) {
+                arr = &data_val.as_array();
+            }
+            if (arr) {
+                out.reserve(arr->size());
+                for (const auto& item : *arr) {
+                    if (item.is_object()) {
+                        out.push_back(parse_plan_order(item.as_object()));
+                    }
+                }
+            }
+        } catch (const std::exception& ex) {
+            if (logger_) {
+                logger_->debug("FuturesQuery", "plan-orders parse fail",
+                    {{"endpoint", path}, {"plan_type", plan_type},
+                     {"exception", ex.what()}});
+            }
+        }
+        return out;
+    };
+
+    std::vector<PlanOrderInfo> result;
+    constexpr char kPlanEndpoint[] = "/api/v2/mix/order/orders-plan-pending";
+    // 1. normal_plan — наши standalone SL/TP fallback и trailing replacement.
+    auto trig = fetch(kPlanEndpoint, "normal_plan");
+    result.insert(result.end(), trig.begin(), trig.end());
+    // 2. profit_loss — preset TPSL обеих сторон одним запросом (в ответе
+    //    запись по каждой стороне с planType pos_profit / pos_loss).
+    auto tpsl = fetch(kPlanEndpoint, "profit_loss");
+    result.insert(result.end(), tpsl.begin(), tpsl.end());
+
+    return result;
+}
+
+// ============================================================
+// get_open_interest_usdt (Bug 2.1 fix)
+// ============================================================
+
+double BitgetFuturesQueryAdapter::get_open_interest_usdt(const Symbol& symbol)
+{
+    const std::string query = "symbol=" + symbol.get()
+                            + "&productType=" + futures_config_.product_type;
+
+    auto resp = rest_client_->get("/api/v2/mix/market/open-interest", query);
+    if (!resp.success) {
+        if (logger_) {
+            logger_->debug("FuturesQuery", "Не удалось получить OI",
+                {{"symbol", symbol.get()}, {"error", resp.error_message}});
+        }
+        return 0.0;
+    }
+
+    try {
+        auto doc = boost::json::parse(resp.body);
+        const auto& root = doc.as_object();
+
+        const auto code = json_str(root, "code");
+        if (code != "00000") {
+            if (logger_) {
+                logger_->debug("FuturesQuery", "Bitget API ошибка (open-interest)",
+                    {{"code", code}, {"msg", json_str(root, "msg")},
+                     {"symbol", symbol.get()}});
+            }
+            return 0.0;
+        }
+
+        // Mix v2 response: data.openInterestList[].size (base coin units) + .symbol.
+        // Также data может содержать .ts. Нужно получить amount AND текущую цену
+        // для перевода в USDT. Используем openInterestList[0].size × ticker last_price.
+        const auto& data = root.at("data");
+        if (!data.is_object()) return 0.0;
+        const auto& data_obj = data.as_object();
+
+        double oi_amount = 0.0;
+        auto oil_it = data_obj.find("openInterestList");
+        if (oil_it != data_obj.end() && oil_it->value().is_array()) {
+            const auto& arr = oil_it->value().as_array();
+            if (!arr.empty() && arr[0].is_object()) {
+                oi_amount = json_dbl(arr[0].as_object(), "size");
+            }
+        } else {
+            // Fallback: openInterest как прямое поле
+            oi_amount = json_dbl(data_obj, "amount");
+        }
+        if (oi_amount <= 0.0) return 0.0;
+
+        // Конвертация в USDT через ticker (получим last_price отдельно).
+        // Для упрощения возвращаем base-coin amount × last_price.
+        // Caller передаст актуальную цену в update_open_interest, либо мы
+        // запросим её здесь — но это второй REST round-trip.
+        // Лучше: возвращаем base-coin amount, конвертация в USDT в caller'е.
+        return oi_amount;
+
+    } catch (const std::exception& ex) {
+        if (logger_) {
+            logger_->debug("FuturesQuery", "Ошибка парсинга open-interest",
+                {{"exception", ex.what()}, {"symbol", symbol.get()}});
+        }
+        return 0.0;
+    }
+}
+
 } // namespace tb::exchange::bitget

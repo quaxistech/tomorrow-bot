@@ -3,8 +3,10 @@
 
 namespace tb::pipeline {
 
-MarketReactionEngine::MarketReactionEngine(std::shared_ptr<logging::ILogger> logger)
-    : logger_(std::move(logger)) {}
+MarketReactionEngine::MarketReactionEngine(std::shared_ptr<logging::ILogger> logger,
+                                            double taker_fee_pct)
+    : logger_(std::move(logger))
+    , taker_fee_pct_(taker_fee_pct) {}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BUILD STATE — assemble unified market state from all data sources
@@ -101,6 +103,35 @@ MarketStateVector MarketReactionEngine::build_state(
     // ── Data quality ──
     s.is_feed_fresh = is_feed_fresh;
     s.data_quality = regime.explanation.data_quality_score;
+
+    // run94: forward advanced indicators from FeatureSnapshot.
+    if (snap.technical.supertrend_valid) {
+        s.supertrend_trend = snap.technical.supertrend_trend;
+    }
+    if (snap.technical.avwap_valid) {
+        s.avwap = snap.technical.avwap;
+        s.avwap_price_vs_vwap_bps = snap.technical.avwap_price_vs_vwap_bps;
+    }
+    if (snap.technical.cvd_valid) {
+        s.cvd_normalized = snap.technical.cvd_normalized;
+        s.cvd_bullish_divergence = snap.technical.cvd_bullish_divergence;
+        s.cvd_bearish_divergence = snap.technical.cvd_bearish_divergence;
+    }
+    if (snap.technical.oi_valid) {
+        s.oi_trend_quadrant = snap.technical.oi_trend_quadrant;
+    }
+    if (snap.technical.liq_valid) {
+        s.liq_cascade_risk = snap.technical.liq_cascade_risk_score;
+        s.liq_dominant_side = snap.technical.liq_dominant_side;
+    }
+    if (snap.technical.spoof_valid) {
+        s.spoof_intensity = snap.technical.spoof_intensity;
+    }
+    if (snap.technical.funding_valid) {
+        s.funding_valid = true;
+        s.funding_recommended_bias = snap.technical.funding_recommended_bias;
+        s.funding_crowding_intensity = snap.technical.funding_crowding_intensity;
+    }
 
     // ── Derived composite scores ──
     // Liquidity score: 0=stress, 1=deep
@@ -268,10 +299,9 @@ void MarketReactionEngine::compute_action_evs(
     const auto& p = decision.probs;
     double atr_move = std::max(state.atr_pct, 0.01);
 
-    // Transaction costs
-    constexpr double kTakerFeePct = 0.06;
+    // Transaction costs (B4.1 fix: taker_fee_pct из config через ctor)
     double half_spread_pct = state.spread_bps / 20000.0 * 100.0;
-    double one_way_cost = half_spread_pct + kTakerFeePct;
+    double one_way_cost = half_spread_pct + taker_fee_pct_;
     double round_trip_cost = 2.0 * one_way_cost;
 
     // Funding drag per 8h window
@@ -516,8 +546,10 @@ void MarketReactionEngine::compute_funding_impact(
 // ═══════════════════════════════════════════════════════════════════════════════
 bool MarketReactionEngine::is_momentum_aligned(
     const MarketStateVector& state, PositionSide side) {
-    if (side == PositionSide::Long) return state.momentum_5 > 0.0001;
-    return state.momentum_5 < -0.0001;
+    // B14.1: 1 bps momentum threshold для direction detection.
+    constexpr double kDirectionMomentumThreshold = 0.0001;
+    if (side == PositionSide::Long) return state.momentum_5 > kDirectionMomentumThreshold;
+    return state.momentum_5 < -kDirectionMomentumThreshold;
 }
 
 MarketProbabilities MarketReactionEngine::softmax_probs(

@@ -153,6 +153,9 @@ void InMemoryPortfolioEngine::record_funding_payment(const Symbol& symbol, doubl
         // BUG-S18-08: skip zero-sized (zombie) positions — they shouldn't accumulate funding
         if (pos.size.get() <= 1e-12) continue;
         pos.accumulated_funding += le.amount;
+        // B11.4 fix: funding учитывается в realized_pnl_today_ (как negative cost).
+        // Долгие позиции с большим funding теперь корректно отображаются в дневном PnL.
+        realized_pnl_today_ -= le.amount;
         recalculate_position_pnl(pos);
 
         logger_->debug("Portfolio", "Записан funding payment",

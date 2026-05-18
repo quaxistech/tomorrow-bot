@@ -49,8 +49,9 @@ public:
     void notify_position_opened(double entry_price, double size,
                                 Side side, PositionSide pos_side);
 
-    /// Уведомить о закрытии позиции
-    void notify_position_closed();
+    /// Уведомить о закрытии позиции. pnl — realized PnL для tracking consecutive
+    /// losses → extended cooldown после 2 подряд lossов на паре.
+    void notify_position_closed(double pnl = 0.0);
 
     /// Уведомить, что вход отклонён pipeline (sizing/risk/exchange)
     void notify_entry_rejected();
@@ -101,6 +102,9 @@ private:
     std::vector<std::string> last_reasons_;
     uint64_t diag_skip_count_{0};
     bool exit_signal_sent_{false};
+    /// run95: счётчик подряд убыточных закрытий. После 2 consecutive losses
+    /// → extended cooldown (30 min вместо обычных cooldown_after_exit_ms 90s).
+    int consecutive_losses_{0};
 };
 
 } // namespace tb::strategy

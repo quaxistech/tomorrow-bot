@@ -22,12 +22,29 @@
 
 * `class FeatureEngine`:
   * Конструктор `(Config, IndicatorEngine, IClock, ILogger, IMetricsRegistry)`.
-  * `on_candle/on_trade/on_ticker(...)` — обновление.
+  * `on_candle/on_trade/on_ticker(...)` — обновление buffer'ов и stateful trackers.
+  * **run94 external updates**: `update_open_interest(symbol, oi_usdt, ts_ns)`, `update_funding_rate(symbol, rate_8h)` — feed данных из REST polls.
   * `compute_snapshot(symbol, book) → optional<FeatureSnapshot>`.
   * `is_ready(symbol) → bool`.
 * `class AdvancedFeatureEngine` — расширения (CUSUM, VPIN, VolumeProfile, TimeOfDay).
 * `FeatureSnapshot` — DTO со всеми фичами.
 * `FeatureEngine::Config` — periods для всех индикаторов, `feed_freshness_ns`, `primary_interval`.
+
+### run93-94 feature additions в TechnicalFeatures
+
+* **run93** (in compute_technical from `indicator_engine`):
+  - `supertrend_value/trend/flipped` — ATR trend follower (10, 3.0)
+  - `stoch_k/d`, `stoch_overbought/oversold/bull_cross/bear_cross` — Stochastic (5, 3, 3)
+  - `ema_fast_9/slow_21`, `ema_pair_trend`, `ema_pair_bull_cross/bear_cross`, `ema_pair_separation_bps`
+* **run94 stateful trackers** (per-symbol streaming on_trade/update_*):
+  - **Anchored VWAP** (session anchor, reset на новый UTC day): `avwap`, `avwap_upper/lower_1sigma`, `avwap_upper/lower_2sigma`, `avwap_price_vs_vwap_bps`
+  - **CVD tracker** (taker buy vs sell pressure): `cvd`, `cvd_change_recent`, `cvd_normalized`, `cvd_bullish/bearish_divergence`
+  - **OI tracker** (4-quadrant Wyckoff): `oi_current`, `oi_change_recent_pct`, `oi_trend_quadrant`
+* **run94 pure-function indicators** (in compute_technical / compute_snapshot):
+  - **Liquidity Sweep**: `liq_sweep_high/low`, `liq_sweep_recovery_pct`
+  - **Funding bias**: `funding_rate_8h`, `funding_crowding_side/intensity`, `funding_recommended_bias`
+  - **Liquidation proxy**: `liq_upside/downside_cluster_pct`, `liq_cascade_risk_score`, `liq_dominant_side`
+  - **Spoof detection** (compute_snapshot, uses top-of-book + cancel burst): `spoof_bid/ask`, `spoof_intensity`
 
 ## Внутренние компоненты
 
