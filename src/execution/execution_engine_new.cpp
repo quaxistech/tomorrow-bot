@@ -87,12 +87,12 @@ Result<OrderId> ExecutionEngine::execute(
 
     ExecutionPlan plan = planner_.plan(intent, risk_decision, exec_alpha, market, uncertainty);
 
-    // NoAction: Hold-сигнал или отсутствие торгового намерения — не создаём ордер
+    // NoAction: Hold-сигнал — это валидный исход, не ошибка
     if (plan.action == ExecutionAction::NoAction) {
         logger_->debug("Execution", "NoAction — ордер не требуется",
             {{"symbol", intent.symbol.get()},
              {"signal_intent", to_string(intent.signal_intent)}});
-        return std::unexpected(TbError::ExecutionFailed);
+        return std::unexpected(TbError::NoActionRequired);
     }
 
     // §15: Создать запись ордера

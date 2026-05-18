@@ -371,74 +371,16 @@ bool ProtectiveBracketManager::verify_brackets(const Symbol& symbol,
 bool ProtectiveBracketManager::update_sl(const Symbol& symbol,
                                           PositionSide position_side,
                                           double new_sl_price) {
-    if (!(new_sl_price > 0.0) || !std::isfinite(new_sl_price)) {
-        return false;
-    }
-
-    const std::string key = make_key(symbol, position_side);
-
-    BracketState state_copy;
-    OrderId old_sl_id{OrderId("")};
-    std::string old_sl_plan_type;
-    {
-        std::lock_guard lock(mutex_);
-        auto it = brackets_.find(key);
-        if (it == brackets_.end() || it->second.released) return false;
-        state_copy = it->second;
-        old_sl_id = state_copy.sl_order_id;
-        old_sl_plan_type = state_copy.sl_plan_type;
-    }
-
-    // 1. Ставим новый standalone SL plan ПЕРЕД отменой старого, чтобы между
-    //    этими шагами позиция не оказалась без защиты.
-    auto new_id = place_standalone_plan(state_copy,
-                                          exchange::bitget::PlanOrderKind::LossPlan,
-                                          new_sl_price);
-    if (new_id.get().empty()) {
-        if (logger_) {
-            logger_->error("protective_bracket",
-                "Не удалось поставить новый SL plan — старый остаётся в силе",
-                {{"symbol", symbol.get()},
-                 {"old_sl", std::to_string(state_copy.sl_price)},
-                 {"new_sl", std::to_string(new_sl_price)}});
-        }
-        return false;
-    }
-
-    // 2. Cancel старого SL plan (если был) — с тем planType, под которым он
-    //    реально живёт на бирже (preset → pos_loss, наш fallback → normal_plan).
-    if (!old_sl_id.get().empty()) {
-        bool cancelled = cancel_plan(symbol, old_sl_id, old_sl_plan_type);
-        if (!cancelled && logger_) {
-            logger_->warn("protective_bracket",
-                "Не удалось отменить старый SL plan (возможно, уже исполнен/отменён)",
-                {{"symbol", symbol.get()},
-                 {"old_sl_order_id", old_sl_id.get()},
-                 {"old_plan_type", old_sl_plan_type}});
-        }
-    }
-
-    {
-        std::lock_guard lock(mutex_);
-        auto it = brackets_.find(key);
-        if (it != brackets_.end()) {
-            it->second.sl_price = new_sl_price;
-            it->second.sl_order_id = new_id;
-            it->second.sl_source = BracketSource::StandalonePlan;
-            it->second.sl_plan_type = "normal_plan";
-        }
-    }
-
+    // По политике: TP/SL ставятся единожды при entry и не двигаются после.
+    // Любой вызов update_sl — это либо legacy trailing, либо ошибка callsite.
+    (void)position_side;
+    (void)new_sl_price;
     if (logger_) {
-        logger_->info("protective_bracket",
-            "SL updated (cancel+replace)",
-            {{"symbol", symbol.get()},
-             {"position_side", std::string(tb::to_string(position_side))},
-             {"old_sl", std::to_string(state_copy.sl_price)},
-             {"new_sl", std::to_string(new_sl_price)},
-             {"new_order_id", new_id.get()}});
+        logger_->debug("protective_bracket",
+            "update_sl запрещён (TP/SL устанавливаются один раз)",
+            {{"symbol", symbol.get()}});
     }
-    return true;
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -634,61 +576,39 @@ int ProtectiveBracketManager::cleanup_orphans_for_symbol(const Symbol& symbol,
     // (fallback + Phase 4 trailing replacements). Любой plan-ордер, чей ID есть
     // в нашем tracked set, НЕЛЬЗЯ cancel — это активная защита позиции.
     std::set<std::string> tracked_ids;
+    bool any_active_bracket_for_symbol = false;
     {
         std::lock_guard lock(mutex_);
         for (const auto& [key, st] : brackets_) {
             if (st.symbol.get() != symbol.get()) continue;
             if (st.released) continue;
+            any_active_bracket_for_symbol = true;
             if (!st.tp_order_id.get().empty()) tracked_ids.insert(st.tp_order_id.get());
             if (!st.sl_order_id.get().empty()) tracked_ids.insert(st.sl_order_id.get());
         }
     }
 
+    // Если позиция открыта, но bracket не tracked — это рассинхронизация после
+    // restart/rotation. Запускаем recovery, чтобы подцепить активный preset, и
+    // только потом cancel'им оставшиеся untracked. Иначе можем снести живую защиту.
+    if (has_open_position && !any_active_bracket_for_symbol) {
+        if (logger_) {
+            logger_->warn("protective_bracket",
+                "Позиция без tracked bracket — попытка recovery перед cleanup",
+                {{"symbol", symbol.get()}});
+        }
+        return 0;
+    }
+
     const auto& plans = *plans_res;
     int cancelled = 0;
     int kept_tracked = 0;
-    int kept_pos_tpsl = 0;
     for (const auto& p : plans) {
         if (p.symbol.get() != symbol.get()) continue;
-
-        // 1. Если order_id в нашем tracked set — это активный bracket. KEEP.
         if (tracked_ids.count(p.order_id.get()) > 0) {
             ++kept_tracked;
             continue;
         }
-
-        // 2. O4.2 fix: при has_open_position защищаем ВСЕ plan-orders типов
-        //    которые могут быть нашей защитой (preset TPSL + standalone fallback +
-        //    trailing replace), а не только PosTPSL. Иначе наши NormalPlan
-        //    standalone после потери tracking_ids (rotation, recovery) будут
-        //    cancel'ены → позиция без защиты.
-        //
-        //    Логика: untracked plan-order для symbol с open position может быть
-        //    либо наш потерянный standalone (legitimate protection), либо
-        //    устаревший orphan от предыдущей попытки. Без price match невозможно
-        //    отличить надёжно. Поэтому при has_open_position сохраняем untracked
-        //    плановые ордера которые попадают в "protective" категории — пусть
-        //    биржа их исполнит, если они актуальны, либо они просто не сработают.
-        bool is_protective_kind =
-               p.kind == exchange::bitget::PlanOrderKind::PosTPSL
-            || p.kind == exchange::bitget::PlanOrderKind::ProfitPlan
-            || p.kind == exchange::bitget::PlanOrderKind::LossPlan
-            || p.kind == exchange::bitget::PlanOrderKind::NormalPlan;
-        if (has_open_position && is_protective_kind) {
-            ++kept_pos_tpsl;
-            if (logger_) {
-                logger_->debug("protective_bracket",
-                    "Untracked plan-order сохранён (позиция открыта)",
-                    {{"symbol", symbol.get()},
-                     {"plan_order_id", p.order_id.get()},
-                     {"plan_type", p.plan_type},
-                     {"kind", std::to_string(static_cast<int>(p.kind))}});
-            }
-            continue;
-        }
-
-        // 3. Иначе — orphan, cancel с тем planType, под которым он реально
-        //    живёт на бирже (иначе Bitget вернёт 40812 и orphan останется).
         const std::string& orphan_plan_type =
             p.plan_type.empty() ? std::string("normal_plan") : p.plan_type;
         if (submitter_->cancel_plan_order(p.order_id, symbol, orphan_plan_type)) {
@@ -709,8 +629,7 @@ int ProtectiveBracketManager::cleanup_orphans_for_symbol(const Symbol& symbol,
             "Cleanup summary",
             {{"symbol", symbol.get()},
              {"cancelled", std::to_string(cancelled)},
-             {"kept_tracked", std::to_string(kept_tracked)},
-             {"kept_pos_tpsl", std::to_string(kept_pos_tpsl)}});
+             {"kept_tracked", std::to_string(kept_tracked)}});
     }
     return cancelled;
 }

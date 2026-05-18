@@ -31,10 +31,6 @@ public:
     virtual std::optional<WorldModelSnapshot> current_state(const Symbol& symbol) const = 0;
 
     virtual void record_feedback(const WorldStateFeedback& feedback) { (void)feedback; }
-    virtual std::optional<StatePerformanceStats> performance_stats(
-        WorldState state, const StrategyId& strategy) const {
-        (void)state; (void)strategy; return std::nullopt;
-    }
     virtual std::string model_version() const { return "3.0.0-min"; }
 };
 

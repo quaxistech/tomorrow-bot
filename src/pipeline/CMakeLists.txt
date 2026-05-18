@@ -10,7 +10,6 @@ add_library(tb_pipeline STATIC
     dual_leg_manager.cpp
     pair_lifecycle_engine.cpp
     pair_execution_coordinator.cpp
-    periodic_trailing_sl.cpp
     pre_trade_gates.cpp
     protective_bracket_manager.cpp
     rest_worker_pool.cpp

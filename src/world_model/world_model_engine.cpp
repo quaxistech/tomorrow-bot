@@ -4,18 +4,8 @@
 
 namespace tb::world_model {
 
-// ─── Defaults preserved for config loader / validator compatibility ──────────
-
-SuitabilityConfig SuitabilityConfig::make_default() {
-    // The 9×N state×strategy table was retired with the adaptive engine.
-    // Single-strategy bot relies on regime hints + uncertainty for gating.
-    return SuitabilityConfig{};
-}
-
 WorldModelConfig WorldModelConfig::make_default() {
-    WorldModelConfig cfg;
-    cfg.suitability = SuitabilityConfig::make_default();
-    return cfg;
+    return WorldModelConfig{};
 }
 
 // ─── String helpers (kept for telemetry/log compatibility) ───────────────────
@@ -104,11 +94,8 @@ WorldState classify(const features::FeatureSnapshot& snap, const WorldModelConfi
         return WorldState::LiquidityVacuum;
     }
 
-    // Trending: ADX strong + directional momentum.
-    // B18.2: 5 bps directional momentum threshold (можно в WorldModelConfig).
-    constexpr double kTrendingMomentumThreshold = 0.0005;
     if (t.adx_valid && t.adx >= cfg.stable_trend.adx_min && t.momentum_valid) {
-        if (std::abs(t.momentum_20) > kTrendingMomentumThreshold) {
+        if (std::abs(t.momentum_20) > cfg.stable_trend.trending_momentum_threshold) {
             return WorldState::StableTrendContinuation;
         }
     }
@@ -131,34 +118,21 @@ WorldState classify(const features::FeatureSnapshot& snap, const WorldModelConfi
     return WorldState::Unknown;
 }
 
-double simple_fragility(const features::FeatureSnapshot& snap) {
-    // B18.3: эмпирические фрагменты-веса. Можно вынести в WorldModelConfig
-    // если потребуется per-symbol калибровка.
-    constexpr double kBaseFragility       = 0.3;
-    constexpr double kSpreadFragSeverity  = 0.3;
-    constexpr double kSpreadBpsThreshold  = 20.0;
-    constexpr double kInstabFragSeverity  = 0.2;
-    constexpr double kInstabThreshold     = 0.5;
-    constexpr double kVpinFragSeverity    = 0.2;
+double simple_fragility(const features::FeatureSnapshot& snap, const WorldModelConfig& cfg) {
     const auto& m = snap.microstructure;
-    double frag = kBaseFragility;
-    if (m.spread_valid && m.spread_bps > kSpreadBpsThreshold) frag += kSpreadFragSeverity;
-    if (m.book_instability > kInstabThreshold)                frag += kInstabFragSeverity;
-    if (m.vpin_valid && m.vpin_toxic)                         frag += kVpinFragSeverity;
+    const auto& f = cfg.fragility;
+    double frag = f.base;
+    if (m.spread_valid && m.spread_bps > f.spread_bps_threshold) frag += f.spread_severity;
+    if (m.book_instability > f.instab_threshold)                  frag += f.instab_severity;
+    if (m.vpin_valid && m.vpin_toxic)                             frag += f.vpin_severity;
     return std::clamp(frag, 0.0, 1.0);
 }
 
 StateProbabilities make_probabilities(WorldState primary) {
     StateProbabilities p;
     p.valid = true;
-    // 0.7 mass on the chosen state, the rest spread evenly across the
-    // four "bad" states that the decision engine penalises. This keeps
-    // downstream consumers (decision/uncertainty) functioning while
-    // removing the full transition-matrix machinery.
     constexpr double kPrimary = 0.7;
-    constexpr double kBadSlice = 0.075;
     for (size_t i = 0; i < kWorldStateCount; ++i) p.values[i] = 0.0;
-    p.values[static_cast<int>(primary)] = kPrimary;
 
     const std::array<WorldState, 4> bad = {
         WorldState::ToxicMicrostructure,
@@ -166,8 +140,20 @@ StateProbabilities make_probabilities(WorldState primary) {
         WorldState::ExhaustionSpike,
         WorldState::ChopNoise
     };
+
+    size_t bad_slots = 0;
+    for (auto s : bad) if (s != primary) ++bad_slots;
+
+    p.values[static_cast<int>(primary)] = kPrimary;
+    const double slice = bad_slots > 0 ? (1.0 - kPrimary) / static_cast<double>(bad_slots) : 0.0;
     for (auto s : bad) {
-        if (s != primary) p.values[static_cast<int>(s)] += kBadSlice;
+        if (s != primary) p.values[static_cast<int>(s)] = slice;
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < kWorldStateCount; ++i) sum += p.values[i];
+    if (sum > 0.0 && std::abs(sum - 1.0) > 1e-9) {
+        for (size_t i = 0; i < kWorldStateCount; ++i) p.values[i] /= sum;
     }
     return p;
 }
@@ -184,7 +170,7 @@ WorldModelSnapshot RuleBasedWorldModelEngine::update(const features::FeatureSnap
     out.state = classify(snap, config_);
     out.label = WorldModelSnapshot::to_label(out.state);
 
-    out.fragility.value = simple_fragility(snap);
+    out.fragility.value = simple_fragility(snap, config_);
     out.fragility.valid = true;
     out.fragility.confidence = 0.7;
 

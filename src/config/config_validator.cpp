@@ -89,8 +89,11 @@ void ConfigValidator::validate_metrics(const MetricsConfig& cfg, ValidationResul
 }
 
 void ConfigValidator::validate_risk(const RiskConfig& cfg, ValidationResult& result) const {
-    if (cfg.max_position_notional <= 0.0) {
-        result.add_error("risk.max_position_notional должен быть больше 0");
+    if (cfg.max_position_notional < 0.0) {
+        result.add_error("risk.max_position_notional не может быть отрицательным");
+    }
+    if (cfg.max_position_notional == 0.0 && cfg.max_position_notional_pct <= 0.0) {
+        result.add_error("Хотя бы один из risk.max_position_notional или max_position_notional_pct должен быть > 0");
     }
     if (cfg.max_daily_loss_pct <= 0.0 || cfg.max_daily_loss_pct > 100.0) {
         result.add_error("risk.max_daily_loss_pct должен быть в диапазоне (0, 100]");
@@ -346,10 +349,10 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
     if (!cfg.futures.enabled) {
         result.add_error("CRITICAL: futures.enabled MUST be true. Bot is FUTURES-ONLY.");
     }
-    // Высокое плечо — предупреждение
-    if (cfg.futures.enabled && cfg.futures.max_leverage > 20) {
-        result.add_warning(
-            std::format("futures.max_leverage ({}) > 20 — высокий риск ликвидации",
+    // Плечо валидируется только верхним пределом биржи (max 125x на Bitget USDT-M).
+    if (cfg.futures.enabled && cfg.futures.max_leverage > 125) {
+        result.add_error(
+            std::format("futures.max_leverage ({}) > 125 — превышает биржевой лимит Bitget",
                         cfg.futures.max_leverage));
     }
     // Начальный капитал должен покрывать хотя бы один минимальный ордер
@@ -409,19 +412,12 @@ void ConfigValidator::validate_cross(const AppConfig& cfg, ValidationResult& res
 
     // max_position_notional should not exceed leveraged capital
     // ИСПРАВЛЕНИЕ M2 (аудит): повышено до error — недостижимые лимиты вводят оператора в заблуждение
-    if (cfg.risk.max_position_notional > max_leveraged_capital && max_leveraged_capital > 0.0) {
+    if (cfg.risk.max_position_notional > 0.0 &&
+        cfg.risk.max_position_notional > max_leveraged_capital && max_leveraged_capital > 0.0) {
         result.add_error(
             std::format("risk.max_position_notional ({:.0f}) > capital×leverage ({:.2f}) — "
                         "лимит позиции недостижим при текущем капитале и плече",
                         cfg.risk.max_position_notional, max_leveraged_capital));
-    }
-
-    // Warn about micro-account operation
-    if (cfg.trading.initial_capital < 50.0) {
-        result.add_warning(
-            std::format("Микро-аккаунт: initial_capital = {:.2f} USDT — "
-                        "бот работает вблизи биржевых минимумов, высокая чувствительность к комиссиям",
-                        cfg.trading.initial_capital));
     }
 }
 

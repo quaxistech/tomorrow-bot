@@ -23,6 +23,16 @@ namespace finance {
 namespace fees {
     constexpr double kDefaultTakerFeePct = 0.0006;  ///< Futures Taker-комиссия 0.06%
     constexpr double kDefaultMakerFeePct = 0.0002;  ///< Futures Maker-комиссия 0.02%
+
+    /// Round-trip taker fee как фракция (entry+exit).
+    constexpr double kRoundTripTakerFraction = kDefaultTakerFeePct * 2.0;
+    /// Round-trip taker fee в процентах.
+    constexpr double kRoundTripTakerPct = kRoundTripTakerFraction * 100.0;
+    /// Экономический пол для ATR%: цена должна двигаться хотя бы на этот процент,
+    /// чтобы перекрыть round-trip taker fee с разумным запасом.
+    constexpr double kEconomicAtrSafetyMultiplier = 1.25;
+    constexpr double kEconomicAtrFloorPct = kRoundTripTakerPct * kEconomicAtrSafetyMultiplier;
+    constexpr double kEconomicAtrFloorFraction = kRoundTripTakerFraction * kEconomicAtrSafetyMultiplier;
 } // namespace fees
 
 /// Лимиты биржи Bitget (USDT-M futures)

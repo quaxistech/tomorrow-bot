@@ -52,10 +52,6 @@ public:
     [[nodiscard]] Result<AppConfig> load(std::string_view path) override;
 
 private:
-    /// Парсит строку вида "  key: value" и возвращает {key, value}
-    [[nodiscard]] static std::pair<std::string, std::string>
-    parse_kv_line(std::string_view line);
-
     /// Извлекает значение по ключу из плоской карты, возвращает default если не найдено
     [[nodiscard]] static std::string
     get_value(const std::unordered_map<std::string, std::string>& kv,

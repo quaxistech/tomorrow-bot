@@ -74,6 +74,9 @@ enum class TbError {
 
     // --- Shadow/offline ---
     ShadowDisabled,                 ///< Теневой режим отключён
+
+    // --- No-op execution ---
+    NoActionRequired,               ///< Hold/NoAction — ордер не нужен, это не ошибка
 };
 
 // ============================================================
@@ -149,6 +152,8 @@ public:
                 return "Нет подтверждения production режима";
             case TbError::ShadowDisabled:
                 return "Теневой режим отключён";
+            case TbError::NoActionRequired:
+                return "Hold/NoAction — действие не требуется";
             default:
                 return "Неизвестная ошибка TomorrowBot";
         }

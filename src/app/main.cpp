@@ -393,9 +393,8 @@ int main(int argc, const char* argv[]) {
     // чтобы YAML-параметры реально влияли на runtime фильтрацию и ранжирование.
     const auto& sc = config.pair_selection.scorer;
     scanner_cfg.min_volume_usdt = std::max(scanner_cfg.min_volume_usdt, sc.volume_tier_minimal);
-    constexpr double kScannerRoundTripFeePct = tb::common::fees::kDefaultTakerFeePct * 2.0 * 100.0;
-    constexpr double kScannerEconomicMinVolPct = kScannerRoundTripFeePct * 1.25;
-    scanner_cfg.min_volatility_pct = std::max(sc.volatility_low_threshold, kScannerEconomicMinVolPct);
+    scanner_cfg.min_volatility_pct = std::max(sc.volatility_low_threshold,
+        tb::common::fees::kEconomicAtrFloorPct);
     scanner_cfg.max_volatility_pct = sc.volatility_high_threshold;
 
     // D12 fix: микро-аккаунт scaling вынесен в ScannerConfig (порог + ослабленные значения).

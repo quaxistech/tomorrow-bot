@@ -397,23 +397,8 @@ TradingPipeline::TradingPipeline(
     }
     portfolio_allocator::HierarchicalAllocator::Config alloc_cfg;
     alloc_cfg.budget.global_budget = config_.trading.initial_capital;
-    // Фьючерсы — масштабировать бюджет на leverage
     alloc_cfg.max_leverage = static_cast<double>(config_.futures.default_leverage);
     alloc_cfg.budget.global_budget *= alloc_cfg.max_leverage;
-    // Для маленьких аккаунтов (< $100) — ослабляем лимиты концентрации
-    // и повышаем target_vol, чтобы не блокировать минимальные ордера биржи ($1 USDT)
-    if (config_.trading.initial_capital < 100.0) {
-        // EDGE-30 (run58 2026-05-15): per-pipeline budget = total/N. С 15 pipelines
-        // budget=$1 на pipeline. С leverage 20× и max_strategy=0.9 → strategy_limit ≈ $18.
-        // Но allocator видит GLOBAL exposure (все pipelines) = $20+ → blocked.
-        // Поднимаем до 5.0 (500% от per-pipeline budget) — отражает что portfolio
-        // shared между pipelines.
-        alloc_cfg.max_concentration_pct = 5.0;
-        alloc_cfg.max_strategy_allocation_pct = 5.0;
-        alloc_cfg.budget.symbol_budget_pct = 5.0;
-        alloc_cfg.target_annual_vol = 1.50;       // 150% — адекватнее для крипто-фьючерсов
-        alloc_cfg.kelly_fraction = 0.50;           // Half-Kelly — не ждать статистику
-    }
     portfolio_allocator_ = std::make_shared<portfolio_allocator::HierarchicalAllocator>(
         alloc_cfg, logger_);
 
@@ -495,10 +480,6 @@ TradingPipeline::TradingPipeline(
     risk_cfg.max_realized_daily_loss_pct = config_.risk.max_realized_daily_loss_pct;
     risk_cfg.max_intraday_drawdown_pct = config_.risk.max_intraday_drawdown_pct;
     risk_cfg.utc_cutoff_hour = config_.risk.utc_cutoff_hour;
-    // Для маленьких аккаунтов — снижаем порог минимальной ликвидности
-    if (config_.trading.initial_capital < 100.0) {
-        risk_cfg.min_liquidity_depth = 1.0;
-    }
     // v11: Фьючерсы с плечом — экспозиция и leverage пропорциональны max_leverage.
     // LeverageEngine может выставить плечо до max_leverage, поэтому пределы risk engine
     // должны использовать max_leverage, а не default_leverage.
@@ -700,17 +681,10 @@ TradingPipeline::TradingPipeline(
                 {{"grace_ms", std::to_string(bracket_cfg.verify_grace_ms)},
                  {"max_attempts", std::to_string(bracket_cfg.max_verify_attempts)}});
 
-            // run87: Periodic monotonic trailing SL — каждые 5 сек tighten SL
-            // вверх (LONG) / вниз (SHORT) только в сторону прибыли.
-            PeriodicTrailingConfig trail_cfg;  // defaults: 5s interval, ATR×1.2
-            trailing_sl_ = std::make_unique<PeriodicTrailingSl>(
-                bracket_manager_, logger_, clock_, trail_cfg);
-            logger_->info("pipeline",
-                "PeriodicTrailingSl инициализирован (monotonic Chandelier Exit)",
-                {{"interval_ms", std::to_string(trail_cfg.min_interval_ms)},
-                 {"atr_mult", std::to_string(trail_cfg.atr_trail_multiplier)},
-                 {"min_move_bps", std::to_string(trail_cfg.min_sl_move_bps)},
-                 {"activation_min_profit_bps", std::to_string(trail_cfg.activation_min_profit_bps)}});
+            // Trailing SL отключён: TP/SL устанавливаются единожды при entry
+            // (AttachedTpSl или standalone fallback). Любые обновления плановых
+            // ордеров после открытия позиции запрещены — это устраняет дубли
+            // plan-ордеров и комиссионный drain от частого place/cancel.
         }
 
         // run90: Stagnant position detector.
@@ -2988,16 +2962,16 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
         snapshot.technical.atr_valid && snapshot.technical.atr_14 > 0.0 &&
         snapshot.mid_price.get() > 0.0) {
         double atr_pct = snapshot.technical.atr_14 / snapshot.mid_price.get();
-        constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0;
-        constexpr double kEconomicAtrFloorPct = kRoundTripTakerFeePct * 1.25;
-        double min_atr_pct = std::max(0.001, kEconomicAtrFloorPct);
-        if (atr_pct < min_atr_pct) {
+        constexpr double kMinAbsAtrFraction = 0.001;
+        const double min_atr_frac = std::max(
+            kMinAbsAtrFraction, common::fees::kEconomicAtrFloorFraction);
+        if (atr_pct < min_atr_frac) {
             if (tick_count_ % 200 == 0) {
                 logger_->info("pipeline",
                     "LOW_VOL BLOCK: ATR% ниже экономического порога сделки",
                     {{"atr_pct", std::to_string(atr_pct * 100.0)},
-                     {"min_atr_pct", std::to_string(min_atr_pct * 100.0)},
-                     {"round_trip_fee_pct", std::to_string(kRoundTripTakerFeePct * 100.0)},
+                     {"min_atr_pct", std::to_string(min_atr_frac * 100.0)},
+                     {"round_trip_fee_pct", std::to_string(common::fees::kRoundTripTakerPct)},
                      {"atr", std::to_string(snapshot.technical.atr_14)},
                      {"price", std::to_string(snapshot.mid_price.get())},
                      {"symbol", symbol_.get()}});
@@ -3725,16 +3699,6 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
 
     risk::RiskDecision risk_decision;
     risk_decision.decided_at = clock_->now();
-
-    // run85 fix (2026-05-16): BUG — `intent.side == Side::Buy` фильтр блокировал
-    // SHORT entries. 22 ордера было отправлено как PostOnly limit (urgency 0.30),
-    // 22 отменены watchdog'ом, 0 fills → нулевая активность.
-    // На скальпинге с $15 капиталом стоимость taker fees 12 bps на round-trip
-    // ничтожна (target TP=1.5×ATR = 150+ bps), а потерянный вход на хорошем сигнале
-    // стоит весь TP. Делаем market entries на ВСЕ сделки (BUY+SELL) для small accounts.
-    if (pre_trade_portfolio.total_capital < 100.0) {
-        intent.urgency = std::max(intent.urgency, 0.85);
-    }
 
     // Execution alpha — вычисляем один раз для всех ветвей
     auto exec_alpha = execution_alpha_->evaluate(intent, snapshot, uncertainty);
@@ -4633,9 +4597,7 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
                 double fees = 0.0;
                 if (snapshot.mid_price.get() > 0.0 && closing_qty.get() > 0.0) {
                     fees = snapshot.mid_price.get() * closing_qty.get()
-                         * config_.trading_params.quick_profit_fee_multiplier > 0.0
-                         ? snapshot.mid_price.get() * closing_qty.get() * 0.0006  // taker round-trip approx
-                         : 0.0;
+                         * common::fees::kRoundTripTakerFraction;
                 }
                 trade_journal_->on_exit_filled(
                     symbol_,
@@ -4650,29 +4612,28 @@ void TradingPipeline::on_feature_snapshot(features::FeatureSnapshot snapshot) {
             reset_trailing_state();
         }
     } else {
-        ++consecutive_rejections_;
+        if (order_result.error() == TbError::NoActionRequired) {
+            if (is_closing_position) close_order_pending_ = false;
+            logger_->debug("pipeline", "NoAction — пропуск без rejection",
+                {{"symbol", symbol_.get()}});
+        } else {
+            ++consecutive_rejections_;
+            if (is_closing_position) close_order_pending_ = false;
 
-        // Если ордер на закрытие позиции не исполнен — снимаем блокировку,
-        // чтобы на следующем тике trailing/TP/time_exit могли повторить попытку.
-        if (is_closing_position) {
-            close_order_pending_ = false;
-        }
-
-        // Экспоненциальный backoff: cooldown × 2^(rejections-1), макс 10 минут
-        int64_t base_cooldown = static_cast<int64_t>(config_.trading_params.order_cooldown_seconds)
-                               * 1'000'000'000LL;
-        int64_t backoff = base_cooldown * (1LL << std::min(consecutive_rejections_, 8));
-        backoff = std::min(backoff, kMaxRejectionBackoffNs);
-        last_order_time_ns_ = clock_->now().get() + backoff - base_cooldown;
-        logger_->warn("pipeline", "Ордер не исполнен",
-            {{"side", intent.side == Side::Buy ? "BUY" : "SELL"},
-             {"symbol", symbol_.get()},
-             {"is_close", is_closing_position ? "true" : "false"},
-             {"consecutive_rejections", std::to_string(consecutive_rejections_)},
-             {"backoff_sec", std::to_string(backoff / 1'000'000'000LL)}});
-        // Уведомить стратегию — не переспамливать вход
-        for (const auto& s : strategy_registry_->active()) {
-            s->notify_entry_rejected();
+            int64_t base_cooldown = static_cast<int64_t>(config_.trading_params.order_cooldown_seconds)
+                                   * 1'000'000'000LL;
+            int64_t backoff = base_cooldown * (1LL << std::min(consecutive_rejections_, 8));
+            backoff = std::min(backoff, kMaxRejectionBackoffNs);
+            last_order_time_ns_ = clock_->now().get() + backoff - base_cooldown;
+            logger_->warn("pipeline", "Ордер не исполнен",
+                {{"side", intent.side == Side::Buy ? "BUY" : "SELL"},
+                 {"symbol", symbol_.get()},
+                 {"is_close", is_closing_position ? "true" : "false"},
+                 {"consecutive_rejections", std::to_string(consecutive_rejections_)},
+                 {"backoff_sec", std::to_string(backoff / 1'000'000'000LL)}});
+            for (const auto& s : strategy_registry_->active()) {
+                s->notify_entry_rejected();
+            }
         }
     }
 
@@ -5070,21 +5031,18 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
         });
     }
 
-    // run87 Periodic Trailing SL: monotonic подтягивание SL для текущей позиции.
-    // Использует данные tick'а (current price + entry tracking) — не блокирует
-    // pipeline (внутренний throttle min_interval_ms=5000).
-    if (trailing_sl_ && bracket_manager_ && has_open_position()
-        && initial_position_size_ > 0.0) {
-        TrailingPositionSnapshot snap;
+    // TP/SL ставятся единожды при entry. После открытия позиции мы не двигаем
+    // защитные plan-ордера — это устраняет fee drain и накопление дублей.
+    // stagnant detector проверяет, что позиция не "застыла", и форсит market close.
+    if (bracket_manager_ && has_open_position() && initial_position_size_ > 0.0) {
+        struct StagnantInput {
+            Symbol symbol{Symbol("")};
+            PositionSide position_side{PositionSide::Long};
+            double entry_price{0.0};
+            double current_price{0.0};
+        } snap;
         snap.symbol = symbol_;
         snap.position_side = current_position_side_;
-        // entry_price — из локального state (set при on_position_opened)
-        // current_price — из snapshot cached
-        // highest/lowest — peak prices с момента entry (tracking в pipeline)
-        // atr — из snapshot.technical
-        // Note: эти поля читаются через cached_market_state_, но для
-        // simplicity передаём минимум — trailing проверит профитность.
-        snap.entry_price = 0.0;  // заполнено ниже если есть position info
         if (portfolio_) {
             auto positions = portfolio_->snapshot();
             for (const auto& p : positions.positions) {
@@ -5095,20 +5053,8 @@ void TradingPipeline::run_periodic_tasks(int64_t now_ns) {
             }
         }
         snap.current_price = cached_market_state_.mid_price;
-        snap.highest_since_entry = highest_price_since_entry_;
-        snap.lowest_since_entry = lowest_price_since_entry_;
-        snap.atr = cached_market_state_.atr_14;
-        // run94: contextual indicators for adaptive trail multiplier.
-        snap.supertrend_trend = cached_market_state_.supertrend_trend;
-        snap.cvd_bullish_div = cached_market_state_.cvd_bullish_divergence;
-        snap.cvd_bearish_div = cached_market_state_.cvd_bearish_divergence;
-        snap.liq_cascade_risk = cached_market_state_.liq_cascade_risk;
 
-        if (snap.entry_price > 0.0 && snap.current_price > 0.0 && snap.atr > 0.0) {
-            (void)trailing_sl_->tick(snap);
-        }
-
-        // run90: stagnant position check. Если pair "застыла" (range < 8 bps
+        // stagnant position check. Если pair "застыла" (range < 8 bps
         // за 120s window и position > 180s) — force exit для освобождения
         // капитала. Pipeline вернётся в idle → soft rotation заберёт его на
         // активную пару. Pair НЕ blacklist'ится — может вернуться через scanner.

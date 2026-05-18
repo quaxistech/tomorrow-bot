@@ -44,14 +44,9 @@ double candle_interval_minutes(std::string_view interval) {
 }
 
 double scanner_min_atr_pct(const ScannerConfig& cfg) {
-    // kDefaultTakerFeePct is a raw fraction (0.0006 = 0.06%); multiply by 100 to get percent units.
-    constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0 * 100.0;
-    constexpr double kRuntimeEconomicAtrFloorPct = kRoundTripTakerFeePct * 1.25;
-
-    // Runtime blocks entries on 1m ATR. Scanner may analyze wider candles, so the
-    // minimum ATR% must be scaled to the scanner timeframe to stay economically equivalent.
     double interval_minutes = std::max(1.0, candle_interval_minutes(cfg.candle_interval));
-    double timeframe_adjusted_floor_pct = kRuntimeEconomicAtrFloorPct * std::sqrt(interval_minutes);
+    double timeframe_adjusted_floor_pct =
+        common::fees::kEconomicAtrFloorPct * std::sqrt(interval_minutes);
     return std::max(cfg.min_volatility_pct, timeframe_adjusted_floor_pct);
 }
 
@@ -158,15 +153,14 @@ FilterVerdict PairFilter::evaluate(const MarketSnapshot& snapshot,
     }
 
     if (snapshot.last_price > 0.0 && features.volatility.atr > 0.0) {
-        constexpr double kRoundTripTakerFeePct = common::fees::kDefaultTakerFeePct * 2.0;
         double atr_pct = features.volatility.atr / snapshot.last_price * 100.0;
         double min_atr_pct = scanner_min_atr_pct(cfg_);
         if (atr_pct < min_atr_pct) {
             return {FilterReason::LowVolatility,
                     "atr_pct=" + std::to_string(atr_pct) +
                     "% < min_atr_pct=" + std::to_string(min_atr_pct) +
-                    "% (round_trip_fee_pct=" + std::to_string(kRoundTripTakerFeePct) +
-                    "%, candle_interval=" + cfg_.candle_interval + ")"};
+                    "% (round_trip_fee_pct=" + std::to_string(common::fees::kRoundTripTakerFraction) +
+                    ", candle_interval=" + cfg_.candle_interval + ")"};
         }
     }
 

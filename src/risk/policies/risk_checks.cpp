@@ -6,6 +6,7 @@
 #include "common/enums.hpp"
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 
 namespace tb::risk {
@@ -247,15 +248,18 @@ void ExposureLimitCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
 void PerTradeRiskCheck::evaluate(const RiskContext& ctx, RiskDecision& d) {
     const double notional = ctx.sizing.approved_notional.get();
 
-    // EDGE-31 (run83 sizing bug): max_position_notional как абсолютный USD floor.
-    // Если задан max_position_notional_pct > 0 — auto-scaled cap = total_capital × pct.
-    // Effective cap = max(абсолют, pct-based) — pct-based перекрывает абсолют когда capital растёт.
-    double effective_cap = cfg_.max_position_notional;
+    // Dynamic-only cap: pct-based берётся всегда если > 0; абсолютный — safety ceiling.
+    // Иначе бы фиксированный пол блокировал рост позиций пропорционально балансу.
+    double effective_cap = std::numeric_limits<double>::infinity();
     if (cfg_.max_position_notional_pct > 0.0 && ctx.portfolio.total_capital > 0.0) {
-        const double pct_cap = ctx.portfolio.total_capital * cfg_.max_position_notional_pct;
-        if (pct_cap > effective_cap) {
-            effective_cap = pct_cap;
-        }
+        effective_cap = ctx.portfolio.total_capital * cfg_.max_position_notional_pct
+                      * std::max(1.0, cfg_.max_leverage);
+    }
+    if (cfg_.max_position_notional > 0.0) {
+        effective_cap = std::min(effective_cap, cfg_.max_position_notional);
+    }
+    if (!std::isfinite(effective_cap) || effective_cap <= 0.0) {
+        effective_cap = ctx.portfolio.total_capital * std::max(1.0, cfg_.max_leverage);
     }
 
     if (notional > effective_cap) {

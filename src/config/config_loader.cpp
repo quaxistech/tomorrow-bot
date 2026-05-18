@@ -94,14 +94,6 @@ void flatten_yaml(const YAML::Node& node,
 // YamlConfigLoader (legacy interface, yaml-cpp backend)
 // ============================================================
 
-std::pair<std::string, std::string>
-YamlConfigLoader::parse_kv_line(std::string_view /*line*/) {
-    // Историческое API из самописного парсера. После миграции на yaml-cpp
-    // эта функция больше не используется внутри `load`, но сохранена для
-    // backward-compat (приватный helper, отмечен в публичном заголовке).
-    return {std::string{}, std::string{}};
-}
-
 std::string
 YamlConfigLoader::get_value(
     const std::unordered_map<std::string, std::string>& kv,
@@ -625,16 +617,10 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     // ── Секция world_model ───────────────────────────────────────────────
     cfg.world_model.model_version = get_tracked(
         "world_model.model_version", cfg.world_model.model_version);
-    cfg.world_model.min_valid_indicators = static_cast<int>(parse_double(
-        get_tracked( "world_model.min_valid_indicators", std::to_string(cfg.world_model.min_valid_indicators)),
-        static_cast<double>(cfg.world_model.min_valid_indicators), "world_model.min_valid_indicators"));
 
     cfg.world_model.toxic.book_instability_min = parse_double(
         get_tracked( "world_model.toxic_microstructure.book_instability_min", std::to_string(cfg.world_model.toxic.book_instability_min)),
         cfg.world_model.toxic.book_instability_min, "world_model.toxic_microstructure.book_instability_min");
-    cfg.world_model.toxic.aggressive_flow_min = parse_double(
-        get_tracked( "world_model.toxic_microstructure.aggressive_flow_min", std::to_string(cfg.world_model.toxic.aggressive_flow_min)),
-        cfg.world_model.toxic.aggressive_flow_min, "world_model.toxic_microstructure.aggressive_flow_min");
     cfg.world_model.toxic.spread_bps_min = parse_double(
         get_tracked( "world_model.toxic_microstructure.spread_bps_min", std::to_string(cfg.world_model.toxic.spread_bps_min)),
         cfg.world_model.toxic.spread_bps_min, "world_model.toxic_microstructure.spread_bps_min");
@@ -642,9 +628,6 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.world_model.liquidity_vacuum.spread_bps_critical = parse_double(
         get_tracked( "world_model.liquidity_vacuum.spread_bps_critical", std::to_string(cfg.world_model.liquidity_vacuum.spread_bps_critical)),
         cfg.world_model.liquidity_vacuum.spread_bps_critical, "world_model.liquidity_vacuum.spread_bps_critical");
-    cfg.world_model.liquidity_vacuum.spread_bps_secondary = parse_double(
-        get_tracked( "world_model.liquidity_vacuum.spread_bps_secondary", std::to_string(cfg.world_model.liquidity_vacuum.spread_bps_secondary)),
-        cfg.world_model.liquidity_vacuum.spread_bps_secondary, "world_model.liquidity_vacuum.spread_bps_secondary");
     cfg.world_model.liquidity_vacuum.liquidity_ratio_min = parse_double(
         get_tracked( "world_model.liquidity_vacuum.liquidity_ratio_min", std::to_string(cfg.world_model.liquidity_vacuum.liquidity_ratio_min)),
         cfg.world_model.liquidity_vacuum.liquidity_ratio_min, "world_model.liquidity_vacuum.liquidity_ratio_min");
@@ -655,43 +638,36 @@ Result<AppConfig> YamlConfigLoader::load(std::string_view path) {
     cfg.world_model.exhaustion.rsi_lower = parse_double(
         get_tracked( "world_model.exhaustion_spike.rsi_lower", std::to_string(cfg.world_model.exhaustion.rsi_lower)),
         cfg.world_model.exhaustion.rsi_lower, "world_model.exhaustion_spike.rsi_lower");
-    cfg.world_model.exhaustion.momentum_abs_min = parse_double(
-        get_tracked( "world_model.exhaustion_spike.momentum_abs_min", std::to_string(cfg.world_model.exhaustion.momentum_abs_min)),
-        cfg.world_model.exhaustion.momentum_abs_min, "world_model.exhaustion_spike.momentum_abs_min");
-
-    // Scalping refactor 2026-05: world_model.fragile_breakout / .compression /
-    // .fragility / .hysteresis / .history / .feedback / .persistence / .suitability
-    // удалены вместе с старой адаптивной машиной. Парсинг этих ключей убран.
-    // YAML loader тихо игнорирует unknown keys, поэтому существующие production
-    // configs не ломаются.
 
     cfg.world_model.stable_trend.adx_min = parse_double(
         get_tracked( "world_model.stable_trend.adx_min", std::to_string(cfg.world_model.stable_trend.adx_min)),
         cfg.world_model.stable_trend.adx_min, "world_model.stable_trend.adx_min");
-    cfg.world_model.stable_trend.rsi_lower = parse_double(
-        get_tracked( "world_model.stable_trend.rsi_lower", std::to_string(cfg.world_model.stable_trend.rsi_lower)),
-        cfg.world_model.stable_trend.rsi_lower, "world_model.stable_trend.rsi_lower");
-    cfg.world_model.stable_trend.rsi_upper = parse_double(
-        get_tracked( "world_model.stable_trend.rsi_upper", std::to_string(cfg.world_model.stable_trend.rsi_upper)),
-        cfg.world_model.stable_trend.rsi_upper, "world_model.stable_trend.rsi_upper");
+    cfg.world_model.stable_trend.trending_momentum_threshold = parse_double(
+        get_tracked( "world_model.stable_trend.trending_momentum_threshold", std::to_string(cfg.world_model.stable_trend.trending_momentum_threshold)),
+        cfg.world_model.stable_trend.trending_momentum_threshold, "world_model.stable_trend.trending_momentum_threshold");
 
     cfg.world_model.chop_noise.adx_max = parse_double(
         get_tracked( "world_model.chop_noise.adx_max", std::to_string(cfg.world_model.chop_noise.adx_max)),
         cfg.world_model.chop_noise.adx_max, "world_model.chop_noise.adx_max");
-    cfg.world_model.chop_noise.rsi_lower = parse_double(
-        get_tracked( "world_model.chop_noise.rsi_lower", std::to_string(cfg.world_model.chop_noise.rsi_lower)),
-        cfg.world_model.chop_noise.rsi_lower, "world_model.chop_noise.rsi_lower");
-    cfg.world_model.chop_noise.rsi_upper = parse_double(
-        get_tracked( "world_model.chop_noise.rsi_upper", std::to_string(cfg.world_model.chop_noise.rsi_upper)),
-        cfg.world_model.chop_noise.rsi_upper, "world_model.chop_noise.rsi_upper");
-    cfg.world_model.chop_noise.spread_bps_max = parse_double(
-        get_tracked( "world_model.chop_noise.spread_bps_max", std::to_string(cfg.world_model.chop_noise.spread_bps_max)),
-        cfg.world_model.chop_noise.spread_bps_max, "world_model.chop_noise.spread_bps_max");
 
-    // suitability.hard_veto_threshold кепт для совместимости (engine ignores).
-    cfg.world_model.suitability.hard_veto_threshold = parse_double(
-        get_tracked( "world_model.suitability.hard_veto_threshold", std::to_string(cfg.world_model.suitability.hard_veto_threshold)),
-        cfg.world_model.suitability.hard_veto_threshold, "world_model.suitability.hard_veto_threshold");
+    cfg.world_model.fragility.base = parse_double(
+        get_tracked("world_model.fragility.base", std::to_string(cfg.world_model.fragility.base)),
+        cfg.world_model.fragility.base, "world_model.fragility.base");
+    cfg.world_model.fragility.spread_severity = parse_double(
+        get_tracked("world_model.fragility.spread_severity", std::to_string(cfg.world_model.fragility.spread_severity)),
+        cfg.world_model.fragility.spread_severity, "world_model.fragility.spread_severity");
+    cfg.world_model.fragility.spread_bps_threshold = parse_double(
+        get_tracked("world_model.fragility.spread_bps_threshold", std::to_string(cfg.world_model.fragility.spread_bps_threshold)),
+        cfg.world_model.fragility.spread_bps_threshold, "world_model.fragility.spread_bps_threshold");
+    cfg.world_model.fragility.instab_severity = parse_double(
+        get_tracked("world_model.fragility.instab_severity", std::to_string(cfg.world_model.fragility.instab_severity)),
+        cfg.world_model.fragility.instab_severity, "world_model.fragility.instab_severity");
+    cfg.world_model.fragility.instab_threshold = parse_double(
+        get_tracked("world_model.fragility.instab_threshold", std::to_string(cfg.world_model.fragility.instab_threshold)),
+        cfg.world_model.fragility.instab_threshold, "world_model.fragility.instab_threshold");
+    cfg.world_model.fragility.vpin_severity = parse_double(
+        get_tracked("world_model.fragility.vpin_severity", std::to_string(cfg.world_model.fragility.vpin_severity)),
+        cfg.world_model.fragility.vpin_severity, "world_model.fragility.vpin_severity");
 
     // ── Секция futures ───────────────────────────────────────────────────
     {

@@ -44,7 +44,7 @@
 #include "pipeline/pipeline_tick_context.hpp"
 #include "pipeline/pipeline_stage_result.hpp"
 #include "pipeline/pipeline_latency_tracker.hpp"
-#include "pipeline/periodic_trailing_sl.hpp"
+// periodic_trailing_sl removed: TP/SL are set once at entry and never updated.
 #include "pipeline/pre_trade_gates.hpp"
 #include "pipeline/protective_bracket_manager.hpp"
 #include "pipeline/rest_worker_pool.hpp"
@@ -337,13 +337,7 @@ private:
     static constexpr int64_t kBracketVerifyIntervalNs = 1'500'000'000LL;  // 1.5 s
     /// run96: periodic orphan plan-orders cleanup (every 5 min). Bug 10.1: atomic.
     std::atomic<int64_t> last_orphan_cleanup_ns_{0};
-    static constexpr int64_t kOrphanCleanupIntervalNs = 300'000'000'000LL;  // 5 min
-
-    // ==================== run87: Periodic Trailing SL =====================
-    /// Periodic monotonic trailing SL — каждые 5 сек пересчитывает SL по
-    /// Chandelier Exit для всех открытых позиций. SL двигается ТОЛЬКО в
-    /// сторону прибыли (monotonic), минимизирует unexpected losses.
-    std::unique_ptr<PeriodicTrailingSl> trailing_sl_;
+    static constexpr int64_t kOrphanCleanupIntervalNs = 60'000'000'000LL;  // 60 sec
 
     // ==================== run90: Stagnant Position Detector ===============
     /// Detect позиции на низкоактивных парах (FFUSDT case). Если за окно
@@ -388,8 +382,9 @@ private:
 
     /// Timestamp последней периодической синхронизации баланса
     int64_t last_balance_sync_ns_{0};
-    /// Интервал синхронизации баланса с биржей: 5 минут
-    static constexpr int64_t kBalanceSyncIntervalNs = 300'000'000'000LL;
+    /// Интервал синхронизации баланса с биржей: 30 секунд.
+    /// Sizing считается от total_capital, поэтому свежий баланс важен между ордерами.
+    static constexpr int64_t kBalanceSyncIntervalNs = 30'000'000'000LL;
 
     /// Production hardening: периодический re-sync clock с биржей (Bitget recvWindow ≈ 5 сек,
     /// long-running NTP drift может сломать подписи). Вызывается через RestWorkerPool.
