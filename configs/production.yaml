@@ -174,7 +174,7 @@ pair_selection:
   # Bitget query rate limit 20 req/s. 300 кандидатов × 2 REST (orderbook+candles)
   # = 600 calls / 20 = 30 сек. С pre-filter большинство отбрасывается без detail —
   # реальные REST ≈ 100-150 calls = 5-7 сек. Запас в scan_timeout_ms.
-  max_candidates_for_candles: 300
+  max_candidates_for_candles: 60
   scan_timeout_ms: 180000
   top_n: 20
   # run103 calibration: user хочет ~20 pairs watchlist. 1.2M → 700k для max coverage.

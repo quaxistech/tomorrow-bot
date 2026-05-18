@@ -128,7 +128,11 @@ struct MarketSnapshot {
         return !symbol.empty()
             && last_price > 0.0
             && !orderbook.bids.empty()
-            && !orderbook.asks.empty();
+            && !orderbook.asks.empty()
+            && orderbook.bids.front().price > 0.0
+            && orderbook.asks.front().price > 0.0
+            && orderbook.bids.front().quantity > 0.0
+            && orderbook.asks.front().quantity > 0.0;
     }
 };
 

@@ -29,6 +29,7 @@
 #include "security/secret_provider.hpp"
 #include "common/enums.hpp"
 #include <boost/json.hpp>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -308,7 +309,9 @@ int main(int argc, const char* argv[]) {
         if (api_key_res && api_secret_res && api_pass_res) {
             auto auth_rest = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
                 config.exchange.endpoint_rest, *api_key_res, *api_secret_res, *api_pass_res,
-                logger, config.exchange.timeout_ms);
+                logger, config.exchange.timeout_ms,
+                config.pair_selection.api_retry_max,
+                config.pair_selection.api_retry_base_delay_ms);
 
             std::string balance_query = "productType=" + config.futures.product_type;
             auto resp = auth_rest->get("/api/v2/mix/account/accounts", balance_query);
@@ -356,7 +359,9 @@ int main(int argc, const char* argv[]) {
     // ---- 4. Сканирование торговых пар (ScannerEngine v2) ----
     // Создаём REST-клиент для сканера (публичный, без аутентификации)
     auto scanner_rest_client = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
-        config.exchange.endpoint_rest, "", "", "", logger, config.exchange.timeout_ms);
+        config.exchange.endpoint_rest, "", "", "", logger, config.exchange.timeout_ms,
+        config.pair_selection.api_retry_max,
+        config.pair_selection.api_retry_base_delay_ms);
 
     // Создаём ScannerConfig из существующей конфигурации
     tb::scanner::ScannerConfig scanner_cfg;
@@ -487,7 +492,9 @@ int main(int argc, const char* argv[]) {
                 auto auth_rest = std::make_shared<tb::exchange::bitget::BitgetRestClient>(
                     config.exchange.endpoint_rest,
                     *api_key_res, *api_secret_res, *passphrase_res,
-                    logger, config.exchange.timeout_ms);
+                    logger, config.exchange.timeout_ms,
+                    config.pair_selection.api_retry_max,
+                    config.pair_selection.api_retry_base_delay_ms);
 
                 {
                     tb::exchange::bitget::BitgetFuturesQueryAdapter futures_query{

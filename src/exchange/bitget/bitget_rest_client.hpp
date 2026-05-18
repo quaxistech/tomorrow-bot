@@ -49,7 +49,9 @@ public:
         std::string api_secret,
         std::string passphrase,
         std::shared_ptr<logging::ILogger> logger,
-        int timeout_ms = 5000
+        int timeout_ms = 5000,
+        int retry_max = 3,
+        int retry_base_delay_ms = 200
     );
 
     ~BitgetRestClient();
@@ -106,8 +108,8 @@ private:
     int timeout_ms_;
 
     /// Retry policy
-    static constexpr int kMaxRetries = 3;
-    static constexpr int kBaseBackoffMs = 200;    ///< Начальная задержка retry
+    int retry_max_;
+    int retry_base_delay_ms_;
     static constexpr int kMaxBackoffMs = 3000;    ///< Максимальная задержка retry
 
     /// Clock sync state

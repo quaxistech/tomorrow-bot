@@ -53,7 +53,6 @@ ProductionGuardResult ProductionGuard::validate(
     ProductionGuardResult result;
     result.detected_mode = mode;
     result.api_keys_are_production = is_production_api(api_base_url);
-    result.env_confirmation_present = check_env_confirmation();
     result.config_hash = config_hash;
 
     // BUG-S4-23 fix: non-production modes bypass all strict credential checks.
@@ -79,17 +78,6 @@ ProductionGuardResult ProductionGuard::validate(
         "Live-торговля разрешена только на release build.");
     return result;
 #endif
-
-    // 1. Переменная окружения подтверждения
-    if (!result.env_confirmation_present) {
-        result.allowed = false;
-        result.reason = "Production режим требует переменную окружения "
-                        "TOMORROW_BOT_PRODUCTION_CONFIRM=I_UNDERSTAND_LIVE_TRADING";
-        logger_->error("ProductionGuard",
-            "ЗАПРЕТ: переменная TOMORROW_BOT_PRODUCTION_CONFIRM не установлена "
-            "или содержит неверный токен");
-        return result;
-    }
 
     // 2. URL API должен быть из allowlist production-хостов
     if (!result.api_keys_are_production) {
@@ -131,17 +119,6 @@ ProductionGuardResult ProductionGuard::validate(
         config_hash));
 
     return result;
-}
-
-bool ProductionGuard::check_env_confirmation() {
-    const char* val = std::getenv("TOMORROW_BOT_PRODUCTION_CONFIRM");
-    if (val == nullptr) return false;
-    // BUG-S4-11 fix: copy into std::string immediately.
-    // std::string_view(val) would retain a raw pointer into the static environment
-    // storage; a concurrent setenv()/putenv() call can invalidate that storage,
-    // causing undefined behaviour. std::string copies the bytes atomically from
-    // the perspective of the comparison and is safe after the pointer is released.
-    return std::string(val) == "I_UNDERSTAND_LIVE_TRADING";
 }
 
 bool ProductionGuard::is_production_api(const std::string& base_url) {

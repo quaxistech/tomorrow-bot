@@ -208,11 +208,43 @@ ScannerResult ScannerEngine::scan() {
         }
     }
 
+    // Keep only fully loaded candidates
+    std::vector<MarketSnapshot> ready_candidates;
+    ready_candidates.reserve(candidates.size());
+
+    for (auto& snap : candidates) {
+
+        // Skip candidates without orderbook
+        if (snap.orderbook.bids.empty() ||
+            snap.orderbook.asks.empty()) {
+
+            logger_->debug(
+                kComp,
+                "Skipping candidate with empty orderbook",
+                {{"symbol", snap.symbol}});
+
+            continue;
+        }
+
+        // Skip candidates without candles
+        if (snap.candles.empty()) {
+
+            logger_->debug(
+                kComp,
+                "Skipping candidate with empty candles",
+                {{"symbol", snap.symbol}});
+
+            continue;
+        }
+
+        ready_candidates.push_back(std::move(snap));
+    }
+
     // ── Step 5: Full analysis pipeline for each candidate ──
     std::vector<SymbolAnalysis> analyzed;
-    analyzed.reserve(candidates.size());
+    analyzed.reserve(ready_candidates.size());
 
-    for (const auto& snap : candidates) {
+    for (const auto& snap : ready_candidates) {
         SymbolAnalysis analysis;
         analysis.symbol = snap.symbol;
         analysis.quantity_precision = snap.quantity_precision;
@@ -591,10 +623,8 @@ std::vector<MarketSnapshot> ScannerEngine::fetch_tickers() {
             if (snap.collected_at_ms == 0) snap.collected_at_ms = now_ms;
 
             // Build minimal orderbook from ticker bid/ask
-            if (snap.best_bid > 0.0 && snap.best_ask > 0.0) {
-                snap.orderbook.bids.push_back({snap.best_bid, 0.0});
-                snap.orderbook.asks.push_back({snap.best_ask, 0.0});
-            }
+            // Ticker only provides best bid/ask; real orderbook must come from fetch_orderbook().
+            snap.orderbook = {};
 
             result.push_back(std::move(snap));
         }

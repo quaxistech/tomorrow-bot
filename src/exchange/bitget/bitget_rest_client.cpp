@@ -14,6 +14,8 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/json.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <mutex>
 #include <random>
@@ -56,13 +58,17 @@ BitgetRestClient::BitgetRestClient(
     std::string api_secret,
     std::string passphrase,
     std::shared_ptr<logging::ILogger> logger,
-    int timeout_ms)
+    int timeout_ms,
+    int retry_max,
+    int retry_base_delay_ms)
     : base_url_(std::move(base_url))
     , api_key_(std::move(api_key))
     , api_secret_(std::move(api_secret))
     , passphrase_(std::move(passphrase))
     , logger_(std::move(logger))
     , timeout_ms_(timeout_ms)
+    , retry_max_(retry_max)
+    , retry_base_delay_ms_(retry_base_delay_ms)
 {
     parse_base_url(base_url_, host_, port_);
 
@@ -316,7 +322,7 @@ RestResponse BitgetRestClient::execute(const std::string& method,
 
     RestResponse response;
 
-    for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
+    for (int attempt = 0; attempt <= retry_max_; ++attempt) {
         // Rate limit: ждём доступный токен перед каждой попыткой
         wait_for_rate_limit(path);
 
@@ -328,7 +334,7 @@ RestResponse BitgetRestClient::execute(const std::string& method,
         }
 
         // Last attempt — don't sleep, just return the error
-        if (attempt == kMaxRetries) {
+        if (attempt == retry_max_) {
             logger_->error(kComp, "Все retry исчерпаны",
                 {{"method", method}, {"path", path},
                  {"attempts", std::to_string(attempt + 1)},
@@ -338,7 +344,7 @@ RestResponse BitgetRestClient::execute(const std::string& method,
         }
 
         // B16.5 fix: на 429 удлиняем backoff (rate limit hit — нужна пауза).
-        int backoff_ms = kBaseBackoffMs * static_cast<int>(std::pow(3, attempt));
+        int backoff_ms = retry_base_delay_ms_ * static_cast<int>(std::pow(3, attempt));
         if (response.status_code == 429) {
             backoff_ms = std::max(backoff_ms, 1000);  // мин 1с при rate limit
         }
@@ -348,7 +354,7 @@ RestResponse BitgetRestClient::execute(const std::string& method,
 
         logger_->warn(kComp, "Transient error, retrying",
             {{"attempt", std::to_string(attempt + 1)},
-             {"max_retries", std::to_string(kMaxRetries)},
+             {"max_retries", std::to_string(retry_max_)},
              {"backoff_ms", std::to_string(backoff_ms)},
              {"status", std::to_string(response.status_code)},
              {"error", response.error_message},
